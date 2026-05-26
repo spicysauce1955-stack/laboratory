@@ -11,6 +11,18 @@ import subprocess
 from pathlib import Path
 
 
+def repo_root(start: Path | None = None) -> Path:
+    """The git work-tree root containing ``start`` (defaults to cwd)."""
+    start = start or Path.cwd()
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(start), "rev-parse", "--show-toplevel"], text=True
+        ).strip()
+        return Path(out)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return Path(start)
+
+
 def current_commit(repo: Path) -> str:
     """Resolve HEAD to a full commit SHA (FR-B1)."""
     return subprocess.check_output(
