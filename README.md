@@ -11,18 +11,30 @@ unchanged.
 
 ## Status
 
-Early scaffold (P0 in progress). Implemented:
-- Project skeleton (`uv` + `src/lab`), data model (`lab.models`, spec §8), backend interface
-  (`lab.backends.base`), manifest helpers (`lab.manifest`).
+P0 in progress. **Working today (local backend, no credentials):** submit → run → status/logs →
+fetch loop via both the CLI and the MCP server, with reproducible per-job manifests.
+- `lab.core` + `lab.store` + `lab.runner` + `lab.backends.local` (detached subprocess supervisor:
+  env injection, wall-clock timeout, auto-recorded terminal state).
+- `lab.cli` (Typer) and `lab.mcp_server` (FastMCP, structured returns) — thin shells over the
+  same `Lab` core. 14 tests, ruff-clean.
 
-Stubs awaiting implementation (see P0 build order in `research/16-decisions.md`):
-- `local` backend → `skypilot` backend, `Lab` core, CLI, MCP server.
+Next (see `research/16-decisions.md`): `skypilot` remote backend; live `metrics` (MLflow
+`get_metric_history`); push notifications; sweeps.
 
 ## Quickstart (dev)
 
 ```bash
 uv sync                       # create venv + uv.lock from pinned deps
-uv run lab --help             # CLI entrypoint (commands are stubs for now)
+
+# CLI
+uv run lab submit -c "python experiments/example_capacity.py" --seed 42
+uv run lab list
+uv run lab status <job_id>
+uv run lab logs <job_id>
+uv run lab fetch <job_id>
+
+# MCP server (stdio) — register this command in your MCP client config
+uv run python -m lab.mcp_server
 ```
 
 ## Layout

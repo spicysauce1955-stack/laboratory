@@ -14,7 +14,8 @@ from pathlib import Path
 
 from lab._util import now
 from lab.backends.base import Backend
-from lab.manifest import current_commit, is_dirty, uv_lock_sha256
+from lab.backends.local import LocalBackend
+from lab.manifest import current_commit, is_dirty, repo_root, uv_lock_sha256
 from lab.models import (
     ArtifactRecord,
     BackendInfo,
@@ -89,3 +90,13 @@ class Lab:
 
     def list_jobs(self) -> list[JobManifest]:
         return [self.store.read_manifest(j) for j in self.store.list_job_ids()]
+
+
+def default_lab(home: Path | None = None) -> Lab:
+    """Construct a Lab over the local backend, rooted at the current git repo.
+
+    Shared by the CLI and the MCP server so both drive the identical core.
+    """
+    repo = repo_root()
+    resolved_home = Path(home) if home else repo / "runs"
+    return Lab(backend=LocalBackend(home=resolved_home, repo=repo), repo=repo, home=resolved_home)

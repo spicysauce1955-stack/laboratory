@@ -10,9 +10,7 @@ from typing import Any
 
 import typer
 
-from lab.backends.local import LocalBackend
-from lab.core import Lab, LabError
-from lab.manifest import repo_root
+from lab.core import Lab, LabError, default_lab
 from lab.models import JobSpec, ResourceRequest
 
 app = typer.Typer(
@@ -22,9 +20,7 @@ app = typer.Typer(
 
 
 def _lab() -> Lab:
-    repo = repo_root()
-    home = repo / "runs"
-    return Lab(backend=LocalBackend(home=home, repo=repo), repo=repo, home=home)
+    return default_lab()
 
 
 def _emit(obj: Any) -> None:
