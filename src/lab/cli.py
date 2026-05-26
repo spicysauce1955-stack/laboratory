@@ -67,6 +67,16 @@ def logs(job_id: str, tail: int = typer.Option(100)) -> None:
 
 
 @app.command()
+def metrics(
+    job_id: str,
+    name: list[str] = typer.Option(None, "--name", "-n", help="filter to these metric names"),
+    since_step: int | None = typer.Option(None, help="only points with step > since_step"),
+) -> None:
+    """Query a job's incremental metric series (FR-D2 — the early-kill loop)."""
+    _emit({"series": _lab().metrics(job_id, names=name or None, since_step=since_step)})
+
+
+@app.command()
 def fetch(job_id: str) -> None:
     """Collect artifacts into runs/<job_id>/; prints local paths (FR-E2)."""
     arts = _lab().fetch_artifacts(job_id)

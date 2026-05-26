@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from lab.models import ArtifactRecord, JobManifest, JobState
 
@@ -34,4 +34,10 @@ class Backend(Protocol):
 
     def collect_artifacts(self, job_id: str, dest: str) -> list[ArtifactRecord]:
         """Pull the run's outputs into ``dest`` (``runs/<job_id>/``) (FR-E1/E2)."""
+        ...
+
+    def read_metrics(
+        self, job_id: str, names: Iterable[str] | None = None, since_step: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Read a job's incremental metric points, live (FR-D2)."""
         ...

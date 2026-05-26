@@ -31,6 +31,7 @@ uv run lab submit -c "python experiments/example_capacity.py" --seed 42
 uv run lab list
 uv run lab status <job_id>
 uv run lab logs <job_id>
+uv run lab metrics <job_id> --since-step 7   # live incremental series (early-kill loop)
 uv run lab fetch <job_id>
 
 # MCP server (stdio) — register this command in your MCP client config

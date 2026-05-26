@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import platform
 import uuid
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 from lab._util import now
 from lab.backends.base import Backend
 from lab.backends.local import LocalBackend
 from lab.manifest import current_commit, is_dirty, repo_root, uv_lock_sha256
+from lab.metrics import group_series
 from lab.models import (
     ArtifactRecord,
     BackendInfo,
@@ -78,6 +81,12 @@ class Lab:
 
     def logs(self, job_id: str, tail: int | None = 100) -> list[str]:
         return list(self.backend.tail_logs(job_id, tail=tail))
+
+    def metrics(
+        self, job_id: str, names: Iterable[str] | None = None, since_step: int | None = None
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Grouped incremental metric series for a job, queryable live (FR-D2)."""
+        return group_series(self.backend.read_metrics(job_id, names=names, since_step=since_step))
 
     def cancel(self, job_id: str) -> JobState:
         return self.backend.cancel(job_id)

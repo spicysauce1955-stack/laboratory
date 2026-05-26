@@ -14,9 +14,11 @@ import subprocess
 import sys
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 from lab._util import infer_artifact_type, now
 from lab.manifest import sha256_file
+from lab.metrics import METRICS_FILE, read_points
 from lab.models import ArtifactRecord, JobManifest, JobState
 from lab.store import JobStore
 
@@ -117,3 +119,10 @@ class LocalBackend:
                     )
         self.store.update_manifest(job_id, artifacts=records)
         return records
+
+    def read_metrics(
+        self, job_id: str, names: Iterable[str] | None = None, since_step: int | None = None
+    ) -> list[dict[str, Any]]:
+        return read_points(
+            self.store.output_dir(job_id) / METRICS_FILE, names=names, since_step=since_step
+        )

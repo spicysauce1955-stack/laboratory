@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 
@@ -31,7 +32,13 @@ def main() -> int:
     # Incremental metric series (EC-4) — observable live by tailing this file.
     with (run_dir / "metrics.jsonl").open("w") as f:
         for step in range(10):
-            f.write(json.dumps({"name": "demo_metric", "value": float(rng.random()), "step": step}) + "\n")
+            point = {
+                "name": "demo_metric",
+                "value": float(rng.random()),
+                "step": step,
+                "wall_time": time.time(),
+            }
+            f.write(json.dumps(point) + "\n")
 
     # An artifact (EC-3).
     (run_dir / "result.json").write_text(json.dumps({"seed": seed, "ok": True}))

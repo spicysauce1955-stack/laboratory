@@ -31,6 +31,7 @@ def test_tools_registered(tmp_path: Path):
         "fetch_artifacts",
         "list",
         "logs",
+        "metrics",
         "status",
         "submit",
     ]
@@ -54,13 +55,15 @@ def test_submit_status_logs_fetch(tmp_path: Path):
         async with Client(server) as c:
             st = (await c.call_tool("status", {"job_id": job_id})).data
             lg = (await c.call_tool("logs", {"job_id": job_id})).data
+            mt = (await c.call_tool("metrics", {"job_id": job_id})).data
             ft = (await c.call_tool("fetch_artifacts", {"job_id": job_id})).data
             ls = (await c.call_tool("list", {})).data
-            return st, lg, ft, ls
+            return st, lg, mt, ft, ls
 
-    st, lg, ft, ls = asyncio.run(query())
+    st, lg, mt, ft, ls = asyncio.run(query())
     assert st["state"] == "succeeded" and st["exit_code"] == 0
     assert isinstance(lg["lines"], list)
+    assert "demo_metric" in mt["series"]
     assert any(a["name"] == "result.json" for a in ft["artifacts"])
     assert ls["jobs"][0]["job_id"] == job_id
 

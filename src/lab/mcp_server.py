@@ -76,6 +76,14 @@ def build_server(lab: Lab) -> FastMCP:
         return {"lines": lab.logs(job_id, tail=tail)}
 
     @mcp.tool
+    def metrics(
+        job_id: str, names: list[str] | None = None, since_step: int | None = None
+    ) -> dict:
+        """Query incremental metric series; returns {series:{name:[{step,value,wall_time}]}} (FR-D2)."""
+        _require(job_id)
+        return {"series": lab.metrics(job_id, names=names, since_step=since_step)}
+
+    @mcp.tool
     def fetch_artifacts(job_id: str) -> dict:
         """Collect artifacts into runs/<job_id>/; returns {local_paths, artifacts} (FR-E2)."""
         _require(job_id)

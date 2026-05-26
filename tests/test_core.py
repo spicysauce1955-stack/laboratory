@@ -30,3 +30,20 @@ def test_end_to_end_submit_and_fetch(tmp_path: Path):
     assert result["seed"] == 11
 
     assert [j.job_id for j in lab.list_jobs()] == [job_id]
+
+
+def test_metrics_query_incremental(tmp_path: Path):
+    repo = repo_root(Path.cwd())
+    backend = LocalBackend(home=tmp_path, repo=repo)
+    lab = Lab(backend=backend, repo=repo, home=tmp_path)
+    job_id = lab.submit(
+        JobSpec(code_ref="HEAD", command=f"{PYTHON} experiments/example_capacity.py", seed=1)
+    )
+    assert wait_terminal(backend, job_id) == JobState.succeeded
+
+    series = lab.metrics(job_id)
+    assert set(series) == {"demo_metric"}
+    assert [p["step"] for p in series["demo_metric"]] == list(range(10))
+
+    incremental = lab.metrics(job_id, since_step=4)  # the early-kill "what's new?" query
+    assert [p["step"] for p in incremental["demo_metric"]] == [5, 6, 7, 8, 9]
