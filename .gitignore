@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Lab run outputs — artifacts fetched locally (spec FR-E2: runs/ stays git-ignored)
+/runs/
+
+# Local dev MLflow store
+/mlruns/
+
+# Secrets — never commit (spec FR-J1)
+.env
+*.key
+*.pem
+
+# OS
+.DS_Store
+
+# NOTE: uv.lock IS committed — it is the reproducibility pin (FR-B2).
