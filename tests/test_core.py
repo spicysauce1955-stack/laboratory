@@ -142,7 +142,7 @@ def test_local_job_records_cost(tmp_path: Path):
     cost = lab.manifest(jid).cost
     assert cost is not None
     assert cost.duration_seconds is not None and cost.duration_seconds >= 0
-    assert cost.hourly_usd == 0.0 and cost.actual_usd == 0.0  # own machine
+    assert cost.hourly_usd == 0.0 and cost.estimated_usd == 0.0 and cost.actual_usd == 0.0  # own machine
 
 
 def test_cache_key():

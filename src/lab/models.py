@@ -56,10 +56,13 @@ class BackendInfo(BaseModel):
 
 
 class CostInfo(BaseModel):
-    """Per-job cost/compute (FR-I2). hourly_usd/actual_usd are 0 for the local backend (own machine)."""
+    """Per-job cost/compute (FR-I2): an up-front estimate plus the actual. hourly/estimated/actual
+    are 0 for the local backend (own machine). For remote jobs ``duration_seconds`` is billed
+    wall-clock (includes provisioning/setup, which clouds charge for)."""
 
     duration_seconds: float | None = None
     hourly_usd: float | None = None
+    estimated_usd: float | None = None  # hourly x wall-clock budget, known at launch
     actual_usd: float | None = None
 
 

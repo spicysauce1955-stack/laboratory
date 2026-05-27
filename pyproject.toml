@@ -40,6 +40,7 @@ dev = [
 cli = [
     "typer>=0.12",
     "fastmcp>=2",
+    "rich>=13",  # terminal dashboard (FR-D3)
 ]
 
 [tool.uv]

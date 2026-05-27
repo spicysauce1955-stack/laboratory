@@ -68,7 +68,10 @@ def run_job(job_dir: Path) -> int:
 
     ended = now()
     cost = CostInfo(
-        duration_seconds=duration_seconds(started, ended), hourly_usd=0.0, actual_usd=0.0
+        duration_seconds=duration_seconds(started, ended),
+        hourly_usd=0.0,
+        estimated_usd=0.0,
+        actual_usd=0.0,
     )
 
     # Respect a concurrent cancel: the backend sets status=cancelled before killing the group.

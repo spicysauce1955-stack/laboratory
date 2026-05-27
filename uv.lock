@@ -1778,6 +1778,7 @@ tracking = [
 [package.dev-dependencies]
 cli = [
     { name = "fastmcp" },
+    { name = "rich" },
     { name = "typer" },
 ]
 dev = [
@@ -1802,6 +1803,7 @@ provides-extras = ["skypilot", "r2", "tracking"]
 [package.metadata.requires-dev]
 cli = [
     { name = "fastmcp", specifier = ">=2" },
+    { name = "rich", specifier = ">=13" },
     { name = "typer", specifier = ">=0.12" },
 ]
 dev = [

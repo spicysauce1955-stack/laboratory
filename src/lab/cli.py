@@ -229,5 +229,18 @@ def wait(
         raise typer.Exit(code=1)
 
 
+@app.command()
+def dashboard(
+    sweep: str | None = typer.Option(None, "--sweep", help="only jobs in this sweep_id"),
+    interval: float = typer.Option(2.0, help="refresh seconds"),
+) -> None:
+    """Live terminal dashboard of job status + cost + latest metrics (FR-D3). Ctrl-C to exit."""
+    from lab.dashboard import run_dashboard
+
+    lab = _lab()
+    ids = lab.jobs_in_sweep(sweep) if sweep else None
+    run_dashboard(lab, ids, interval=interval)
+
+
 if __name__ == "__main__":
     app()

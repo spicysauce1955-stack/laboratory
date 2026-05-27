@@ -75,6 +75,17 @@ def _safe_down(sky_mod, cluster: str) -> None:
         print(f"[lab] teardown warning for {cluster}: {e}")
 
 
+def _hourly_cost(handle) -> float | None:
+    """USD/hour for the launched cluster, or None if unavailable (best-effort, FR-I2)."""
+    try:
+        launched = getattr(handle, "launched_resources", None)
+        if launched is not None:
+            return float(launched.get_cost(3600))
+    except Exception as e:  # noqa: BLE001
+        print(f"[lab] cost estimate unavailable: {e}")
+    return None
+
+
 def run_job(job_dir: Path) -> int:
     job_dir = Path(job_dir)
     store = JobStore(job_dir.parent)
@@ -96,6 +107,12 @@ def run_job(job_dir: Path) -> int:
             idle_minutes_to_autostop=DEFAULT_AUTOSTOP_MIN,
         )
         sky_job_id, handle = sky.stream_and_get(request_id)  # returns once the job is submitted (0.12)
+        # Record the cost estimate up-front so a running job already shows cost (FR-I2).
+        hourly_usd = _hourly_cost(handle)
+        estimated_usd = actual_cost(hourly_usd, parse_duration(manifest.resources.timeout))
+        store.update_manifest(
+            job_id, cost=CostInfo(hourly_usd=hourly_usd, estimated_usd=estimated_usd)
+        )
         # Wait for the run to actually finish before fetching artifacts / tearing down.
         try:
             sky.tail_logs(cluster, sky_job_id, follow=True)  # streams run logs; blocks till done
@@ -130,16 +147,12 @@ def run_job(job_dir: Path) -> int:
             print(f"[lab] R2 upload failed: {e}")
 
     ended = now()
-    hourly_usd = None
-    try:
-        launched = getattr(handle, "launched_resources", None)
-        if launched is not None:
-            hourly_usd = float(launched.get_cost(3600))  # USD/hour for the chosen instance (FR-I2)
-    except Exception as e:  # noqa: BLE001
-        print(f"[lab] cost estimate unavailable: {e}")
     dur = duration_seconds(started, ended)
     cost = CostInfo(
-        duration_seconds=dur, hourly_usd=hourly_usd, actual_usd=actual_cost(hourly_usd, dur)
+        duration_seconds=dur,
+        hourly_usd=hourly_usd,
+        estimated_usd=estimated_usd,
+        actual_usd=actual_cost(hourly_usd, dur),
     )
 
     # Respect a concurrent cancel (backend set status=cancelled before killing us).
