@@ -6,14 +6,17 @@ Wired to the local backend by default; structured JSON output mirrors the MCP §
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import typer
 
 from lab.core import Lab, LabError, default_lab
 from lab.manifest import repo_root
-from lab.models import JobSpec, ResourceRequest
+from lab.models import JobSpec, JobState, ResourceRequest
 from lab.store import JobStore
+
+_TERMINAL = {JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out}
 
 app = typer.Typer(
     help="Laboratory — remote experiment runner (CLI mirror of the MCP tools, spec §9).",
@@ -170,6 +173,47 @@ def list_jobs() -> None:
             ]
         }
     )
+
+
+@app.command()
+def wait(
+    job_ids: list[str] = typer.Argument(None, help="job id(s) to wait for"),
+    sweep: str | None = typer.Option(None, "--sweep", help="wait for all jobs in this sweep_id"),
+    interval: float = typer.Option(10.0, help="seconds between cheap status polls (FR-G2)"),
+    timeout: float | None = typer.Option(None, help="give up after N seconds"),
+    done_file: Path | None = typer.Option(
+        None, "--done-file", help="write the final summary here on completion (a sentinel a hook can watch)"
+    ),
+) -> None:
+    """Block until the job(s) reach a terminal state, then exit (FR-G1).
+
+    Run as a Claude Code background task — its completion is the push signal the session acts on,
+    so the agent need not poll. Exits non-zero if it gave up on a timeout.
+    """
+    ids = _lab().jobs_in_sweep(sweep) if sweep else list(job_ids or [])
+    if not ids:
+        msg = f"sweep {sweep!r} matched no jobs" if sweep else "pass job id(s) or --sweep <sweep_id>"
+        _emit({"error": msg})
+        raise typer.Exit(code=2)
+    store = JobStore(repo_root() / "runs")
+    missing = [j for j in ids if not store.manifest_path(j).exists()]
+    if missing:  # fail-loud (FR-F3), not a raw traceback
+        _emit({"error": f"unknown job id(s): {missing}"})
+        raise typer.Exit(code=2)
+    manifests = _lab_for(ids[0]).wait(ids, interval=interval, timeout=timeout)
+    all_terminal = all(m.status in _TERMINAL for m in manifests)
+    summary = {
+        "all_terminal": all_terminal,
+        "jobs": [
+            {"job_id": m.job_id, "state": m.status.value, "exit_code": m.exit_code}
+            for m in manifests
+        ],
+    }
+    _emit(summary)
+    if done_file is not None:
+        done_file.write_text(json.dumps(summary, indent=2, default=str))
+    if not all_terminal:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

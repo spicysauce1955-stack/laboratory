@@ -11,6 +11,7 @@ from __future__ import annotations
 import itertools
 import platform
 import shlex
+import time
 import uuid
 from collections.abc import Iterable
 from pathlib import Path
@@ -34,6 +35,10 @@ from lab.models import (
     RunSpec,
 )
 from lab.store import JobStore
+
+_TERMINAL_STATES = frozenset(
+    {JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out}
+)
 
 
 class LabError(RuntimeError):
@@ -168,6 +173,33 @@ class Lab:
 
     def list_jobs(self) -> list[JobManifest]:
         return [self.store.read_manifest(j) for j in self.store.list_job_ids()]
+
+    def jobs_in_sweep(self, sweep_id: str) -> list[str]:
+        return [j.job_id for j in self.list_jobs() if j.sweep_id == sweep_id]
+
+    def wait(
+        self, job_ids: list[str], *, interval: float = 10.0, timeout: float | None = None
+    ) -> list[JobManifest]:
+        """Block until every job reaches a terminal state (or ``timeout``), then return manifests.
+
+        Meant to run as a Claude Code background task: its completion is the push signal, so the
+        agent need not poll (FR-G1). Uses cheap status reads (FR-G2); status reads the store, so
+        this works for jobs of any backend.
+        """
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        pending = list(job_ids)
+        while pending:
+            pending = [j for j in pending if self.status(j) not in _TERMINAL_STATES]
+            if not pending:
+                break
+            if deadline is None:
+                time.sleep(max(0.05, interval))  # guard against a busy-loop on interval<=0
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break  # timed out before all jobs finished
+                time.sleep(max(0.05, min(interval, remaining)))  # never overrun the deadline
+        return [self.manifest(j) for j in job_ids]
 
 
 def default_lab(home: Path | None = None, backend: str = "local") -> Lab:

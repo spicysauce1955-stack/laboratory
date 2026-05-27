@@ -1,8 +1,9 @@
 import json
+import time
 from pathlib import Path
 
 import pytest
-from helpers import PYTHON, wait_terminal
+from helpers import PYTHON, TERMINAL, wait_terminal
 
 from lab.backends.local import LocalBackend
 from lab.core import Lab, LabError, expand_grid
@@ -102,3 +103,31 @@ def test_sweep_job_cap(tmp_path: Path):
     lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
     with pytest.raises(LabError):
         lab.sweep("python x.py", {"a": list(range(20))}, max_jobs=5)
+
+
+def test_wait_returns_when_jobs_terminal(tmp_path: Path):
+    repo = repo_root(Path.cwd())
+    backend = LocalBackend(home=tmp_path, repo=repo)
+    lab = Lab(backend=backend, repo=repo, home=tmp_path)
+    _, job_ids = lab.sweep(f"{PYTHON} experiments/example_capacity.py", {"K": [1, 2]})
+    manifests = lab.wait(job_ids, interval=0.2, timeout=30)
+    assert all(m.status == JobState.succeeded for m in manifests)
+
+
+def test_wait_respects_timeout(tmp_path: Path):
+    repo = repo_root(Path.cwd())
+    backend = LocalBackend(home=tmp_path, repo=repo)
+    lab = Lab(backend=backend, repo=repo, home=tmp_path)
+    jid = lab.submit(JobSpec(code_ref="HEAD", command=f'{PYTHON} -c "import time; time.sleep(30)"'))
+    t0 = time.monotonic()
+    # interval (5s) >> timeout (0.5s): must still return ~at the timeout, not at the next interval
+    manifests = lab.wait([jid], interval=5.0, timeout=0.5)
+    assert time.monotonic() - t0 < 3  # not the 30s job, and not the 5s interval boundary
+    assert manifests[0].status not in TERMINAL  # gave up while still running
+    backend.cancel(jid)  # clean up the sleeper
+
+
+def test_wait_empty_returns_empty(tmp_path: Path):
+    repo = repo_root(Path.cwd())
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
+    assert lab.wait([]) == []
