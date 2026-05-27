@@ -185,13 +185,13 @@ class SkyPilotBackend:
         try:
             import sky
 
-            sky.cancel(cluster, all=True)
+            sky.get(sky.cancel(cluster, all=True))  # 0.12: RequestId
         except Exception:  # noqa: BLE001 - best-effort; teardown below is what matters
             pass
         try:
             import sky
 
-            sky.down(cluster)
+            sky.get(sky.down(cluster))  # 0.12: RequestId
         except Exception:  # noqa: BLE001
             pass
         return JobState.cancelled

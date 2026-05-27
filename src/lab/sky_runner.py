@@ -10,9 +10,10 @@ Entry point:  python -m lab.sky_runner <job_dir>
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
 
-from lab._util import now
+from lab._util import now, parse_duration
 from lab.backends.skypilot import (
     DEFAULT_AUTOSTOP_MIN,
     REMOTE_RUN_DIR,
@@ -24,16 +25,36 @@ from lab.models import JobState
 from lab.store import JobStore
 
 
-def _final_job_state(sky_mod, cluster: str, sky_job_id: int | None) -> JobState:
-    try:
-        for rec in sky_mod.queue(cluster, skip_finished=False):
-            if sky_job_id is None or rec.get("job_id") == sky_job_id:
-                status = rec.get("status")
-                name = getattr(status, "name", str(status).split(".")[-1])
-                return map_job_status(name)
-    except Exception as e:  # noqa: BLE001
-        print(f"[lab] could not read final job status: {e}")
-    return JobState.failed
+_TERMINAL_NAMES = {"SUCCEEDED", "FAILED", "FAILED_SETUP", "FAILED_DRIVER", "CANCELLED"}
+
+
+def _rec_field(rec, key: str):
+    return rec.get(key) if isinstance(rec, dict) else getattr(rec, key, None)
+
+
+def _job_status_name(sky_mod, cluster: str, sky_job_id: int | None) -> str | None:
+    recs = sky_mod.get(sky_mod.queue(cluster, skip_finished=False))  # 0.12: RequestId
+    for rec in recs:
+        if sky_job_id is None or _rec_field(rec, "job_id") == sky_job_id:
+            status = _rec_field(rec, "status")
+            return getattr(status, "name", str(status).split(".")[-1])
+    return None
+
+
+def _wait_terminal(sky_mod, cluster: str, sky_job_id: int | None, max_wait: float) -> JobState:
+    """Poll the remote job until terminal — sky.launch (0.12) returns at submit time, not
+    completion, so we must wait before fetching artifacts and tearing down."""
+    deadline = time.time() + max_wait
+    name: str | None = None
+    while time.time() < deadline:
+        try:
+            name = _job_status_name(sky_mod, cluster, sky_job_id)
+        except Exception as e:  # noqa: BLE001
+            print(f"[lab] queue poll error: {e}")
+        if name in _TERMINAL_NAMES:
+            break
+        time.sleep(10)
+    return map_job_status(name or "FAILED")
 
 
 def _rsync_down(cluster: str, remote_dir: str, local_dir: Path) -> None:
@@ -47,7 +68,7 @@ def _rsync_down(cluster: str, remote_dir: str, local_dir: Path) -> None:
 
 def _safe_down(sky_mod, cluster: str) -> None:
     try:
-        sky_mod.down(cluster)
+        sky_mod.get(sky_mod.down(cluster))  # 0.12: RequestId
     except Exception as e:  # noqa: BLE001
         print(f"[lab] teardown warning for {cluster}: {e}")
 
@@ -65,15 +86,20 @@ def run_job(job_dir: Path) -> int:
 
     try:
         task = build_task(manifest, workdir=Path.cwd())
-        sky_job_id, _ = sky.launch(
+        request_id = sky.launch(
             task,
             cluster_name=cluster,
             down=True,
             idle_minutes_to_autostop=DEFAULT_AUTOSTOP_MIN,
-            detach_run=False,
-            stream_logs=True,
         )
-        final = _final_job_state(sky, cluster, sky_job_id)
+        sky_job_id, _ = sky.stream_and_get(request_id)  # returns once the job is submitted (0.12)
+        # Wait for the run to actually finish before fetching artifacts / tearing down.
+        try:
+            sky.tail_logs(cluster, sky_job_id, follow=True)  # streams run logs; blocks till done
+        except Exception as e:  # noqa: BLE001
+            print(f"[lab] tail_logs issue: {e}")
+        max_wait = (parse_duration(manifest.resources.timeout) or 3600) + 300
+        final = _wait_terminal(sky, cluster, sky_job_id, max_wait)
     except Exception as e:  # noqa: BLE001
         store.update_manifest(
             job_id, status=JobState.failed, ended_at=now(), end_reason=f"launch error: {e}"[:300]

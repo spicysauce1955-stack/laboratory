@@ -8,6 +8,7 @@ dependencies = [
     "numpy<2",          # spec FR-B2: NumPy <2 pin
     "pydantic>=2",      # manifest / structured models (spec §8)
     "typer>=0.12",      # CLI mirror (FR-F2)
+    "click<8.2",        # ray (in SkyPilot's remote runtime) crashes on click>=8.2
     "fastmcp>=2",       # MCP server (FR-F1)
     "mlflow>=2",        # tracking + live metrics (FR-D2)
     "hydra-core>=1.3",  # experiment config (Experiment Contract §7)
@@ -16,12 +17,12 @@ dependencies = [
 # Remote provisioning backend — deferred until we wire the skypilot backend (P0-remote).
 # Install when needed, e.g.:  uv add "skypilot[vast]"   (vast.ai for the GPU/P1 path)
 [project.optional-dependencies]
-# skypilot 0.8.x is the newest compatible with our numpy<2 pin; its [vast] extra leaves
-# vastai-sdk unbounded (>=0.1.12), but vastai-sdk 1.x dropped `creds_source` which 0.8.x calls.
-# Pin to the pre-1.0 line it was written against.
+# skypilot>=0.12 pins click<8.2 (which its remote ray runtime requires) — hence the base deps
+# also cap click<8.2. skypilot 0.12 uses the newer VastAI().client API, so pin vastai-sdk>=1.0
+# (its [vast] extra pin is too loose — leaving it picks an old 0.2.x that lacks .client).
 # `pip` is required because SkyPilot shells out to `pip3` locally during Vast provisioning,
 # and uv-managed venvs don't include pip by default.
-skypilot = ["skypilot[vast]>=0.8,<0.9", "vastai-sdk>=0.1.12,<1", "pip"]
+skypilot = ["skypilot[vast]>=0.12", "vastai-sdk>=1.0", "pip"]
 
 [project.scripts]
 lab = "lab.cli:app"
