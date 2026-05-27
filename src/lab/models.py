@@ -76,7 +76,7 @@ class MetricRecord(BaseModel):
 class JobSpec(BaseModel):
     """Input to ``submit`` (FR-A1 / MCP §9). ``code_ref`` is resolved to a commit."""
 
-    code_ref: str
+    code_ref: str = "HEAD"
     command: str
     config: dict | None = None
     seed: int | None = None

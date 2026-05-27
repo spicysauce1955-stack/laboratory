@@ -6,8 +6,8 @@ import pytest
 from helpers import PYTHON, TERMINAL, wait_terminal
 
 from lab.backends.local import LocalBackend
-from lab.core import Lab, LabError, expand_grid
-from lab.manifest import repo_root
+from lab.core import Lab, LabError, cache_key, expand_grid
+from lab.manifest import is_dirty, repo_root
 from lab.models import JobSpec, JobState
 
 
@@ -131,3 +131,30 @@ def test_wait_empty_returns_empty(tmp_path: Path):
     repo = repo_root(Path.cwd())
     lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
     assert lab.wait([]) == []
+
+
+def test_cache_key():
+    k = cache_key("abc", "python x.py", {"a": 1, "b": 2}, 5)
+    assert k == cache_key("abc", "python x.py", {"b": 2, "a": 1}, 5)  # config order-insensitive
+    assert k == cache_key("abc", "python x.py", {"a": "1", "b": "2"}, 5)  # value type-insensitive
+    assert k != cache_key("abc", "python x.py", {"a": 1, "b": 2}, 6)  # seed matters
+    assert k != cache_key("abc", "python y.py", {"a": 1, "b": 2}, 5)  # command matters
+    assert k != cache_key("def", "python x.py", {"a": 1, "b": 2}, 5)  # commit matters
+
+
+def test_find_cached(tmp_path: Path):
+    repo = repo_root(Path.cwd())
+    backend = LocalBackend(home=tmp_path, repo=repo)
+    lab = Lab(backend=backend, repo=repo, home=tmp_path)
+    cmd = f"{PYTHON} experiments/example_capacity.py"
+    jid = lab.submit(JobSpec(code_ref="HEAD", command=cmd, seed=5, config={"K": 1}))
+    assert wait_terminal(backend, jid) == JobState.succeeded
+
+    # identical job -> hit (require_clean=False: the dev tree is dirty during tests)
+    assert lab.find_cached(JobSpec(command=cmd, seed=5, config={"K": 1}), require_clean=False) == jid
+    # different seed / command -> miss
+    assert lab.find_cached(JobSpec(command=cmd, seed=6, config={"K": 1}), require_clean=False) is None
+    assert lab.find_cached(JobSpec(command="python other.py", seed=5), require_clean=False) is None
+    # clean-tree gate: a dirty working tree disables caching
+    if is_dirty(repo):
+        assert lab.find_cached(JobSpec(command=cmd, seed=5, config={"K": 1})) is None

@@ -63,6 +63,7 @@ def _parse_grid(items: list[str]) -> dict[str, list]:
 def submit(
     command: str = typer.Option(..., "--command", "-c", help="entrypoint, e.g. 'python experiments/x.py'"),
     backend: str = typer.Option("local", "--backend", help="local | skypilot"),
+    cache: bool = typer.Option(False, "--cache", help="reuse a prior succeeded identical job (FR-B5)"),
     seed: int | None = typer.Option(None, help="explicit seed (recorded in the manifest)"),
     code_ref: str = typer.Option("HEAD", help="git ref to pin"),
     cpus: int | None = typer.Option(None),
@@ -71,24 +72,26 @@ def submit(
     accelerators: str | None = typer.Option(None, "--accelerators", help="e.g. RTX_3070:1 (required for Vast)"),
     timeout: str | None = typer.Option(None, help="wall-clock limit, e.g. 2h / 30m / 45s"),
 ) -> None:
-    """Submit a job without blocking; prints {job_id, status} (FR-A1)."""
+    """Submit a job without blocking; prints {job_id, cached, status} (FR-A1)."""
     lab = _lab(backend)
+    spec = JobSpec(
+        code_ref=code_ref,
+        command=command,
+        seed=seed,
+        resources=ResourceRequest(
+            cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout
+        ),
+        submitted_by="human",
+    )
+    if cache and (cached_id := lab.find_cached(spec)) is not None:
+        _emit({"job_id": cached_id, "cached": True, "status": lab.status(cached_id).value})
+        return
     try:
-        job_id = lab.submit(
-            JobSpec(
-                code_ref=code_ref,
-                command=command,
-                seed=seed,
-                resources=ResourceRequest(
-                    cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout
-                ),
-                submitted_by="human",
-            )
-        )
+        job_id = lab.submit(spec)
     except LabError as e:  # fail-loud, actionable (FR-F3)
         _emit({"error": str(e)})
         raise typer.Exit(code=1) from e
-    _emit({"job_id": job_id, "status": lab.status(job_id).value})
+    _emit({"job_id": job_id, "cached": False, "status": lab.status(job_id).value})
 
 
 @app.command()

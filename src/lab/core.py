@@ -8,7 +8,9 @@ chosen :class:`~lab.backends.base.Backend`.
 
 from __future__ import annotations
 
+import hashlib
 import itertools
+import json
 import platform
 import shlex
 import time
@@ -57,6 +59,31 @@ def expand_grid(grid: dict[str, list[Any]]) -> list[dict[str, Any]]:
     return [dict(zip(keys, combo)) for combo in itertools.product(*(grid[k] for k in keys))]
 
 
+def _normalize_config(value: Any) -> Any:
+    """Canonicalise config for hashing: stringify leaf values (preserving structure) so the same
+    logical job hashes equal regardless of how its values were typed — the CLI keeps grid values as
+    strings while the API/MCP pass ints/floats, and the experiment coerces types anyway."""
+    if isinstance(value, dict):
+        return {k: _normalize_config(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_config(v) for v in value]
+    return str(value)
+
+
+def cache_key(commit: str, command: str, config: dict[str, Any] | None, seed: int) -> str:
+    """Stable hash identifying an 'identical job' for result caching (FR-B5).
+
+    The spec keys on commit+config+seed; we also include the command (entrypoint), since the lab
+    runs arbitrary commands and two different experiments at the same commit/config/seed are not
+    the same job. Config leaves are normalised (stringified) so a value isn't type-sensitive.
+    """
+    payload = json.dumps(
+        {"commit": commit, "command": command, "config": _normalize_config(config or {}), "seed": seed},
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
 class Lab:
     def __init__(self, backend: Backend, repo: Path, home: Path) -> None:
         self.backend = backend
@@ -93,6 +120,29 @@ class Lab:
         self.store.create(manifest)
         self.backend.submit(manifest)
         return job_id
+
+    def find_cached(self, spec: JobSpec, *, require_clean: bool = True) -> str | None:
+        """Return a prior SUCCEEDED job with the same commit+command+config+seed, else None (FR-B5).
+
+        With ``require_clean`` (default), a dirty working tree disables caching and only clean-tree
+        jobs are eligible — a dirty commit doesn't fully capture the code, so reusing its result
+        isn't safe.
+        """
+        if require_clean and is_dirty(self.repo):
+            return None
+        seed = spec.seed if spec.seed is not None else 0
+        key = cache_key(current_commit(self.repo), spec.command, spec.config, seed)
+        for m in self.list_jobs():
+            if m.status is not JobState.succeeded or (require_clean and m.code.git_dirty):
+                continue
+            if (
+                cache_key(
+                    m.code.git_commit, m.run.entrypoint_command, m.run.resolved_config, m.run.seed
+                )
+                == key
+            ):
+                return m.job_id
+        return None
 
     def sweep(
         self,

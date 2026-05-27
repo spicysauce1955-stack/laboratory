@@ -46,6 +46,7 @@ def build_server(lab: Lab) -> FastMCP:
     def submit(
         command: str,
         backend: str = "local",
+        cache: bool = False,
         seed: int | None = None,
         code_ref: str = "HEAD",
         cpus: int | None = None,
@@ -54,23 +55,24 @@ def build_server(lab: Lab) -> FastMCP:
         accelerators: str | None = None,
         timeout: str | None = None,
     ) -> dict:
-        """Submit a job without blocking on backend (local|skypilot); returns {job_id, status} (FR-A1)."""
+        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5)."""
         the_lab = _lab(backend)
+        spec = JobSpec(
+            code_ref=code_ref,
+            command=command,
+            seed=seed,
+            resources=ResourceRequest(
+                cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout
+            ),
+            submitted_by="agent",
+        )
+        if cache and (cached_id := the_lab.find_cached(spec)) is not None:
+            return {"job_id": cached_id, "cached": True, "status": the_lab.status(cached_id).value}
         try:
-            job_id = the_lab.submit(
-                JobSpec(
-                    code_ref=code_ref,
-                    command=command,
-                    seed=seed,
-                    resources=ResourceRequest(
-                        cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout
-                    ),
-                    submitted_by="agent",
-                )
-            )
+            job_id = the_lab.submit(spec)
         except LabError as e:
             raise ToolError(str(e)) from e
-        return {"job_id": job_id, "status": the_lab.status(job_id).value}
+        return {"job_id": job_id, "cached": False, "status": the_lab.status(job_id).value}
 
     @mcp.tool
     def sweep(
