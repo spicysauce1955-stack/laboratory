@@ -101,11 +101,17 @@ class Lab:
         return [self.store.read_manifest(j) for j in self.store.list_job_ids()]
 
 
-def default_lab(home: Path | None = None) -> Lab:
-    """Construct a Lab over the local backend, rooted at the current git repo.
-
-    Shared by the CLI and the MCP server so both drive the identical core.
+def default_lab(home: Path | None = None, backend: str = "local") -> Lab:
+    """Construct a Lab rooted at the current git repo, over the named backend
+    (``local`` or ``skypilot``). Shared by the CLI and MCP so both drive the identical core.
     """
     repo = repo_root()
     resolved_home = Path(home) if home else repo / "runs"
-    return Lab(backend=LocalBackend(home=resolved_home, repo=repo), repo=repo, home=resolved_home)
+    be: Backend
+    if backend == "skypilot":
+        from lab.backends.skypilot import SkyPilotBackend
+
+        be = SkyPilotBackend(home=resolved_home, repo=repo)
+    else:
+        be = LocalBackend(home=resolved_home, repo=repo)
+    return Lab(backend=be, repo=repo, home=resolved_home)

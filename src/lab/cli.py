@@ -11,7 +11,9 @@ from typing import Any
 import typer
 
 from lab.core import Lab, LabError, default_lab
+from lab.manifest import repo_root
 from lab.models import JobSpec, ResourceRequest
+from lab.store import JobStore
 
 app = typer.Typer(
     help="Laboratory — remote experiment runner (CLI mirror of the MCP tools, spec §9).",
@@ -19,8 +21,15 @@ app = typer.Typer(
 )
 
 
-def _lab() -> Lab:
-    return default_lab()
+def _lab(backend: str = "local") -> Lab:
+    return default_lab(backend=backend)
+
+
+def _lab_for(job_id: str) -> Lab:
+    """Build a Lab over whichever backend actually ran the job (from its manifest)."""
+    home = repo_root() / "runs"
+    provisioner = JobStore(home).read_manifest(job_id).backend.provisioner
+    return default_lab(home=home, backend=provisioner)
 
 
 def _emit(obj: Any) -> None:
@@ -30,20 +39,23 @@ def _emit(obj: Any) -> None:
 @app.command()
 def submit(
     command: str = typer.Option(..., "--command", "-c", help="entrypoint, e.g. 'python experiments/x.py'"),
+    backend: str = typer.Option("local", "--backend", help="local | skypilot"),
     seed: int | None = typer.Option(None, help="explicit seed (recorded in the manifest)"),
     code_ref: str = typer.Option("HEAD", help="git ref to pin"),
     cpus: int | None = typer.Option(None),
+    memory: str | None = typer.Option(None, help="e.g. 8 or 8+ (GB)"),
+    gpus: int | None = typer.Option(None),
     timeout: str | None = typer.Option(None, help="wall-clock limit, e.g. 2h / 30m / 45s"),
 ) -> None:
     """Submit a job without blocking; prints {job_id, status} (FR-A1)."""
-    lab = _lab()
+    lab = _lab(backend)
     try:
         job_id = lab.submit(
             JobSpec(
                 code_ref=code_ref,
                 command=command,
                 seed=seed,
-                resources=ResourceRequest(cpus=cpus, timeout=timeout),
+                resources=ResourceRequest(cpus=cpus, memory=memory, gpus=gpus, timeout=timeout),
                 submitted_by="human",
             )
         )
@@ -56,13 +68,13 @@ def submit(
 @app.command()
 def status(job_id: str) -> None:
     """Show a job's state (FR-A2)."""
-    _emit({"job_id": job_id, "state": _lab().status(job_id).value})
+    _emit({"job_id": job_id, "state": _lab_for(job_id).status(job_id).value})
 
 
 @app.command()
 def logs(job_id: str, tail: int = typer.Option(100)) -> None:
     """Tail a job's logs (FR-D1)."""
-    for line in _lab().logs(job_id, tail=tail):
+    for line in _lab_for(job_id).logs(job_id, tail=tail):
         typer.echo(line)
 
 
@@ -73,20 +85,20 @@ def metrics(
     since_step: int | None = typer.Option(None, help="only points with step > since_step"),
 ) -> None:
     """Query a job's incremental metric series (FR-D2 — the early-kill loop)."""
-    _emit({"series": _lab().metrics(job_id, names=name or None, since_step=since_step)})
+    _emit({"series": _lab_for(job_id).metrics(job_id, names=name or None, since_step=since_step)})
 
 
 @app.command()
 def fetch(job_id: str) -> None:
     """Collect artifacts into runs/<job_id>/; prints local paths (FR-E2)."""
-    arts = _lab().fetch_artifacts(job_id)
+    arts = _lab_for(job_id).fetch_artifacts(job_id)
     _emit({"local_paths": [a.path for a in arts], "artifacts": [a.model_dump() for a in arts]})
 
 
 @app.command()
 def cancel(job_id: str) -> None:
     """Cancel a job and tear down its machine (FR-A3, FR-C2)."""
-    _emit({"job_id": job_id, "state": _lab().cancel(job_id).value})
+    _emit({"job_id": job_id, "state": _lab_for(job_id).cancel(job_id).value})
 
 
 @app.command(name="list")
