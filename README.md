@@ -16,10 +16,12 @@ fetch loop via both the CLI and the MCP server, with reproducible per-job manife
 - `lab.core` + `lab.store` + `lab.runner` + `lab.backends.local` (detached subprocess supervisor:
   env injection, wall-clock timeout, auto-recorded terminal state).
 - `lab.cli` (Typer) and `lab.mcp_server` (FastMCP, structured returns) — thin shells over the
-  same `Lab` core. 14 tests, ruff-clean.
+  same `Lab` core, both with backend selection (local | skypilot).
+- **`skypilot` remote backend** — validated end-to-end on Vast.ai: provision → remote `uv sync`
+  → run → durable artifacts on Cloudflare **R2** → autostop teardown.
+- 28 tests, ruff-clean.
 
-Next (see `research/16-decisions.md`): `skypilot` remote backend; live `metrics` (MLflow
-`get_metric_history`); push notifications; sweeps.
+Next (see `research/16-decisions.md`): push notifications; sweeps; leaner remote dep group.
 
 ## Quickstart (dev)
 
@@ -36,6 +38,15 @@ uv run lab fetch <job_id>
 
 # MCP server (stdio) — register this command in your MCP client config
 uv run python -m lab.mcp_server
+
+# Remote backend (Vast.ai via SkyPilot): uv sync --extra skypilot, set a Vast API key, then:
+uv run lab submit -c "python experiments/example_capacity.py" \
+  --backend skypilot --accelerators RTX4090:1 --timeout 20m
+
+# Durable artifacts on Cloudflare R2 (optional): uv sync --extra r2, creds in
+# ~/.cloudflare/r2.credentials, then export before submitting/fetching:
+export LAB_R2_ENDPOINT="https://<account>.r2.cloudflarestorage.com"
+export LAB_R2_BUCKET="lab-artifacts"
 ```
 
 ## Layout
