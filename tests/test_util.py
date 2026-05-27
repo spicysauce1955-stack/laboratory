@@ -1,4 +1,16 @@
-from lab._util import infer_artifact_type, parse_duration
+from datetime import datetime, timedelta, timezone
+
+from lab._util import actual_cost, duration_seconds, infer_artifact_type, parse_duration
+
+
+def test_duration_and_cost():
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert duration_seconds(t0, t0 + timedelta(seconds=90)) == 90
+    assert duration_seconds(None, t0) is None
+    assert actual_cost(0.40, 3600) == 0.4
+    assert actual_cost(0.40, 1800) == 0.2
+    assert actual_cost(None, 100) is None
+    assert actual_cost(0.4, None) is None
 
 
 def test_parse_duration_units():

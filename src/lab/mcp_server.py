@@ -113,6 +113,7 @@ def build_server(lab: Lab) -> FastMCP:
             "ended_at": _iso(m.ended_at),
             "exit_code": m.exit_code,
             "end_reason": m.end_reason,
+            "cost": m.cost.model_dump() if m.cost else None,
         }
 
     @mcp.tool

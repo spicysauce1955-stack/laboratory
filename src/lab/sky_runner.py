@@ -13,7 +13,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from lab._util import now, parse_duration
+from lab._util import actual_cost, duration_seconds, now, parse_duration
 from lab.backends.skypilot import (
     DEFAULT_AUTOSTOP_MIN,
     REMOTE_RUN_DIR,
@@ -22,7 +22,7 @@ from lab.backends.skypilot import (
     map_job_status,
     promote_timeout,
 )
-from lab.models import JobState
+from lab.models import CostInfo, JobState
 from lab.storage import R2Store, r2_enabled
 from lab.store import JobStore
 
@@ -82,7 +82,8 @@ def run_job(job_dir: Path) -> int:
     manifest = store.read_manifest(job_id)
     cluster = cluster_name_for(job_id)
 
-    store.update_manifest(job_id, status=JobState.running, started_at=now())
+    started = now()
+    store.update_manifest(job_id, status=JobState.running, started_at=started)
 
     import sky
 
@@ -94,7 +95,7 @@ def run_job(job_dir: Path) -> int:
             down=True,
             idle_minutes_to_autostop=DEFAULT_AUTOSTOP_MIN,
         )
-        sky_job_id, _ = sky.stream_and_get(request_id)  # returns once the job is submitted (0.12)
+        sky_job_id, handle = sky.stream_and_get(request_id)  # returns once the job is submitted (0.12)
         # Wait for the run to actually finish before fetching artifacts / tearing down.
         try:
             sky.tail_logs(cluster, sky_job_id, follow=True)  # streams run logs; blocks till done
@@ -128,15 +129,29 @@ def run_job(job_dir: Path) -> int:
         except Exception as e:  # noqa: BLE001
             print(f"[lab] R2 upload failed: {e}")
 
+    ended = now()
+    hourly_usd = None
+    try:
+        launched = getattr(handle, "launched_resources", None)
+        if launched is not None:
+            hourly_usd = float(launched.get_cost(3600))  # USD/hour for the chosen instance (FR-I2)
+    except Exception as e:  # noqa: BLE001
+        print(f"[lab] cost estimate unavailable: {e}")
+    dur = duration_seconds(started, ended)
+    cost = CostInfo(
+        duration_seconds=dur, hourly_usd=hourly_usd, actual_usd=actual_cost(hourly_usd, dur)
+    )
+
     # Respect a concurrent cancel (backend set status=cancelled before killing us).
     if store.read_manifest(job_id).status != JobState.cancelled:
         store.update_manifest(
             job_id,
             status=final,
-            ended_at=now(),
+            ended_at=ended,
             exit_code=0 if final == JobState.succeeded else 1,
             end_reason=final.value,
             artifacts_uri=artifacts_uri,
+            cost=cost,
         )
 
     _safe_down(sky, cluster)

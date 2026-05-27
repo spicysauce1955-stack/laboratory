@@ -19,6 +19,20 @@ def now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def duration_seconds(started: datetime | None, ended: datetime | None) -> float | None:
+    """Wall-clock seconds between two timestamps, or None if either is missing (FR-I2)."""
+    if started is None or ended is None:
+        return None
+    return (ended - started).total_seconds()
+
+
+def actual_cost(hourly_usd: float | None, seconds: float | None) -> float | None:
+    """Actual USD = hourly rate prorated over the run's wall-clock (FR-I2)."""
+    if hourly_usd is None or seconds is None:
+        return None
+    return round(hourly_usd * seconds / 3600.0, 6)
+
+
 def parse_duration(value: str | None) -> float | None:
     """Parse a wall-clock limit (FR-I1). ``'2h'``/``'30m'``/``'45s'``/``'1d'`` or plain seconds.
 

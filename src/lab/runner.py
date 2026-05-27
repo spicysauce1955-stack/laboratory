@@ -13,8 +13,8 @@ import signal
 import subprocess
 from pathlib import Path
 
-from lab._util import now, parse_duration
-from lab.models import JobState
+from lab._util import duration_seconds, now, parse_duration
+from lab.models import CostInfo, JobState
 from lab.store import JobStore
 
 
@@ -40,7 +40,8 @@ def run_job(job_dir: Path) -> int:
     env["LAB_SEED"] = str(manifest.run.seed)
 
     timeout = parse_duration(manifest.resources.timeout)
-    store.update_manifest(job_id, status=JobState.running, started_at=now())
+    started = now()
+    store.update_manifest(job_id, status=JobState.running, started_at=started)
 
     timed_out = False
     with store.logs_path(job_id).open("w") as logf:
@@ -65,9 +66,14 @@ def run_job(job_dir: Path) -> int:
                 proc.kill()
                 exit_code = proc.wait()
 
+    ended = now()
+    cost = CostInfo(
+        duration_seconds=duration_seconds(started, ended), hourly_usd=0.0, actual_usd=0.0
+    )
+
     # Respect a concurrent cancel: the backend sets status=cancelled before killing the group.
     if store.read_manifest(job_id).status == JobState.cancelled:
-        store.update_manifest(job_id, ended_at=now(), exit_code=exit_code)
+        store.update_manifest(job_id, ended_at=ended, exit_code=exit_code, cost=cost)
         return exit_code if exit_code is not None else 1
 
     if timed_out:
@@ -78,7 +84,7 @@ def run_job(job_dir: Path) -> int:
         status, reason = JobState.failed, f"exit code {exit_code}"
 
     store.update_manifest(
-        job_id, status=status, ended_at=now(), exit_code=exit_code, end_reason=reason
+        job_id, status=status, ended_at=ended, exit_code=exit_code, end_reason=reason, cost=cost
     )
     return exit_code if exit_code is not None else 1
 

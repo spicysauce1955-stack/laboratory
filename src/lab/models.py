@@ -55,6 +55,14 @@ class BackendInfo(BaseModel):
     region: str | None = None
 
 
+class CostInfo(BaseModel):
+    """Per-job cost/compute (FR-I2). hourly_usd/actual_usd are 0 for the local backend (own machine)."""
+
+    duration_seconds: float | None = None
+    hourly_usd: float | None = None
+    actual_usd: float | None = None
+
+
 class ArtifactRecord(BaseModel):
     name: str
     type: ArtifactType = "other"
@@ -102,6 +110,7 @@ class JobManifest(BaseModel):
     ended_at: datetime | None = None
     exit_code: int | None = None
     end_reason: str | None = None
+    cost: CostInfo | None = None  # FR-I2
     metrics_uri: str | None = None
     logs_uri: str | None = None
     artifacts_uri: str | None = None  # durable object-store prefix, e.g. r2://lab-artifacts/<id>

@@ -125,8 +125,18 @@ def sweep(
 
 @app.command()
 def status(job_id: str) -> None:
-    """Show a job's state (FR-A2)."""
-    _emit({"job_id": job_id, "state": _lab_for(job_id).status(job_id).value})
+    """Show a job's state + cost (FR-A2, FR-I2)."""
+    lab = _lab_for(job_id)
+    state = lab.status(job_id)
+    m = lab.manifest(job_id)
+    _emit(
+        {
+            "job_id": job_id,
+            "state": state.value,
+            "exit_code": m.exit_code,
+            "cost": m.cost.model_dump() if m.cost else None,
+        }
+    )
 
 
 @app.command()

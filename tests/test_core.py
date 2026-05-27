@@ -133,6 +133,18 @@ def test_wait_empty_returns_empty(tmp_path: Path):
     assert lab.wait([]) == []
 
 
+def test_local_job_records_cost(tmp_path: Path):
+    repo = repo_root(Path.cwd())
+    backend = LocalBackend(home=tmp_path, repo=repo)
+    lab = Lab(backend=backend, repo=repo, home=tmp_path)
+    jid = lab.submit(JobSpec(command=f"{PYTHON} experiments/example_capacity.py", seed=1))
+    assert wait_terminal(backend, jid) == JobState.succeeded
+    cost = lab.manifest(jid).cost
+    assert cost is not None
+    assert cost.duration_seconds is not None and cost.duration_seconds >= 0
+    assert cost.hourly_usd == 0.0 and cost.actual_usd == 0.0  # own machine
+
+
 def test_cache_key():
     k = cache_key("abc", "python x.py", {"a": 1, "b": 2}, 5)
     assert k == cache_key("abc", "python x.py", {"b": 2, "a": 1}, 5)  # config order-insensitive
