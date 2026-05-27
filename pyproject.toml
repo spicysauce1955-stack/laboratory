@@ -4,13 +4,11 @@ version = "0.1.0"
 description = "Remote Experiment Runner — reproducible remote jobs with an agent-usable (MCP) interface and live observability."
 readme = "README.md"
 requires-python = ">=3.12"
+# Experiment-runtime deps only — this is what the remote installs to RUN an experiment.
+# Control-plane deps (CLI/MCP) live in the `cli` group; tracking/skypilot/r2 are extras.
 dependencies = [
     "numpy<2",          # spec FR-B2: NumPy <2 pin
-    "pydantic>=2",      # manifest / structured models (spec §8)
-    "typer>=0.12",      # CLI mirror (FR-F2)
-    "click<8.2",        # ray (in SkyPilot's remote runtime) crashes on click>=8.2
-    "fastmcp>=2",       # MCP server (FR-F1)
-    "mlflow>=2",        # tracking + live metrics (FR-D2)
+    "pydantic>=2",      # shared models (spec §8) + experiment config
     "hydra-core>=1.3",  # experiment config (Experiment Contract §7)
 ]
 
@@ -25,6 +23,8 @@ dependencies = [
 skypilot = ["skypilot[vast]>=0.12", "vastai-sdk>=1.0", "pip"]
 # Durable artifact storage on Cloudflare R2 (S3-compatible) for the lab control plane.
 r2 = ["boto3>=1.34"]
+# Experiment tracking (opt-in; not needed to run the lab or most experiments).
+tracking = ["mlflow>=2"]
 
 [project.scripts]
 lab = "lab.cli:app"
@@ -35,6 +35,20 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
 ]
+# Control-plane deps (CLI + MCP). Default-installed for local dev (see [tool.uv].default-groups);
+# the remote `uv sync --no-default-groups` skips them so experiments install only runtime deps.
+cli = [
+    "typer>=0.12",
+    "fastmcp>=2",
+]
+
+[tool.uv]
+default-groups = ["dev", "cli"]
+# Cap click<8.2 as a resolution constraint (not a dependency), decoupled from any group:
+# SkyPilot's remote ray runtime crashes on click>=8.2 (and skypilot 0.12 itself requires it).
+# As a constraint, click is only installed where something else pulls it (typer), never on the
+# lean remote — and the cap survives renaming/removing the `cli` group.
+constraint-dependencies = ["click<8.2"]
 
 [build-system]
 requires = ["hatchling"]

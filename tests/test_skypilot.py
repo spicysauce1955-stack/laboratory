@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from helpers import make_manifest
 
 from lab.backends.skypilot import (
@@ -34,6 +35,7 @@ def test_cluster_name_for():
 def test_build_scripts_and_timeout():
     setup = build_setup_script()
     assert "uv sync --frozen" in setup and "astral.sh/uv/install" in setup
+    assert "--no-default-groups" in setup  # remote installs runtime deps only, not the CLI/MCP
 
     m = make_manifest("j1", "python experiments/example_capacity.py", timeout="30m")
     run = build_run_script(m)
@@ -59,6 +61,7 @@ def test_promote_timeout(tmp_path):
 
 
 def test_build_task_fields(tmp_path: Path):
+    pytest.importorskip("sky")  # build_task needs the optional `skypilot` extra
     m = make_manifest("j1", "python run.py", seed=5)
     task = build_task(m, workdir=tmp_path)
     assert task.envs["LAB_RUN_ID"] == "j1"

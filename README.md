@@ -26,7 +26,8 @@ Next (see `research/16-decisions.md`): push notifications; sweeps; leaner remote
 ## Quickstart (dev)
 
 ```bash
-uv sync                       # create venv + uv.lock from pinned deps
+uv sync                                # local backend + CLI/MCP (lean default)
+uv sync --extra skypilot --extra r2    # + remote (Vast) backend & durable R2 (full dev)
 
 # CLI
 uv run lab submit -c "python experiments/example_capacity.py" --seed 42
