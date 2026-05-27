@@ -16,7 +16,10 @@ dependencies = [
 # Remote provisioning backend — deferred until we wire the skypilot backend (P0-remote).
 # Install when needed, e.g.:  uv add "skypilot[vast]"   (vast.ai for the GPU/P1 path)
 [project.optional-dependencies]
-skypilot = ["skypilot>=0.7"]
+# skypilot 0.8.x is the newest compatible with our numpy<2 pin; its [vast] extra leaves
+# vastai-sdk unbounded (>=0.1.12), but vastai-sdk 1.x dropped `creds_source` which 0.8.x calls.
+# Pin to the pre-1.0 line it was written against.
+skypilot = ["skypilot[vast]>=0.8,<0.9", "vastai-sdk>=0.1.12,<1"]
 
 [project.scripts]
 lab = "lab.cli:app"
