@@ -23,6 +23,7 @@ from lab.backends.skypilot import (
     promote_timeout,
 )
 from lab.models import JobState
+from lab.storage import R2Store, r2_enabled
 from lab.store import JobStore
 
 
@@ -115,6 +116,18 @@ def run_job(job_dir: Path) -> int:
 
     final = promote_timeout(final, store.output_dir(job_id))  # failed -> timed_out if sentinel
 
+    # Push the fetched outputs to durable storage (survives teardown / other machines).
+    artifacts_uri = None
+    if r2_enabled():
+        try:
+            r2 = R2Store.from_env()
+            if r2 is not None:
+                n = r2.upload_dir(store.output_dir(job_id), job_id)
+                artifacts_uri = r2.uri(job_id)
+                print(f"[lab] uploaded {n} artifact(s) to {artifacts_uri}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[lab] R2 upload failed: {e}")
+
     # Respect a concurrent cancel (backend set status=cancelled before killing us).
     if store.read_manifest(job_id).status != JobState.cancelled:
         store.update_manifest(
@@ -123,6 +136,7 @@ def run_job(job_dir: Path) -> int:
             ended_at=now(),
             exit_code=0 if final == JobState.succeeded else 1,
             end_reason=final.value,
+            artifacts_uri=artifacts_uri,
         )
 
     _safe_down(sky, cluster)

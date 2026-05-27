@@ -19,6 +19,7 @@ from lab.backends.base import Backend
 from lab.backends.local import LocalBackend
 from lab.manifest import current_commit, is_dirty, repo_root, uv_lock_sha256
 from lab.metrics import group_series
+from lab.storage import R2Store, r2_enabled
 from lab.models import (
     ArtifactRecord,
     BackendInfo,
@@ -92,6 +93,13 @@ class Lab:
         return self.backend.cancel(job_id)
 
     def fetch_artifacts(self, job_id: str, dest: str | None = None) -> list[ArtifactRecord]:
+        out = self.store.output_dir(job_id)
+        has_local = out.exists() and any(out.iterdir())
+        if not has_local and r2_enabled():  # local copy gone — pull the durable copy from R2
+            manifest = self.store.read_manifest(job_id)
+            r2 = R2Store.from_env()
+            if manifest.artifacts_uri and r2 is not None:
+                r2.download_dir(job_id, out)
         return self.backend.collect_artifacts(job_id, dest or str(self.store.job_dir(job_id)))
 
     def manifest(self, job_id: str) -> JobManifest:

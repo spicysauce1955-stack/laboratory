@@ -104,4 +104,5 @@ class JobManifest(BaseModel):
     end_reason: str | None = None
     metrics_uri: str | None = None
     logs_uri: str | None = None
+    artifacts_uri: str | None = None  # durable object-store prefix, e.g. r2://lab-artifacts/<id>
     artifacts: list[ArtifactRecord] = Field(default_factory=list)

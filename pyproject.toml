@@ -23,6 +23,8 @@ dependencies = [
 # `pip` is required because SkyPilot shells out to `pip3` locally during Vast provisioning,
 # and uv-managed venvs don't include pip by default.
 skypilot = ["skypilot[vast]>=0.12", "vastai-sdk>=1.0", "pip"]
+# Durable artifact storage on Cloudflare R2 (S3-compatible) for the lab control plane.
+r2 = ["boto3>=1.34"]
 
 [project.scripts]
 lab = "lab.cli:app"
