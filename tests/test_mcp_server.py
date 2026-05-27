@@ -68,6 +68,22 @@ def test_submit_status_logs_fetch(tmp_path: Path):
     assert ls["jobs"][0]["job_id"] == job_id
 
 
+def test_submit_accepts_backend_param(tmp_path: Path):
+    lab, server = _make(tmp_path)
+
+    async def do_submit() -> str:
+        async with Client(server) as c:
+            r = await c.call_tool(
+                "submit",
+                {"command": f"{PYTHON} experiments/example_capacity.py", "backend": "local", "seed": 2},
+            )
+            return r.data["job_id"]
+
+    job_id = asyncio.run(do_submit())
+    assert wait_terminal(lab.backend, job_id) == JobState.succeeded
+    assert lab.manifest(job_id).backend.provisioner == "local"
+
+
 def test_unknown_job_is_fail_loud(tmp_path: Path):
     _, server = _make(tmp_path)
 

@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     import sky
 
 REMOTE_RUN_DIR = "/tmp/lab_run"
+TIMEOUT_SENTINEL = ".lab_timed_out"  # written by the run script when `timeout` kills the job
 DEFAULT_AUTOSTOP_MIN = 5  # safety-net teardown if the supervisor process dies
 _TERMINAL = {JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out}
 
@@ -71,15 +72,34 @@ def build_setup_script() -> str:
 
 
 def build_run_script(manifest: JobManifest) -> str:
-    """Activate the env, then run the entrypoint under a wall-clock timeout (FR-I1)."""
+    """Activate the env, then run the entrypoint under a wall-clock timeout (FR-I1).
+
+    On a timeout, GNU `timeout` exits 124; we drop a sentinel into the run dir so the supervisor
+    can label the job `timed_out` (not just `failed`) after fetching outputs.
+    """
     timeout = parse_duration(manifest.resources.timeout)
-    guard = f"timeout {int(timeout)} " if timeout else ""
-    return (
-        'export PATH="$HOME/.local/bin:$PATH"\n'
-        "source .venv/bin/activate\n"
-        f'mkdir -p "{REMOTE_RUN_DIR}"\n'
-        f"{guard}{manifest.run.entrypoint_command}\n"
-    )
+    lines = [
+        'export PATH="$HOME/.local/bin:$PATH"',
+        "source .venv/bin/activate",
+        f'mkdir -p "{REMOTE_RUN_DIR}"',
+    ]
+    if timeout:
+        lines += [
+            f"timeout {int(timeout)} {manifest.run.entrypoint_command}",
+            "rc=$?",
+            f'[ "$rc" = "124" ] && touch "{REMOTE_RUN_DIR}/{TIMEOUT_SENTINEL}"',
+            "exit $rc",
+        ]
+    else:
+        lines.append(manifest.run.entrypoint_command)
+    return "\n".join(lines) + "\n"
+
+
+def promote_timeout(final: JobState, output_dir: Path) -> JobState:
+    """Promote a failed run to timed_out if the run script left the timeout sentinel (FR-I1)."""
+    if final == JobState.failed and (Path(output_dir) / TIMEOUT_SENTINEL).exists():
+        return JobState.timed_out
+    return final
 
 
 def build_task(manifest: JobManifest, workdir: Path) -> sky.Task:
@@ -202,7 +222,7 @@ class SkyPilotBackend:
         records: list[ArtifactRecord] = []
         if out.exists():
             for f in sorted(out.rglob("*")):
-                if f.is_file():
+                if f.is_file() and not f.name.startswith("."):  # skip sentinels/hidden files
                     rel = f.relative_to(out).as_posix()
                     records.append(
                         ArtifactRecord(

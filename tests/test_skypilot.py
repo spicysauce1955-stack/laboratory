@@ -3,11 +3,13 @@ from pathlib import Path
 from helpers import make_manifest
 
 from lab.backends.skypilot import (
+    TIMEOUT_SENTINEL,
     build_run_script,
     build_setup_script,
     build_task,
     cluster_name_for,
     map_job_status,
+    promote_timeout,
 )
 from lab.models import JobState
 
@@ -40,6 +42,20 @@ def test_build_scripts_and_timeout():
     assert "source .venv/bin/activate" in run
 
     assert "timeout " not in build_run_script(make_manifest("j2", "python x.py"))  # no limit
+
+
+def test_run_script_timeout_sentinel():
+    run = build_run_script(make_manifest("j", "python x.py", timeout="30m"))
+    assert "timeout 1800 python x.py" in run
+    assert TIMEOUT_SENTINEL in run and "rc=$?" in run and "exit $rc" in run
+
+
+def test_promote_timeout(tmp_path):
+    assert promote_timeout(JobState.failed, tmp_path) == JobState.failed
+    (tmp_path / TIMEOUT_SENTINEL).touch()
+    assert promote_timeout(JobState.failed, tmp_path) == JobState.timed_out
+    # only a failed run is promoted
+    assert promote_timeout(JobState.succeeded, tmp_path) == JobState.succeeded
 
 
 def test_build_task_fields(tmp_path: Path):

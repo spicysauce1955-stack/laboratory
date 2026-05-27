@@ -20,6 +20,7 @@ from lab.backends.skypilot import (
     build_task,
     cluster_name_for,
     map_job_status,
+    promote_timeout,
 )
 from lab.models import JobState
 from lab.store import JobStore
@@ -111,6 +112,8 @@ def run_job(job_dir: Path) -> int:
         _rsync_down(cluster, REMOTE_RUN_DIR, store.output_dir(job_id))
     except Exception as e:  # noqa: BLE001
         print(f"[lab] artifact rsync failed: {e}")
+
+    final = promote_timeout(final, store.output_dir(job_id))  # failed -> timed_out if sentinel
 
     # Respect a concurrent cancel (backend set status=cancelled before killing us).
     if store.read_manifest(job_id).status != JobState.cancelled:

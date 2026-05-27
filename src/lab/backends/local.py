@@ -106,7 +106,7 @@ class LocalBackend:
         records: list[ArtifactRecord] = []
         if out.exists():
             for f in sorted(out.rglob("*")):
-                if f.is_file():
+                if f.is_file() and not f.name.startswith("."):  # skip sentinels/hidden files
                     rel = f.relative_to(out).as_posix()
                     records.append(
                         ArtifactRecord(
