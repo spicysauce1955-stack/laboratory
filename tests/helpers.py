@@ -21,7 +21,12 @@ TERMINAL = {JobState.succeeded, JobState.failed, JobState.cancelled, JobState.ti
 
 
 def make_manifest(
-    job_id: str, command: str, *, seed: int = 0, timeout: str | None = None
+    job_id: str,
+    command: str,
+    *,
+    seed: int = 0,
+    timeout: str | None = None,
+    accelerators: str | None = None,
 ) -> JobManifest:
     return JobManifest(
         job_id=job_id,
@@ -30,7 +35,7 @@ def make_manifest(
         code=CodeRef(git_commit="0" * 40, git_dirty=False),
         env=EnvInfo(uv_lock_sha256="test", python_version="3.12"),
         run=RunSpec(entrypoint_command=command, seed=seed),
-        resources=ResourceRequest(timeout=timeout),
+        resources=ResourceRequest(timeout=timeout, accelerators=accelerators),
         backend=BackendInfo(provisioner="local"),
         status=JobState.queued,
     )

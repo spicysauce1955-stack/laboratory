@@ -97,14 +97,14 @@ def build_task(manifest: JobManifest, workdir: Path) -> sky.Task:
         },
         workdir=str(workdir),
     )
-    # NOTE: GPU *type* isn't modelled in ResourceRequest yet (only a count), and a count alone
-    # isn't a valid SkyPilot accelerator spec — so P0 requests CPU/memory and lets SkyPilot
-    # cost-optimise the offer. Typed GPU selection is a P1 follow-up.
+    # Vast is GPU-only in SkyPilot's catalog, so `accelerators` (e.g. "RTX_3070:1") is typically
+    # required; cpus/memory further constrain. If accelerators is None SkyPilot cost-optimises.
     task.set_resources(
         sky.Resources(
             cloud=sky.Vast(),
             cpus=manifest.resources.cpus,
             memory=manifest.resources.memory,
+            accelerators=manifest.resources.accelerators or None,
         )
     )
     return task

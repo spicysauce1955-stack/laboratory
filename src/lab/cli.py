@@ -45,6 +45,7 @@ def submit(
     cpus: int | None = typer.Option(None),
     memory: str | None = typer.Option(None, help="e.g. 8 or 8+ (GB)"),
     gpus: int | None = typer.Option(None),
+    accelerators: str | None = typer.Option(None, "--accelerators", help="e.g. RTX_3070:1 (required for Vast)"),
     timeout: str | None = typer.Option(None, help="wall-clock limit, e.g. 2h / 30m / 45s"),
 ) -> None:
     """Submit a job without blocking; prints {job_id, status} (FR-A1)."""
@@ -55,7 +56,9 @@ def submit(
                 code_ref=code_ref,
                 command=command,
                 seed=seed,
-                resources=ResourceRequest(cpus=cpus, memory=memory, gpus=gpus, timeout=timeout),
+                resources=ResourceRequest(
+                    cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout
+                ),
                 submitted_by="human",
             )
         )

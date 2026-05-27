@@ -50,3 +50,8 @@ def test_build_task_fields(tmp_path: Path):
     assert task.envs["LAB_RUN_DIR"]
     assert "run.py" in task.run
     assert "uv sync" in task.setup
+
+    # accelerators flow through to the Resources (required for Vast)
+    gpu_task = build_task(make_manifest("j2", "python r.py", accelerators="T4:1"), workdir=tmp_path)
+    res = next(iter(gpu_task.resources))
+    assert "T4" in str(res.accelerators)

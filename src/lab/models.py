@@ -28,6 +28,7 @@ class ResourceRequest(BaseModel):
     cpus: int | None = None
     gpus: int | None = None
     memory: str | None = None  # e.g. "32GB"
+    accelerators: str | None = None  # SkyPilot accelerator spec, e.g. "RTX_3070:1" (remote)
     timeout: str | None = None  # wall-clock limit, e.g. "2h" (FR-I1)
 
 

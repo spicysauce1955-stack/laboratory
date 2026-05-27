@@ -19,7 +19,9 @@ dependencies = [
 # skypilot 0.8.x is the newest compatible with our numpy<2 pin; its [vast] extra leaves
 # vastai-sdk unbounded (>=0.1.12), but vastai-sdk 1.x dropped `creds_source` which 0.8.x calls.
 # Pin to the pre-1.0 line it was written against.
-skypilot = ["skypilot[vast]>=0.8,<0.9", "vastai-sdk>=0.1.12,<1"]
+# `pip` is required because SkyPilot shells out to `pip3` locally during Vast provisioning,
+# and uv-managed venvs don't include pip by default.
+skypilot = ["skypilot[vast]>=0.8,<0.9", "vastai-sdk>=0.1.12,<1", "pip"]
 
 [project.scripts]
 lab = "lab.cli:app"
