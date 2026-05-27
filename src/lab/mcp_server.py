@@ -73,6 +73,33 @@ def build_server(lab: Lab) -> FastMCP:
         return {"job_id": job_id, "status": the_lab.status(job_id).value}
 
     @mcp.tool
+    def sweep(
+        command: str,
+        grid: dict[str, list],
+        backend: str = "local",
+        seed: int | None = None,
+        cpus: int | None = None,
+        memory: str | None = None,
+        gpus: int | None = None,
+        accelerators: str | None = None,
+        timeout: str | None = None,
+    ) -> dict:
+        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5)."""
+        the_lab = _lab(backend)
+        try:
+            sweep_id, job_ids = the_lab.sweep(
+                command,
+                grid,
+                seed=seed,
+                resources=ResourceRequest(
+                    cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout
+                ),
+            )
+        except LabError as e:
+            raise ToolError(str(e)) from e
+        return {"sweep_id": sweep_id, "job_ids": job_ids}
+
+    @mcp.tool
     def status(job_id: str) -> dict:
         """Return a job's state + timing (FR-A2); cheap to poll (FR-G2)."""
         m = _require(job_id)
@@ -121,7 +148,12 @@ def build_server(lab: Lab) -> FastMCP:
         """List jobs; returns {jobs: [...]} (FR-H1)."""
         return {
             "jobs": [
-                {"job_id": j.job_id, "status": j.status.value, "created_at": _iso(j.created_at)}
+                {
+                    "job_id": j.job_id,
+                    "sweep_id": j.sweep_id,
+                    "status": j.status.value,
+                    "created_at": _iso(j.created_at),
+                }
                 for j in _lab().list_jobs()
             ]
         }

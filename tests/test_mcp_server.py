@@ -34,7 +34,26 @@ def test_tools_registered(tmp_path: Path):
         "metrics",
         "status",
         "submit",
+        "sweep",
     ]
+
+
+def test_sweep_tool(tmp_path: Path):
+    lab, server = _make(tmp_path)
+
+    async def go():
+        async with Client(server) as c:
+            r = await c.call_tool(
+                "sweep",
+                {"command": f"{PYTHON} experiments/example_capacity.py", "grid": {"K": [1, 2]}},
+            )
+            return r.data
+
+    data = asyncio.run(go())
+    assert data["sweep_id"].startswith("sweep-")
+    assert len(data["job_ids"]) == 2
+    for jid in data["job_ids"]:
+        assert wait_terminal(lab.backend, jid) == JobState.succeeded
 
 
 def test_submit_status_logs_fetch(tmp_path: Path):

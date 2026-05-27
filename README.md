@@ -36,6 +36,7 @@ uv run lab status <job_id>
 uv run lab logs <job_id>
 uv run lab metrics <job_id> --since-step 7   # live incremental series (early-kill loop)
 uv run lab fetch <job_id>
+uv run lab sweep -c "python experiments/example_capacity.py" -g "seed=1,2,3"   # grid → job-per-point
 
 # MCP server (stdio) — register this command in your MCP client config
 uv run python -m lab.mcp_server

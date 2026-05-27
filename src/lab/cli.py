@@ -36,6 +36,26 @@ def _emit(obj: Any) -> None:
     typer.echo(json.dumps(obj, indent=2, default=str))
 
 
+def _parse_grid(items: list[str]) -> dict[str, list]:
+    """Parse repeated `--grid key=v1,v2,...` options into {key: [values]}.
+
+    Values stay strings — the experiment (e.g. Hydra) coerces types, so the lab doesn't guess.
+    """
+    grid: dict[str, list] = {}
+    for item in items:
+        if "=" not in item:
+            raise typer.BadParameter(f"--grid expects key=v1,v2,... (got {item!r})")
+        key, vals = item.split("=", 1)
+        key = key.strip()
+        values = [v.strip() for v in vals.split(",") if v.strip()]
+        if not values:
+            raise typer.BadParameter(f"--grid {key!r} has no values")
+        if key in grid:
+            raise typer.BadParameter(f"--grid {key!r} given more than once")
+        grid[key] = values
+    return grid
+
+
 @app.command()
 def submit(
     command: str = typer.Option(..., "--command", "-c", help="entrypoint, e.g. 'python experiments/x.py'"),
@@ -66,6 +86,35 @@ def submit(
         _emit({"error": str(e)})
         raise typer.Exit(code=1) from e
     _emit({"job_id": job_id, "status": lab.status(job_id).value})
+
+
+@app.command()
+def sweep(
+    command: str = typer.Option(..., "--command", "-c", help="entrypoint, e.g. 'python experiments/x.py'"),
+    grid: list[str] = typer.Option(..., "--grid", "-g", help="key=v1,v2,... (repeatable)"),
+    backend: str = typer.Option("local", "--backend", help="local | skypilot"),
+    seed: int | None = typer.Option(None),
+    cpus: int | None = typer.Option(None),
+    memory: str | None = typer.Option(None),
+    gpus: int | None = typer.Option(None),
+    accelerators: str | None = typer.Option(None, "--accelerators"),
+    timeout: str | None = typer.Option(None, help="wall-clock per job, e.g. 2h"),
+) -> None:
+    """Submit a parameter-grid sweep: one job per point under a sweep_id (FR-A5)."""
+    lab = _lab(backend)
+    try:
+        sweep_id, job_ids = lab.sweep(
+            command,
+            _parse_grid(grid),
+            seed=seed,
+            resources=ResourceRequest(
+                cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout
+            ),
+        )
+    except LabError as e:
+        _emit({"error": str(e)})
+        raise typer.Exit(code=1) from e
+    _emit({"sweep_id": sweep_id, "count": len(job_ids), "job_ids": job_ids})
 
 
 @app.command()
@@ -111,7 +160,12 @@ def list_jobs() -> None:
     _emit(
         {
             "jobs": [
-                {"job_id": j.job_id, "status": j.status.value, "created_at": j.created_at}
+                {
+                    "job_id": j.job_id,
+                    "sweep_id": j.sweep_id,
+                    "status": j.status.value,
+                    "created_at": j.created_at,
+                }
                 for j in jobs
             ]
         }
