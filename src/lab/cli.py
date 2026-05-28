@@ -11,6 +11,7 @@ from typing import Any
 
 import typer
 
+from lab._util import wrap_with_extras
 from lab.core import Lab, LabError, default_lab
 from lab.manifest import repo_root
 from lab.models import JobSpec, JobState, ResourceRequest
@@ -71,12 +72,13 @@ def submit(
     gpus: int | None = typer.Option(None),
     accelerators: str | None = typer.Option(None, "--accelerators", help="e.g. RTX_3070:1 (required for Vast)"),
     timeout: str | None = typer.Option(None, help="wall-clock limit, e.g. 2h / 30m / 45s"),
+    with_pkg: list[str] = typer.Option(None, "--with", help="extra runtime package(s) for this job (repeatable; layered via uv run --with)"),
 ) -> None:
     """Submit a job without blocking; prints {job_id, cached, status} (FR-A1)."""
     lab = _lab(backend)
     spec = JobSpec(
         code_ref=code_ref,
-        command=command,
+        command=wrap_with_extras(command, with_pkg),
         seed=seed,
         resources=ResourceRequest(
             cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout
@@ -105,12 +107,13 @@ def sweep(
     gpus: int | None = typer.Option(None),
     accelerators: str | None = typer.Option(None, "--accelerators"),
     timeout: str | None = typer.Option(None, help="wall-clock per job, e.g. 2h"),
+    with_pkg: list[str] = typer.Option(None, "--with", help="extra runtime package(s) per job (repeatable; layered via uv run --with)"),
 ) -> None:
     """Submit a parameter-grid sweep: one job per point under a sweep_id (FR-A5)."""
     lab = _lab(backend)
     try:
         sweep_id, job_ids = lab.sweep(
-            command,
+            wrap_with_extras(command, with_pkg),
             _parse_grid(grid),
             seed=seed,
             resources=ResourceRequest(

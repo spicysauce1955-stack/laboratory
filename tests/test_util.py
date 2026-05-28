@@ -1,6 +1,26 @@
 from datetime import datetime, timedelta, timezone
 
-from lab._util import actual_cost, duration_seconds, infer_artifact_type, parse_duration
+from lab._util import (
+    actual_cost,
+    duration_seconds,
+    infer_artifact_type,
+    parse_duration,
+    wrap_with_extras,
+)
+
+
+def test_wrap_with_extras():
+    assert wrap_with_extras("python x.py", None) == "python x.py"
+    assert wrap_with_extras("python x.py", []) == "python x.py"
+    assert wrap_with_extras("python x.py", ["scipy"]) == "uv run --with scipy python x.py"
+    assert (
+        wrap_with_extras("python x.py", ["scipy", "scikit-learn"])
+        == "uv run --with scipy --with scikit-learn python x.py"
+    )
+    # special chars are shell-quoted
+    assert wrap_with_extras("python x.py", ["scipy>=1"]) == "uv run --with 'scipy>=1' python x.py"
+    # no double `uv run` prefix when the command already starts with one
+    assert wrap_with_extras("uv run python x.py", ["scipy"]) == "uv run --with scipy python x.py"
 
 
 def test_duration_and_cost():

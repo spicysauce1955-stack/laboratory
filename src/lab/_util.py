@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 from datetime import datetime, timezone
 
 _UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
@@ -31,6 +32,21 @@ def actual_cost(hourly_usd: float | None, seconds: float | None) -> float | None
     if hourly_usd is None or seconds is None:
         return None
     return round(hourly_usd * seconds / 3600.0, 6)
+
+
+def wrap_with_extras(command: str, extras: list[str] | None) -> str:
+    """Layer extra runtime packages on top of an entrypoint via ``uv run --with``.
+
+    Lets a single job declare deps the lean remote env (numpy/pydantic/hydra) doesn't include
+    (e.g. ``scipy``) without modifying the project. If the command already starts with ``uv run``,
+    the ``--with`` flags are injected after it (no double prefix).
+    """
+    if not extras:
+        return command
+    flags = " ".join(f"--with {shlex.quote(e)}" for e in extras)
+    if command.startswith("uv run "):
+        return command.replace("uv run ", f"uv run {flags} ", 1)
+    return f"uv run {flags} {command}"
 
 
 def parse_duration(value: str | None) -> float | None:

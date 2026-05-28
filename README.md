@@ -31,6 +31,7 @@ uv sync --extra skypilot --extra r2    # + remote (Vast) backend & durable R2 (f
 
 # CLI
 uv run lab submit -c "python experiments/example_capacity.py" --seed 42
+uv run lab submit -c "python experiments/x.py" --with scipy --with scikit-learn   # per-job runtime deps
 uv run lab list
 uv run lab status <job_id>
 uv run lab logs <job_id>

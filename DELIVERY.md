@@ -116,6 +116,14 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
+**Extra runtime deps per job.** The remote env is intentionally lean (numpy + pydantic + hydra-core). If your experiment needs more — e.g. `scipy` for LP feasibility — pass `--with PKG` to `lab submit`/`sweep` (repeatable). The lab layers them via `uv run --with`, so no project changes are required:
+
+```bash
+uv run lab submit -c "python experiments/capacity.py" --with scipy --with scikit-learn
+```
+
+The same works if you'd rather hand-write it in the command (`uv run --with scipy python …`). Validated end-to-end on the local backend; the remote path uses the identical wrapper and Vast instances have PyPI access.
+
 See `experiments/example_capacity.py` for a runnable reference. (If you prefer Hydra+Pydantic configs, the `key=value` overrides are Hydra-native — just consume them through Hydra.)
 
 ---
@@ -129,6 +137,7 @@ See `experiments/example_capacity.py` for a runnable reference. (If you prefer H
 uv run lab submit -c "python experiments/capacity.py" --seed 7 --timeout 2h
 #   --backend skypilot --accelerators RTX4090:1   → run on Vast (GPU required there)
 #   --cache                                        → reuse a prior identical succeeded job
+#   --with scipy --with scikit-learn               → extra runtime deps for this job
 #   --cpus / --memory / --gpus / --code-ref        → resources / pinning
 
 uv run lab list                       # all jobs (job_id, sweep_id, status)
@@ -144,6 +153,8 @@ uv run lab sweep -c "python experiments/capacity.py" -g "K=50,100,200" -g "seed=
 
 # Block until done, then exit — run in the background so its completion notifies you:
 uv run lab wait --sweep <sweep_id> --done-file runs/<sweep>.done
+#   Exit code: 0 = all terminal, 1 = timed out before all done. If invoked via a wrapper that
+#   may mask the exit code, parse the JSON / --done-file — `"all_terminal"` is the truth.
 
 # Live dashboard (status + cost + latest metrics), Ctrl-C to exit:
 uv run lab dashboard           # or  --sweep <sweep_id>

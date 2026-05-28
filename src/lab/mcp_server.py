@@ -16,6 +16,7 @@ from datetime import datetime
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
+from lab._util import wrap_with_extras
 from lab.core import Lab, LabError, default_lab
 from lab.models import JobManifest, JobSpec, ResourceRequest
 from lab.store import JobStore
@@ -54,12 +55,13 @@ def build_server(lab: Lab) -> FastMCP:
         gpus: int | None = None,
         accelerators: str | None = None,
         timeout: str | None = None,
+        with_pkg: list[str] | None = None,
     ) -> dict:
-        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5)."""
+        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with."""
         the_lab = _lab(backend)
         spec = JobSpec(
             code_ref=code_ref,
-            command=command,
+            command=wrap_with_extras(command, with_pkg),
             seed=seed,
             resources=ResourceRequest(
                 cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout
@@ -85,12 +87,13 @@ def build_server(lab: Lab) -> FastMCP:
         gpus: int | None = None,
         accelerators: str | None = None,
         timeout: str | None = None,
+        with_pkg: list[str] | None = None,
     ) -> dict:
-        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5)."""
+        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5). with_pkg layers extra runtime packages via uv run --with."""
         the_lab = _lab(backend)
         try:
             sweep_id, job_ids = the_lab.sweep(
-                command,
+                wrap_with_extras(command, with_pkg),
                 grid,
                 seed=seed,
                 resources=ResourceRequest(
