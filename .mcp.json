@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "lab": {
+      "command": "uv",
+      "args": ["run", "python", "-m", "lab.mcp_server"]
+    }
+  }
+}
