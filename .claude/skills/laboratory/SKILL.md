@@ -133,13 +133,16 @@ the local output is empty (e.g. after a fresh clone).
 `{}` → `{"jobs": [{job_id, sweep_id, status, created_at}, ...]}`. All jobs in
 `runs/`.
 
-## 5. The CLI surface (and the one CLI-only command)
+## 5. The CLI surface (and the CLI-only commands)
 
 Every MCP tool has a matching CLI command (`uv run lab submit / sweep / status
 / logs / metrics / fetch / cancel / list`). The `lab` CLI prints JSON
 mirroring the MCP returns.
 
-**`uv run lab wait` is CLI-only and is the push-notify primitive.**
+Two commands are CLI-only by design:
+
+### `uv run lab wait` — the push-notify primitive
+
 Block until one or more jobs reach a terminal state:
 
 ```bash
@@ -151,10 +154,40 @@ uv run lab wait --sweep <sweep_id> --done-file done.json
 Why CLI-only: the right pattern is to run `lab wait` as a **Claude Code
 background task**, keep working in the foreground, and let the task's
 process-exit notify the harness — at which point you read `done.json` and
-proceed. Exit code is non-zero on timeout (use that as a retry signal).
+proceed.
 
-`uv run lab dashboard` (optional, interactive) — live terminal table of all
-jobs with state, cost, and latest metric. Ctrl-C to exit.
+**Exit codes:**
+- `0` — all jobs terminal AND all teardowns clean.
+- `1` — gave up on `--timeout` (some jobs still not terminal).
+- `2` — bad arguments (no job ids / unknown id / empty sweep).
+- `3` — all terminal BUT at least one **teardown leaked** (`teardown_status: "failed"`).
+  Treat as an urgent signal — a paid GPU rental may still be running. Run
+  `lab reconcile` immediately (see §6.F below).
+
+### `uv run lab reconcile [--apply]` — leak detection & cleanup (FR-C2)
+
+Lists active Vast.ai rentals directly via the vastai-sdk and cross-checks
+them against the local job DB. **Always run this after seeing
+`teardown_status: "failed"` or `lab wait` exiting 3.**
+
+```bash
+uv run lab reconcile             # dry-run: print orphans + ghosts
+uv run lab reconcile --apply     # destroy the orphans
+```
+
+- **Orphans** = Vast.ai rentals labelled `lab-*` but not tied to any running
+  lab job (probable leaks; bill until destroyed).
+- **Ghosts** = lab jobs whose manifest still says `running` but Vast has no
+  matching rental (supervisor probably died; safe to investigate via
+  `lab status <id>`).
+
+Exit code: `0` if nothing to do, `3` if orphans were found in dry-run
+mode (re-run with `--apply`), `2` on error.
+
+### `uv run lab dashboard` — live terminal view
+
+Live table of all jobs with state, cost, latest metric, and a **`teardown`**
+column that flags `LEAK` rows loudly. Ctrl-C to exit.
 
 ## 6. Canonical workflows
 
@@ -189,6 +222,14 @@ The remote env is lean (numpy/pydantic/hydra only). For a one-off dep:
 This wraps the command as `uv run --with scipy python experiments/needs_scipy.py`
 (see `tests/test_util.py:12-23`). Same on the CLI: `lab submit -c "..." --with scipy`.
 
+### F. Recover from a teardown leak (FR-C2)
+See **`examples/04-reconcile-leak.md`**. Pattern: `lab wait` exits 3 (or you
+see `teardown_status: "failed"` in `lab status`) → `lab reconcile` (dry-run)
+→ inspect the orphans → `lab reconcile --apply` to destroy them. The lab
+already retries `sky.down` and falls back to vastai-sdk directly on failure,
+so leaks are rare — but `reconcile` is the operational safety net when even
+that fails.
+
 ## 7. Backend selection
 
 | Backend | When to use | Required kwargs |
@@ -205,7 +246,10 @@ and marked `timed_out` if it overruns, and the machine is torn down.
 Every job writes `runs/<job_id>/manifest.json` (model in `src/lab/models.py`)
 recording: created_at, git commit (+ dirty flag), uv.lock sha256, command,
 resolved config, seed, backend + machine type + region, status timeline,
-exit code + end reason, cost (estimated + actual), artifact URIs.
+exit code + end reason, cost (estimated + actual), artifact URIs, and
+**`teardown_status`** (`"succeeded" | "failed" | null`) — the FR-C2 leak
+signal. A `"failed"` value means a paid rental may still be billing; the
+`end_reason` field is annotated with an actionable instruction in that case.
 
 `runs/` is git-ignored. For artifacts that must survive a clean clone (and
 for cross-machine `mcp__lab__fetch_artifacts`), enable R2 (see §2). Manifests
@@ -217,11 +261,18 @@ record artifact **URIs**, never credentials (spec FR-J1).
 - **Vast marketplace flakiness.** A single failed launch (machine vanished
   mid-provision) is not "the pipeline is broken" — resubmit; SkyPilot will
   pick a different offer.
-- **`lab wait` timeout exits non-zero.** Use the exit code as the retry signal.
-  (If a wrapper script swallows it, you'll mistakenly see "ok" — check the
-  job's `state` via `mcp__lab__status` to be sure.)
-- **No MCP `wait` tool.** By design: agents shouldn't block an MCP call for
-  hours. Use the CLI as a background task.
+- **`lab wait` exit codes are meaningful.** `0` = clean; `1` = timed out;
+  `3` = **a teardown leaked** (paid rental may still be running — run
+  `lab reconcile` now); `2` = bad args. If a wrapper script swallows the
+  exit code, you'll mistakenly see "ok" — check `teardown_status` via
+  `mcp__lab__status` to be sure.
+- **`teardown_status: "failed"` is a money alarm.** The lab already retries
+  `sky.down` for ~3.5 min and falls back to direct vastai-sdk destroy; a
+  `"failed"` value means even that failed. **Always follow up with
+  `lab reconcile --apply`** to stop the bleed.
+- **No MCP `wait` or `reconcile` tools.** By design: agents shouldn't block
+  an MCP call for hours, and reconcile is an operational/destructive command.
+  Both live on the CLI; use `lab wait` as a background task.
 - **Skypilot jobs need explicit `accelerators` and `timeout`.** Missing
   either is the most common mistake.
 - **Grid values are strings on the argv.** The experiment (Hydra/typer/argparse)

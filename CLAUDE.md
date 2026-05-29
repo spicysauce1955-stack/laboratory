@@ -17,6 +17,10 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   **FastMCP**; artifacts = object store (Cloudflare R2/S3) → `runs/<job_id>/`.
 - **Experiment Contract (§7):** any committed `uv run` entrypoint, determined by config+seed,
   writes to `$LAB_RUN_DIR`, logs metrics via `log_metric(name, value, step)`, exits non-zero on fail.
+- **Teardown is cost-critical (FR-C2):** every skypilot job runs through `robust_teardown`
+  (sky.down retries → vastai-sdk fallback). A persistent failure flips `teardown_status="failed"`
+  on the manifest and makes `lab wait` exit 3. **Recovery: `uv run lab reconcile [--apply]`**
+  finds orphaned `lab-*` Vast rentals not tied to a running job and destroys them.
 
 ## Conventions
 - `ruff` (line length 100), `mypy --strict` on `src/lab`. CLI and MCP server are thin shells over
