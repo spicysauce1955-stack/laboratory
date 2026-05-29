@@ -18,6 +18,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -34,6 +35,10 @@ if TYPE_CHECKING:
 REMOTE_RUN_DIR = "/tmp/lab_run"
 TIMEOUT_SENTINEL = ".lab_timed_out"  # written by the run script when `timeout` kills the job
 DEFAULT_AUTOSTOP_MIN = 5  # safety-net teardown if the supervisor process dies
+# Teardown retry budget: ~3.5 min total (first attempt + 5 retries spaced 5/15/30/60/120 s).
+# Long enough to ride out a transient DNS/API hiccup; short enough that a cluster that's
+# genuinely stuck still gets nuked via the vast-sdk fallback in well under 5 minutes.
+TEARDOWN_BACKOFFS = (5, 15, 30, 60, 120)
 _TERMINAL = {JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out}
 
 # SkyPilot JobStatus name -> lab JobState (pure; unit-tested).
@@ -102,6 +107,155 @@ def promote_timeout(final: JobState, output_dir: Path) -> JobState:
     if final == JobState.failed and (Path(output_dir) / TIMEOUT_SENTINEL).exists():
         return JobState.timed_out
     return final
+
+
+# ---------------------------------------------------------------------------
+# Teardown — robust retry + vast-sdk fallback so a transient SkyPilot error
+# never leaks a paid GPU rental (FR-C2 leak prevention).
+# ---------------------------------------------------------------------------
+
+
+def _get_vast_client() -> Any:
+    """Construct a vastai-sdk client. Test seam: monkeypatch this to inject a fake."""
+    from vastai_sdk import VastAI  # type: ignore[import-untyped]
+
+    return VastAI()
+
+
+def _instance_label(inst: dict[str, Any]) -> str:
+    """Concatenate the candidate name-fields a Vast.ai instance dict may carry, lower-cased.
+
+    SkyPilot's Vast adapter tags the rental with the cluster name in ``label``; we also probe
+    a few neighbouring field names so a Vast SDK change doesn't silently disable matching.
+    """
+    parts = [str(inst.get(k, "")) for k in ("label", "name", "instance_label", "machine_name")]
+    return " ".join(parts).lower()
+
+
+def list_vast_instances(client: Any | None = None) -> list[dict[str, Any]]:
+    """Return every active rental on the Vast.ai account (raises if vastai-sdk unavailable)."""
+    if client is None:
+        client = _get_vast_client()
+    return list(client.show_instances())
+
+
+def _vast_destroy_matching(cluster: str, client: Any | None = None) -> list[int]:
+    """Destroy every Vast rental whose label contains ``cluster``; return their IDs."""
+    if client is None:
+        client = _get_vast_client()
+    needle = cluster.lower()
+    destroyed: list[int] = []
+    for inst in list_vast_instances(client=client):
+        if needle not in _instance_label(inst):
+            continue
+        inst_id = inst.get("id")
+        if inst_id is None:
+            continue
+        try:
+            client.destroy_instance(id=int(inst_id))
+            destroyed.append(int(inst_id))
+            print(f"[lab] vast-direct destroyed instance {inst_id} (cluster={cluster})")
+        except Exception as e:  # noqa: BLE001 — best-effort; the next instance might still go
+            print(f"[lab] vast-direct destroy {inst_id} failed: {e}")
+    return destroyed
+
+
+def robust_teardown(
+    sky_mod: Any, cluster: str, *, backoffs: tuple[int, ...] = TEARDOWN_BACKOFFS
+) -> dict[str, Any]:
+    """Tear down a SkyPilot cluster with retry + vastai-sdk fallback.
+
+    Why this exists: a single ``sky.down`` call that swallows transient errors (network hiccup,
+    Vast.ai API timeout) used to leak rentals — the cluster kept billing while we marked the
+    job ``failed`` and moved on. We now retry sky.down with exponential backoff, then bypass
+    SkyPilot's local registry entirely and ask Vast.ai itself to destroy any rental whose
+    label matches the cluster name.
+
+    Returns a structured outcome suitable for persistence on the manifest:
+
+    .. code-block:: python
+
+        {
+          "status": "succeeded" | "failed",
+          "attempts": int,             # total sky.down attempts (1 + retries)
+          "vast_fallback_used": bool,
+          "vast_destroyed": list[int], # Vast instance IDs killed via fallback
+          "error": str | None,         # last sky.down error if any
+        }
+
+    ``status == "succeeded"`` means: either sky.down returned, OR the vast SDK fallback ran and
+    either destroyed instances or found none matching. ``"failed"`` means even the fallback
+    raised — a human needs to check ``vastai show_instances`` (and ``lab reconcile``) NOW.
+    """
+    last_err: str | None = None
+    delays = (0, *backoffs)  # first try has no delay
+    for attempt, delay in enumerate(delays, start=1):
+        if delay:
+            time.sleep(delay)
+        try:
+            sky_mod.get(sky_mod.down(cluster))
+            return {
+                "status": "succeeded",
+                "attempts": attempt,
+                "vast_fallback_used": False,
+                "vast_destroyed": [],
+                "error": None,
+            }
+        except Exception as e:  # noqa: BLE001
+            last_err = f"{type(e).__name__}: {e}"
+            print(
+                f"[lab] sky.down attempt {attempt}/{len(delays)} for {cluster} failed: {last_err}"
+            )
+
+    # SkyPilot teardown didn't take. Talk to Vast directly — it's the source of truth.
+    print(f"[lab] sky.down exhausted for {cluster}; falling back to vast-sdk direct destroy")
+    try:
+        destroyed = _vast_destroy_matching(cluster)
+        return {
+            "status": "succeeded",  # destroyed-or-none-found are both safe outcomes
+            "attempts": len(delays),
+            "vast_fallback_used": True,
+            "vast_destroyed": destroyed,
+            "error": last_err,
+        }
+    except Exception as e:  # noqa: BLE001
+        return {
+            "status": "failed",
+            "attempts": len(delays),
+            "vast_fallback_used": True,
+            "vast_destroyed": [],
+            "error": f"sky.down: {last_err}; vast-direct: {type(e).__name__}: {e}",
+        }
+
+
+def tear_down_and_record(sky_mod: Any, cluster: str, store: JobStore, job_id: str) -> bool:
+    """Call :func:`robust_teardown` and persist its outcome on the job manifest.
+
+    Returns ``True`` iff teardown succeeded. On failure, ``teardown_status='failed'`` is
+    written and ``end_reason`` is annotated with an actionable instruction so the leak is
+    visible in ``lab status`` / ``lab dashboard`` / ``lab wait``.
+    """
+    outcome = robust_teardown(sky_mod, cluster)
+    succeeded: bool = outcome["status"] == "succeeded"
+    fields: dict[str, Any] = {"teardown_status": "succeeded" if succeeded else "failed"}
+    annotation: str | None = None
+    if not succeeded:
+        annotation = (
+            f"TEARDOWN FAILED for cluster {cluster!r}: {outcome['error']} after "
+            f"{outcome['attempts']} sky.down attempts AND vast-sdk fallback. "
+            "Run `lab reconcile --apply` (or `vastai destroy_instance <id>`) to stop the bleed."
+        )
+    elif outcome["vast_fallback_used"]:
+        annotation = (
+            f"sky.down failed ({outcome['error']}); vast-sdk fallback destroyed "
+            f"{outcome['vast_destroyed']}"
+        )
+    if annotation is not None:
+        print(f"[lab] {annotation}")
+        existing = (store.read_manifest(job_id).end_reason or "").strip()
+        fields["end_reason"] = (f"{existing} | {annotation}" if existing else annotation)[:600]
+    store.update_manifest(job_id, **fields)
+    return succeeded
 
 
 def build_task(manifest: JobManifest, workdir: Path) -> sky.Task:
@@ -210,12 +364,9 @@ class SkyPilotBackend:
             sky.get(sky.cancel(cluster, all=True))  # 0.12: RequestId
         except Exception:  # noqa: BLE001 - best-effort; teardown below is what matters
             pass
-        try:
-            import sky
+        import sky
 
-            sky.get(sky.down(cluster))  # 0.12: RequestId
-        except Exception:  # noqa: BLE001
-            pass
+        tear_down_and_record(sky, cluster, self.store, job_id)
         return JobState.cancelled
 
     def collect_artifacts(self, job_id: str, dest: str) -> list[ArtifactRecord]:

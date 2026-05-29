@@ -40,7 +40,17 @@ def test_render_table_smoke():
             "state": "running",
             "duration_s": 1.2,
             "cost_usd": 0.01,
+            "teardown": "",
             "latest_metric": "loss=0.5@3",
-        }
+        },
+        {  # a LEAK row — must render without error
+            "job_id": "j2",
+            "sweep_id": "",
+            "state": "failed",
+            "duration_s": 30.0,
+            "cost_usd": 0.20,
+            "teardown": "LEAK",
+            "latest_metric": "",
+        },
     ]
-    assert render_table(rows) is not None  # builds a rich Table without error
+    assert render_table(rows) is not None

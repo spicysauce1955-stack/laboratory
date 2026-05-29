@@ -128,7 +128,7 @@ def sweep(
 
 @app.command()
 def status(job_id: str) -> None:
-    """Show a job's state + cost (FR-A2, FR-I2)."""
+    """Show a job's state + cost + teardown_status (FR-A2, FR-I2, FR-C2)."""
     lab = _lab_for(job_id)
     state = lab.status(job_id)
     m = lab.manifest(job_id)
@@ -138,6 +138,8 @@ def status(job_id: str) -> None:
             "state": state.value,
             "exit_code": m.exit_code,
             "cost": m.cost.model_dump() if m.cost else None,
+            "teardown_status": m.teardown_status,
+            "end_reason": m.end_reason,
         }
     )
 
@@ -218,10 +220,17 @@ def wait(
         raise typer.Exit(code=2)
     manifests = _lab_for(ids[0]).wait(ids, interval=interval, timeout=timeout)
     all_terminal = all(m.status in _TERMINAL for m in manifests)
+    teardown_leaks = [m.job_id for m in manifests if m.teardown_status == "failed"]
     summary = {
         "all_terminal": all_terminal,
+        "teardown_leaks": teardown_leaks,  # FR-C2 — non-empty == a paid rental may still be running
         "jobs": [
-            {"job_id": m.job_id, "state": m.status.value, "exit_code": m.exit_code}
+            {
+                "job_id": m.job_id,
+                "state": m.status.value,
+                "exit_code": m.exit_code,
+                "teardown_status": m.teardown_status,
+            }
             for m in manifests
         ],
     }
@@ -230,6 +239,8 @@ def wait(
         done_file.write_text(json.dumps(summary, indent=2, default=str))
     if not all_terminal:
         raise typer.Exit(code=1)
+    if teardown_leaks:
+        raise typer.Exit(code=3)  # all terminal but at least one cluster may still be billing
 
 
 @app.command()
@@ -243,6 +254,29 @@ def dashboard(
     lab = _lab()
     ids = lab.jobs_in_sweep(sweep) if sweep else None
     run_dashboard(lab, ids, interval=interval)
+
+
+@app.command()
+def reconcile(
+    apply: bool = typer.Option(
+        False, "--apply", help="destroy orphaned rentals (default: dry-run report only)"
+    ),
+) -> None:
+    """Cross-check Vast.ai rentals against local jobs to find leaks (FR-C2).
+
+    Dry-run by default. ``--apply`` destroys every Vast.ai rental whose label matches the lab
+    cluster pattern but has no live local job — use this to clean up after a teardown failure
+    (look for ``teardown_status: "failed"`` in ``lab status``). Exits 3 if orphans are found in
+    dry-run mode — re-run with --apply, or destroy by hand via ``vastai destroy_instance <id>``.
+    """
+    try:
+        report = _lab(backend="skypilot").reconcile(apply=apply)
+    except LabError as e:
+        _emit({"error": str(e)})
+        raise typer.Exit(code=2) from e
+    _emit(report)
+    if report["orphans"] and not apply:
+        raise typer.Exit(code=3)  # action required: re-run with --apply
 
 
 if __name__ == "__main__":

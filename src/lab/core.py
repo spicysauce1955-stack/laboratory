@@ -227,6 +227,81 @@ class Lab:
     def jobs_in_sweep(self, sweep_id: str) -> list[str]:
         return [j.job_id for j in self.list_jobs() if j.sweep_id == sweep_id]
 
+    def reconcile(self, *, apply: bool = False) -> dict[str, Any]:
+        """Cross-check Vast.ai rentals against the local job DB (FR-C2 leak detection).
+
+        Returns a structured report of:
+
+        - ``orphans``: Vast.ai rentals whose label looks like a lab cluster (``lab-*``) but does
+          NOT match any **running** local job — these are very likely leaked rentals.
+        - ``ghosts``: running local jobs whose cluster name does not appear in any active Vast
+          rental label — the supervisor probably died before recording terminal state.
+        - ``destroyed``: Vast instance IDs we actually destroyed (only when ``apply=True``).
+
+        With ``apply=True``, each orphan is destroyed via the vastai-sdk directly (bypassing
+        SkyPilot's local registry — which may have already lost track of the rental). Without
+        ``apply``, it's a dry run; no rentals are touched.
+
+        Raises :class:`LabError` if vastai-sdk is unavailable or the listing call fails — there is
+        no safe degraded mode for a leak-detection command.
+        """
+        from lab.backends.skypilot import (  # local import: skypilot is an optional extra
+            _instance_label,
+            cluster_name_for,
+            list_vast_instances,
+        )
+
+        try:
+            instances = list_vast_instances()
+        except ImportError as e:
+            raise LabError(
+                "vastai-sdk not installed; run `uv sync --extra skypilot` then retry"
+            ) from e
+        except Exception as e:  # noqa: BLE001
+            raise LabError(f"could not list Vast.ai rentals: {e}") from e
+
+        running_clusters = {
+            cluster_name_for(j.job_id): j.job_id
+            for j in self.list_jobs()
+            if j.status not in _TERMINAL_STATES
+        }
+
+        orphans: list[dict[str, Any]] = []
+        matched_clusters: set[str] = set()
+        for inst in instances:
+            label = _instance_label(inst)
+            if "lab-" not in label:
+                continue  # not ours — leave it alone
+            matched = next((c for c in running_clusters if c.lower() in label), None)
+            if matched is not None:
+                matched_clusters.add(matched)
+                continue
+            orphans.append({"id": inst.get("id"), "label": label})
+
+        destroyed: list[int] = []
+        if apply and orphans:
+            from lab.backends.skypilot import _get_vast_client
+
+            client = _get_vast_client()
+            for orph in orphans:
+                inst_id = orph["id"]
+                if inst_id is None:
+                    continue
+                try:
+                    client.destroy_instance(id=int(inst_id))
+                    destroyed.append(int(inst_id))
+                except Exception as e:  # noqa: BLE001
+                    print(f"[lab] reconcile destroy {inst_id} failed: {e}")
+
+        ghosts = sorted(running_clusters.keys() - matched_clusters)
+        return {
+            "instances_total": len(instances),
+            "orphans": orphans,
+            "destroyed": destroyed,
+            "ghosts": ghosts,
+            "applied": apply,
+        }
+
     def wait(
         self, job_ids: list[str], *, interval: float = 10.0, timeout: float | None = None
     ) -> list[JobManifest]:

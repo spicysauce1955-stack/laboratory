@@ -3,8 +3,9 @@ import time
 from pathlib import Path
 
 import pytest
-from helpers import PYTHON, TERMINAL, wait_terminal
+from helpers import PYTHON, TERMINAL, make_manifest, wait_terminal
 
+import lab.backends.skypilot as skypilot_mod
 from lab.backends.local import LocalBackend
 from lab.core import Lab, LabError, cache_key, expand_grid
 from lab.manifest import is_dirty, repo_root
@@ -152,6 +153,76 @@ def test_cache_key():
     assert k != cache_key("abc", "python x.py", {"a": 1, "b": 2}, 6)  # seed matters
     assert k != cache_key("abc", "python y.py", {"a": 1, "b": 2}, 5)  # command matters
     assert k != cache_key("def", "python x.py", {"a": 1, "b": 2}, 5)  # commit matters
+
+
+def _seed_running_job(lab: Lab, job_id: str) -> None:
+    """Drop a manifest with status=running directly on disk (bypasses backend.submit)."""
+    m = make_manifest(job_id, "python x.py")
+    m.status = JobState.running
+    lab.store.create(m)
+
+
+def test_reconcile_finds_orphans_dry_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A Vast rental labeled lab-* with no matching running lab job is an orphan."""
+    repo = repo_root(Path.cwd())
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
+    _seed_running_job(lab, "job-alive")  # cluster: lab-job-alive
+    vast_instances = [
+        {"id": 100, "label": "sky-lab-job-alive-abcdef"},  # matches running job
+        {"id": 200, "label": "sky-lab-old-orphan-deadbe"},  # lab-prefix, no match -> orphan
+        {"id": 300, "label": "other-users-rental"},  # not ours -> ignored
+    ]
+    monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda: vast_instances)
+
+    report = lab.reconcile(apply=False)
+    assert report["instances_total"] == 3
+    assert [o["id"] for o in report["orphans"]] == [200]
+    assert report["destroyed"] == []  # dry run
+    assert report["ghosts"] == []  # the only running job matched
+    assert report["applied"] is False
+
+
+def test_reconcile_apply_destroys_orphans(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo = repo_root(Path.cwd())
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
+    vast_instances = [{"id": 42, "label": "sky-lab-stale-abcdef"}]
+    monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda: vast_instances)
+
+    destroyed_ids: list[int] = []
+
+    class _FakeClient:
+        def destroy_instance(self, id: int) -> dict:  # noqa: A002
+            destroyed_ids.append(int(id))
+            return {"ok": True}
+
+    monkeypatch.setattr(skypilot_mod, "_get_vast_client", lambda: _FakeClient())
+    report = lab.reconcile(apply=True)
+    assert report["destroyed"] == [42]
+    assert destroyed_ids == [42]
+    assert report["applied"] is True
+
+
+def test_reconcile_finds_ghosts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A running lab job with no matching Vast rental is a ghost (supervisor likely died)."""
+    repo = repo_root(Path.cwd())
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
+    _seed_running_job(lab, "job-ghost")
+    monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda: [])
+    report = lab.reconcile(apply=False)
+    assert report["orphans"] == []
+    assert report["ghosts"] == ["lab-job-ghost"]
+
+
+def test_reconcile_propagates_import_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo = repo_root(Path.cwd())
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
+
+    def _boom() -> list[dict]:
+        raise ImportError("no vastai-sdk")
+
+    monkeypatch.setattr(skypilot_mod, "list_vast_instances", _boom)
+    with pytest.raises(LabError, match="vastai-sdk not installed"):
+        lab.reconcile()
 
 
 def test_find_cached(tmp_path: Path):

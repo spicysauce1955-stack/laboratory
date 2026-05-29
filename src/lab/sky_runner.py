@@ -21,6 +21,7 @@ from lab.backends.skypilot import (
     cluster_name_for,
     map_job_status,
     promote_timeout,
+    tear_down_and_record,
 )
 from lab.models import CostInfo, JobState
 from lab.storage import R2Store, r2_enabled
@@ -66,13 +67,6 @@ def _rsync_down(cluster: str, remote_dir: str, local_dir: Path) -> None:
         check=True,
         timeout=180,
     )
-
-
-def _safe_down(sky_mod, cluster: str) -> None:
-    try:
-        sky_mod.get(sky_mod.down(cluster))  # 0.12: RequestId
-    except Exception as e:  # noqa: BLE001
-        print(f"[lab] teardown warning for {cluster}: {e}")
 
 
 def _hourly_cost(handle) -> float | None:
@@ -124,7 +118,7 @@ def run_job(job_dir: Path) -> int:
         store.update_manifest(
             job_id, status=JobState.failed, ended_at=now(), end_reason=f"launch error: {e}"[:300]
         )
-        _safe_down(sky, cluster)
+        tear_down_and_record(sky, cluster, store, job_id)
         return 1
 
     try:
@@ -167,8 +161,8 @@ def run_job(job_dir: Path) -> int:
             cost=cost,
         )
 
-    _safe_down(sky, cluster)
-    return 0
+    teardown_ok = tear_down_and_record(sky, cluster, store, job_id)
+    return 0 if teardown_ok else 2  # 2 = ran ok but teardown leaked — manifest has details
 
 
 if __name__ == "__main__":

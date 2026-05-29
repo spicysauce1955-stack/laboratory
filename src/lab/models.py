@@ -114,6 +114,7 @@ class JobManifest(BaseModel):
     exit_code: int | None = None
     end_reason: str | None = None
     cost: CostInfo | None = None  # FR-I2
+    teardown_status: str | None = None  # "succeeded" | "failed" | None — FR-C2 leak detection
     metrics_uri: str | None = None
     logs_uri: str | None = None
     artifacts_uri: str | None = None  # durable object-store prefix, e.g. r2://lab-artifacts/<id>

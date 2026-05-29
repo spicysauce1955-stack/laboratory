@@ -36,6 +36,9 @@ def dashboard_rows(lab: Lab, job_ids: list[str] | None = None) -> list[dict[str,
         cost_usd = None
         if cost is not None:  # show actual once known, else the up-front estimate (FR-I2)
             cost_usd = cost.actual_usd if cost.actual_usd is not None else cost.estimated_usd
+        # teardown column: surfaced loudly because a "LEAK" here costs money (FR-C2 leak detection)
+        td = m.teardown_status
+        teardown = "LEAK" if td == "failed" else ("ok" if td == "succeeded" else "")
         rows.append(
             {
                 "job_id": m.job_id,
@@ -45,6 +48,7 @@ def dashboard_rows(lab: Lab, job_ids: list[str] | None = None) -> list[dict[str,
                 if cost and cost.duration_seconds is not None
                 else None,
                 "cost_usd": cost_usd,
+                "teardown": teardown,
                 "latest_metric": ", ".join(latest[:3]),
             }
         )
@@ -55,7 +59,7 @@ def render_table(rows: list[dict[str, Any]]) -> Table:
     from rich.table import Table
 
     table = Table(title="lab — jobs", expand=True)
-    for col in ("job_id", "sweep", "state", "dur(s)", "cost($)", "latest metric"):
+    for col in ("job_id", "sweep", "state", "dur(s)", "cost($)", "teardown", "latest metric"):
         table.add_column(col, overflow="fold")
     for r in rows:
         table.add_row(
@@ -64,6 +68,7 @@ def render_table(rows: list[dict[str, Any]]) -> Table:
             r["state"],
             "-" if r["duration_s"] is None else str(r["duration_s"]),
             "-" if r["cost_usd"] is None else f"{r['cost_usd']:.4f}",
+            r["teardown"] or "-",
             r["latest_metric"] or "-",
         )
     return table
