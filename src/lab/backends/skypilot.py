@@ -143,6 +143,28 @@ def list_vast_instances(client: Any | None = None) -> list[dict[str, Any]]:
     return list(client.show_instances())
 
 
+def vast_hourly_for_cluster(cluster: str, client: Any | None = None) -> float | None:
+    """Actual billed USD/hour (``dph_total``) for the Vast rental backing ``cluster``, or None.
+
+    SkyPilot's ``get_cost()`` reads its own catalog and under-reports Vast prices (~4x low); the
+    rental's own ``dph_total`` is the real billed rate, so we prefer it for cost accuracy (FR-I2).
+    Returns None if no rental matches the cluster or the price field is absent/unparseable, so the
+    caller can fall back to the SkyPilot estimate.
+    """
+    needle = cluster.lower()
+    for inst in list_vast_instances(client=client):
+        if needle not in _instance_label(inst):
+            continue
+        dph = inst.get("dph_total")
+        if dph is None:
+            return None
+        try:
+            return float(dph)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _vast_destroy_matching(cluster: str, client: Any | None = None) -> list[int]:
     """Destroy every Vast rental whose label contains ``cluster``; return their IDs."""
     if client is None:

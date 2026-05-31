@@ -12,6 +12,7 @@ from __future__ import annotations
 import subprocess
 import time
 from pathlib import Path
+from typing import Any
 
 from lab._util import actual_cost, duration_seconds, now, parse_duration
 from lab.backends.skypilot import (
@@ -25,6 +26,7 @@ from lab.backends.skypilot import (
     promote_timeout,
     provision_with_watchdog,
     tear_down_and_record,
+    vast_hourly_for_cluster,
 )
 from lab.models import CostInfo, JobState
 from lab.storage import R2Store, r2_enabled
@@ -83,6 +85,19 @@ def _hourly_cost(handle) -> float | None:
     return None
 
 
+def _resolve_hourly(cluster: str, handle: Any) -> float | None:
+    """Prefer the rental's real billed price (Vast ``dph_total``) over SkyPilot's catalog estimate,
+    which under-reports Vast ~4x. Falls back to the estimate if the live price is unavailable."""
+    try:
+        actual = vast_hourly_for_cluster(cluster)
+    except Exception as e:  # noqa: BLE001 — best-effort; the estimate is the fallback
+        print(f"[lab] vast price lookup failed, using estimate: {e}")
+        actual = None
+    if actual is not None:
+        return actual
+    return _hourly_cost(handle)
+
+
 def run_job(job_dir: Path) -> int:
     job_dir = Path(job_dir)
     store = JobStore(job_dir.parent)
@@ -110,8 +125,9 @@ def run_job(job_dir: Path) -> int:
             or DEFAULT_PROVISION_TIMEOUT_MIN * 60
         )
         sky_job_id, handle = provision_with_watchdog(sky, request_id, timeout_s=provision_s)
-        # Record the cost estimate up-front so a running job already shows cost (FR-I2).
-        hourly_usd = _hourly_cost(handle)
+        # Record cost up-front so a running job already shows it (FR-I2). The host is UP now, so
+        # the Vast rental exists — bill at its real dph_total, not SkyPilot's low catalog estimate.
+        hourly_usd = _resolve_hourly(cluster, handle)
         estimated_usd = actual_cost(hourly_usd, parse_duration(manifest.resources.timeout))
         store.update_manifest(
             job_id, cost=CostInfo(hourly_usd=hourly_usd, estimated_usd=estimated_usd)

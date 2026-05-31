@@ -17,6 +17,7 @@ from lab.backends.skypilot import (
     provision_with_watchdog,
     robust_teardown,
     tear_down_and_record,
+    vast_hourly_for_cluster,
 )
 from lab.models import JobState
 from lab.store import JobStore
@@ -267,3 +268,36 @@ def test_provision_watchdog_reraises_real_error():
     with pytest.raises(RuntimeError, match="offer disappeared"):
         provision_with_watchdog(sky, "req-3", timeout_s=5.0)
     assert sky.api_cancel_calls == []  # a genuine error is not a timeout abort
+
+
+# ----------------------------------------------------------------------------
+# vast_hourly_for_cluster — bill at the rental's real dph_total, not SkyPilot's
+# catalog get_cost() estimate which under-reports Vast prices ~4x (FR-I2).
+# ----------------------------------------------------------------------------
+
+
+def test_vast_hourly_for_cluster_returns_dph_total(monkeypatch: pytest.MonkeyPatch):
+    instances = [
+        {"id": 1, "label": "sky-lab-abc-xyz", "dph_total": 1.57},  # the rental for our cluster
+        {"id": 2, "label": "someone-elses", "dph_total": 9.99},  # unrelated -> ignored
+    ]
+    monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda client=None: instances)
+    assert vast_hourly_for_cluster("lab-abc") == 1.57
+
+
+def test_vast_hourly_for_cluster_coerces_string_price(monkeypatch: pytest.MonkeyPatch):
+    instances = [{"id": 1, "label": "sky-lab-abc-xyz", "dph_total": "1.57"}]  # API may stringify
+    monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda client=None: instances)
+    assert vast_hourly_for_cluster("lab-abc") == 1.57
+
+
+def test_vast_hourly_for_cluster_none_when_no_match(monkeypatch: pytest.MonkeyPatch):
+    instances = [{"id": 1, "label": "other-rental", "dph_total": 1.0}]
+    monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda client=None: instances)
+    assert vast_hourly_for_cluster("lab-abc") is None
+
+
+def test_vast_hourly_for_cluster_none_when_price_missing(monkeypatch: pytest.MonkeyPatch):
+    instances = [{"id": 1, "label": "sky-lab-abc-xyz"}]  # matches, but no dph_total field
+    monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda client=None: instances)
+    assert vast_hourly_for_cluster("lab-abc") is None

@@ -261,6 +261,14 @@ record artifact **URIs**, never credentials (spec FR-J1).
 - **Vast marketplace flakiness.** A single failed launch (machine vanished
   mid-provision) is not "the pipeline is broken" — resubmit; SkyPilot will
   pick a different offer.
+- **Provisioning watchdog → `failed` with "provisioning exceeded …".** A dead
+  Vast host stuck in "loading" used to hang the job forever. The lab now aborts
+  any host that doesn't reach UP within the provision timeout (default **8m**,
+  override with `--provision-timeout 10m` / `provision_timeout="10m"`), tears it
+  down, and marks the job `failed` with `end_reason` `provisioning exceeded
+  <N>s (… likely a dead Vast offer)`. **This is a dead-host signal, not a code
+  failure — just resubmit** (a fresh offer usually comes up healthy). Distinct
+  from a run-time `timed_out`, which means your experiment itself ran too long.
 - **`lab wait` exit codes are meaningful.** `0` = clean; `1` = timed out;
   `3` = **a teardown leaked** (paid rental may still be running — run
   `lab reconcile` now); `2` = bad args. If a wrapper script swallows the
