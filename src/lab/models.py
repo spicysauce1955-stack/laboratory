@@ -30,6 +30,7 @@ class ResourceRequest(BaseModel):
     memory: str | None = None  # e.g. "32GB"
     accelerators: str | None = None  # SkyPilot accelerator spec, e.g. "RTX_3070:1" (remote)
     timeout: str | None = None  # wall-clock limit, e.g. "2h" (FR-I1)
+    provision_timeout: str | None = None  # max time to reach UP, e.g. "10m" (default 8m; skypilot)
 
 
 class CodeRef(BaseModel):

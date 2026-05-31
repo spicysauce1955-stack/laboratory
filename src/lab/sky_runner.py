@@ -16,11 +16,14 @@ from pathlib import Path
 from lab._util import actual_cost, duration_seconds, now, parse_duration
 from lab.backends.skypilot import (
     DEFAULT_AUTOSTOP_MIN,
+    DEFAULT_PROVISION_TIMEOUT_MIN,
     REMOTE_RUN_DIR,
+    ProvisionTimeout,
     build_task,
     cluster_name_for,
     map_job_status,
     promote_timeout,
+    provision_with_watchdog,
     tear_down_and_record,
 )
 from lab.models import CostInfo, JobState
@@ -100,7 +103,13 @@ def run_job(job_dir: Path) -> int:
             down=True,
             idle_minutes_to_autostop=DEFAULT_AUTOSTOP_MIN,
         )
-        sky_job_id, handle = sky.stream_and_get(request_id)  # returns once the job is submitted (0.12)
+        # stream_and_get blocks until the job is submitted (0.12), i.e. until the host is UP. Bound
+        # it so a dead Vast offer stuck in "loading" can't hang the supervisor forever (FR-I1).
+        provision_s = (
+            parse_duration(manifest.resources.provision_timeout)
+            or DEFAULT_PROVISION_TIMEOUT_MIN * 60
+        )
+        sky_job_id, handle = provision_with_watchdog(sky, request_id, timeout_s=provision_s)
         # Record the cost estimate up-front so a running job already shows cost (FR-I2).
         hourly_usd = _hourly_cost(handle)
         estimated_usd = actual_cost(hourly_usd, parse_duration(manifest.resources.timeout))
@@ -114,6 +123,18 @@ def run_job(job_dir: Path) -> int:
             print(f"[lab] tail_logs issue: {e}")
         max_wait = (parse_duration(manifest.resources.timeout) or 3600) + 300
         final = _wait_terminal(sky, cluster, sky_job_id, max_wait)
+    except ProvisionTimeout:
+        store.update_manifest(
+            job_id,
+            status=JobState.failed,
+            ended_at=now(),
+            end_reason=(
+                f"provisioning exceeded {provision_s:.0f}s "
+                "(host never reached UP — likely a dead Vast offer; resubmit for a fresh host)"
+            )[:300],
+        )
+        tear_down_and_record(sky, cluster, store, job_id)
+        return 1
     except Exception as e:  # noqa: BLE001
         store.update_manifest(
             job_id, status=JobState.failed, ended_at=now(), end_reason=f"launch error: {e}"[:300]

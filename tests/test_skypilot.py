@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 
 import pytest
@@ -6,12 +7,14 @@ from helpers import make_manifest
 import lab.backends.skypilot as skypilot_mod
 from lab.backends.skypilot import (
     TIMEOUT_SENTINEL,
+    ProvisionTimeout,
     build_run_script,
     build_setup_script,
     build_task,
     cluster_name_for,
     map_job_status,
     promote_timeout,
+    provision_with_watchdog,
     robust_teardown,
     tear_down_and_record,
 )
@@ -210,3 +213,57 @@ def test_tear_down_and_record_marks_success_when_sky_down_succeeds(_no_sleep, tm
     ok = tear_down_and_record(sky, "lab-job-2", store, "job-2")
     assert ok is True
     assert store.read_manifest("job-2").teardown_status == "succeeded"
+
+
+# ----------------------------------------------------------------------------
+# provision_with_watchdog — bound the blocking stream_and_get so a dead Vast host
+# stuck in "loading" can't hang the supervisor forever (FR-I1 provisioning guard).
+# ----------------------------------------------------------------------------
+
+
+class _FakeLaunchSky:
+    """Stand-in for `sky` covering the provisioning surface: ``stream_and_get`` blocks/returns/
+    raises per config; ``api_cancel`` records the abort call."""
+
+    def __init__(
+        self,
+        *,
+        sleep_s: float = 0.0,
+        raise_exc: Exception | None = None,
+        result: tuple = (1, "handle"),
+    ) -> None:
+        self.sleep_s = sleep_s
+        self.raise_exc = raise_exc
+        self.result = result
+        self.api_cancel_calls: list[object] = []
+
+    def stream_and_get(self, request_id: object) -> tuple:
+        if self.sleep_s:
+            time.sleep(self.sleep_s)  # real sleep — simulates a host stuck provisioning
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return self.result
+
+    def api_cancel(self, request_id: object) -> None:
+        self.api_cancel_calls.append(request_id)
+
+
+def test_provision_watchdog_returns_on_fast_launch():
+    sky = _FakeLaunchSky(result=(42, "handle"))
+    job_id, handle = provision_with_watchdog(sky, "req-1", timeout_s=5.0)
+    assert (job_id, handle) == (42, "handle")
+    assert sky.api_cancel_calls == []  # healthy launch: never aborted
+
+
+def test_provision_watchdog_times_out_on_hang():
+    sky = _FakeLaunchSky(sleep_s=1.0)  # "host" never finishes provisioning
+    with pytest.raises(ProvisionTimeout):
+        provision_with_watchdog(sky, "req-2", timeout_s=0.05)
+    assert sky.api_cancel_calls == ["req-2"]  # best-effort abort fired
+
+
+def test_provision_watchdog_reraises_real_error():
+    sky = _FakeLaunchSky(raise_exc=RuntimeError("offer disappeared"))
+    with pytest.raises(RuntimeError, match="offer disappeared"):
+        provision_with_watchdog(sky, "req-3", timeout_s=5.0)
+    assert sky.api_cancel_calls == []  # a genuine error is not a timeout abort

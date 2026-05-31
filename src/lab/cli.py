@@ -72,6 +72,7 @@ def submit(
     gpus: int | None = typer.Option(None),
     accelerators: str | None = typer.Option(None, "--accelerators", help="e.g. RTX_3070:1 (required for Vast)"),
     timeout: str | None = typer.Option(None, help="wall-clock limit, e.g. 2h / 30m / 45s"),
+    provision_timeout: str | None = typer.Option(None, "--provision-timeout", help="abort if the host doesn't reach UP in time, e.g. 10m (skypilot; default 8m)"),
     with_pkg: list[str] = typer.Option(None, "--with", help="extra runtime package(s) for this job (repeatable; layered via uv run --with)"),
 ) -> None:
     """Submit a job without blocking; prints {job_id, cached, status} (FR-A1)."""
@@ -81,7 +82,8 @@ def submit(
         command=wrap_with_extras(command, with_pkg),
         seed=seed,
         resources=ResourceRequest(
-            cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout
+            cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
+            provision_timeout=provision_timeout,
         ),
         submitted_by="human",
     )
@@ -107,6 +109,7 @@ def sweep(
     gpus: int | None = typer.Option(None),
     accelerators: str | None = typer.Option(None, "--accelerators"),
     timeout: str | None = typer.Option(None, help="wall-clock per job, e.g. 2h"),
+    provision_timeout: str | None = typer.Option(None, "--provision-timeout", help="abort a host that doesn't reach UP in time, e.g. 10m (skypilot; default 8m)"),
     with_pkg: list[str] = typer.Option(None, "--with", help="extra runtime package(s) per job (repeatable; layered via uv run --with)"),
 ) -> None:
     """Submit a parameter-grid sweep: one job per point under a sweep_id (FR-A5)."""
@@ -117,7 +120,8 @@ def sweep(
             _parse_grid(grid),
             seed=seed,
             resources=ResourceRequest(
-                cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout
+                cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
+                provision_timeout=provision_timeout,
             ),
         )
     except LabError as e:

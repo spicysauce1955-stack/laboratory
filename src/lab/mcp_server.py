@@ -55,16 +55,18 @@ def build_server(lab: Lab) -> FastMCP:
         gpus: int | None = None,
         accelerators: str | None = None,
         timeout: str | None = None,
+        provision_timeout: str | None = None,
         with_pkg: list[str] | None = None,
     ) -> dict:
-        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with."""
+        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP."""
         the_lab = _lab(backend)
         spec = JobSpec(
             code_ref=code_ref,
             command=wrap_with_extras(command, with_pkg),
             seed=seed,
             resources=ResourceRequest(
-                cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout
+                cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
+                provision_timeout=provision_timeout,
             ),
             submitted_by="agent",
         )
@@ -87,9 +89,10 @@ def build_server(lab: Lab) -> FastMCP:
         gpus: int | None = None,
         accelerators: str | None = None,
         timeout: str | None = None,
+        provision_timeout: str | None = None,
         with_pkg: list[str] | None = None,
     ) -> dict:
-        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5). with_pkg layers extra runtime packages via uv run --with."""
+        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5). with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP."""
         the_lab = _lab(backend)
         try:
             sweep_id, job_ids = the_lab.sweep(
@@ -97,7 +100,8 @@ def build_server(lab: Lab) -> FastMCP:
                 grid,
                 seed=seed,
                 resources=ResourceRequest(
-                    cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout
+                    cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
+                    provision_timeout=provision_timeout,
                 ),
             )
         except LabError as e:

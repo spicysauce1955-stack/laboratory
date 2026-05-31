@@ -18,6 +18,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterable
 from pathlib import Path
@@ -35,6 +36,9 @@ if TYPE_CHECKING:
 REMOTE_RUN_DIR = "/tmp/lab_run"
 TIMEOUT_SENTINEL = ".lab_timed_out"  # written by the run script when `timeout` kills the job
 DEFAULT_AUTOSTOP_MIN = 5  # safety-net teardown if the supervisor process dies
+# Provisioning watchdog: a healthy Vast host reaches UP in ~2-4 min, so 8 min clears
+# slow-but-alive hosts while catching ones stuck in "loading" forever (a dead offer).
+DEFAULT_PROVISION_TIMEOUT_MIN = 8
 # Teardown retry budget: ~3.5 min total (first attempt + 5 retries spaced 5/15/30/60/120 s).
 # Long enough to ride out a transient DNS/API hiccup; short enough that a cluster that's
 # genuinely stuck still gets nuked via the vast-sdk fallback in well under 5 minutes.
@@ -256,6 +260,57 @@ def tear_down_and_record(sky_mod: Any, cluster: str, store: JobStore, job_id: st
         fields["end_reason"] = (f"{existing} | {annotation}" if existing else annotation)[:600]
     store.update_manifest(job_id, **fields)
     return succeeded
+
+
+# ---------------------------------------------------------------------------
+# Provisioning watchdog — bound the blocking ``stream_and_get`` so a Vast host
+# that never reaches UP (stuck in "loading") can't hang the supervisor forever.
+# ---------------------------------------------------------------------------
+
+
+class ProvisionTimeout(Exception):
+    """Raised when a SkyPilot launch does not finish provisioning within the watchdog window."""
+
+
+def provision_with_watchdog(sky_mod: Any, request_id: Any, *, timeout_s: float) -> tuple[Any, Any]:
+    """Run ``sky_mod.stream_and_get(request_id)`` under a wall-clock watchdog.
+
+    ``stream_and_get`` blocks streaming provisioning logs until the remote job is *submitted*,
+    which only happens after the host reaches UP. A dead Vast offer never gets there, so the call
+    blocks indefinitely. We run it in a daemon thread and ``join`` for ``timeout_s``:
+
+    - returns ``(sky_job_id, handle)`` if provisioning completes in time;
+    - raises :class:`ProvisionTimeout` if it doesn't (best-effort ``sky_mod.api_cancel`` first);
+    - re-raises unchanged any genuine error ``stream_and_get`` raised before the timeout.
+
+    The thread is a daemon, so if it's still stuck after the timeout it dies with the supervisor
+    process and never blocks teardown or exit.
+    """
+    holder: dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            holder["value"] = sky_mod.stream_and_get(request_id)
+        except BaseException as e:  # noqa: BLE001 — surfaced to the caller below
+            holder["error"] = e
+
+    thread = threading.Thread(target=_run, name="lab-provision-watchdog", daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+
+    if thread.is_alive():
+        try:
+            sky_mod.api_cancel(request_id)  # best-effort abort; robust_teardown kills the host
+        except Exception as e:  # noqa: BLE001
+            print(f"[lab] api_cancel after provision timeout failed: {e}")
+        raise ProvisionTimeout(
+            f"provisioning did not complete within {timeout_s:.0f}s"
+        )
+
+    if "error" in holder:
+        raise holder["error"]
+    value: tuple[Any, Any] = holder["value"]
+    return value
 
 
 def build_task(manifest: JobManifest, workdir: Path) -> sky.Task:
