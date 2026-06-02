@@ -1,9 +1,9 @@
 ---
 name: laboratory
-description: "Run reproducible ML experiments on local or remote (Vast.ai via SkyPilot) machines via the lab MCP/CLI. Use when the user asks to: run/submit an experiment, sweep over K/alpha/seeds, watch metrics live and kill early if off-track, fetch artifacts, reproduce a prior run, or any tempotron-capacity / GPU-on-Vast / cost-bounded compute task. Triggers: lab submit, lab sweep, lab wait, run experiment remote, sweep parameters, watch metrics live, fetch artifacts, kill early if off-track, reproduce job."
+description: "Run/execute a reproducible ML or compute experiment via the lab runner (MCP tools / `lab` CLI) — in this repo this is the right way to actually launch a training/experiment job, not running the script directly. Use when the user wants the work done, not just discussed: run, launch, submit, or kick off an experiment file; sweep or grid over hyperparameters, seeds, alpha, K, learning rate, or batch size and report which config won; put a job on a remote GPU (e.g. an RTX 4090 on Vast.ai via SkyPilot), cap its cost or runtime, or fan out many parallel trials cheaply without babysitting; keep a long job alive past disconnect and notify with final metrics; stream live metrics and kill a diverging run early; fetch a finished job's results, artifacts, or plots; reproduce a prior run; or diagnose a billing/teardown leak ('am I still being charged?', a stuck Vast rental, `lab wait` exit code 3). Also covers tempotron-capacity experiments. Triggers: lab submit, lab sweep, lab wait. Skip for merely writing an experiment script, reading a saved result file, or plotting existing metrics."
 metadata:
-  version: "0.1.0"
-  last_updated: "2026-05-28"
+  version: "0.2.0"
+  last_updated: "2026-06-02"
   status: active
 ---
 
