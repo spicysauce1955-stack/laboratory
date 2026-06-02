@@ -44,7 +44,7 @@ Notes on the grid:
 ```bash
 uv run lab wait --sweep sweep-20260528-141900-9f00 \
                 --done-file /tmp/lab-done-sweep-9f00.json \
-                --timeout 2h
+                --timeout 7200   # SECONDS (= 2h). `lab wait --timeout` is NOT a duration string.
 ```
 
 Run this as a Claude Code background task. Sweeps with skypilot run in

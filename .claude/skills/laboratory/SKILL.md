@@ -149,7 +149,14 @@ Block until one or more jobs reach a terminal state:
 uv run lab wait <job_id_1> <job_id_2> --done-file done.json
 # or:
 uv run lab wait --sweep <sweep_id> --done-file done.json
+# with a deadline — NOTE: --timeout here is SECONDS (a number), not "30m":
+uv run lab wait <job_id> --timeout 1800 --done-file done.json
 ```
+
+> **Gotcha — `wait --timeout` is in seconds, not a duration string.** Unlike
+> `submit`/`sweep` `--timeout`, which accept `"30m"`/`"2h"`, `lab wait --timeout`
+> takes a raw number of seconds (e.g. `1800` for 30 min). Passing `30m` here
+> exits `2` (bad args). Convert first.
 
 Why CLI-only: the right pattern is to run `lab wait` as a **Claude Code
 background task**, keep working in the foreground, and let the task's
@@ -207,7 +214,9 @@ filter to `sweep_id`, fetch each, summarize succeeded vs failed.
 ### C. Live early-kill (watch and stop if off-track)
 See **`examples/03-live-early-kill.md`**. Pattern: submit → poll
 `mcp__lab__metrics(job_id, since_step=last)` every ~10s → if the divergence
-criterion fires, `mcp__lab__cancel(job_id)`.
+criterion fires, `mcp__lab__cancel(job_id)`. The returned points live under the
+**`series`** key (`result["series"]["loss"]`), not at the top level — index
+into `series` before reading values.
 
 ### D. Reuse cached results
 Pass `cache=true` to `mcp__lab__submit`. The lab hashes

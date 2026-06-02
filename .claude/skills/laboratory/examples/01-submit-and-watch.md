@@ -93,7 +93,8 @@ mcp__lab__logs(job_id="20260528-141233-a1b2c3", tail=200)  # stdout/stderr tail
 - `lab wait` exits non-zero if it gives up on its own `--timeout`. If
   `done.json` has `all_terminal: false`, you timed out — bump the interval or
   check the job state directly.
-- For long jobs you can pass `--timeout 2h` to `lab wait` so you eventually
-  get woken even if the job hangs.
+- For long jobs you can pass `--timeout 7200` to `lab wait` so you eventually
+  get woken even if the job hangs. Note: `lab wait --timeout` is in **seconds**
+  (a number), not a duration string like `2h` — passing `2h` here exits `2`.
 - The same shape works for `--backend skypilot`; the only difference is the
   fetch may pull from R2 if the local output dir is empty.
