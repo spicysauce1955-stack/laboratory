@@ -1,0 +1,22 @@
+[
+  {"query": "I've got a tempotron capacity experiment in experiments/capacity.py — run it across seeds 1 through 10 and alpha 0.1, 0.2, 0.5 and tell me where the capacity breaks down. it'll probably need a GPU box", "should_trigger": true},
+  {"query": "kick off experiments/train.py on a remote 4090 with a 30 minute cap — I don't want it running forever racking up vast charges", "should_trigger": true},
+  {"query": "run my experiment and keep an eye on the loss as it trains; if it's clearly diverging after a few hundred steps just kill it, no point burning compute", "should_trigger": true},
+  {"query": "I need to reproduce the run from last week with seed 42 exactly — same commit, same config. how do I do that in this setup?", "should_trigger": true},
+  {"query": "sweep the learning rate over 1e-4, 1e-3, 1e-2 and batch size 32, 64 for experiments/mnist.py, wait for them all, then tell me which config won", "should_trigger": true},
+  {"query": "submit this training job so it survives me closing my laptop, and let me know when it's done with the final metrics", "should_trigger": true},
+  {"query": "my `lab wait` came back with exit code 3 and one job shows teardown_status failed — am I being billed for a machine right now?? what do I do", "should_trigger": true},
+  {"query": "I want to run experiments/example_capacity.py but it imports scipy which isn't in our locked env, and I don't want to add it permanently — just for this one run", "should_trigger": true},
+  {"query": "fan out about 50 runs of the perceptron capacity experiment over different K values on vast and pull all the artifacts back when they finish", "should_trigger": true},
+  {"query": "launch the training job and stream me the metrics live, then grab result.json and the plots once it converges", "should_trigger": true},
+  {"query": "I keep hearing this is embarrassingly parallel over seeds — what's the cheapest way to actually run a few hundred of these capacity trials without babysitting each one?", "should_trigger": true},
+  {"query": "read runs/20260601-a1b2c3/output/result.json and tell me what the final accuracy was", "should_trigger": false},
+  {"query": "write me a tempotron capacity experiment script that logs loss per epoch and writes a result.json at the end", "should_trigger": false},
+  {"query": "explain what perceptron storage capacity (alpha_c) means and why it's around 2 for the simple perceptron", "should_trigger": false},
+  {"query": "experiments/capacity.py is really slow on the inner matmul — can you profile it and speed up the numpy?", "should_trigger": false},
+  {"query": "set up a github actions workflow that runs pytest on every push to main", "should_trigger": false},
+  {"query": "I need a throwaway Ubuntu 22.04 box with a GPU to mess around in for an afternoon — spin one up and give me SSH access", "should_trigger": false},
+  {"query": "make a matplotlib chart from these three metrics.jsonl files comparing the sweeps, save it as compare.png", "should_trigger": false},
+  {"query": "review my PR that refactors the skypilot teardown logic in src/lab/backends/skypilot.py", "should_trigger": false},
+  {"query": "the mlflow tracking UI won't start on port 5000, I get a connection refused — how do I fix it?", "should_trigger": false}
+]

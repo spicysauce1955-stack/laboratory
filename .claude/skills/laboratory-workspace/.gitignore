@@ -1,0 +1,5 @@
+# Regenerable eval run outputs — agent SUMMARY.md files, grading/timing/benchmark
+# artifacts, review.html, and the description-optimization logs. Reproduce by re-running
+# the eval subagents + grade.py + build_benchmark.py against the committed fixtures/evals.
+iteration-*/
+desc-opt/

@@ -1,0 +1,41 @@
+{
+  "skill_name": "laboratory",
+  "note": "Iteration 2 — richer prompts that exercise the lab's real capability surface (live early-kill, failure surfacing, per-job extra deps, cache/clean-tree gate, teardown-leak recovery). All local-backend, short jobs, no live reconcile against a real Vast account. Iteration-1 covered the basics (submit-and-watch, sweep, reproduce-and-inspect). Fixtures live in ../laboratory-workspace/fixtures/.",
+  "evals": [
+    {
+      "id": 0,
+      "name": "live-early-kill",
+      "prompt": "Submit .claude/skills/laboratory-workspace/fixtures/slow_metric.py through the lab on the local backend. It logs a `loss` metric over time. Watch the loss as it comes in, and kill the run early as soon as the loss is clearly going the wrong way (rising instead of falling) — I don't want to pay for a diverging run. Tell me which step you killed it at, the partial loss series you saw, and the job's final state. Write it to SUMMARY.md.",
+      "expected_output": "Agent submits slow_metric.py (local), polls the metric series incrementally (lab metrics --since-step / mcp__lab__metrics) rather than blocking, detects the rising loss, cancels the job before it finishes, and reports the kill step + partial series + final state=cancelled.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "name": "handle-failure",
+      "prompt": "Run .claude/skills/laboratory-workspace/fixtures/failing.py through the lab on the local backend and tell me what happened — it didn't produce the results I expected. I need to know whether it actually failed, the exit code, the reason, and whether it logged anything before dying. Write your diagnosis to SUMMARY.md.",
+      "expected_output": "Agent submits failing.py (local), waits, then correctly diagnoses state=failed with a non-zero exit_code (3), reports the end_reason, and surfaces the partial metrics/logs it produced before crashing. Does NOT claim the run succeeded.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "extra-dependency",
+      "prompt": "I need to run .claude/skills/laboratory-workspace/fixtures/needs_dep.py through the lab on my local machine, but it depends on the `humanize` package which isn't in the project's locked environment and I do NOT want to add it as a permanent dependency. Make it run successfully for just this job and show me its output. Write what you did to SUMMARY.md.",
+      "expected_output": "Agent recognizes the per-job extra-dependency mechanism (lab with_pkg=['humanize'] / CLI --with humanize), submits needs_dep.py with humanize layered in for that job only, the job succeeds, and the agent reports the result — without editing pyproject.toml/uv.lock.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "cache-reuse",
+      "prompt": "Run experiments/example_capacity.py with seed 5 through the lab locally. Then submit the exact same experiment again, but this time ask the lab to reuse the earlier result if it can instead of recomputing. Tell me whether it actually reused the cached result, and if it didn't, explain exactly why. Write it to SUMMARY.md.",
+      "expected_output": "Agent runs example_capacity.py seed 5 (local), then submits the identical job with caching enabled (cache=true / --cache). It reports whether the cache hit, and — because the working tree is dirty (untracked files) — correctly explains that the dirty-tree gate disabled the cache (cache only hits on a clean tree with identical commit+command+config+seed).",
+      "files": []
+    },
+    {
+      "id": 4,
+      "name": "leak-recovery-plan",
+      "prompt": "One of my remote (skypilot/Vast) lab jobs finished but shows teardown_status: \"failed\", and my `lab wait` came back with exit code 3. I'm worried I'm being billed for a machine that's still running. Walk me through exactly what to do to stop losing money, step by step — and explain the difference between what the lab calls an 'orphan' and a 'ghost'. IMPORTANT: just give me the playbook in writing; do NOT actually run reconcile or touch the cloud account yourself. Write the playbook to SUMMARY.md.",
+      "expected_output": "Agent explains the teardown-leak recovery workflow from the skill: run `lab reconcile` dry-run first to list orphans, sanity-check, then `lab reconcile --apply` to destroy them; correctly distinguishes orphans (Vast rentals labelled lab-* with no running job — these cost money, destroy them) from ghosts (running lab jobs with no matching rental — stale local state, no cost). Conveys cost urgency. Does NOT execute reconcile or touch the account.",
+      "files": []
+    }
+  ]
+}
