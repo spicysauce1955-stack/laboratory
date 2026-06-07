@@ -20,7 +20,9 @@ _REDACTED = "…REDACTED…"
 _PATTERNS = (
     re.compile(r"(api_key=)[^&\s\"']+", re.IGNORECASE),
     re.compile(r"([?&][\w-]*?_key=)[^&\s\"']+", re.IGNORECASE),
-    re.compile(r"(Authorization:\s*)\S+", re.IGNORECASE),
+    # Mask the WHOLE header value (scheme + token), not just the first token: a real
+    # `Authorization: Bearer <jwt>` has a space, so `\S+` would leave the token exposed.
+    re.compile(r"(Authorization:[ \t]*).+", re.IGNORECASE),
 )
 
 

@@ -20,6 +20,15 @@ def test_redact_masks_authorization_header():
     assert "REDACTED" in redact("Authorization: Bearer-xyz")
 
 
+def test_redact_masks_authorization_token_after_space():
+    # A real `Authorization: Bearer <token>` has a space — the token (not just the scheme)
+    # must be masked, or the credential leaks.
+    token = "eyJhbGciOiJIUzI1NiJ9.payload.sig"
+    out = redact(f"Authorization: Bearer {token}")
+    assert token not in out and "Bearer" not in out
+    assert "REDACTED" in out
+
+
 def test_redact_leaves_plain_text_untouched():
     line = "[lab] provisioning host lab-abc-123 (RTX4090:1)"
     assert redact(line) == line
