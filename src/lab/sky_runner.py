@@ -184,8 +184,12 @@ def run_job(job_dir: Path) -> int:
             _rsync_down(cluster, REMOTE_RUN_DIR, store.output_dir(job_id))
 
         final = _wait_terminal(
-            sky, cluster, sky_job_id, max_wait,
-            heartbeat_s=HEARTBEAT_S, on_heartbeat=_heartbeat,
+            sky,
+            cluster,
+            sky_job_id,
+            max_wait,
+            heartbeat_s=HEARTBEAT_S,
+            on_heartbeat=_heartbeat,
         )
     except ProvisionTimeout:
         store.update_manifest(

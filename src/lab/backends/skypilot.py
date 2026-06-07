@@ -379,9 +379,7 @@ def provision_with_watchdog(sky_mod: Any, request_id: Any, *, timeout_s: float) 
             sky_mod.api_cancel(request_id)  # best-effort abort; robust_teardown kills the host
         except Exception as e:  # noqa: BLE001
             print(f"[lab] api_cancel after provision timeout failed: {e}")
-        raise ProvisionTimeout(
-            f"provisioning did not complete within {timeout_s:.0f}s"
-        )
+        raise ProvisionTimeout(f"provisioning did not complete within {timeout_s:.0f}s")
 
     if "error" in holder:
         raise holder["error"]

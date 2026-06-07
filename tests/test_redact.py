@@ -30,11 +30,6 @@ def test_redact_is_idempotent():
     assert redact(once) == once
 
 
-import os
-
-from lab.redact import install_log_redaction
-
-
 def test_install_log_redaction_scrubs_fd_output(tmp_path, capfd):
     log = tmp_path / "logs.txt"
     # Run in a child process: install_log_redaction reassigns fds 1/2 for the whole process,

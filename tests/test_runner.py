@@ -3,6 +3,7 @@ from pathlib import Path
 
 from helpers import PYTHON, make_manifest
 
+import lab.sky_runner as sky_runner
 from lab.models import JobState
 from lab.runner import run_job
 from lab.store import JobStore
@@ -45,9 +46,6 @@ def test_timeout_terminates(tmp_path: Path):
     assert m.end_reason == "wall-clock timeout"
 
 
-import lab.sky_runner as sky_runner
-
-
 def test_wait_terminal_fires_heartbeat(monkeypatch):
     # Fake sky_mod whose queue reports RUNNING for several polls, then SUCCEEDED.
     polls = {"n": 0}
@@ -69,8 +67,13 @@ def test_wait_terminal_fires_heartbeat(monkeypatch):
     beats = {"n": 0}
 
     final = sky_runner._wait_terminal(
-        _FakeSky(), "lab-x", 1, max_wait=10_000,
-        poll_s=1.0, heartbeat_s=3.0, on_heartbeat=lambda: beats.__setitem__("n", beats["n"] + 1),
+        _FakeSky(),
+        "lab-x",
+        1,
+        max_wait=10_000,
+        poll_s=1.0,
+        heartbeat_s=3.0,
+        on_heartbeat=lambda: beats.__setitem__("n", beats["n"] + 1),
     )
     from lab.models import JobState
 

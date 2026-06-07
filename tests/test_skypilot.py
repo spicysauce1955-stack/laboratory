@@ -17,9 +17,11 @@ from lab.backends.skypilot import (
     provision_with_watchdog,
     robust_teardown,
     tear_down_and_record,
+    vast_balance,
     vast_hourly_for_cluster,
 )
 from lab.models import JobState
+from lab.sky_runner import provision_failure_reason
 from lab.store import JobStore
 
 
@@ -59,19 +61,19 @@ def test_build_scripts_and_timeout():
 
 def test_run_script_group_kill_and_sentinel():
     run = build_run_script(make_manifest("j", "python x.py", timeout="30m"))
-    assert "sleep 1800" in run                 # 30m wall
-    assert "kill -TERM -$$" in run             # TERM the whole process group
-    assert "kill -KILL -$$" in run             # then KILL after the grace
+    assert "sleep 1800" in run  # 30m wall
+    assert "kill -TERM -$$" in run  # TERM the whole process group
+    assert "kill -KILL -$$" in run  # then KILL after the grace
     assert f"sleep {skypilot_mod.TIMEOUT_KILL_GRACE_S}" in run
-    assert TIMEOUT_SENTINEL in run             # killer drops the sentinel for promote_timeout
+    assert TIMEOUT_SENTINEL in run  # killer drops the sentinel for promote_timeout
 
 
 def test_run_script_self_destruct_watchdog():
     run = build_run_script(make_manifest("j", "python x.py", timeout="30m"))
     margin = skypilot_mod.SELF_DESTRUCT_MARGIN_S
-    assert f"sleep {1800 + margin}" in run     # poweroff at wall + margin
+    assert f"sleep {1800 + margin}" in run  # poweroff at wall + margin
     assert "poweroff" in run
-    assert "nohup setsid bash -c" in run       # detached, survives the supervisor
+    assert "nohup setsid bash -c" in run  # detached, survives the supervisor
 
 
 def test_promote_timeout(tmp_path):
@@ -317,9 +319,6 @@ def test_vast_hourly_for_cluster_none_when_price_missing(monkeypatch: pytest.Mon
     assert vast_hourly_for_cluster("lab-abc") is None
 
 
-from lab.backends.skypilot import vast_balance
-
-
 def test_vast_balance_reads_credit(monkeypatch):
     class _V:
         def show_user(self):
@@ -336,9 +335,6 @@ def test_vast_balance_none_on_error(monkeypatch):
 
     monkeypatch.setattr(skypilot_mod, "_get_vast_client", lambda: _V())
     assert vast_balance() is None
-
-
-from lab.sky_runner import provision_failure_reason
 
 
 def test_provision_failure_reason_flags_negative_balance(monkeypatch):
