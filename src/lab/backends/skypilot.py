@@ -195,6 +195,30 @@ def vast_hourly_for_cluster(cluster: str, client: Any | None = None) -> float | 
     return None
 
 
+def vast_balance(client: Any | None = None) -> float | None:
+    """Current Vast.ai account balance/credit (USD), or None if unavailable (best-effort).
+
+    A depleted/negative balance makes Vast reject rentals with ``400 Bad Request``, which
+    SkyPilot surfaces as a generic "Failed to provision … resources" — indistinguishable from
+    "no GPUs". We consult this on a provision failure to give an actionable message (§8).
+    """
+    if client is None:
+        client = _get_vast_client()
+    try:
+        info = client.show_user()
+    except Exception as e:  # noqa: BLE001 — best-effort; caller falls back to the generic message
+        print(f"[lab] vast balance lookup failed: {e}")
+        return None
+    for key in ("credit", "balance"):
+        val = info.get(key) if isinstance(info, dict) else getattr(info, key, None)
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def _vast_destroy_matching(cluster: str, client: Any | None = None) -> list[int]:
     """Destroy every Vast rental whose label contains ``cluster``; return their IDs."""
     if client is None:

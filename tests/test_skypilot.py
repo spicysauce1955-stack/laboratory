@@ -315,3 +315,51 @@ def test_vast_hourly_for_cluster_none_when_price_missing(monkeypatch: pytest.Mon
     instances = [{"id": 1, "label": "sky-lab-abc-xyz"}]  # matches, but no dph_total field
     monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda client=None: instances)
     assert vast_hourly_for_cluster("lab-abc") is None
+
+
+from lab.backends.skypilot import vast_balance
+
+
+def test_vast_balance_reads_credit(monkeypatch):
+    class _V:
+        def show_user(self):
+            return {"credit": -1.46, "balance": -1.46}
+
+    monkeypatch.setattr(skypilot_mod, "_get_vast_client", lambda: _V())
+    assert vast_balance() == -1.46
+
+
+def test_vast_balance_none_on_error(monkeypatch):
+    class _V:
+        def show_user(self):
+            raise RuntimeError("api down")
+
+    monkeypatch.setattr(skypilot_mod, "_get_vast_client", lambda: _V())
+    assert vast_balance() is None
+
+
+from lab.sky_runner import provision_failure_reason
+
+
+def test_provision_failure_reason_flags_negative_balance(monkeypatch):
+    import lab.sky_runner as sr
+
+    monkeypatch.setattr(sr, "vast_balance", lambda: -1.46)
+    reason = provision_failure_reason("launch error: Failed to provision all possible resources")
+    assert "balance is $-1.46" in reason and "top up" in reason
+
+
+def test_provision_failure_reason_keeps_generic_when_funded(monkeypatch):
+    import lab.sky_runner as sr
+
+    monkeypatch.setattr(sr, "vast_balance", lambda: 25.0)
+    generic = "launch error: Failed to provision all possible resources"
+    assert provision_failure_reason(generic) == generic
+
+
+def test_provision_failure_reason_keeps_generic_when_balance_unknown(monkeypatch):
+    import lab.sky_runner as sr
+
+    monkeypatch.setattr(sr, "vast_balance", lambda: None)
+    generic = "launch error: Failed to provision all possible resources"
+    assert provision_failure_reason(generic) == generic

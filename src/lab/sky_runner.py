@@ -27,6 +27,7 @@ from lab.backends.skypilot import (
     promote_timeout,
     provision_with_watchdog,
     tear_down_and_record,
+    vast_balance,
     vast_hourly_for_cluster,
 )
 from lab.models import CostInfo, JobState
@@ -124,6 +125,18 @@ def _resolve_hourly(cluster: str, handle: Any) -> float | None:
     return _hourly_cost(handle)
 
 
+def provision_failure_reason(generic: str) -> str:
+    """Enrich a generic provision-failure message with the Vast balance when that's the cause (§8).
+
+    Vast returns 400 on rentals when the balance is depleted; SkyPilot reports that as a generic
+    "no resources" string. If the balance is known and not positive, say so instead.
+    """
+    bal = vast_balance()
+    if bal is not None and bal <= 0:
+        return f"Vast account balance is ${bal:.2f} — top up to provision"
+    return generic
+
+
 def run_job(job_dir: Path) -> int:
     job_dir = Path(job_dir)
     store = JobStore(job_dir.parent)
@@ -187,8 +200,9 @@ def run_job(job_dir: Path) -> int:
         tear_down_and_record(sky, cluster, store, job_id)
         return 1
     except Exception as e:  # noqa: BLE001
+        reason = provision_failure_reason(f"launch error: {e}")
         store.update_manifest(
-            job_id, status=JobState.failed, ended_at=now(), end_reason=f"launch error: {e}"[:300]
+            job_id, status=JobState.failed, ended_at=now(), end_reason=reason[:300]
         )
         tear_down_and_record(sky, cluster, store, job_id)
         return 1
