@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ from lab.store import JobStore
 
 
 _TERMINAL_NAMES = {"SUCCEEDED", "FAILED", "FAILED_SETUP", "FAILED_DRIVER", "CANCELLED"}
+HEARTBEAT_S = 60.0  # how often the supervisor rsyncs partial results down mid-run (§6c)
 
 
 def _rec_field(rec, key: str):
@@ -50,11 +52,26 @@ def _job_status_name(sky_mod, cluster: str, sky_job_id: int | None) -> str | Non
     return None
 
 
-def _wait_terminal(sky_mod, cluster: str, sky_job_id: int | None, max_wait: float) -> JobState:
+def _wait_terminal(
+    sky_mod,
+    cluster: str,
+    sky_job_id: int | None,
+    max_wait: float,
+    *,
+    poll_s: float = 10.0,
+    heartbeat_s: float | None = None,
+    on_heartbeat: Callable[[], None] | None = None,
+) -> JobState:
     """Poll the remote job until terminal — sky.launch (0.12) returns at submit time, not
-    completion, so we must wait before fetching artifacts and tearing down."""
+    completion, so we must wait before fetching artifacts and tearing down.
+
+    If ``heartbeat_s``/``on_heartbeat`` are given, ``on_heartbeat`` is called roughly every
+    ``heartbeat_s`` of polling so the supervisor can fetch partial results mid-run; a callback
+    error is logged, never fatal (§6c — don't lose ``results.csv`` to a late teardown).
+    """
     deadline = time.time() + max_wait
     name: str | None = None
+    since_beat = 0.0
     while time.time() < deadline:
         try:
             name = _job_status_name(sky_mod, cluster, sky_job_id)
@@ -62,7 +79,15 @@ def _wait_terminal(sky_mod, cluster: str, sky_job_id: int | None, max_wait: floa
             print(f"[lab] queue poll error: {e}")
         if name in _TERMINAL_NAMES:
             break
-        time.sleep(10)
+        time.sleep(poll_s)
+        if heartbeat_s and on_heartbeat is not None:
+            since_beat += poll_s
+            if since_beat >= heartbeat_s:
+                since_beat = 0.0
+                try:
+                    on_heartbeat()
+                except Exception as e:  # noqa: BLE001
+                    print(f"[lab] heartbeat rsync skipped: {e}")
     return map_job_status(name or "FAILED")
 
 
@@ -140,7 +165,15 @@ def run_job(job_dir: Path) -> int:
         except Exception as e:  # noqa: BLE001
             print(f"[lab] tail_logs issue: {e}")
         max_wait = (parse_duration(manifest.resources.timeout) or 3600) + 300
-        final = _wait_terminal(sky, cluster, sky_job_id, max_wait)
+
+        def _heartbeat() -> None:
+            # Best-effort: pull partial results so a late/failed teardown can't lose them (§6c).
+            _rsync_down(cluster, REMOTE_RUN_DIR, store.output_dir(job_id))
+
+        final = _wait_terminal(
+            sky, cluster, sky_job_id, max_wait,
+            heartbeat_s=HEARTBEAT_S, on_heartbeat=_heartbeat,
+        )
     except ProvisionTimeout:
         store.update_manifest(
             job_id,
