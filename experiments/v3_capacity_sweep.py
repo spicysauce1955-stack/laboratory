@@ -47,6 +47,7 @@ import csv
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -94,31 +95,56 @@ def make_patterns(
     n_patterns: int,
     n_aff: int,
     t_window: float,
-    gen: torch.Generator,
+    rng: np.random.Generator,
     device: torch.device,
+    mean_spikes: float = 1.0,
+    ensemble: str = "poisson",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Draw ``n_tasks`` independent pattern sets.
 
-    Each afferent emits a homogeneous Poisson train on ``[0, T]`` at rate ``1/T`` (mean 1 spike);
-    labels are +/-1 with equal probability.
+    ``ensemble`` selects the input model:
 
-    Returns ``(spike_times, valid, labels, max_spikes)`` with
+    - ``"poisson"`` (default, RMS 2010): each afferent emits a homogeneous Poisson train on
+      ``[0, T]`` with ``mean_spikes`` expected spikes (rate ``mean_spikes/T``). Setting
+      ``mean_spikes`` proportional to K keeps the number of afferents active per PSP-width
+      (~``2 N mean_spikes / K``) constant as the window grows -- the "constant temporal density" mode.
+    - ``"single"`` (Gutig & Sompolinsky 2006, the latency code, Figs 3a/4): **exactly one** spike
+      per afferent at a time drawn iid ``U[0, T]``. This is the ensemble whose capacity is
+      ``alpha_c ~ 3``.
+    - ``"synchrony_half"`` (GS 2006 Fig 4a gray curve, the rate-coding control): in each pattern a
+      random half of afferents fire **synchronously** at one common time (the other half are
+      silent). Spike *timing* carries no information -> the tempotron rule reduces to the perceptron
+      rule and ``alpha_c -> 2``.
+
+    Labels are +/-1 with equal probability. Returns ``(spike_times, valid, labels, max_spikes)`` with
     ``spike_times, valid`` of shape ``(n_tasks, P, N, max_spikes)`` and ``labels`` of ``(n_tasks, P)``.
     """
+    # Draw on the CPU via a numpy Generator, then move to ``device``. PyTorch's RNG is *per-device*
+    # (CUDA and CPU streams differ for the same seed), so a numpy source makes the patterns
+    # device-INDEPENDENT -> the run is bit-reproducible on any backend and the saved weights can be
+    # re-verified on CPU (G_capture reweight). The draw order is fixed for reproducibility.
     shape = (n_tasks, n_patterns, n_aff)
-    counts = torch.poisson(torch.ones(shape, device=device), generator=gen).to(torch.int64)
-    max_spikes = max(1, int(counts.max().item()))
-    spike_times = t_window * torch.rand(
-        (n_tasks, n_patterns, n_aff, max_spikes), generator=gen, device=device, dtype=torch.float32
-    )
-    spike_idx = torch.arange(max_spikes, device=device).view(1, 1, 1, max_spikes)
-    valid = (spike_idx < counts.unsqueeze(-1)).to(torch.float32)
-    labels = torch.where(
-        torch.rand((n_tasks, n_patterns), generator=gen, device=device) < 0.5,
-        torch.tensor(1.0, device=device),
-        torch.tensor(-1.0, device=device),
-    )
-    return spike_times, valid, labels, max_spikes
+    if ensemble == "single":
+        # Exactly one spike per afferent, time ~ U[0, T] (GS 2006 latency ensemble).
+        max_spikes = 1
+        spike_times = (t_window * rng.random((n_tasks, n_patterns, n_aff, 1))).astype(np.float32)
+        valid = np.ones((n_tasks, n_patterns, n_aff, 1), dtype=np.float32)
+    elif ensemble == "synchrony_half":
+        # Random half of afferents fire at one common per-pattern time; rest silent (perceptron).
+        max_spikes = 1
+        t_common = (t_window * rng.random((n_tasks, n_patterns, 1, 1))).astype(np.float32)
+        spike_times = np.broadcast_to(t_common, (n_tasks, n_patterns, n_aff, 1)).copy()
+        active = (rng.random(shape) < 0.5).astype(np.float32)
+        valid = active[..., None]
+    else:  # "poisson" (RMS 2010)
+        counts = rng.poisson(float(mean_spikes), size=shape).astype(np.int64)
+        max_spikes = max(1, int(counts.max()))
+        spike_times = (t_window * rng.random((n_tasks, n_patterns, n_aff, max_spikes))).astype(np.float32)
+        spike_idx = np.arange(max_spikes).reshape(1, 1, 1, max_spikes)
+        valid = (spike_idx < counts[..., None]).astype(np.float32)
+    labels = np.where(rng.random((n_tasks, n_patterns)) < 0.5, 1.0, -1.0).astype(np.float32)
+    to = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(device)  # noqa: E731
+    return to(spike_times), to(valid), to(labels), max_spikes
 
 
 def precompute_traces(
@@ -159,6 +185,40 @@ def _forward(s: torch.Tensor, w: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     return vmax, targ
 
 
+def scheduled_lr(
+    lr: float,
+    ep: int,
+    *,
+    epochs: int,
+    schedule: str = "none",
+    warmup: int = 0,
+    step_size: int = 0,
+    gamma: float = 0.1,
+) -> float:
+    """Scheduled learning rate at epoch ``ep`` (V10: the tuned nuisance LR schedule).
+
+    A linear **warmup** over the first ``warmup`` epochs (``lr*(ep+1)/warmup``) precedes the chosen
+    decay. After warmup:
+    - ``"none"`` (constant): ``lr``.
+    - ``"cosine"``: half-cosine anneal to 0 over ``[warmup, epochs]``.
+    - ``"step"``: ``lr * gamma**floor(ep/step_size)`` (no decay if ``step_size<=0``).
+
+    Extracted as a module function so the schedule is unit-testable in isolation
+    (``tests/test_v10_minibatch.py``); ``train_batch`` calls it once per epoch.
+    """
+    if warmup and ep < warmup:
+        return lr * (ep + 1) / warmup
+    if schedule == "cosine":
+        t = (ep - warmup) / max(1, epochs - warmup)
+        t = min(1.0, max(0.0, t))
+        return lr * 0.5 * (1.0 + math.cos(math.pi * t))
+    if schedule == "step":
+        if step_size <= 0:
+            return lr
+        return lr * (gamma ** (ep // step_size))
+    return lr  # "none" / constant
+
+
 def train_batch(
     s: torch.Tensor,        # (Sb, P, G, N) precomputed traces
     labels: torch.Tensor,   # (Sb, P) in {-1,+1}
@@ -169,13 +229,48 @@ def train_batch(
     epochs: int,
     threshold: torch.Tensor | None = None,  # (Sb,) fixed U_th; if None, calibrate at init
     mode: str = "online",
+    uth_scale: float = 1.0,       # V5 gauge knob: multiply the calibrated U_th
+    kappa_target: float = 0.0,    # V5 margin band: require signed margin >= kappa_target*|U_th|
+    noise_sigmas: tuple[float, ...] = (),  # V6 output-noise levels for the robust-capacity probe
+    vthr_fixed: float | None = None,  # V8 faithful-GS: fix V_thr (=1) and rescale init weights to it
+    log_every: int = 0,    # V8: if >0, print converged-fraction every log_every epochs (live monitor)
+    patience: int = 0,     # V8: if >0, stop a cell after this many epochs with no new convergence
+    log_tag: str = "",
+    record_history: bool = False,  # V8: record per-epoch mean/std error & GS-cost across the seed batch
+    metric_cb=None,  # V8: callback(epoch, err_mean, loss_mean) -> stream learning curve to metrics.jsonl
+    capture: bool = False,    # V9: record FULL per-seed per-epoch trajectories (raw store)
+    patience_min_delta: float = 0.0,  # V9: a loss drop below best-min_delta counts as "improvement"
+    optimizer: str = "momentum",  # V9 batch mode: momentum | adam | rmsprop (findability probe)
+    lr_schedule: str = "none",    # V9 batch mode: none | cosine (decay lr -> 0 over the budget)
+    lr_warmup: int = 0,           # V9 batch mode: linear lr warmup over the first this-many epochs
+    # --- V10 unified minibatch path (mode='minibatch'): tuned optimizer/schedule/batch HPs ---
+    batch_size: int = 0,          # minibatch size b (1=online .. P=full); required for mode='minibatch'
+    lr_step_size: int = 0,        # 'step' schedule: epochs between gamma-decays (tuned)
+    lr_gamma: float = 0.1,        # 'step' schedule: multiplicative decay factor (tuned)
+    adam_betas: tuple[float, float] = (0.9, 0.999),  # tuned Adam (beta1, beta2)
+    adam_eps: float = 1e-8,       # tuned Adam epsilon
+    rms_alpha: float = 0.99,      # tuned RMSprop smoothing rho
+    rms_eps: float = 1e-8,        # tuned RMSprop epsilon
+    report_epochs: tuple[int, ...] = (),  # Hyperband rungs: epochs at which to report p_solve
+    report_cb=None,               # callback(epoch:int, p_solve:float)->bool; True => prune & stop
+    valid_mask: torch.Tensor | None = None,  # (Sb,P) 1/0: padded (0) slots are inert (minibatch only)
 ) -> dict[str, torch.Tensor]:
     """Gutig-Sompolinsky rule, vectorised across tasks. Threshold fixed (median V_max at init).
 
-    ``mode='online'`` (default, what RMS used): per-pattern updates within a shuffled epoch; a task
-    is converged once a full epoch passes with **zero updates** (the textbook perceptron criterion),
-    which is detected without an extra forward pass. ``mode='batch'`` sums the misclassified updates
-    and applies them once per epoch (vectorised but oscillation-prone near capacity; kept for study).
+    ``mode='online'`` (default, what GS/RMS used): per-pattern updates within a shuffled epoch; a
+    task is converged once a full epoch passes with **zero updates** (the textbook perceptron
+    criterion), detected without an extra forward pass. With ``momentum>0`` the online path chains a
+    velocity across **error trials** (``dw_current = dw + momentum*dw_prev``, GS 2006 Methods; the
+    effective step is amplified up to ``1/(1-momentum)`` when the direction is consistent).
+    ``mode='batch'`` sums the misclassified updates and applies them once per epoch (vectorised but
+    oscillation-prone near capacity; kept for study).
+
+    Gauge of the threshold:
+    - ``vthr_fixed=None`` (default): if ``threshold`` is given use it, else **calibrate** U_th to the
+      median V_max at init (the gauge-preserving convention; weights init ~ N(0,1)).
+    - ``vthr_fixed=v`` (faithful GS): hold ``V_thr = v`` (=1) and rescale the init weights so the
+      median V_max equals ``v`` (a balanced P(fire)=1/2 start at the *fixed* threshold). By the
+      U_th<->||w|| gauge invariance this measures the same capacity as the calibrate convention.
 
     Returns per-task tensors: ``converged``, ``epochs_run``, ``wnorm``, ``mean_margin``,
     ``threshold``, ``init_fire_rate``, ``final_errfrac``.
@@ -184,56 +279,399 @@ def train_batch(
     dev = s.device
     w = w_init.clone()
     vmax, _ = _forward(s, w)
-    if threshold is None:
-        threshold = vmax.median(dim=1).values  # (Sb,)
-    init_fire_rate = (vmax >= threshold[:, None]).float().mean(dim=1)
+
+    def _vmax_median(v: torch.Tensor) -> torch.Tensor:
+        """Per-seed median V_max over *valid* patterns (mask=None => over all P)."""
+        if valid_mask is None:
+            return v.median(dim=1).values
+        return torch.stack([v[i][valid_mask[i] > 0].median() for i in range(sb)])
+
+    if vthr_fixed is not None:
+        # Faithful GS: fixed threshold, rescale init weights so median V_max == vthr_fixed.
+        med = _vmax_median(vmax).clamp(min=1e-12)  # (Sb,)
+        w = w * (vthr_fixed / med)[:, None]
+        vmax, _ = _forward(s, w)
+        threshold = torch.full((sb,), float(vthr_fixed), device=dev)
+    elif threshold is None:
+        threshold = _vmax_median(vmax)  # (Sb,)
+    threshold = threshold * uth_scale  # V5 gauge: rescale the (fixed) threshold
+    band = kappa_target * threshold.abs()  # required signed-margin band (0 => bare zero-error rule)
+    if valid_mask is None:
+        init_fire_rate = (vmax >= threshold[:, None]).float().mean(dim=1)
+    else:
+        fired = (vmax >= threshold[:, None]).float() * valid_mask
+        init_fire_rate = fired.sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1.0)
     converged = torch.zeros(sb, dtype=torch.bool, device=dev)
     epochs_run = torch.full((sb,), epochs, dtype=torch.int64, device=dev)
     arange_sb = torch.arange(sb, device=dev)
     vel = torch.zeros_like(w)
+    best_conv = 0           # most tasks converged so far (for the no-progress early stop)
+    stall = 0               # epochs since best_conv last improved
+    history: list[tuple[int, float, float, float, float]] = []  # (epoch, err_mean, err_std, cost_mean, cost_std)
+
+    # V9 raw capture: full per-seed per-epoch trajectories (online mode only). NaN-padded to the
+    # budget; sliced to the actual epochs run on return. Everything downstream is derived offline
+    # from these arrays, so the run computes/discards no summary scalar that an analysis might want.
+    cap = capture and mode in ("online", "batch", "minibatch")
+    last_ep = -1
+    best_loss = float("inf")
+    # V9 batch-mode optimizer state (Adam/RMSprop moments) + a no-op for online.
+    adam_m = torch.zeros_like(w)
+    adam_v = torch.zeros_like(w)
+    adam_step = 0           # V10 minibatch: global Adam step counter for bias correction
+    pruned = False          # V10: set True if a Hyperband report_cb requested a prune
+    report_set = set(int(e) for e in report_epochs)  # V10: rung epochs (epochs-run = ep+1)
+
+    def _lr_at(ep: int) -> float:
+        """Scheduled learning rate for this epoch (V10 ``scheduled_lr``: warmup + none/cosine/step)."""
+        return scheduled_lr(lr, ep, epochs=epochs, schedule=lr_schedule, warmup=lr_warmup,
+                            step_size=lr_step_size, gamma=lr_gamma)
+
+    if cap:
+        err_buf = torch.full((sb, epochs), float("nan"), device=dev)
+        loss_buf = torch.full((sb, epochs), float("nan"), device=dev)
+        wnorm_buf = torch.full((sb, epochs), float("nan"), device=dev)
+        nupd_buf = torch.full((sb, epochs), float("nan"), device=dev)
+        kp_buf = torch.full((sb, epochs), float("nan"), device=dev)
+        km_buf = torch.full((sb, epochs), float("nan"), device=dev)
+        npos = (labels > 0).float().sum(dim=1).clamp(min=1.0)  # (Sb,) per-seed #(+1) patterns
+        nneg = (labels < 0).float().sum(dim=1).clamp(min=1.0)  # (Sb,) per-seed #(-1) patterns
 
     for ep in range(epochs):
         active = (~converged).float().unsqueeze(-1)  # (Sb, 1)
         if mode == "online":
+            lr_ep = _lr_at(ep)  # V9: per-epoch scheduled LR (== lr when lr_schedule='none')
             order = torch.randperm(p, device=dev)
             updates = torch.zeros(sb, device=dev)  # #updates this epoch (per task)
+            err_acc = torch.zeros(sb, device=dev)   # raw training errors this epoch (all seeds, ungated)
+            cost_acc = torch.zeros(sb, device=dev)  # GS hinge cost relu(band - signed_margin)
+            kp_acc = torch.zeros(sb, device=dev)    # V9: running sum of signed margin on +1 patterns
+            km_acc = torch.zeros(sb, device=dev)    # V9: running sum of signed margin on -1 patterns
             for pi in order:
                 sp = s[:, pi]                               # (Sb, G, N) contiguous
                 vp = torch.einsum("bgn,bn->bg", sp, w)
                 vmx, tg = vp.max(dim=1)                     # (Sb,)
-                pred_p = torch.where(vmx >= threshold, 1.0, -1.0)
-                e = (pred_p != labels[:, pi]).float() * active.squeeze(-1)  # 1 on active errors
+                # update when the signed margin is below the band (band=0 => bare zero-error rule)
+                smarg = (vmx - threshold) * labels[:, pi]
+                if record_history or cap:
+                    err_acc = err_acc + (smarg < band).float()
+                    cost_acc = cost_acc + torch.relu(band - smarg)
+                if cap:
+                    lab_pi = labels[:, pi]
+                    kp_acc = kp_acc + smarg * (lab_pi > 0).float()
+                    km_acc = km_acc + smarg * (lab_pi < 0).float()
+                e = (smarg < band).float() * active.squeeze(-1)
                 updates = updates + e
                 grad = sp[arange_sb, tg]                    # (Sb, N) = s_i(t_max)
-                w = w + (lr * labels[:, pi] * e).unsqueeze(-1) * grad
+                corr = (lr_ep * labels[:, pi]).unsqueeze(-1) * grad  # GS correction dw = lr*y*s(t_max)
+                e_col = e.unsqueeze(-1)
+                # momentum (GS 2006): on error trials vel = corr + momentum*vel, w += vel; on correct
+                # trials carry the velocity and leave w unchanged. momentum=0 => bare online rule.
+                vel = e_col * (corr + momentum * vel) + (1.0 - e_col) * vel
+                w = w + e_col * vel
+            if record_history:
+                ef = err_acc / p   # per-seed training-error fraction this epoch (all seeds)
+                cs = cost_acc / p  # per-seed mean GS hinge cost (threshold units)
+                history.append((ep, float(ef.mean()), float(ef.std()),
+                                float(cs.mean()), float(cs.std())))
+            if cap:
+                ep_err, ep_loss, ep_nupd = err_acc / p, cost_acc / p, updates
+                ep_kp, ep_km = kp_acc / npos, km_acc / nneg
             newly = (updates == 0) & (~converged)
-        else:  # batch mode
+        elif mode == "minibatch":  # V10 unified path: b in {1..P}, tuned optimizer / schedule / freeze
+            # One shuffled pass split into ceil(P/b) minibatch steps (Sec 6.1). The GS hinge subgradient
+            # is the per-minibatch MEAN over margin-violators, g = (1/b) sum_{viol} y s(t*); each
+            # optimizer ascends +g. A step is gated per-seed by (still active) AND (has a violator in
+            # this minibatch): at b=1, constant lambda, mu=0.99 this reproduces the faithful online GS
+            # rule bit-for-bit (the velocity advances only on error steps), and at b=P it matches the
+            # full-batch freeze gate. Convergence = a full epoch with zero violators encountered.
+            lr_ep = _lr_at(ep)
+            order = torch.randperm(p, device=dev)
+            bs = max(1, min(batch_size, p))
+            n_steps = (p + bs - 1) // bs
+            act = active.squeeze(-1)                          # (Sb,) 1.0 while unconverged
+            viol_enc = torch.zeros(sb, device=dev)            # violators seen by active seeds -> converge
+            if record_history or cap:
+                err_acc = torch.zeros(sb, device=dev)
+                cost_acc = torch.zeros(sb, device=dev)
+                kp_acc = torch.zeros(sb, device=dev)
+                km_acc = torch.zeros(sb, device=dev)
+            for st_i in range(n_steps):
+                bidx = order[st_i * bs:(st_i + 1) * bs]       # (b,) pattern indices this minibatch
+                sb_s = s[:, bidx]                              # (Sb, b, G, N)
+                lab_b = labels[:, bidx]                        # (Sb, b)
+                bb = sb_s.shape[1]
+                vb = torch.einsum("bkgn,bn->bkg", sb_s, w)     # (Sb, b, G)
+                vmx, tg = vb.max(dim=2)                        # (Sb, b)
+                smarg = (vmx - threshold[:, None]) * lab_b     # (Sb, b) signed margin
+                viol = (smarg < band[:, None]).float()         # (Sb, b) margin-violating patterns
+                if valid_mask is not None:
+                    vmask_b = valid_mask[:, bidx]              # (Sb, b): 0 => padded/inert slot
+                    viol = viol * vmask_b                       # padded slots are never violators
+                    nb = vmask_b.sum(dim=1).clamp(min=1.0)      # (Sb,) valid patterns in this minibatch
+                else:
+                    nb = float(bb)
+                viol_enc = viol_enc + viol.sum(dim=1) * act
+                gidx = tg.view(sb, bb, 1, 1).expand(sb, bb, 1, n)
+                gpat = torch.gather(sb_s, 2, gidx).squeeze(2)  # (Sb, b, N) = s_i(t*) per pattern
+                g = ((lab_b * viol).unsqueeze(-1) * gpat).sum(dim=1)  # (Sb, N) GS ascent over violators
+                g = g / nb if valid_mask is None else g / nb[:, None]   # mean over valid minibatch
+                has_viol = (viol.sum(dim=1) > 0).float().unsqueeze(-1)     # (Sb,1) does this seed update?
+                gate = active * has_viol                       # active AND a violator present
+                if optimizer == "adam":
+                    b1, b2 = adam_betas
+                    adam_m.mul_(b1).add_(g, alpha=1 - b1)
+                    adam_v.mul_(b2).addcmul_(g, g, value=1 - b2)
+                    adam_step += 1
+                    mhat = adam_m / (1 - b1 ** adam_step)
+                    vhat = adam_v / (1 - b2 ** adam_step)
+                    step = lr_ep * mhat / (vhat.sqrt() + adam_eps)
+                elif optimizer == "rmsprop":
+                    adam_v.mul_(rms_alpha).addcmul_(g, g, value=1 - rms_alpha)
+                    step = lr_ep * g / (adam_v.sqrt() + rms_eps)
+                else:  # momentum -- gate the velocity too so only error steps advance it (b=1 == GS)
+                    vel = gate * (momentum * vel + g) + (1.0 - gate) * vel
+                    step = lr_ep * vel
+                w = w + step * gate
+                if record_history or cap:
+                    err_acc = err_acc + viol.sum(dim=1)
+                    cost_acc = cost_acc + torch.relu(band[:, None] - smarg).sum(dim=1)
+                if cap:
+                    kp_acc = kp_acc + (smarg * (lab_b > 0).float()).sum(dim=1)
+                    km_acc = km_acc + (smarg * (lab_b < 0).float()).sum(dim=1)
+            if cap:
+                ep_err, ep_loss, ep_nupd = err_acc / p, cost_acc / p, viol_enc
+                ep_kp, ep_km = kp_acc / npos, km_acc / nneg
+            # A diverged seed (NaN/inf weights from too-large an LR) has NaN margins, and NaN<band is
+            # False -> it would look like "zero violators". Require finite weights to count as solved,
+            # so divergent HP configs report low p_solve and get pruned (not spuriously "converged").
+            newly = (viol_enc == 0) & (~converged) & torch.isfinite(w).all(dim=1)
+        else:  # batch mode -- full-gradient step with a selectable optimizer (V9 findability probe)
             vmax, targ = _forward(s, w)
-            err = (torch.where(vmax >= threshold[:, None], 1.0, -1.0) != labels).float()
+            signed = (vmax - threshold[:, None]) * labels    # (Sb, P) signed margin
+            err = (signed < band[:, None]).float()           # violating / misclassified patterns
             idx = targ.view(sb, p, 1, 1).expand(sb, p, 1, n)
-            grad = torch.gather(s, 2, idx).squeeze(2)       # (Sb, P, N)
-            dw = lr * ((err * labels).unsqueeze(-1) * grad).sum(dim=1)
-            vel = momentum * vel + dw
-            w = w + vel * active
+            grad = torch.gather(s, 2, idx).squeeze(2)        # (Sb, P, N) = s_i(t_max) per pattern
+            g = ((err * labels).unsqueeze(-1) * grad).sum(dim=1)  # raw GS ascent gradient (Sb, N)
+            lr_ep = _lr_at(ep)
+            if optimizer == "adam":
+                b1, b2, eps = 0.9, 0.999, 1e-8
+                adam_m.mul_(b1).add_(g, alpha=1 - b1)
+                adam_v.mul_(b2).addcmul_(g, g, value=1 - b2)
+                t = ep + 1
+                mhat = adam_m / (1 - b1 ** t)
+                vhat = adam_v / (1 - b2 ** t)
+                step = lr_ep * mhat / (vhat.sqrt() + eps)
+            elif optimizer == "rmsprop":
+                a, eps = 0.99, 1e-8
+                adam_v.mul_(a).addcmul_(g, g, value=1 - a)
+                step = lr_ep * g / (adam_v.sqrt() + eps)
+            else:  # "momentum" (the original batch rule: vel = mom*vel + g, step = lr*vel)
+                vel = momentum * vel + g
+                step = lr_ep * vel
+            # Freeze a seed the instant it is error-free: with g=0 the momentum/Adam state still has
+            # inertia and would drift the weights back OFF the solution. Gate the step by "still has
+            # errors" (and by not-yet-converged) so a found solution stays put.
+            still = (err.sum(dim=1) > 0).float().unsqueeze(-1)
+            w = w + step * active * still
+            if cap:
+                ep_err, ep_loss, ep_nupd = err.mean(dim=1), torch.relu(band[:, None] - signed).mean(dim=1), err.sum(dim=1)
+                ep_kp = (signed * (labels > 0).float()).sum(dim=1) / npos
+                ep_km = (signed * (labels < 0).float()).sum(dim=1) / nneg
             newly = (err.sum(dim=1) == 0) & (~converged)
         epochs_run = torch.where(newly, torch.tensor(ep, device=dev), epochs_run)
         converged = converged | newly
+        last_ep = ep
+        if cap:
+            # Record this epoch's per-seed trajectory from the cheap per-epoch reductions (no extra
+            # forward pass). ``ep_*`` are set by whichever update path (online/batch) ran above.
+            err_buf[:, ep] = ep_err
+            loss_buf[:, ep] = ep_loss
+            wnorm_buf[:, ep] = w.norm(dim=1)
+            nupd_buf[:, ep] = ep_nupd
+            kp_buf[:, ep] = ep_kp
+            km_buf[:, ep] = ep_km
+        # V10 Hyperband rung hook: report p_solve at the requested epochs (epochs-run = ep+1) and
+        # prune (stop training) the instant the callback says so -- the early-stopping that makes the
+        # FTE budget go further. Reported p_solve is the fraction of seeds converged so far.
+        if report_set and report_cb is not None and (ep + 1) in report_set:
+            p_solve_now = float(converged.float().mean().item())
+            if bool(report_cb(ep + 1, p_solve_now)):
+                pruned = True
+                break
         if bool(converged.all()):
             break
+        if cap:
+            # V9 patience: "no improvement" = neither the seed-averaged GS loss dropped below its
+            # running best (by more than patience_min_delta) NOR a new seed converged, for `patience`
+            # consecutive epochs. Tracking the *continuous* loss keeps a still-descending
+            # (budget-limited) cell running; also resetting on any new convergence protects a slow
+            # straggler from being cut when a few permanently-stuck seeds plateau the average.
+            n_conv = int(converged.sum().item())
+            cur_loss = float(ep_loss.mean().item())
+            # "improvement" is a RELATIVE drop below the running-best loss (patience_min_delta as a
+            # fraction), so the criterion is scale-free across the orders of magnitude the loss spans
+            # from far-below to near capacity, and robust to mu=0.99 jitter.
+            improved = cur_loss < best_loss * (1.0 - patience_min_delta)
+            if cur_loss < best_loss:
+                best_loss = cur_loss
+            if n_conv > best_conv:
+                best_conv = n_conv
+            if improved or bool(newly.any()):
+                stall = 0
+            else:
+                stall += 1
+            if log_every and (ep + 1) % log_every == 0:
+                err_all = float(ep_err.mean().item())
+                if metric_cb is not None:                      # stream the learning curve, death-proof
+                    metric_cb(ep + 1, err_all, cur_loss)
+                print(f"    [{log_tag}] ep={ep + 1} conv={n_conv}/{sb} err={err_all:.3f} "
+                      f"loss={cur_loss:.4f} stall={stall}", flush=True)
+            if patience and stall >= patience and n_conv < sb:
+                if log_every:
+                    print(f"    [{log_tag}] early-stop at ep={ep + 1} "
+                          f"(loss flat for {stall} epochs)", flush=True)
+                break
+        # live monitor + no-progress early stop (only meaningful for large epoch budgets)
+        elif (log_every and (ep + 1) % log_every == 0) or patience:
+            n_conv = int(converged.sum().item())
+            if n_conv > best_conv:
+                best_conv = n_conv
+                stall = 0
+            else:
+                stall += 1
+            if log_every and (ep + 1) % log_every == 0:
+                vtmp, _ = _forward(s, w)                        # (Sb, P) per-pattern V_max
+                rerr = ((torch.where(vtmp >= threshold[:, None], 1.0, -1.0) != labels).float()
+                        .mean(dim=1))                          # per-seed error fraction
+                rmean = float((rerr * (~converged).float()).sum().item() / max(1, sb - n_conv))
+                err_all = float(rerr.mean())                   # seed-averaged training error (all seeds)
+                signed = (vtmp - threshold[:, None]) * labels  # GS hinge loss relu(band - margin)
+                loss_all = float(torch.relu(band[:, None] - signed).mean())
+                if metric_cb is not None:                      # stream the learning curve, death-proof
+                    metric_cb(ep + 1, err_all, loss_all)
+                print(f"    [{log_tag}] ep={ep + 1} conv={n_conv}/{sb} err={err_all:.3f} "
+                      f"loss={loss_all:.4f} resid_unconv={rmean:.3f} stall={stall}", flush=True)
+            if patience and stall >= patience and n_conv < sb:
+                if log_every:
+                    print(f"    [{log_tag}] early-stop at ep={ep + 1} "
+                          f"(no new convergence for {stall} epochs)", flush=True)
+                break
+
+    if mode == "minibatch":
+        # For still-unconverged seeds, record the epochs actually executed (last_ep+1) rather than the
+        # full budget, so the HPO driver's FTE accounting (sum of seed-epochs) is exact even when the
+        # run was pruned or all-converged early. Converged seeds keep their convergence epoch.
+        ran = last_ep + 1
+        epochs_run = torch.where(converged, epochs_run,
+                                 torch.full_like(epochs_run, ran))
 
     vmax, _ = _forward(s, w)
     pred = torch.where(vmax >= threshold[:, None], 1.0, -1.0)
     final_errfrac = (pred != labels).float().mean(dim=1)  # per-task residual error fraction
-    margin = ((vmax - threshold[:, None]) * labels).mean(dim=1)
-    return {
+    signed_margin = (vmax - threshold[:, None]) * labels  # (Sb,P); >0 when correct
+    margin = signed_margin.mean(dim=1)
+    pos = (labels > 0).float()
+    neg = (labels < 0).float()
+    kappa_plus = (signed_margin * pos).sum(dim=1) / pos.sum(dim=1).clamp(min=1.0)
+    kappa_minus = (signed_margin * neg).sum(dim=1) / neg.sum(dim=1).clamp(min=1.0)
+    # V6 output-noise robustness: per-task mean error when the decision variable is perturbed by
+    # sigma*U_th Gaussian noise (Rubin 2017 output-noise model), averaged over draws.
+    noisy_err = {}
+    if noise_sigmas:
+        ng = torch.Generator(device=dev); ng.manual_seed(12345)
+        for sg in noise_sigmas:
+            acc = torch.zeros(sb, device=dev)
+            for _ in range(4):
+                vn = vmax + sg * threshold[:, None] * torch.randn(vmax.shape, generator=ng, device=dev)
+                acc += (torch.where(vn >= threshold[:, None], 1.0, -1.0) != labels).float().mean(dim=1)
+            noisy_err[sg] = acc / 4.0
+    out = {
         "converged": converged,
         "epochs_run": epochs_run,
         "wnorm": w.norm(dim=1),
         "mean_margin": margin,
+        "kappa_plus": kappa_plus,    # mean signed margin on target (+1) patterns
+        "kappa_minus": kappa_minus,  # mean signed margin on null (-1) patterns
+        "weights": w,                # final weights (for robustness probe)
         "threshold": threshold,
         "init_fire_rate": init_fire_rate,
         "final_errfrac": final_errfrac,
+        "noisy_err": noisy_err,
+        "history": history,  # per-epoch (epoch, err_mean, err_std, cost_mean, cost_std) if recorded
+        "pruned": pruned,    # V10: True if a Hyperband report_cb requested an early prune
     }
+    if cap:
+        # Slice the NaN-padded buffers to the epochs actually run for this batch (last_ep+1). All
+        # downstream numerics/figures are derived offline from these per-seed per-epoch arrays.
+        ne = last_ep + 1
+        out["cap"] = {
+            "traj_err": err_buf[:, :ne],     # (Sb, ne) per-seed training-error fraction vs epoch
+            "traj_loss": loss_buf[:, :ne],   # (Sb, ne) per-seed GS hinge loss vs epoch
+            "traj_wnorm": wnorm_buf[:, :ne],  # (Sb, ne) per-seed ||w|| vs epoch
+            "traj_nupd": nupd_buf[:, :ne],   # (Sb, ne) per-seed #weight-updates vs epoch
+            "traj_kp": kp_buf[:, :ne],       # (Sb, ne) per-seed running kappa_plus vs epoch
+            "traj_km": km_buf[:, :ne],       # (Sb, ne) per-seed running kappa_minus vs epoch
+            "n_epochs": ne,                  # epochs this batch ran (== budget unless early-stopped)
+        }
+    return out
+
+
+def mean_pairwise_overlap(weights: list[torch.Tensor], convs: list[torch.Tensor]) -> torch.Tensor:
+    """Mean |cosine overlap| among the *converged* multi-restart solutions, per task (V7).
+
+    ``weights[r]``/``convs[r]`` are ``(Sb,N)``/``(Sb,)`` for restart r. Returns ``(Sb,)``: the mean of
+    ``|w_a . w_b| / (||w_a|| ||w_b||)`` over restart pairs (a<b) that both converged (NaN if <2). q≈0
+    means independent runs land in near-orthogonal clusters (RMS Fig.3 shattering, q0≈0); q≈1 means
+    the same region.
+    """
+    W = torch.stack(weights)                      # (R, Sb, N)
+    C = torch.stack(convs).float()                # (R, Sb)
+    Wn = W / W.norm(dim=2, keepdim=True).clamp(min=1e-12)
+    gram = torch.einsum("rbn,sbn->rsb", Wn, Wn).abs()   # (R, R, Sb)
+    r = W.shape[0]
+    triu = torch.triu(torch.ones(r, r, device=W.device), diagonal=1).unsqueeze(-1)
+    pair = C.unsqueeze(1) * C.unsqueeze(0) * triu        # (R, R, Sb) both-converged upper pairs
+    den = pair.sum(dim=(0, 1))
+    out = (gram * pair).sum(dim=(0, 1)) / den.clamp(min=1.0)
+    out[den < 1] = float("nan")
+    return out
+
+
+def robustness_radius(
+    s: torch.Tensor,          # (Sb, P, G, N)
+    w: torch.Tensor,          # (Sb, N) converged weights
+    threshold: torch.Tensor,  # (Sb,)
+    labels: torch.Tensor,     # (Sb, P)
+    rng: np.random.Generator,
+    *,
+    n_levels: int = 10,
+    max_eta: float = 0.6,
+    n_draws: int = 3,
+    err_tol: float = 0.05,
+) -> torch.Tensor:
+    """Local-entropy / robustness proxy (Baldassi): the relative weight-noise level eta at which a
+    converged solution first exceeds ``err_tol`` training error.
+
+    For each level eta in (0, max_eta], perturb ``w -> w + eta*(||w||/sqrt N)*xi`` (xi ~ N(0,I)),
+    averaged over ``n_draws``, and record the smallest eta whose mean error exceeds ``err_tol``
+    (``max_eta`` if never). Larger radius => the solution sits in a wider, denser basin.
+    """
+    sb, _, _, n = s.shape
+    scale = (w.norm(dim=1, keepdim=True) / math.sqrt(n))  # (Sb,1)
+    radius = torch.full((sb,), float(max_eta), device=s.device)
+    for li in range(1, n_levels + 1):
+        eta = max_eta * li / n_levels
+        err_acc = torch.zeros(sb, device=s.device)
+        for _ in range(n_draws):
+            xi = torch.from_numpy(rng.standard_normal((sb, n), dtype=np.float32)).to(s.device)
+            vmax, _ = _forward(s, w + eta * scale * xi)
+            pred = torch.where(vmax >= threshold[:, None], 1.0, -1.0)
+            err_acc += (pred != labels).float().mean(dim=1)
+        err = err_acc / n_draws
+        newly = (err > err_tol) & (radius >= max_eta - 1e-9)
+        radius = torch.where(newly, torch.tensor(eta, device=s.device), radius)
+    return radius
 
 
 # --------------------------------------------------------------------------------------------
@@ -263,9 +701,42 @@ def main() -> int:
     lr = float(ov.get("lr", "0.05"))
     momentum = float(ov.get("momentum", "0.0"))
     mode = ov.get("mode", "online")  # 'online' (RMS rule) or 'batch'
+    # Input firing density. Default mean_spikes=1 (RMS rate-1/T model). If spikes_per_K>0, the
+    # per-afferent mean is spikes_per_K*K (constant temporal density -> tests the lnlnK lift without
+    # finite-N starvation; see the design doc).
+    mean_spikes_fixed = float(ov.get("mean_spikes", "1.0"))
+    spikes_per_K = float(ov.get("spikes_per_K", "0"))
     grid_per_corr = int(ov.get("grid_per_corr", "8"))   # time-grid points per sqrt(tau_s tau_m)
+    # V8 faithful Gutig-Sompolinsky 2006 knobs (defaults preserve the RMS V3 behaviour exactly):
+    ensemble = ov.get("ensemble", "poisson")  # 'poisson'|'single' (GS latency)|'synchrony_half'
+    lr_mode = ov.get("lr_mode", "fixed")      # 'fixed' (use lr) | 'gs' (lambda = coeff*T/(tau_m N V0))
+    lr_gs_coeff = float(ov.get("lr_gs_coeff", "3e-3"))  # GS Fig-4 capacity schedule coefficient
+    vthr_fixed_ov = ov.get("vthr_fixed", "")  # faithful GS fixes V_thr (e.g. 1.0); '' => calibrate U_th
+    vthr_fixed = float(vthr_fixed_ov) if vthr_fixed_ov else None
+    # Live learning-curve logging cadence (epochs). Default ON (~50 points/cell) so EVERY run streams
+    # its training error+loss to metrics.jsonl -- captured live and surviving a teardown/rsync failure.
+    log_every = int(ov.get("log_every", "0"))
+    patience = int(ov.get("patience", "0"))     # early-stop a cell after this many no-progress epochs
+    history_flag = int(ov.get("history", "0"))  # also write the fine-grained per-epoch CSV per cell
+    # V9 raw capture: write FULL per-seed per-epoch trajectories + final weights per cell to .npz, so
+    # every numeric/figure is derived offline (analysis/v9_*.py) without rerunning the GPU. Online only.
+    capture = int(ov.get("capture", "0"))
+    patience_min_delta = float(ov.get("patience_min_delta", "0.0"))
+    # V9 findability probe: in batch mode, swap the optimizer / add an LR schedule to test whether the
+    # near-capacity plateau of the bare GS rule is an OPTIMIZATION limit (vs a true capacity limit).
+    optimizer = ov.get("optimizer", "momentum")  # momentum | adam | rmsprop (batch mode only)
+    lr_schedule = ov.get("lr_schedule", "none")  # none | cosine
+    lr_warmup = int(ov.get("lr_warmup", "0"))
+    if log_every == 0:
+        log_every = max(1, epochs // 50)        # default: ~50 learning-curve points per cell
     anchor_k = {float(x) for x in ov.get("anchor_K", "").split(",") if x}
     n_restarts = int(ov.get("n_restarts", "10"))
+    robust_probe = int(ov.get("robust_probe", "0"))  # V4: perturbation-robustness of solutions
+    overlap_probe = int(ov.get("overlap_probe", "0"))  # V7: pairwise overlap of multi-restart solutions
+    uth_scale = float(ov.get("uth_scale", "1.0"))     # V5 gauge knob
+    kappa_target = float(ov.get("kappa_target", "0.0"))  # V5 margin-band target
+    noise_sigmas = tuple(float(x) for x in ov.get("noise_sigmas", "").split(",") if x)  # V6
+    noise_tol = float(ov.get("noise_tol", "0.05"))  # V6: max noisy error for a task to count robust
     elem_budget = int(float(ov.get("elem_budget", "64e6")))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -287,7 +758,9 @@ def main() -> int:
     print(
         f"V3 capacity | seed={master_seed} device={device} K={k_list} N={n_list} "
         f"alphas={alphas} n_seeds={n_seeds} epochs={epochs} lr={lr} mom={momentum} "
-        f"grid_per_corr={grid_per_corr} anchor_K={sorted(anchor_k)} restarts={n_restarts}",
+        f"grid_per_corr={grid_per_corr} anchor_K={sorted(anchor_k)} restarts={n_restarts} "
+        f"mean_spikes={mean_spikes_fixed} spikes_per_K={spikes_per_K} ensemble={ensemble} "
+        f"lr_mode={lr_mode} lr_gs_coeff={lr_gs_coeff} vthr_fixed={vthr_fixed} V0={PSP_V0:.4f}",
         flush=True,
     )
 
@@ -305,19 +778,22 @@ def main() -> int:
 
     for k in k_list:
         t_window = k * SQRT_TAU
+        mean_spikes = spikes_per_K * k if spikes_per_K > 0 else mean_spikes_fixed
         dt = SQRT_TAU / grid_per_corr
         n_grid = round(t_window / dt) + 1
         t_grid = torch.arange(n_grid, device=device, dtype=torch.float32) * dt
         do_restart = k in anchor_k
         for n_aff in n_list:
+            # GS 2006 Fig-4 capacity schedule: lambda = coeff * T / (tau_m * N * V0). 'fixed' keeps lr.
+            lr_cell = (lr_gs_coeff * t_window / (TAU_M * n_aff * PSP_V0)) if lr_mode == "gs" else lr
             for alpha in alphas:
                 cell_i += 1
                 p = round(alpha * n_aff)
                 if p == 0:
                     continue
-                gen = torch.Generator(device=device)
-                gen.manual_seed(cell_seed(master_seed, n_aff, alpha, k))
-                spikes, valid, labels, _ = make_patterns(n_seeds, p, n_aff, t_window, gen, device)
+                rng = np.random.default_rng(cell_seed(master_seed, n_aff, alpha, k))
+                spikes, valid, labels, _ = make_patterns(n_seeds, p, n_aff, t_window, rng, device,
+                                                          mean_spikes=mean_spikes, ensemble=ensemble)
 
                 # seed-batch size from the trace-tensor memory budget
                 per_task_bytes = n_grid * p * n_aff * 4
@@ -330,35 +806,88 @@ def main() -> int:
                 mg = torch.zeros(n_seeds, device=device)
                 fire = torch.zeros(n_seeds, device=device)
                 errf = torch.zeros(n_seeds, device=device)
+                kp = torch.zeros(n_seeds, device=device)
+                km = torch.zeros(n_seeds, device=device)
+                rad = torch.full((n_seeds,), float("nan"), device=device)
+                ovl = torch.full((n_seeds,), float("nan"), device=device)
+                noisy_acc = {sg: torch.zeros(n_seeds, device=device) for sg in noise_sigmas}
+                # V9 raw store: final weights/threshold per seed + the per-batch trajectory buffers.
+                weights_all = torch.zeros(n_seeds, n_aff, device=device) if capture else None
+                thr_all = torch.zeros(n_seeds, device=device) if capture else None
+                cap_batches: list[tuple[int, int, dict]] = []
 
                 for b0 in range(0, n_seeds, sb_size):
                     b1 = min(b0 + sb_size, n_seeds)
                     s = precompute_traces(spikes[b0:b1], valid[b0:b1], t_grid, elem_budget)
                     lab_b = labels[b0:b1]
-                    wgen = torch.Generator(device=device)
-                    wgen.manual_seed(cell_seed(master_seed, n_aff, alpha, k, tag=1) + b0)
-                    w0 = torch.randn(b1 - b0, n_aff, generator=wgen, device=device)
-                    res = train_batch(s, lab_b, w0, lr=lr, momentum=momentum, epochs=epochs,
-                                      mode=mode)
+                    wrng = np.random.default_rng(cell_seed(master_seed, n_aff, alpha, k, tag=1) + b0)
+                    w0 = torch.from_numpy(
+                        wrng.standard_normal((b1 - b0, n_aff), dtype=np.float32)).to(device)
+                    # stream the seed-averaged learning curve (error+loss vs epoch) to metrics.jsonl
+                    # for the representative first seed-batch -- live and survives a teardown/rsync loss.
+                    def _mcb(ep: int, errm: float, lossm: float, _a: float = alpha, _n: int = n_aff) -> None:
+                        emit(f"trainerr_N{_n}_a{_a:.2f}", errm, ep)
+                        emit(f"trainloss_N{_n}_a{_a:.2f}", lossm, ep)
+                    res = train_batch(s, lab_b, w0, lr=lr_cell, momentum=momentum, epochs=epochs,
+                                      mode=mode, uth_scale=uth_scale, kappa_target=kappa_target,
+                                      noise_sigmas=noise_sigmas, vthr_fixed=vthr_fixed,
+                                      log_every=log_every, patience=patience,
+                                      log_tag=f"K{round(k)}N{n_aff}a{alpha:.2f}b{b0}",
+                                      record_history=bool(history_flag) and b0 == 0,
+                                      metric_cb=_mcb if b0 == 0 else None,
+                                      capture=bool(capture), patience_min_delta=patience_min_delta,
+                                      optimizer=optimizer, lr_schedule=lr_schedule, lr_warmup=lr_warmup)
+                    if capture:
+                        weights_all[b0:b1] = res["weights"]
+                        thr_all[b0:b1] = res["threshold"]
+                        cap_batches.append((b0, b1, {k_: v.detach().to("cpu")
+                                                     for k_, v in res["cap"].items()
+                                                     if isinstance(v, torch.Tensor)}))
+                    if history_flag and b0 == 0 and res["history"]:
+                        hpath = run_dir / f"history_N{n_aff}_a{alpha:.2f}.csv"
+                        with hpath.open("w", newline="") as hf:
+                            hw = csv.writer(hf)
+                            hw.writerow(["epoch", "err_mean", "err_std", "cost_mean", "cost_std",
+                                         "alpha", "N", "n_seeds_batch"])
+                            for row_h in res["history"]:
+                                hw.writerow([*row_h, alpha, n_aff, b1 - b0])
                     conv[b0:b1] = res["converged"]
                     ep_run[b0:b1] = res["epochs_run"].float()
                     wn[b0:b1] = res["wnorm"]
                     mg[b0:b1] = res["mean_margin"]
                     fire[b0:b1] = res["init_fire_rate"]
                     errf[b0:b1] = res["final_errfrac"]
+                    kp[b0:b1] = res["kappa_plus"]
+                    km[b0:b1] = res["kappa_minus"]
+                    for sg in noise_sigmas:
+                        noisy_acc[sg][b0:b1] = res["noisy_err"][sg]
+
+                    if robust_probe:
+                        rr_rad = robustness_radius(s, res["weights"], res["threshold"], lab_b, wrng)
+                        # only meaningful for converged tasks; leave others NaN
+                        rad[b0:b1] = torch.where(res["converged"], rr_rad,
+                                                 torch.full_like(rr_rad, float("nan")))
 
                     if do_restart:
                         any_conv = res["converged"].clone()
                         thr = res["threshold"]
+                        ws = [res["weights"]]; cs = [res["converged"]]
                         for r in range(1, n_restarts):
-                            wgen.manual_seed(cell_seed(master_seed, n_aff, alpha, k, tag=2 + r) + b0)
-                            wr = torch.randn(b1 - b0, n_aff, generator=wgen, device=device)
-                            rr = train_batch(s, lab_b, wr, lr=lr, momentum=momentum,
-                                             epochs=epochs, threshold=thr, mode=mode)
+                            rrng = np.random.default_rng(
+                                cell_seed(master_seed, n_aff, alpha, k, tag=2 + r) + b0)
+                            wr = torch.from_numpy(
+                                rrng.standard_normal((b1 - b0, n_aff), dtype=np.float32)).to(device)
+                            rr = train_batch(s, lab_b, wr, lr=lr_cell, momentum=momentum,
+                                             epochs=epochs, threshold=thr, mode=mode,
+                                             uth_scale=1.0, kappa_target=kappa_target,
+                                             vthr_fixed=vthr_fixed)
                             any_conv = any_conv | rr["converged"]
-                            if bool(any_conv.all()):
-                                break
+                            ws.append(rr["weights"]); cs.append(rr["converged"])
+                            if (not overlap_probe) and bool(any_conv.all()):
+                                break  # overlap needs all restarts; else stop once any solves
                         conv_multi[b0:b1] = any_conv
+                        if overlap_probe:
+                            ovl[b0:b1] = mean_pairwise_overlap(ws, cs)
                     del s
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
@@ -370,25 +899,106 @@ def main() -> int:
                 # residual error fraction among UNCONVERGED tasks: ~0 => budget-limited (would
                 # likely solve with more epochs); large => capacity-limited (genuinely stuck).
                 resid = float((errf * (~conv).float()).sum().item() / max(1, n_unconv))
+                # per-class margins + robustness on CONVERGED tasks (where a solution exists)
+                cmask = conv.float()
+                nconv = max(1.0, float(conv.sum().item()))
+                kp_conv = float((kp * cmask).sum().item() / nconv) if n_solved else float("nan")
+                km_conv = float((km * cmask).sum().item() / nconv) if n_solved else float("nan")
+                if robust_probe and n_solved:
+                    rconv = rad[conv]
+                    rad_mean = float(rconv[~torch.isnan(rconv)].mean().item())
+                else:
+                    rad_mean = float("nan")
+                # GS 2006 Fig-4a learning-time observable: epochs-to-converge among solved tasks
+                # (the curve that diverges at alpha_c). mean_epochs (all tasks) saturates at the
+                # budget above capacity, so the median over converged runs is the cleaner signal.
+                median_epochs_conv = float(ep_run[conv].median().item()) if n_solved else float("nan")
+                mean_epochs_conv = float(ep_run[conv].mean().item()) if n_solved else float("nan")
                 row = {
                     "K": k, "N": n_aff, "alpha": alpha, "P": p, "n_seeds": n_seeds,
                     "n_solved": n_solved, "p_solve": p_solve, "p_solve_se": p_se,
                     "mean_epochs": float(ep_run.mean().item()),
+                    "median_epochs": float(ep_run.median().item()),
+                    "mean_epochs_conv": mean_epochs_conv,
+                    "median_epochs_conv": median_epochs_conv,
+                    "lr_cell": float(lr_cell), "ensemble": ensemble,
                     "resid_errfrac_unconv": resid,
                     "mean_wnorm": float(wn.mean().item()),
                     "mean_margin": float(mg.mean().item()),
+                    "kappa_plus_conv": kp_conv,
+                    "kappa_minus_conv": km_conv,
+                    "robustness_radius": rad_mean,
+                    "mean_restart_overlap": (float(ovl[~torch.isnan(ovl)].mean().item())
+                                             if overlap_probe and (~torch.isnan(ovl)).any() else float("nan")),
                     "mean_init_fire_rate": float(fire.mean().item()),
+                    "mean_spikes": mean_spikes,
+                    # V6: fraction of tasks that stay correct (noisy error < 2%) under output noise
+                    # sigma -> its 1/2-crossing in alpha is the robust capacity alpha_b(sigma).
+                    **{f"p_robust_s{int(round(sg*100)):03d}":
+                       float((noisy_acc[sg] < noise_tol).float().mean().item()) for sg in noise_sigmas},
                     "n_grid": n_grid, "dt": dt, "lr": lr, "epochs": epochs,
                     "n_restarts": n_restarts if do_restart else 0,
                     "n_solved_multi": int(conv_multi.sum().item()) if do_restart else -1,
                     "p_solve_multi": (int(conv_multi.sum().item()) / n_seeds) if do_restart else -1.0,
                 }
                 rows.append(row)
+                if capture:
+                    # Assemble the per-cell raw store: per-seed per-epoch trajectories (NaN-padded to
+                    # the cell's max epochs, concatenated over seed-batches) + final per-seed state +
+                    # final weights. Plus the in-run reference scalars, so the offline pipeline can
+                    # prove it reconstructs them losslessly (G_capture). One .npz per cell -> a partial
+                    # run is still fully analysable cell-by-cell (survives a teardown/rsync failure).
+                    cells_dir = run_dir / "cells"
+                    cells_dir.mkdir(exist_ok=True)
+                    max_ne = max((cd["traj_err"].shape[1] for _, _, cd in cap_batches), default=0)
+                    ran_epochs = np.zeros(n_seeds, dtype=np.int64)
+
+                    def _assemble(key: str) -> np.ndarray:
+                        arr = np.full((n_seeds, max_ne), np.nan, dtype=np.float32)
+                        for b0_, b1_, cd in cap_batches:
+                            a = cd[key].numpy()
+                            arr[b0_:b1_, : a.shape[1]] = a
+                            ran_epochs[b0_:b1_] = a.shape[1]
+                        return arr
+
+                    traj = {f"{ch}": _assemble(ch) for ch in
+                            ("traj_err", "traj_loss", "traj_wnorm", "traj_nupd", "traj_kp", "traj_km")}
+                    npz_path = cells_dir / f"cell_N{n_aff}_a{alpha:.3f}_K{round(k)}.npz"
+                    np.savez_compressed(
+                        npz_path,
+                        # --- per-seed per-epoch trajectories (Sb, max_ne), NaN past each seed's stop ---
+                        **traj,
+                        ran_epochs=ran_epochs,                       # epochs actually run per seed
+                        # --- final per-seed state ---
+                        converged=conv.cpu().numpy(),
+                        epochs_to_conv=ep_run.cpu().numpy(),         # convergence epoch (==budget if not)
+                        final_errfrac=errf.cpu().numpy(),
+                        final_wnorm=wn.cpu().numpy(),
+                        final_kappa_plus=kp.cpu().numpy(),
+                        final_kappa_minus=km.cpu().numpy(),
+                        init_fire_rate=fire.cpu().numpy(),
+                        threshold=thr_all.cpu().numpy(),
+                        robustness_radius=rad.cpu().numpy(),
+                        weights=weights_all.cpu().numpy(),           # (n_seeds, N) final weights
+                        # --- cell metadata (scalars) ---
+                        N=np.int64(n_aff), alpha=np.float64(alpha), K=np.float64(k), P=np.int64(p),
+                        n_seeds=np.int64(n_seeds), lr_cell=np.float64(lr_cell),
+                        epochs_budget=np.int64(epochs), dt=np.float64(dt), n_grid=np.int64(n_grid),
+                        momentum=np.float64(momentum), master_seed=np.int64(master_seed),
+                        patience=np.int64(patience), vthr_fixed=np.float64(vthr_fixed or float("nan")),
+                        ensemble=np.str_(ensemble), optimizer=np.str_(optimizer),
+                        lr_schedule=np.str_(lr_schedule), mode=np.str_(mode),
+                        # --- in-run reference scalars (for the lossless-reconstruction gate) ---
+                        ref_p_solve=np.float64(p_solve), ref_n_solved=np.int64(n_solved),
+                        ref_median_epochs_conv=np.float64(median_epochs_conv),
+                        ref_resid=np.float64(resid),
+                    )
                 emit(f"psolve_K{round(k)}_N{n_aff}", p_solve, round(1000 * alpha))
                 print(
                     f"[{cell_i}/{n_cells}] K={k:.0f} N={n_aff} a={alpha:.3f} P={p} "
                     f"p_solve={p_solve:.3f}+/-{p_se:.3f} resid={resid:.3f} "
-                    f"<ep>={row['mean_epochs']:.0f} fire0={row['mean_init_fire_rate']:.2f}"
+                    f"<ep>={row['mean_epochs']:.0f} med_ep_conv={median_epochs_conv:.0f} "
+                    f"fire0={row['mean_init_fire_rate']:.2f}"
                     + (f" p_multi={row['p_solve_multi']:.3f}" if do_restart else ""),
                     flush=True,
                 )
@@ -399,8 +1009,15 @@ def main() -> int:
         "params": {
             "master_seed": master_seed, "K_list": k_list, "N_list": n_list, "alphas": alphas,
             "n_seeds": n_seeds, "epochs": epochs, "lr": lr, "momentum": momentum, "mode": mode,
+            "mean_spikes_fixed": mean_spikes_fixed, "spikes_per_K": spikes_per_K,
+            "robust_probe": robust_probe, "uth_scale": uth_scale, "kappa_target": kappa_target,
+            "noise_sigmas": list(noise_sigmas), "overlap_probe": overlap_probe,
             "grid_per_corr": grid_per_corr, "tau_m": TAU_M, "tau_s": TAU_S,
             "anchor_K": sorted(anchor_k), "n_restarts": n_restarts,
+            "ensemble": ensemble, "lr_mode": lr_mode, "lr_gs_coeff": lr_gs_coeff,
+            "optimizer": optimizer, "lr_schedule": lr_schedule, "lr_warmup": lr_warmup,
+            "patience": patience, "patience_min_delta": patience_min_delta,
+            "vthr_fixed": vthr_fixed, "psp_v0": PSP_V0,
             "device": str(device),
             "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         },
@@ -413,6 +1030,38 @@ def main() -> int:
             wtr = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
             wtr.writeheader()
             wtr.writerows(rows)
+    if capture:
+        # Self-describing manifest for the raw store: provenance + the cell-file index, so the offline
+        # pipeline (analysis/v9_*.py) can load and verify the dataset without any other state.
+        try:
+            git_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parent,
+                stderr=subprocess.DEVNULL).decode().strip()
+        except Exception:
+            git_sha = None
+        cells = sorted(str(p.relative_to(run_dir)) for p in (run_dir / "cells").glob("*.npz")) \
+            if (run_dir / "cells").exists() else []
+        manifest = {
+            "experiment": "v9_capacity_capture",
+            "git_sha": git_sha,
+            "created": time.time(),
+            "versions": {"numpy": np.__version__, "torch": torch.__version__,
+                         "python": sys.version.split()[0]},
+            "params": results["params"],
+            "capture_schema": {
+                "trajectories": ["traj_err", "traj_loss", "traj_wnorm", "traj_nupd",
+                                 "traj_kp", "traj_km"],
+                "trajectory_shape": "(n_seeds, max_epochs_run), NaN past each seed's stop epoch",
+                "final_state": ["converged", "epochs_to_conv", "final_errfrac", "final_wnorm",
+                                "final_kappa_plus", "final_kappa_minus", "init_fire_rate",
+                                "threshold", "robustness_radius", "weights", "ran_epochs"],
+                "reference_scalars": ["ref_p_solve", "ref_n_solved", "ref_median_epochs_conv",
+                                      "ref_resid"],
+            },
+            "cells": cells,
+        }
+        (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=float))
+        print(f"raw store: {len(cells)} cell .npz + manifest.json under {run_dir}", flush=True)
     print(f"done in {elapsed:.1f}s -> {run_dir}/results.json ({len(rows)} cells)", flush=True)
     return 0
 
