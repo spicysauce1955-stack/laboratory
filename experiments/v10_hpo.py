@@ -197,12 +197,19 @@ def main() -> int:
     gs_base_lr = 3e-3 * T_WINDOW / (TAU_M * tune_n * PSP_V0)
     rungs = hyperband_rungs(r_min, r_max, eta)
 
+    allow_cpu = int(ov.get("allow_cpu", "0"))
+    if not torch.cuda.is_available() and not allow_cpu:
+        # Fail FAST on a CPU-only instance: the N=200 / 60-FTE study is hopeless on CPU and would burn
+        # the whole timeout doing nothing. Exit nonzero so the lab marks it failed and we resubmit.
+        print("FATAL: no CUDA device (torch.cuda.is_available()==False); refusing CPU run. "
+              "Pass allow_cpu=1 only for a tiny local smoke.", flush=True)
+        return 2
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
         gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"GPU: {torch.cuda.get_device_name(0)} ({gb:.0f} GB)", flush=True)
     else:
-        print("WARNING: no CUDA device; CPU (smoke only).", flush=True)
+        print("WARNING: no CUDA device; CPU (allow_cpu=1, smoke only).", flush=True)
     print(f"V10 HPO | arm={arm} seed={master_seed} N={tune_n} seeds={n_seeds} alphas={alphas} "
           f"R={r_min}->{r_max} eta={eta} rungs={rungs} budget_fte={budget_fte} "
           f"gs_base_lr={gs_base_lr:.3e} fte_unit={fte_unit:.0f}", flush=True)
