@@ -271,6 +271,10 @@ def main() -> int:
         }
         with trials_path.open("a") as f:
             f.write(json.dumps(rec) + "\n")
+        # Stream the FULL record to stdout too (prefix TRIALREC), so logs.txt is a complete, durable
+        # capture even if a wall-timeout kills the job before the end-of-run artifact dump and the
+        # rsync of trials.jsonl misses (the lab fetch is unreliable mid-run).
+        print("TRIALREC " + json.dumps(rec), flush=True)
         print(f"  trial {trial.number}: arm={arm} obj={objective_value:.3f} "
               f"{'PRUNED' if pruned else 'done'} fte={fte_trial:.3f} "
               f"(cum {state['fte']:.2f}/{budget_fte}) {cfg['optimizer']} b={cfg['batch_token']}",
