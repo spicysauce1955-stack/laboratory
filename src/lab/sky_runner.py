@@ -29,6 +29,7 @@ from lab.backends.skypilot import (
     vast_hourly_for_cluster,
 )
 from lab.models import CostInfo, JobState
+from lab.redact import install_log_redaction
 from lab.storage import R2Store, r2_enabled
 from lab.store import JobStore
 
@@ -102,6 +103,7 @@ def run_job(job_dir: Path) -> int:
     job_dir = Path(job_dir)
     store = JobStore(job_dir.parent)
     job_id = job_dir.name
+    install_log_redaction(store.logs_path(job_id))  # scrub secrets before any SkyPilot output
     manifest = store.read_manifest(job_id)
     cluster = cluster_name_for(job_id)
 

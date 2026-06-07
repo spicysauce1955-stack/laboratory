@@ -28,3 +28,28 @@ def test_redact_leaves_plain_text_untouched():
 def test_redact_is_idempotent():
     once = redact(f"?api_key={SECRET}")
     assert redact(once) == once
+
+
+import os
+
+from lab.redact import install_log_redaction
+
+
+def test_install_log_redaction_scrubs_fd_output(tmp_path, capfd):
+    log = tmp_path / "logs.txt"
+    # Run in a child process: install_log_redaction reassigns fds 1/2 for the whole process,
+    # which would clobber the test runner's stdout if done in-process.
+    import subprocess
+    import sys
+
+    secret = "0000000000000000000000000000000000000"
+    code = (
+        "import os,sys; from lab.redact import install_log_redaction;"
+        f"install_log_redaction({str(log)!r});"
+        f"os.write(1, b'GET /asks/1/?api_key={secret}\\n');"
+        "sys.stdout.flush()"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+    content = log.read_text()
+    assert secret not in content
+    assert "REDACTED" in content
