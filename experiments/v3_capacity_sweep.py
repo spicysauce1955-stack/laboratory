@@ -724,9 +724,19 @@ def main() -> int:
     patience_min_delta = float(ov.get("patience_min_delta", "0.0"))
     # V9 findability probe: in batch mode, swap the optimizer / add an LR schedule to test whether the
     # near-capacity plateau of the bare GS rule is an OPTIMIZATION limit (vs a true capacity limit).
-    optimizer = ov.get("optimizer", "momentum")  # momentum | adam | rmsprop (batch mode only)
-    lr_schedule = ov.get("lr_schedule", "none")  # none | cosine
+    optimizer = ov.get("optimizer", "momentum")  # momentum | adam | rmsprop (batch/minibatch mode)
+    lr_schedule = ov.get("lr_schedule", "none")  # none | cosine | step
     lr_warmup = int(ov.get("lr_warmup", "0"))
+    # V10 minibatch knobs (mode='minibatch'): tuned batch size b + optimizer/schedule HPs, so a winning
+    # HPO config can be re-run for the confirmation study (Sec 14.5) straight from the CLI.
+    batch_size = int(ov.get("batch_size", "0"))   # b in {1..P}; required when mode='minibatch'
+    lr_step_size = int(ov.get("lr_step_size", "0"))
+    lr_gamma = float(ov.get("lr_gamma", "0.1"))
+    adam_b1 = float(ov.get("adam_b1", "0.9"))
+    adam_b2 = float(ov.get("adam_b2", "0.999"))
+    adam_eps = float(ov.get("adam_eps", "1e-8"))
+    rms_alpha = float(ov.get("rms_alpha", "0.99"))
+    rms_eps = float(ov.get("rms_eps", "1e-8"))
     if log_every == 0:
         log_every = max(1, epochs // 50)        # default: ~50 learning-curve points per cell
     anchor_k = {float(x) for x in ov.get("anchor_K", "").split(",") if x}
@@ -836,7 +846,10 @@ def main() -> int:
                                       record_history=bool(history_flag) and b0 == 0,
                                       metric_cb=_mcb if b0 == 0 else None,
                                       capture=bool(capture), patience_min_delta=patience_min_delta,
-                                      optimizer=optimizer, lr_schedule=lr_schedule, lr_warmup=lr_warmup)
+                                      optimizer=optimizer, lr_schedule=lr_schedule, lr_warmup=lr_warmup,
+                                      batch_size=batch_size, lr_step_size=lr_step_size, lr_gamma=lr_gamma,
+                                      adam_betas=(adam_b1, adam_b2), adam_eps=adam_eps,
+                                      rms_alpha=rms_alpha, rms_eps=rms_eps)
                     if capture:
                         weights_all[b0:b1] = res["weights"]
                         thr_all[b0:b1] = res["threshold"]
