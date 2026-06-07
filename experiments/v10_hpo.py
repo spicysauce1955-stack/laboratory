@@ -122,7 +122,10 @@ def suggest_config(trial: optuna.Trial, arm: str, gs_base_lr: float, r_max: int)
         cfg["lr_mult"] = lr_mult
         cfg["momentum"] = trial.suggest_categorical("momentum", [0.0, 0.9, 0.99, 0.999])
         cfg["optimizer"] = "momentum"
-        sched = trial.suggest_categorical("sched", ["none", "cosine", "step"])
+        # Per-optimizer schedule param NAME: in the random/union arm both sgd ({none,cosine,step}) and
+        # adam/rmsprop ({none,cosine}) occur, and Optuna forbids one param name carrying two different
+        # categorical value-sets across trials ("dynamic value space"). Distinct names avoid that.
+        sched = trial.suggest_categorical("sched_sgd", ["none", "cosine", "step"])
     else:
         cfg["lr"] = trial.suggest_float("lr", 1e-4, 1e-1, log=True)
         if opt == "adam":
@@ -134,7 +137,7 @@ def suggest_config(trial: optuna.Trial, arm: str, gs_base_lr: float, r_max: int)
             cfg["optimizer"] = "rmsprop"
             cfg["rms_alpha"] = trial.suggest_categorical("rms_alpha", [0.9, 0.99])
             cfg["rms_eps"] = trial.suggest_categorical("rms_eps", [1e-8, 1e-6])
-        sched = trial.suggest_categorical("sched", ["none", "cosine"])
+        sched = trial.suggest_categorical(f"sched_{opt}", ["none", "cosine"])
 
     cfg["lr_schedule"] = sched
     if sched == "step":
