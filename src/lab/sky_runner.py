@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -26,14 +27,17 @@ from lab.backends.skypilot import (
     promote_timeout,
     provision_with_watchdog,
     tear_down_and_record,
+    vast_balance,
     vast_hourly_for_cluster,
 )
 from lab.models import CostInfo, JobState
+from lab.redact import install_log_redaction
 from lab.storage import R2Store, r2_enabled
 from lab.store import JobStore
 
 
 _TERMINAL_NAMES = {"SUCCEEDED", "FAILED", "FAILED_SETUP", "FAILED_DRIVER", "CANCELLED"}
+HEARTBEAT_S = 60.0  # how often the supervisor rsyncs partial results down mid-run (§6c)
 
 
 def _rec_field(rec, key: str):
@@ -49,11 +53,26 @@ def _job_status_name(sky_mod, cluster: str, sky_job_id: int | None) -> str | Non
     return None
 
 
-def _wait_terminal(sky_mod, cluster: str, sky_job_id: int | None, max_wait: float) -> JobState:
+def _wait_terminal(
+    sky_mod,
+    cluster: str,
+    sky_job_id: int | None,
+    max_wait: float,
+    *,
+    poll_s: float = 10.0,
+    heartbeat_s: float | None = None,
+    on_heartbeat: Callable[[], None] | None = None,
+) -> JobState:
     """Poll the remote job until terminal — sky.launch (0.12) returns at submit time, not
-    completion, so we must wait before fetching artifacts and tearing down."""
+    completion, so we must wait before fetching artifacts and tearing down.
+
+    If ``heartbeat_s``/``on_heartbeat`` are given, ``on_heartbeat`` is called roughly every
+    ``heartbeat_s`` of polling so the supervisor can fetch partial results mid-run; a callback
+    error is logged, never fatal (§6c — don't lose ``results.csv`` to a late teardown).
+    """
     deadline = time.time() + max_wait
     name: str | None = None
+    since_beat = 0.0
     while time.time() < deadline:
         try:
             name = _job_status_name(sky_mod, cluster, sky_job_id)
@@ -61,7 +80,15 @@ def _wait_terminal(sky_mod, cluster: str, sky_job_id: int | None, max_wait: floa
             print(f"[lab] queue poll error: {e}")
         if name in _TERMINAL_NAMES:
             break
-        time.sleep(10)
+        time.sleep(poll_s)
+        if heartbeat_s and on_heartbeat is not None:
+            since_beat += poll_s
+            if since_beat >= heartbeat_s:
+                since_beat = 0.0
+                try:
+                    on_heartbeat()
+                except Exception as e:  # noqa: BLE001
+                    print(f"[lab] heartbeat rsync skipped: {e}")
     return map_job_status(name or "FAILED")
 
 
@@ -98,10 +125,23 @@ def _resolve_hourly(cluster: str, handle: Any) -> float | None:
     return _hourly_cost(handle)
 
 
+def provision_failure_reason(generic: str) -> str:
+    """Enrich a generic provision-failure message with the Vast balance when that's the cause (§8).
+
+    Vast returns 400 on rentals when the balance is depleted; SkyPilot reports that as a generic
+    "no resources" string. If the balance is known and not positive, say so instead.
+    """
+    bal = vast_balance()
+    if bal is not None and bal <= 0:
+        return f"Vast account balance is ${bal:.2f} — top up to provision"
+    return generic
+
+
 def run_job(job_dir: Path) -> int:
     job_dir = Path(job_dir)
     store = JobStore(job_dir.parent)
     job_id = job_dir.name
+    install_log_redaction(store.logs_path(job_id))  # scrub secrets before any SkyPilot output
     manifest = store.read_manifest(job_id)
     cluster = cluster_name_for(job_id)
 
@@ -138,7 +178,19 @@ def run_job(job_dir: Path) -> int:
         except Exception as e:  # noqa: BLE001
             print(f"[lab] tail_logs issue: {e}")
         max_wait = (parse_duration(manifest.resources.timeout) or 3600) + 300
-        final = _wait_terminal(sky, cluster, sky_job_id, max_wait)
+
+        def _heartbeat() -> None:
+            # Best-effort: pull partial results so a late/failed teardown can't lose them (§6c).
+            _rsync_down(cluster, REMOTE_RUN_DIR, store.output_dir(job_id))
+
+        final = _wait_terminal(
+            sky,
+            cluster,
+            sky_job_id,
+            max_wait,
+            heartbeat_s=HEARTBEAT_S,
+            on_heartbeat=_heartbeat,
+        )
     except ProvisionTimeout:
         store.update_manifest(
             job_id,
@@ -152,8 +204,9 @@ def run_job(job_dir: Path) -> int:
         tear_down_and_record(sky, cluster, store, job_id)
         return 1
     except Exception as e:  # noqa: BLE001
+        reason = provision_failure_reason(f"launch error: {e}")
         store.update_manifest(
-            job_id, status=JobState.failed, ended_at=now(), end_reason=f"launch error: {e}"[:300]
+            job_id, status=JobState.failed, ended_at=now(), end_reason=reason[:300]
         )
         tear_down_and_record(sky, cluster, store, job_id)
         return 1
