@@ -43,21 +43,35 @@ def test_cluster_name_for():
 def test_build_scripts_and_timeout():
     setup = build_setup_script()
     assert "uv sync --frozen" in setup and "astral.sh/uv/install" in setup
-    assert "--no-default-groups" in setup  # remote installs runtime deps only, not the CLI/MCP
+    assert "--no-default-groups" in setup
 
     m = make_manifest("j1", "python experiments/example_capacity.py", timeout="30m")
     run = build_run_script(m)
-    assert "timeout 1800 " in run  # 30m -> 1800s wall-clock guard (FR-I1)
+    # Entrypoint runs in its own session so the timer can group-kill the whole tree (§6).
+    assert "setsid --wait bash -c" in run
     assert "python experiments/example_capacity.py" in run
     assert "source .venv/bin/activate" in run
+    # No timeout scaffolding when there is no cap.
+    bare = build_run_script(make_manifest("j2", "python x.py"))
+    assert "setsid --wait" not in bare and "poweroff" not in bare
+    assert "python x.py" in bare
 
-    assert "timeout " not in build_run_script(make_manifest("j2", "python x.py"))  # no limit
 
-
-def test_run_script_timeout_sentinel():
+def test_run_script_group_kill_and_sentinel():
     run = build_run_script(make_manifest("j", "python x.py", timeout="30m"))
-    assert "timeout 1800 python x.py" in run
-    assert TIMEOUT_SENTINEL in run and "rc=$?" in run and "exit $rc" in run
+    assert "sleep 1800" in run                 # 30m wall
+    assert "kill -TERM -$$" in run             # TERM the whole process group
+    assert "kill -KILL -$$" in run             # then KILL after the grace
+    assert f"sleep {skypilot_mod.TIMEOUT_KILL_GRACE_S}" in run
+    assert TIMEOUT_SENTINEL in run             # killer drops the sentinel for promote_timeout
+
+
+def test_run_script_self_destruct_watchdog():
+    run = build_run_script(make_manifest("j", "python x.py", timeout="30m"))
+    margin = skypilot_mod.SELF_DESTRUCT_MARGIN_S
+    assert f"sleep {1800 + margin}" in run     # poweroff at wall + margin
+    assert "poweroff" in run
+    assert "nohup setsid bash -c" in run       # detached, survives the supervisor
 
 
 def test_promote_timeout(tmp_path):

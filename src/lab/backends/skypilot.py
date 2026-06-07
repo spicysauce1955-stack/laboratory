@@ -35,6 +35,8 @@ if TYPE_CHECKING:
 
 REMOTE_RUN_DIR = "/tmp/lab_run"
 TIMEOUT_SENTINEL = ".lab_timed_out"  # written by the run script when `timeout` kills the job
+TIMEOUT_KILL_GRACE_S = 30  # SIGTERM -> wait -> SIGKILL grace for a process that ignores TERM
+SELF_DESTRUCT_MARGIN_S = 600  # instance self-poweroff backstop fires at wall + this (§6)
 DEFAULT_AUTOSTOP_MIN = 5  # safety-net teardown if the supervisor process dies
 # Provisioning watchdog: a healthy Vast host reaches UP in ~2-4 min, so 8 min clears
 # slow-but-alive hosts while catching ones stuck in "loading" forever (a dead offer).
@@ -83,10 +85,18 @@ def build_setup_script() -> str:
 
 
 def build_run_script(manifest: JobManifest) -> str:
-    """Activate the env, then run the entrypoint under a wall-clock timeout (FR-I1).
+    """Activate the env, then run the entrypoint under an instance-side wall-clock cap (FR-I1, §6).
 
-    On a timeout, GNU `timeout` exits 124; we drop a sentinel into the run dir so the supervisor
-    can label the job `timed_out` (not just `failed`) after fetching outputs.
+    The cap must hold even if the local supervisor dies, so enforcement is entirely on the box:
+
+    * the entrypoint runs under ``setsid --wait`` in its OWN session/process group; an in-session
+      timer ``kill``s ``-$$`` (the whole group) on timeout, so the orphaned ``uv``→``python``→
+      worker tree dies too → the host goes idle → SkyPilot's autostop tears it down with no
+      supervisor involved. The killer drops a sentinel so ``promote_timeout`` labels it
+      ``timed_out`` (not just ``failed``) regardless of the exit code.
+    * a detached ``poweroff`` watchdog at ``wall + SELF_DESTRUCT_MARGIN_S`` is a hard backstop:
+      if both the wrapper and autostop somehow fail, the instance powers itself off so GPU
+      billing can never run far past the cap.
     """
     timeout = parse_duration(manifest.resources.timeout)
     lines = [
@@ -94,15 +104,35 @@ def build_run_script(manifest: JobManifest) -> str:
         "source .venv/bin/activate",
         f'mkdir -p "{REMOTE_RUN_DIR}"',
     ]
-    if timeout:
-        lines += [
-            f"timeout {int(timeout)} {manifest.run.entrypoint_command}",
-            "rc=$?",
-            f'[ "$rc" = "124" ] && touch "{REMOTE_RUN_DIR}/{TIMEOUT_SENTINEL}"',
-            "exit $rc",
-        ]
-    else:
+    if not timeout:
         lines.append(manifest.run.entrypoint_command)
+        return "\n".join(lines) + "\n"
+
+    wall = int(timeout)
+    grace = TIMEOUT_KILL_GRACE_S
+    sentinel = f"{REMOTE_RUN_DIR}/{TIMEOUT_SENTINEL}"
+    cmd = manifest.run.entrypoint_command
+    # Inner script runs inside a fresh session (setsid). $$ there is the session/group leader,
+    # so `kill -<sig> -$$` signals the entire group. $! / $child expand in the inner shell too —
+    # they are inside the single-quoted bash -c body, untouched by the outer shell.
+    inner = (
+        f"{cmd} &\n"
+        "child=$!\n"
+        f'( sleep {wall}; touch "{sentinel}"; '
+        "kill -TERM -$$ 2>/dev/null; "
+        f"sleep {grace}; kill -KILL -$$ 2>/dev/null ) &\n"
+        'wait "$child"\n'
+    )
+    lines += [
+        # Hard backstop: power the box off at wall+margin no matter what (§6 cost cap).
+        f"nohup setsid bash -c 'sleep {wall + SELF_DESTRUCT_MARGIN_S}; "
+        "sudo poweroff -f || poweroff -f || sudo shutdown -h now || shutdown -h now' "
+        ">/dev/null 2>&1 </dev/null &",
+        # Foreground, blocking, group-killable run of the entrypoint.
+        f"setsid --wait bash -c '{inner}'",
+        "rc=$?",
+        'exit "$rc"',
+    ]
     return "\n".join(lines) + "\n"
 
 
