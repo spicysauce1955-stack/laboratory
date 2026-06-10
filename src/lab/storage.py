@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 R2_CREDENTIALS_FILE = Path.home() / ".cloudflare" / "r2.credentials"
 DEFAULT_BUCKET = "lab-artifacts"
@@ -26,13 +27,16 @@ def r2_enabled() -> bool:
 
 
 class R2Store:
-    def __init__(self, endpoint: str, bucket: str = DEFAULT_BUCKET) -> None:
+    def __init__(self, endpoint: str, bucket: str = DEFAULT_BUCKET, client: Any | None = None) -> None:
+        self.bucket = bucket
+        if client is not None:
+            self._s3 = client
+            return
         import boto3
 
         # Let boto3 read the R2 creds file unless AWS creds are already in the env.
         if not os.environ.get("AWS_ACCESS_KEY_ID") and R2_CREDENTIALS_FILE.exists():
             os.environ.setdefault("AWS_SHARED_CREDENTIALS_FILE", str(R2_CREDENTIALS_FILE))
-        self.bucket = bucket
         self._s3 = boto3.client("s3", endpoint_url=endpoint, region_name="auto")
 
     @classmethod
@@ -79,3 +83,50 @@ class R2Store:
                 token = resp.get("NextContinuationToken")
             else:
                 return count
+
+    # -- generic single-object ops -----------------------------------------------
+
+    def put_text(self, key: str, text: str) -> None:
+        self._s3.put_object(Bucket=self.bucket, Key=key, Body=text.encode())
+
+    def get_text(self, key: str) -> str | None:
+        """The object's text, or None if the key doesn't exist."""
+        try:
+            body: bytes = self._s3.get_object(Bucket=self.bucket, Key=key)["Body"].read()
+        except Exception as e:  # noqa: BLE001 — boto raises dynamic ClientError subclasses
+            if "NoSuchKey" in str(e) or getattr(e, "response", {}).get("Error", {}).get(
+                "Code"
+            ) in ("NoSuchKey", "404"):
+                return None
+            raise
+        return body.decode()
+
+    def exists(self, key: str) -> bool:
+        try:
+            self._s3.head_object(Bucket=self.bucket, Key=key)
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+    def delete(self, key: str) -> None:
+        self._s3.delete_object(Bucket=self.bucket, Key=key)
+
+    def list_keys(self, prefix: str) -> list[str]:
+        keys: list[str] = []
+        token: str | None = None
+        while True:
+            kwargs: dict[str, Any] = {"Bucket": self.bucket, "Prefix": prefix}
+            if token:
+                kwargs["ContinuationToken"] = token
+            resp = self._s3.list_objects_v2(**kwargs)
+            keys += [o["Key"] for o in resp.get("Contents", [])]
+            if not resp.get("IsTruncated"):
+                return keys
+            token = resp.get("NextContinuationToken")
+
+    def upload_file(self, local: Path, key: str) -> None:
+        self._s3.upload_file(str(local), self.bucket, key)
+
+    def download_file(self, key: str, local: Path) -> None:
+        Path(local).parent.mkdir(parents=True, exist_ok=True)
+        self._s3.download_file(self.bucket, key, str(local))
