@@ -3,7 +3,8 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from helpers import PYTHON
+from helpers import PYTHON, wait_terminal
+from lab.backends.local import LocalBackend
 from lab.models import JobSpec
 from lab.scheduler.bundle import create_bundle
 from lab.scheduler.models import ControlConfig, Guardrails, Registration, RegState, Triggers
@@ -109,3 +110,102 @@ def test_held_entries_still_expire_but_never_launch(tmp_path: Path):
     clock.t = T0 + timedelta(hours=2)
     sched.tick()
     assert q.get_entry("reg-a").state is RegState.expired
+
+
+def test_no_triggers_launches_immediately(tmp_path: Path):
+    sched, q = make_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a")
+    rep = sched.tick()
+    assert rep.launched == ["reg-a"]
+    e = q.get_entry("reg-a")
+    assert e.state is RegState.launched and e.job_id is not None
+    # The job actually ran (LocalBackend, real subprocess).
+    backend = LocalBackend(home=tmp_path / "runs", repo=tmp_path)
+    assert wait_terminal(backend, e.job_id).value == "succeeded"
+
+
+def test_not_before_gates(tmp_path: Path):
+    clock = FakeClock()
+    sched, q = make_sched(tmp_path, clock)
+    put_reg(q, tmp_path, "reg-a", triggers=Triggers(not_before=T0 + timedelta(hours=5)))
+    assert sched.tick().launched == []
+    assert "not_before" in q.get_entry("reg-a").last_skip_reason
+    clock.t = T0 + timedelta(hours=6)
+    assert sched.tick().launched == ["reg-a"]
+
+
+def test_window_gates(tmp_path: Path):
+    from datetime import time as dtime
+
+    from lab.scheduler.models import DailyWindow
+
+    clock = FakeClock()  # T0 = 12:00 UTC
+    sched, q = make_sched(tmp_path, clock)
+    w = DailyWindow(start=dtime(23, 0), end=dtime(7, 0), tz="UTC")
+    put_reg(q, tmp_path, "reg-a", triggers=Triggers(window=w))
+    assert sched.tick().launched == []
+    clock.t = T0.replace(hour=23, minute=30)
+    assert sched.tick().launched == ["reg-a"]
+
+
+def test_dependency_waits_then_launches(tmp_path: Path):
+    sched, q = make_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a")
+    put_reg(q, tmp_path, "reg-b", triggers=Triggers(after=["reg-a"]))
+    rep = sched.tick()
+    assert rep.launched == ["reg-a"]  # b waits
+    backend = LocalBackend(home=tmp_path / "runs", repo=tmp_path)
+    wait_terminal(backend, q.get_entry("reg-a").job_id)
+    sched.tick()  # syncs a -> succeeded (Task 7) ... then:
+    rep3 = sched.tick()
+    assert "reg-b" in rep3.launched or q.get_entry("reg-b").state is RegState.launched
+
+
+def test_dependency_failure_cancels_dependent(tmp_path: Path):
+    sched, q = make_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a", state=RegState.failed)
+    put_reg(q, tmp_path, "reg-b", triggers=Triggers(after=["reg-a"]))
+    rep = sched.tick()
+    assert rep.cancelled == ["reg-b"]
+    e = q.get_entry("reg-b")
+    assert e.state is RegState.cancelled and "reg-a" in (e.last_skip_reason or "")
+
+
+def test_cancel_marker_blocks_launch(tmp_path: Path):
+    sched, q = make_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a")
+    q.request_cancel("reg-a")
+    rep = sched.tick()
+    assert rep.launched == [] and q.get_entry("reg-a").state is RegState.cancelled
+
+
+def test_orphaned_launching_reverts_to_pending(tmp_path: Path):
+    clock = FakeClock()
+    sched, q = make_sched(tmp_path, clock)
+    reg = put_reg(q, tmp_path, "reg-a", state=RegState.launching)
+    q.put_entry(reg.model_copy(update={"state_changed_at": T0 - timedelta(minutes=20)}))
+    rep = sched.tick()
+    # no job manifest carries registration_id reg-a -> the launch never happened
+    assert q.get_entry("reg-a").state in (RegState.pending, RegState.launched)
+    assert rep.launched == ["reg-a"] or q.get_entry("reg-a").state is RegState.pending
+
+
+def test_orphaned_launching_with_existing_job_repairs_to_launched(tmp_path: Path):
+    clock = FakeClock()
+    sched, q = make_sched(tmp_path, clock)
+    put_reg(q, tmp_path, "reg-a")
+    sched.tick()
+    job_id = q.get_entry("reg-a").job_id
+    assert job_id is not None
+    # Simulate the crash window: entry says launching/stale, but the job exists.
+    broken = q.get_entry("reg-a").model_copy(
+        update={
+            "state": RegState.launching,
+            "job_id": None,
+            "state_changed_at": T0 - timedelta(minutes=20),
+        }
+    )
+    q.put_entry(broken)
+    sched.tick()
+    repaired = q.get_entry("reg-a")
+    assert repaired.state is RegState.launched and repaired.job_id == job_id

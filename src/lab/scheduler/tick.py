@@ -14,12 +14,14 @@ from pathlib import Path
 from lab._util import now
 from lab.backends.local import LocalBackend
 from lab.core import Lab
-from lab.scheduler.models import Registration, RegState, TickReport
+from lab.scheduler.models import ControlConfig, Registration, RegState, TickReport
 from lab.scheduler.queue import QueueStore
 from lab.store import JobStore
 
 
 class Scheduler:
+    LAUNCHING_ORPHAN_S = 600.0  # spec §5: launching older than 10 min is repaired
+
     def __init__(
         self,
         queue: QueueStore,
@@ -76,15 +78,104 @@ class Scheduler:
                 rep.expired.append(reg.reg_id)
 
     def _evaluate_and_launch(
-        self, entries: list[Registration], control: object, rep: TickReport
+        self, entries: list[Registration], control: ControlConfig, rep: TickReport
     ) -> None:
+        by_id = {r.reg_id: r for r in entries}
         for reg in entries:
+            if reg.state is RegState.launching:
+                self._repair_launching(reg, rep)
+                continue
             if reg.state is not RegState.pending:
+                continue
+            reg = self.queue.get_entry(reg.reg_id)  # fresh copy (expiry may have written)
+            if reg.state is not RegState.pending:
+                continue
+            if self.queue.cancel_requested(reg.reg_id):
+                self._transition(reg, RegState.cancelled, reason="cancelled by user")
+                rep.cancelled.append(reg.reg_id)
                 continue
             if self.queue.held(reg.reg_id):
                 rep.skipped[reg.reg_id] = "held"
                 continue
-            # Trigger/guardrail evaluation + launch land in Tasks 6, 8, 9.
+            blocked = self._trigger_block(reg, by_id, rep)
+            if blocked is not None:
+                if blocked != "":  # "" => dependency hard-failure already handled
+                    self.queue.put_entry(reg.model_copy(update={"last_skip_reason": blocked}))
+                    rep.skipped[reg.reg_id] = blocked
+                continue
+            self._launch(reg, rep)
+
+    def _trigger_block(
+        self, reg: Registration, by_id: dict[str, Registration], rep: TickReport
+    ) -> str | None:
+        """None = all triggers hold; '' = entry was hard-cancelled; else the skip reason."""
+        nowt = self.now_fn()
+        t = reg.triggers
+        if t.not_before is not None and nowt < t.not_before:
+            return f"not_before {t.not_before.isoformat()}"
+        if t.window is not None and not t.window.contains(nowt):
+            return f"outside window {t.window.start}-{t.window.end} {t.window.tz}"
+        for dep_id in t.after:
+            dep = by_id.get(dep_id)
+            if dep is None:
+                self._transition(reg, RegState.cancelled, reason=f"dependency {dep_id} ended missing")
+                rep.cancelled.append(reg.reg_id)
+                return ""
+            dep_state = dep.state
+            if dep_state in (RegState.failed, RegState.expired, RegState.cancelled):
+                self._transition(
+                    reg, RegState.cancelled, reason=f"dependency {dep_id} ended {dep_state.value}"
+                )
+                rep.cancelled.append(reg.reg_id)
+                return ""
+            if dep_state is not RegState.succeeded:
+                return f"waiting on dependency {dep_id} ({dep_state.value})"
+        return None  # price + guardrails extend this in Tasks 8-9
+
+    def _launch(self, reg: Registration, rep: TickReport) -> None:
+        reg = self._transition(reg, RegState.launching, reason=None)
+        if self.queue.cancel_requested(reg.reg_id):  # spec §5 cancel race: re-check pre-submit
+            self._transition(reg, RegState.cancelled, reason="cancelled by user")
+            rep.cancelled.append(reg.reg_id)
+            return
+        try:
+            bundle_dir = self.home / "_bundles" / reg.reg_id
+            tar = self.queue.fetch_bundle(reg.reg_id, self.home / "_bundles")
+            from lab.scheduler.bundle import extract_bundle
+
+            extract_bundle(tar, bundle_dir)
+            lab = self.make_lab(bundle_dir)
+            job_id = lab.submit(reg.spec, code=reg.code, registration_id=reg.reg_id)
+        except Exception as e:  # noqa: BLE001 — a bad entry must not kill the tick (spec §5)
+            self._transition(reg, RegState.pending, reason=f"launch error: {e}"[:300])
+            rep.errors.append(f"{reg.reg_id}: {e}")
+            return
+        self._transition(
+            reg, RegState.launched, reason=None, job_id=job_id, launched_at=self.now_fn()
+        )
+        rep.launched.append(reg.reg_id)
+
+    def _repair_launching(self, reg: Registration, rep: TickReport) -> None:
+        """A tick crashed mid-launch (spec §5): decide from evidence, after a grace period."""
+        changed = reg.state_changed_at or reg.created_at
+        if (self.now_fn() - changed).total_seconds() < self.LAUNCHING_ORPHAN_S:
+            return
+        job = next(
+            (
+                self.store.read_manifest(j)
+                for j in self.store.list_job_ids()
+                if self.store.read_manifest(j).registration_id == reg.reg_id
+            ),
+            None,
+        )
+        if job is not None:  # the submit happened -> repair forward
+            self._transition(
+                reg, RegState.launched, reason="repaired: launch had completed",
+                job_id=job.job_id, launched_at=job.created_at,
+            )
+            rep.synced[reg.reg_id] = "launched (repaired)"
+        else:
+            self._transition(reg, RegState.pending, reason="repaired: launch never happened")
 
     def _transition(self, reg: Registration, state: RegState, *, reason: str | None = None,
                     **extra: object) -> Registration:
