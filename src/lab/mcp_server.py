@@ -12,6 +12,7 @@ manifest), mirroring the CLI. ``build_server(lab)`` lets tests inject a Lab at a
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -189,7 +190,7 @@ def build_server(lab: Lab) -> FastMCP:
         offer_query: str | None = None,
         max_cost: float | None = None,
         after: list[str] | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Register a deferred job: launched by the scheduler when all triggers hold (time window HH:MM-HH:MM, Vast price <= max_hourly $/h, after=reg_ids succeeded). expires (+3d / ISO) is the required run-by guardrail; worst-case cost = max_hourly x timeout."""
         from datetime import datetime, timedelta
         from datetime import time as dt_time
@@ -248,7 +249,7 @@ def build_server(lab: Lab) -> FastMCP:
         }
 
     @mcp.tool
-    def queue_list() -> dict:
+    def queue_list() -> dict[str, Any]:
         """List deferred registrations: state, job_id, last skip reason, scheduler heartbeat age."""
         queue = default_queue()
         hb = queue.read_heartbeat()
@@ -274,7 +275,7 @@ def build_server(lab: Lab) -> FastMCP:
         }
 
     @mcp.tool
-    def queue_show(reg_id: str) -> dict:
+    def queue_show(reg_id: str) -> dict[str, Any]:
         """Full registration record (triggers, guardrails, provenance, state history fields)."""
         import json as _json
 
@@ -282,11 +283,11 @@ def build_server(lab: Lab) -> FastMCP:
             reg = default_queue().get_entry(reg_id)
         except FileNotFoundError as e:
             raise ToolError(f"registration '{reg_id}' not found") from e
-        loaded: dict = _json.loads(reg.model_dump_json())
+        loaded: dict[str, Any] = _json.loads(reg.model_dump_json())
         return loaded
 
     @mcp.tool
-    def queue_cancel(reg_id: str) -> dict:
+    def queue_cancel(reg_id: str) -> dict[str, Any]:
         """Request cancellation; the scheduler applies it on its next tick (also cancels a launched job)."""
         queue = default_queue()
         try:
@@ -297,7 +298,7 @@ def build_server(lab: Lab) -> FastMCP:
         return {"reg_id": reg_id, "cancel_requested": True}
 
     @mcp.tool
-    def queue_pause(paused: bool = True) -> dict:
+    def queue_pause(paused: bool = True) -> dict[str, Any]:
         """Pause/resume all scheduler launches (global switch; heartbeat keeps beating)."""
         queue = default_queue()
         queue.write_control(queue.read_control().model_copy(update={"paused": paused}))
