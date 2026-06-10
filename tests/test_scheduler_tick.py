@@ -3,9 +3,10 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from helpers import PYTHON, wait_terminal
+from helpers import PYTHON, make_manifest, wait_terminal
+from lab._util import now as utc_now
 from lab.backends.local import LocalBackend
-from lab.models import JobSpec, ResourceRequest
+from lab.models import BackendInfo, JobSpec, JobState, ResourceRequest
 from lab.scheduler.bundle import create_bundle
 from lab.scheduler.models import ControlConfig, Guardrails, Registration, RegState, Triggers
 from lab.scheduler.queue import LocalQueueStore
@@ -355,3 +356,84 @@ def test_post_launch_price_verify_reverts_to_pending(tmp_path: Path, monkeypatch
     again = q.get_entry("reg-a")
     assert again.state is RegState.pending and again.job_id is None
     assert "price" in (again.last_skip_reason or "")
+
+
+# ------------------------------------------------------------------ Task 15: watchdog
+
+
+def _watchdog_sched(tmp_path: Path, **kw) -> tuple[Scheduler, LocalQueueStore]:
+    q = LocalQueueStore(tmp_path / "queue")
+    return Scheduler(q, home=tmp_path / "runs", now_fn=utc_now, **kw), q
+
+
+def _skypilot_launched_reg(
+    tmp_path: Path, q: LocalQueueStore, sched: Scheduler,
+    *, started_ago_s: float, timeout: str = "1h",
+) -> None:
+    """A launched skypilot-backed reg whose supervisor pid is dead (impossible pid)."""
+    put_reg(q, tmp_path, "reg-a", command="python x.py")
+    m = make_manifest("j-sky", "python x.py", timeout=timeout).model_copy(
+        update={
+            "status": JobState.running,
+            "started_at": utc_now() - timedelta(seconds=started_ago_s),
+            "backend": BackendInfo(provisioner="skypilot"),
+            "registration_id": "reg-a",
+        }
+    )
+    sched.store.create(m)
+    sched.store.write_runtime("j-sky", runner_pid=99999999, cluster="lab-j-sky")
+    q.put_entry(
+        q.get_entry("reg-a").model_copy(
+            update={
+                "state": RegState.launched,
+                "job_id": "j-sky",
+                "launched_at": utc_now() - timedelta(seconds=started_ago_s),
+            }
+        )
+    )
+
+
+def test_watchdog_respawns_when_cluster_alive_within_timeout(tmp_path: Path):
+    sched, q = _watchdog_sched(tmp_path)
+    _skypilot_launched_reg(tmp_path, q, sched, started_ago_s=60)
+    events: list[str] = []
+    sched._cluster_alive = lambda cluster: True  # type: ignore[method-assign]
+    sched._respawn_supervisor = lambda job_id: events.append(f"respawn:{job_id}")  # type: ignore[method-assign]
+    sched.tick()
+    assert events == ["respawn:j-sky"]
+
+
+def test_watchdog_times_out_overdue_job(tmp_path: Path):
+    sched, q = _watchdog_sched(tmp_path)
+    _skypilot_launched_reg(tmp_path, q, sched, started_ago_s=2 * 3600, timeout="1h")
+    events: list[str] = []
+    sched._cluster_alive = lambda cluster: True  # type: ignore[method-assign]
+    sched._teardown = lambda cluster, job_id: events.append(f"down:{cluster}") or True  # type: ignore[method-assign]
+    sched.tick()
+    assert events == ["down:lab-j-sky"]
+    assert sched.store.read_manifest("j-sky").status.value == "timed_out"
+    assert q.get_entry("reg-a").state is RegState.failed
+
+
+def test_watchdog_marks_failed_when_cluster_gone(tmp_path: Path):
+    sched, q = _watchdog_sched(tmp_path)
+    _skypilot_launched_reg(tmp_path, q, sched, started_ago_s=60)
+    sched._cluster_alive = lambda cluster: False  # type: ignore[method-assign]
+    sched.tick()
+    m = sched.store.read_manifest("j-sky")
+    assert m.status.value == "failed" and "supervisor died" in (m.end_reason or "")
+
+
+def test_reconcile_sweep_every_n_ticks(tmp_path: Path):
+    sched, q = _watchdog_sched(tmp_path, reconcile_every=2)
+    calls: list[bool] = []
+    sched._reconcile = lambda apply: calls.append(apply) or {"orphans": []}  # type: ignore[method-assign]
+    sched.tick()
+    sched.tick()  # tick_count 2 -> sweep
+    sched.tick()
+    sched.tick()  # tick_count 4 -> sweep
+    assert calls == [False, False]
+    q.write_control(ControlConfig(auto_reconcile=True))
+    sched.tick()
+    sched.tick()  # tick_count 6 -> sweep with apply=True
+    assert calls[-1] is True

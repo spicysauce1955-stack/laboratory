@@ -22,6 +22,18 @@ from lab.scheduler.queue import QueueStore
 from lab.store import JobStore
 
 
+def _pid_alive(pid: int) -> bool:
+    import os
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 class Scheduler:
     LAUNCHING_ORPHAN_S = 600.0  # spec §5: launching older than 10 min is repaired
 
@@ -34,6 +46,7 @@ class Scheduler:
         now_fn: Callable[[], datetime] = now,
         host: str | None = None,
         price_feed: PriceFeed | None = None,
+        reconcile_every: int = 30,
     ) -> None:
         self.queue = queue
         self.home = Path(home)
@@ -42,6 +55,7 @@ class Scheduler:
         self.host = host or platform.node()
         self.store = JobStore(self.home)
         self.price_feed = price_feed
+        self.reconcile_every = reconcile_every
 
     def make_lab(self, repo: Path) -> Lab:
         """Lab over the launch backend, rooted at an extracted bundle. Test seam."""
@@ -50,6 +64,41 @@ class Scheduler:
 
             return Lab(backend=SkyPilotBackend(home=self.home, repo=repo), repo=repo, home=self.home)
         return Lab(backend=LocalBackend(home=self.home, repo=repo), repo=repo, home=self.home)
+
+    def _cluster_alive(self, cluster: str) -> bool:
+        """Does a Vast rental back this cluster? Test seam."""
+        from lab.backends.skypilot import vast_hourly_for_cluster
+
+        try:
+            return vast_hourly_for_cluster(cluster) is not None
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _respawn_supervisor(self, job_id: str) -> None:
+        """Re-attach a supervisor to a live cluster (sky_runner --adopt). Test seam."""
+        import subprocess
+        import sys
+
+        job_dir = self.store.job_dir(job_id)
+        logf = self.store.logs_path(job_id).open("a")
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "lab.sky_runner", str(job_dir), "--adopt"],
+            stdout=logf, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+        self.store.write_runtime(job_id, runner_pid=proc.pid)
+
+    def _teardown(self, cluster: str, job_id: str) -> bool:
+        """Robust teardown of an overdue orphan. Test seam."""
+        import sky
+
+        from lab.backends.skypilot import tear_down_and_record
+
+        return tear_down_and_record(sky, cluster, self.store, job_id)
+
+    def _reconcile(self, apply: bool) -> dict[str, object]:
+        """FR-C2 sweep. Test seam."""
+        lab = self.make_lab(self.home)
+        return lab.reconcile(apply=apply)
 
     def tick(self) -> TickReport:
         rep = TickReport(at=self.now_fn())
@@ -62,6 +111,11 @@ class Scheduler:
             self._sync(entries, rep)            # Task 7
             self._expire(entries, rep)
             self._evaluate_and_launch(entries, control, rep)  # Task 6 (+8, 9)
+            if tick_count % self.reconcile_every == 0:
+                try:
+                    rep.reconcile = self._reconcile(control.auto_reconcile)
+                except Exception as e:  # noqa: BLE001
+                    rep.errors.append(f"reconcile sweep: {e}")
         self.queue.write_heartbeat(
             {
                 "at": rep.at.isoformat(),
@@ -120,6 +174,32 @@ class Scheduler:
             except FileNotFoundError:
                 rep.errors.append(f"{reg.reg_id}: manifest {reg.job_id} missing")
                 continue
+            if (
+                manifest.status not in self._TERMINAL_MAP
+                and manifest.backend.provisioner == "skypilot"
+            ):
+                rt = self.store.read_runtime(reg.job_id)
+                pid = rt.get("runner_pid")
+                if pid and not _pid_alive(int(pid)):
+                    cluster = str(rt.get("cluster") or f"lab-{reg.job_id}")
+                    deadline_s = parse_duration(manifest.resources.timeout) or 3600.0
+                    started = manifest.started_at or manifest.created_at
+                    overdue = (self.now_fn() - started).total_seconds() > deadline_s + 300
+                    if not self._cluster_alive(cluster):
+                        manifest = self.store.update_manifest(
+                            reg.job_id, status=JobState.failed, ended_at=self.now_fn(),
+                            end_reason="supervisor died; instance gone",
+                        )
+                    elif overdue:
+                        ok = self._teardown(cluster, reg.job_id)
+                        manifest = self.store.update_manifest(
+                            reg.job_id, status=JobState.timed_out, ended_at=self.now_fn(),
+                            end_reason="watchdog: past timeout with dead supervisor",
+                            teardown_status="succeeded" if ok else "failed",
+                        )
+                    else:
+                        self._respawn_supervisor(reg.job_id)
+                        rep.synced[reg.reg_id] = "supervisor respawned (adopt)"
             max_h = reg.triggers.max_hourly_usd
             if (
                 manifest.status not in self._TERMINAL_MAP
