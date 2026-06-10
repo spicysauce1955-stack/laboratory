@@ -17,6 +17,7 @@ from lab.core import Lab
 from lab.models import JobState
 from lab.scheduler.bundle import extract_bundle
 from lab.scheduler.models import ControlConfig, Registration, RegState, TickReport
+from lab.scheduler.price import PriceFeed
 from lab.scheduler.queue import QueueStore
 from lab.store import JobStore
 
@@ -32,6 +33,7 @@ class Scheduler:
         backend: str = "local",
         now_fn: Callable[[], datetime] = now,
         host: str | None = None,
+        price_feed: PriceFeed | None = None,
     ) -> None:
         self.queue = queue
         self.home = Path(home)
@@ -39,6 +41,7 @@ class Scheduler:
         self.now_fn = now_fn
         self.host = host or platform.node()
         self.store = JobStore(self.home)
+        self.price_feed = price_feed
 
     def make_lab(self, repo: Path) -> Lab:
         """Lab over the launch backend, rooted at an extracted bundle. Test seam."""
@@ -51,6 +54,8 @@ class Scheduler:
     def tick(self) -> TickReport:
         rep = TickReport(at=self.now_fn())
         tick_count = int((self.queue.read_heartbeat() or {}).get("tick_count", 0)) + 1
+        self._price_cache: dict[tuple[str | None, str | None], float | None] = {}
+        self._best_hourly_seen: dict[str, float] = {}
         control = self.queue.read_control()
         if not control.paused:
             entries = self.queue.list_entries()
@@ -163,7 +168,23 @@ class Scheduler:
             dep_state = by_id[dep_id].state
             if dep_state is not RegState.succeeded:
                 return f"waiting on dependency {dep_id} ({dep_state.value})"
-        return None  # price + guardrails extend this in Tasks 8-9
+        if t.max_hourly_usd is not None:
+            if self.price_feed is None:
+                return "price trigger set but no price feed configured"
+            key = (reg.spec.resources.accelerators, t.offer_query)
+            if key not in self._price_cache:
+                try:
+                    self._price_cache[key] = self.price_feed.best_hourly(key[0], key[1])
+                except Exception as e:  # noqa: BLE001 — API error skips, never crashes (spec §5)
+                    rep.errors.append(f"price feed: {e}")
+                    return f"price feed error: {e}"[:200]
+            best = self._price_cache[key]
+            if best is None:
+                return "no matching offer available"
+            if best > t.max_hourly_usd:
+                return f"price ${best:.3f}/h above max ${t.max_hourly_usd:.3f}/h"
+            self._best_hourly_seen[reg.reg_id] = best  # consumed by guardrails (Task 9)
+        return None  # guardrails extend this in Task 9
 
     def _launch(self, reg: Registration, rep: TickReport) -> None:
         reg = self._transition(reg, RegState.launching, reason=None)

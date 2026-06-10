@@ -5,7 +5,7 @@ from pathlib import Path
 
 from helpers import PYTHON, wait_terminal
 from lab.backends.local import LocalBackend
-from lab.models import JobSpec
+from lab.models import JobSpec, ResourceRequest
 from lab.scheduler.bundle import create_bundle
 from lab.scheduler.models import ControlConfig, Guardrails, Registration, RegState, Triggers
 from lab.scheduler.queue import LocalQueueStore
@@ -256,3 +256,53 @@ def test_cancel_marker_on_launched_cancels_the_job(tmp_path: Path):
     assert q.get_entry("reg-a").state is RegState.cancelled
     backend = LocalBackend(home=tmp_path / "runs", repo=tmp_path)
     assert backend.status(e.job_id).value == "cancelled"
+
+
+class FakePrices:
+    def __init__(self, hourly: float | None) -> None:
+        self.hourly = hourly
+        self.calls = 0
+
+    def best_hourly(self, accelerators, extra_query=None):
+        self.calls += 1
+        return self.hourly
+
+
+def _gpu_reg(q, tmp_path, reg_id, max_hourly: float, **kw):
+    r = put_reg(q, tmp_path, reg_id, triggers=Triggers(max_hourly_usd=max_hourly), **kw)
+    q.put_entry(
+        r.model_copy(
+            update={"spec": r.spec.model_copy(update={
+                "resources": ResourceRequest(accelerators="RTX_4090:1", timeout="1h")})}
+        )
+    )
+    return r
+
+
+def test_price_above_threshold_skips(tmp_path: Path):
+    feed = FakePrices(0.40)
+    sched, q = make_sched(tmp_path, price_feed=feed)
+    _gpu_reg(q, tmp_path, "reg-a", max_hourly=0.25)
+    rep = sched.tick()
+    assert rep.launched == [] and "price" in rep.skipped["reg-a"]
+
+
+def test_price_below_threshold_launches(tmp_path: Path):
+    sched, q = make_sched(tmp_path, price_feed=FakePrices(0.20))
+    _gpu_reg(q, tmp_path, "reg-a", max_hourly=0.25)
+    assert sched.tick().launched == ["reg-a"]
+
+
+def test_no_offers_skips(tmp_path: Path):
+    sched, q = make_sched(tmp_path, price_feed=FakePrices(None))
+    _gpu_reg(q, tmp_path, "reg-a", max_hourly=0.25)
+    assert "no matching offer" in sched.tick().skipped["reg-a"]
+
+
+def test_price_feed_deduped_per_tick(tmp_path: Path):
+    feed = FakePrices(0.20)
+    sched, q = make_sched(tmp_path, price_feed=feed)
+    _gpu_reg(q, tmp_path, "reg-a", max_hourly=0.25)
+    _gpu_reg(q, tmp_path, "reg-b", max_hourly=0.25)
+    sched.tick()
+    assert feed.calls == 1  # same accelerator spec -> one search_offers call (spec §4.5)
