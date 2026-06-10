@@ -219,3 +219,40 @@ def test_orphaned_launching_with_existing_job_repairs_to_launched(tmp_path: Path
     sched.tick()
     repaired = q.get_entry("reg-a")
     assert repaired.state is RegState.launched and repaired.job_id == job_id
+
+
+def test_sync_mirrors_terminal_state_and_manifest(tmp_path: Path):
+    sched, q = make_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a")
+    sched.tick()
+    e = q.get_entry("reg-a")
+    backend = LocalBackend(home=tmp_path / "runs", repo=tmp_path)
+    wait_terminal(backend, e.job_id)
+    rep = sched.tick()
+    assert rep.synced.get("reg-a") == "succeeded"
+    assert q.get_entry("reg-a").state is RegState.succeeded
+    mirrored = q.read_mirrored(e.job_id)
+    assert mirrored is not None and mirrored.status.value == "succeeded"
+
+
+def test_sync_maps_failed_job_to_failed_reg(tmp_path: Path):
+    sched, q = make_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a", command=f"{PYTHON} -c 'raise SystemExit(3)'")
+    sched.tick()
+    e = q.get_entry("reg-a")
+    backend = LocalBackend(home=tmp_path / "runs", repo=tmp_path)
+    wait_terminal(backend, e.job_id)
+    sched.tick()
+    assert q.get_entry("reg-a").state is RegState.failed
+
+
+def test_cancel_marker_on_launched_cancels_the_job(tmp_path: Path):
+    sched, q = make_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a", command=f"{PYTHON} -c 'import time; time.sleep(60)'")
+    sched.tick()
+    e = q.get_entry("reg-a")
+    q.request_cancel("reg-a")
+    sched.tick()
+    assert q.get_entry("reg-a").state is RegState.cancelled
+    backend = LocalBackend(home=tmp_path / "runs", repo=tmp_path)
+    assert backend.status(e.job_id).value == "cancelled"

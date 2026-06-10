@@ -14,6 +14,7 @@ from pathlib import Path
 from lab._util import now
 from lab.backends.local import LocalBackend
 from lab.core import Lab
+from lab.models import JobState
 from lab.scheduler.bundle import extract_bundle
 from lab.scheduler.models import ControlConfig, Registration, RegState, TickReport
 from lab.scheduler.queue import QueueStore
@@ -67,9 +68,36 @@ class Scheduler:
         )
         return rep
 
+    _TERMINAL_MAP = {
+        JobState.succeeded: RegState.succeeded,
+        JobState.failed: RegState.failed,
+        JobState.timed_out: RegState.failed,
+        JobState.cancelled: RegState.cancelled,
+    }
+
     # ------------------------------------------------------------------ phases
     def _sync(self, entries: list[Registration], rep: TickReport) -> None:
         """Mirror launched jobs' state back onto registrations (Task 7)."""
+        for reg in entries:
+            if reg.state is not RegState.launched or reg.job_id is None:
+                continue
+            try:
+                manifest = self.store.read_manifest(reg.job_id)
+            except FileNotFoundError:
+                rep.errors.append(f"{reg.reg_id}: manifest {reg.job_id} missing")
+                continue
+            if manifest.status not in self._TERMINAL_MAP and self.queue.cancel_requested(
+                reg.reg_id
+            ):
+                lab = self.make_lab(self.home / "_bundles" / reg.reg_id)
+                lab.cancel(reg.job_id)
+                manifest = self.store.read_manifest(reg.job_id)
+            self.queue.mirror_manifest(manifest)  # laptop visibility + stateless host (spec §4.3)
+            new_state = self._TERMINAL_MAP.get(manifest.status)
+            if new_state is not None:
+                updated = self._transition(reg, new_state, reason=manifest.end_reason)
+                entries[entries.index(reg)] = updated  # dependents see it this tick's eval
+                rep.synced[reg.reg_id] = new_state.value
 
     def _expire(self, entries: list[Registration], rep: TickReport) -> None:
         nowt = self.now_fn()
