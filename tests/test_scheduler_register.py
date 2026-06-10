@@ -48,3 +48,26 @@ def test_worst_case_cost():
     assert worst_case_cost(t, r) == 0.5
     assert worst_case_cost(Triggers(), r) is None
     assert worst_case_cost(t, ResourceRequest()) is None
+
+
+def test_parse_expires_relative_and_iso():
+    from datetime import datetime, timedelta, timezone
+
+    from lab._util import now
+    from lab.scheduler.register import parse_expires
+
+    d = parse_expires("+3d")
+    assert abs((d - now()) - timedelta(days=3)) < timedelta(seconds=5)
+    assert parse_expires("2030-01-01T00:00:00Z") == datetime(2030, 1, 1, tzinfo=timezone.utc)
+    for bad in ("+bad", "not-a-date"):
+        with pytest.raises(ValueError):
+            parse_expires(bad)
+
+
+def test_parse_window_and_errors():
+    from lab.scheduler.register import parse_window
+
+    w = parse_window("23:00-07:00", "UTC")
+    assert (w.start.hour, w.end.hour, w.tz) == (23, 7, "UTC")
+    with pytest.raises(ValueError, match="HH:MM-HH:MM"):
+        parse_window("23:00", "UTC")

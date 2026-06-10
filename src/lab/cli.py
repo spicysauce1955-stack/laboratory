@@ -6,20 +6,20 @@ Wired to the local backend by default; structured JSON output mirrors the MCP §
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
-from datetime import time as dt_time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import typer
 
-from lab._util import now, parse_duration, wrap_with_extras
+from lab._util import now, wrap_with_extras
 from lab.core import Lab, LabError, default_lab
 from lab.manifest import repo_root
 from lab.models import JobSpec, JobState, ResourceRequest
-from lab.scheduler.models import DailyWindow, Guardrails, RegState, Triggers
+from lab.scheduler.models import Guardrails, RegState, Triggers
 from lab.scheduler.price import PriceFeed
 from lab.scheduler.queue import QueueStore, default_queue
+from lab.scheduler.register import parse_expires, parse_window
 from lab.scheduler.register import register as sched_register
 from lab.scheduler.register import worst_case_cost
 from lab.scheduler.tick import Scheduler
@@ -316,31 +316,6 @@ def _repo() -> Path:
     return Path(env) if env else repo_root()
 
 
-def _parse_expires(value: str) -> datetime:
-    """``+3d``/``+12h`` (relative) or an ISO timestamp."""
-    if value.startswith("+"):
-        try:
-            secs = parse_duration(value[1:])
-        except ValueError as e:
-            raise typer.BadParameter(f"bad relative expiry {value!r}") from e
-        if secs is None:
-            raise typer.BadParameter(f"bad relative expiry {value!r}")
-        return now() + timedelta(seconds=secs)
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-def _parse_window(value: str, tz: str) -> DailyWindow:
-    try:
-        start_s, end_s = value.split("-", 1)
-        return DailyWindow(
-            start=dt_time.fromisoformat(start_s.strip()),
-            end=dt_time.fromisoformat(end_s.strip()),
-            tz=tz,
-        )
-    except ValueError as e:
-        raise typer.BadParameter(f"--window expects HH:MM-HH:MM (got {value!r})") from e
-
-
 @app.command()
 def register(
     command: str = typer.Option(
@@ -385,16 +360,21 @@ def register(
         _emit({"error": "--timeout is required for GPU registrations (it is the cost bound)"})
         raise typer.Exit(code=1)
     queue = default_queue()
+    try:
+        expires_at = parse_expires(expires)
+        win = parse_window(window, tz) if window else None
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
     triggers = Triggers(
         not_before=(
             datetime.fromisoformat(not_before.replace("Z", "+00:00")) if not_before else None
         ),
-        window=_parse_window(window, tz) if window else None,
+        window=win,
         max_hourly_usd=max_hourly,
         offer_query=offer_query,
         after=list(after or []),
     )
-    guardrails = Guardrails(expires_at=_parse_expires(expires), max_cost_usd=max_cost)
+    guardrails = Guardrails(expires_at=expires_at, max_cost_usd=max_cost)
     spec = JobSpec(
         command=command,
         seed=seed,

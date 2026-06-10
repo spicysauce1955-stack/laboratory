@@ -169,8 +169,9 @@ def build_server(lab: Lab) -> FastMCP:
             ]
         }
 
-    from lab.scheduler.models import DailyWindow, Guardrails, RegState, Triggers
+    from lab.scheduler.models import Guardrails, RegState, Triggers
     from lab.scheduler.queue import default_queue
+    from lab.scheduler.register import parse_expires, parse_window
     from lab.scheduler.register import register as sched_register
     from lab.scheduler.register import worst_case_cost
 
@@ -192,35 +193,20 @@ def build_server(lab: Lab) -> FastMCP:
         after: list[str] | None = None,
     ) -> dict[str, Any]:
         """Register a deferred job: launched by the scheduler when all triggers hold (time window HH:MM-HH:MM, Vast price <= max_hourly $/h, after=reg_ids succeeded). expires (+3d / ISO) is the required run-by guardrail; worst-case cost = max_hourly x timeout."""
-        from datetime import datetime, timedelta
-        from datetime import time as dt_time
-
-        from lab._util import now, parse_duration
+        from datetime import datetime
 
         if accelerators and timeout is None:
             raise ToolError("timeout is required for GPU registrations (it is the cost bound)")
-        if expires.startswith("+"):
-            secs = parse_duration(expires[1:])
-            if secs is None:
-                raise ToolError(f"bad relative expiry {expires!r}")
-            expires_at = now() + timedelta(seconds=secs)
-        else:
-            expires_at = datetime.fromisoformat(expires.replace("Z", "+00:00"))
-        win = None
-        if window:
-            try:
-                s, e = window.split("-", 1)
-                win = DailyWindow(
-                    start=dt_time.fromisoformat(s.strip()),
-                    end=dt_time.fromisoformat(e.strip()),
-                    tz=tz,
-                )
-            except ValueError as exc:
-                raise ToolError(f"window expects HH:MM-HH:MM (got {window!r})") from exc
-        triggers = Triggers(
-            not_before=(
+        try:
+            expires_at = parse_expires(expires)
+            win = parse_window(window, tz) if window else None
+            not_before_dt = (
                 datetime.fromisoformat(not_before.replace("Z", "+00:00")) if not_before else None
-            ),
+            )
+        except ValueError as e:
+            raise ToolError(str(e)) from e
+        triggers = Triggers(
+            not_before=not_before_dt,
             window=win,
             max_hourly_usd=max_hourly,
             offer_query=offer_query,
