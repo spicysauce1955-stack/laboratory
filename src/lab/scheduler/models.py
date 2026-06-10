@@ -17,7 +17,11 @@ from lab.models import CodeRef, JobSpec
 
 
 class RegState(str, Enum):
-    """Registration lifecycle (spec §3). ``held`` is derived from the laptop's hold marker."""
+    """Registration lifecycle (spec §3).
+
+    ``held`` is a *display-only* state derived from the laptop's hold marker — the scheduler
+    MUST NOT persist it into an entry; a held entry stays ``pending`` on disk.
+    """
 
     pending = "pending"
     launching = "launching"
@@ -37,6 +41,8 @@ class DailyWindow(BaseModel):
     tz: str = "UTC"  # IANA name
 
     def contains(self, dt: datetime) -> bool:
+        if dt.tzinfo is None:
+            raise ValueError("DailyWindow.contains requires a tz-aware datetime")
         local = dt.astimezone(ZoneInfo(self.tz)).time()
         if self.start <= self.end:
             return self.start <= local < self.end

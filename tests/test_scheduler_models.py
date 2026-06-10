@@ -1,6 +1,7 @@
 """Scheduler data models: window containment (incl. midnight crossing + tz), defaults."""
 
 from datetime import datetime, time, timezone
+import pytest
 
 from lab.scheduler.models import (
     ControlConfig,
@@ -64,3 +65,9 @@ def test_triggers_all_optional():
     assert Triggers() == Triggers(
         not_before=None, window=None, max_hourly_usd=None, offer_query=None, after=[]
     )
+
+
+def test_window_rejects_naive_datetime():
+    w = DailyWindow(start=time(9, 0), end=time(17, 0), tz="UTC")
+    with pytest.raises(ValueError, match="tz-aware"):
+        w.contains(datetime(2026, 6, 10, 12, 0))
