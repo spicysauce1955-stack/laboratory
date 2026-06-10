@@ -22,3 +22,6 @@ __pycache__/
 .DS_Store
 
 # NOTE: uv.lock IS committed — it is the reproducibility pin (FR-B2).
+
+# Claude worktrees (session isolation)
+.claude/worktrees/
