@@ -171,6 +171,16 @@ def test_dependency_failure_cancels_dependent(tmp_path: Path):
     assert e.state is RegState.cancelled and "reg-a" in (e.last_skip_reason or "")
 
 
+def test_dead_dep_behind_waiting_dep_cancels_immediately(tmp_path: Path):
+    sched, q = make_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a")  # pending (waiting)
+    put_reg(q, tmp_path, "reg-b", state=RegState.failed)
+    put_reg(q, tmp_path, "reg-c", triggers=Triggers(after=["reg-a", "reg-b"]))
+    rep = sched.tick()
+    assert "reg-c" in rep.cancelled
+    assert q.get_entry("reg-c").state is RegState.cancelled
+
+
 def test_cancel_marker_blocks_launch(tmp_path: Path):
     sched, q = make_sched(tmp_path)
     put_reg(q, tmp_path, "reg-a")
@@ -185,9 +195,9 @@ def test_orphaned_launching_reverts_to_pending(tmp_path: Path):
     reg = put_reg(q, tmp_path, "reg-a", state=RegState.launching)
     q.put_entry(reg.model_copy(update={"state_changed_at": T0 - timedelta(minutes=20)}))
     rep = sched.tick()
-    # no job manifest carries registration_id reg-a -> the launch never happened
-    assert q.get_entry("reg-a").state in (RegState.pending, RegState.launched)
-    assert rep.launched == ["reg-a"] or q.get_entry("reg-a").state is RegState.pending
+    # repair runs and reverts to pending; launch happens on a LATER tick, not this one
+    assert q.get_entry("reg-a").state is RegState.pending
+    assert rep.launched == []
 
 
 def test_orphaned_launching_with_existing_job_repairs_to_launched(tmp_path: Path):

@@ -14,6 +14,7 @@ from pathlib import Path
 from lab._util import now
 from lab.backends.local import LocalBackend
 from lab.core import Lab
+from lab.scheduler.bundle import extract_bundle
 from lab.scheduler.models import ControlConfig, Registration, RegState, TickReport
 from lab.scheduler.queue import QueueStore
 from lab.store import JobStore
@@ -115,19 +116,19 @@ class Scheduler:
             return f"not_before {t.not_before.isoformat()}"
         if t.window is not None and not t.window.contains(nowt):
             return f"outside window {t.window.start}-{t.window.end} {t.window.tz}"
-        for dep_id in t.after:
+        for dep_id in t.after:  # dead deps cancel immediately, even behind waiting ones
             dep = by_id.get(dep_id)
-            if dep is None:
-                self._transition(reg, RegState.cancelled, reason=f"dependency {dep_id} ended missing")
+            if dep is None or dep.state in (
+                RegState.failed,
+                RegState.expired,
+                RegState.cancelled,
+            ):
+                why = dep.state.value if dep is not None else "missing"
+                self._transition(reg, RegState.cancelled, reason=f"dependency {dep_id} ended {why}")
                 rep.cancelled.append(reg.reg_id)
                 return ""
-            dep_state = dep.state
-            if dep_state in (RegState.failed, RegState.expired, RegState.cancelled):
-                self._transition(
-                    reg, RegState.cancelled, reason=f"dependency {dep_id} ended {dep_state.value}"
-                )
-                rep.cancelled.append(reg.reg_id)
-                return ""
+        for dep_id in t.after:
+            dep_state = by_id[dep_id].state
             if dep_state is not RegState.succeeded:
                 return f"waiting on dependency {dep_id} ({dep_state.value})"
         return None  # price + guardrails extend this in Tasks 8-9
@@ -141,8 +142,6 @@ class Scheduler:
         try:
             bundle_dir = self.home / "_bundles" / reg.reg_id
             tar = self.queue.fetch_bundle(reg.reg_id, self.home / "_bundles")
-            from lab.scheduler.bundle import extract_bundle
-
             extract_bundle(tar, bundle_dir)
             lab = self.make_lab(bundle_dir)
             job_id = lab.submit(reg.spec, code=reg.code, registration_id=reg.reg_id)
@@ -162,9 +161,9 @@ class Scheduler:
             return
         job = next(
             (
-                self.store.read_manifest(j)
+                m
                 for j in self.store.list_job_ids()
-                if self.store.read_manifest(j).registration_id == reg.reg_id
+                if (m := self.store.read_manifest(j)).registration_id == reg.reg_id
             ),
             None,
         )
@@ -176,6 +175,7 @@ class Scheduler:
             rep.synced[reg.reg_id] = "launched (repaired)"
         else:
             self._transition(reg, RegState.pending, reason="repaired: launch never happened")
+            rep.errors.append(f"{reg.reg_id}: repaired launching -> pending (no job manifest)")
 
     def _transition(self, reg: Registration, state: RegState, *, reason: str | None = None,
                     **extra: object) -> Registration:
