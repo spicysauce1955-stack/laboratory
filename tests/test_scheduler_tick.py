@@ -306,3 +306,52 @@ def test_price_feed_deduped_per_tick(tmp_path: Path):
     _gpu_reg(q, tmp_path, "reg-b", max_hourly=0.25)
     sched.tick()
     assert feed.calls == 1  # same accelerator spec -> one search_offers call (spec §4.5)
+
+
+def test_per_job_cost_cap(tmp_path: Path):
+    sched, q = make_sched(tmp_path, price_feed=FakePrices(0.50))
+    _gpu_reg(q, tmp_path, "reg-a", max_hourly=1.0)
+    q.put_entry(q.get_entry("reg-a").model_copy(
+        update={"guardrails": Guardrails(expires_at=T0 + timedelta(days=1), max_cost_usd=0.25)}))
+    rep = sched.tick()  # 0.50/h x 1h = 0.50 > 0.25
+    assert "max_cost" in rep.skipped["reg-a"]
+
+
+def test_daily_budget_skips_not_cancels(tmp_path: Path):
+    sched, q = make_sched(tmp_path, price_feed=FakePrices(2.0))
+    q.write_control(ControlConfig(budget_usd_per_day=3.0))
+    _gpu_reg(q, tmp_path, "reg-a", max_hourly=3.0)
+    _gpu_reg(q, tmp_path, "reg-b", max_hourly=3.0)
+    rep = sched.tick()  # each estimated 2.0 -> only one fits the $3/day budget
+    assert len(rep.launched) == 1
+    other = ({"reg-a", "reg-b"} - set(rep.launched)).pop()
+    assert "budget" in rep.skipped[other]
+    assert q.get_entry(other).state is RegState.pending  # retried next tick
+
+
+def test_max_concurrent(tmp_path: Path):
+    sched, q = make_sched(tmp_path)
+    q.write_control(ControlConfig(max_concurrent=1))
+    slow = f"{PYTHON} -c 'import time; time.sleep(60)'"
+    put_reg(q, tmp_path, "reg-a", command=slow)
+    put_reg(q, tmp_path, "reg-b", command=slow)
+    rep = sched.tick()
+    assert len(rep.launched) == 1
+    other = ({"reg-a", "reg-b"} - set(rep.launched)).pop()
+    assert "concurren" in rep.skipped[other]
+
+
+def test_post_launch_price_verify_reverts_to_pending(tmp_path: Path, monkeypatch):
+    from lab.models import CostInfo
+
+    sched, q = make_sched(tmp_path, price_feed=FakePrices(0.20))
+    _gpu_reg(q, tmp_path, "reg-a", max_hourly=0.25,
+             command=f"{PYTHON} -c 'import time; time.sleep(60)'")
+    sched.tick()
+    e = q.get_entry("reg-a")
+    # Supervisor later records the real rental price: way above the threshold (offer raced away).
+    sched.store.update_manifest(e.job_id, cost=CostInfo(hourly_usd=0.90))
+    sched.tick()
+    again = q.get_entry("reg-a")
+    assert again.state is RegState.pending and again.job_id is None
+    assert "price" in (again.last_skip_reason or "")

@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import platform
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from lab._util import now
+from lab._util import now, parse_duration
 from lab.backends.local import LocalBackend
 from lab.core import Lab
 from lab.models import JobState
@@ -80,6 +80,35 @@ class Scheduler:
         JobState.cancelled: RegState.cancelled,
     }
 
+    # ------------------------------------------------------------------ helpers
+    def _job_status(self, job_id: str) -> JobState:
+        try:
+            return self.store.read_manifest(job_id).status
+        except FileNotFoundError:
+            return JobState.failed
+
+    def _spend_last_24h(self, entries: list[Registration]) -> float:
+        cutoff = self.now_fn() - timedelta(hours=24)
+        total = 0.0
+        for r in entries:
+            if r.launched_at is None or r.launched_at < cutoff or r.job_id is None:
+                continue
+            try:
+                cost = self.store.read_manifest(r.job_id).cost
+            except FileNotFoundError:
+                continue
+            if cost and cost.estimated_usd:
+                total += cost.estimated_usd
+        return total
+
+    def _estimate_cost(self, reg: Registration) -> float | None:
+        """Worst-case launch cost: best offer $/h x wall-clock timeout (FR-I2 arithmetic)."""
+        hourly = self._best_hourly_seen.get(reg.reg_id)
+        secs = parse_duration(reg.spec.resources.timeout)
+        if hourly is None or secs is None:
+            return None
+        return hourly * secs / 3600.0
+
     # ------------------------------------------------------------------ phases
     def _sync(self, entries: list[Registration], rep: TickReport) -> None:
         """Mirror launched jobs' state back onto registrations (Task 7)."""
@@ -90,6 +119,29 @@ class Scheduler:
                 manifest = self.store.read_manifest(reg.job_id)
             except FileNotFoundError:
                 rep.errors.append(f"{reg.reg_id}: manifest {reg.job_id} missing")
+                continue
+            max_h = reg.triggers.max_hourly_usd
+            if (
+                manifest.status not in self._TERMINAL_MAP
+                and max_h is not None
+                and manifest.cost is not None
+                and manifest.cost.hourly_usd is not None
+                and manifest.cost.hourly_usd > max_h * 1.15
+            ):
+                try:
+                    lab = self.make_lab(self.home / "_bundles" / reg.reg_id)
+                    lab.cancel(reg.job_id)
+                    self.queue.mirror_manifest(self.store.read_manifest(reg.job_id))
+                    self._transition(
+                        reg, RegState.pending, job_id=None, launched_at=None,
+                        reason=(
+                            f"relaunch: price verify — actual ${manifest.cost.hourly_usd:.3f}/h "
+                            f"exceeded max ${max_h:.3f}/h (+15% slack)"
+                        ),
+                    )
+                    rep.synced[reg.reg_id] = "price-verify rollback"
+                except Exception as e:  # noqa: BLE001 — a bad entry must not kill the tick (§5)
+                    rep.errors.append(f"{reg.reg_id}: price-verify cancel error: {e}"[:300])
                 continue
             if manifest.status not in self._TERMINAL_MAP and self.queue.cancel_requested(
                 reg.reg_id
@@ -118,6 +170,13 @@ class Scheduler:
     def _evaluate_and_launch(
         self, entries: list[Registration], control: ControlConfig, rep: TickReport
     ) -> None:
+        running = [
+            r for r in entries
+            if r.state is RegState.launched and r.job_id is not None
+            and self._job_status(r.job_id) not in self._TERMINAL_MAP
+        ]
+        committed = self._spend_last_24h(entries)
+        n_running = len(running)
         by_id = {r.reg_id: r for r in entries}
         for reg in entries:
             if reg.state is RegState.launching:
@@ -141,7 +200,28 @@ class Scheduler:
                     self.queue.put_entry(reg.model_copy(update={"last_skip_reason": blocked}))
                     rep.skipped[reg.reg_id] = blocked
                 continue
+            est = self._estimate_cost(reg)
+            cap = reg.guardrails.max_cost_usd
+            if est is not None and cap is not None and est > cap:
+                reason = f"estimated ${est:.2f} exceeds max_cost ${cap:.2f}"
+                self.queue.put_entry(reg.model_copy(update={"last_skip_reason": reason}))
+                rep.skipped[reg.reg_id] = reason
+                continue
+            budget = control.budget_usd_per_day
+            if budget is not None and est is not None and committed + est > budget:
+                reason = f"daily budget: committed ${committed:.2f} + ${est:.2f} > ${budget:.2f}"
+                self.queue.put_entry(reg.model_copy(update={"last_skip_reason": reason}))
+                rep.skipped[reg.reg_id] = reason
+                continue
+            if n_running >= control.max_concurrent:
+                reason = f"max_concurrent={control.max_concurrent} reached"
+                self.queue.put_entry(reg.model_copy(update={"last_skip_reason": reason}))
+                rep.skipped[reg.reg_id] = reason
+                continue
             self._launch(reg, rep)
+            if reg.reg_id in rep.launched:
+                n_running += 1
+                committed += est or 0.0
 
     def _trigger_block(
         self, reg: Registration, by_id: dict[str, Registration], rep: TickReport
