@@ -91,19 +91,36 @@ class Lab:
         self.home = Path(home)
         self.store = JobStore(self.home)
 
-    def submit(self, spec: JobSpec, *, allow_dirty: bool = True, sweep_id: str | None = None) -> str:
-        """Build + persist the manifest, then launch via the backend (FR-A1, FR-B)."""
-        dirty = is_dirty(self.repo)
-        if dirty and not allow_dirty:
-            raise LabError("working tree is dirty; commit or pass allow_dirty=True (FR-B1)")
+    def submit(
+        self,
+        spec: JobSpec,
+        *,
+        allow_dirty: bool = True,
+        sweep_id: str | None = None,
+        code: CodeRef | None = None,
+        registration_id: str | None = None,
+    ) -> str:
+        """Build + persist the manifest, then launch via the backend (FR-A1, FR-B).
+
+        ``code`` overrides git introspection — used by the scheduler, which submits from an
+        extracted bundle (not a git repo) with provenance captured at registration time.
+        """
+        if code is None:
+            dirty = is_dirty(self.repo)
+            if dirty and not allow_dirty:
+                raise LabError("working tree is dirty; commit or pass allow_dirty=True (FR-B1)")
+            code = CodeRef(git_commit=current_commit(self.repo), git_dirty=dirty)
+        elif code.git_dirty and not allow_dirty:
+            raise LabError("bundle captured a dirty tree but allow_dirty=False (FR-B1)")
         seed = spec.seed if spec.seed is not None else 0  # explicit + recorded (FR-B4)
         job_id = _new_job_id()
         manifest = JobManifest(
             job_id=job_id,
             sweep_id=sweep_id,
+            registration_id=registration_id,
             created_at=now(),
             submitted_by=spec.submitted_by,
-            code=CodeRef(git_commit=current_commit(self.repo), git_dirty=dirty),
+            code=code,
             env=EnvInfo(
                 uv_lock_sha256=uv_lock_sha256(self.repo / "uv.lock"),
                 python_version=platform.python_version(),

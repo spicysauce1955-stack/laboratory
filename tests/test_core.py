@@ -9,7 +9,7 @@ import lab.backends.skypilot as skypilot_mod
 from lab.backends.local import LocalBackend
 from lab.core import Lab, LabError, cache_key, expand_grid
 from lab.manifest import is_dirty, repo_root
-from lab.models import JobSpec, JobState
+from lab.models import CodeRef, JobSpec, JobState
 
 
 def test_end_to_end_submit_and_fetch(tmp_path: Path):
@@ -241,3 +241,19 @@ def test_find_cached(tmp_path: Path):
     # clean-tree gate: a dirty working tree disables caching
     if is_dirty(repo):
         assert lab.find_cached(JobSpec(command=cmd, seed=5, config={"K": 1})) is None
+
+
+def test_submit_with_code_override_skips_git(tmp_path: Path):
+    """A pre-captured CodeRef lets submit run from a non-git dir (scheduler bundles)."""
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "uv.lock").write_text("lock")
+    home = tmp_path / "runs"
+    lab = Lab(backend=LocalBackend(home=home, repo=bundle), repo=bundle, home=home)
+    code = CodeRef(git_commit="a" * 40, git_dirty=True)
+    job_id = lab.submit(
+        JobSpec(command=f"{PYTHON} -c 'print(1)'"), code=code, registration_id="reg-7"
+    )
+    m = lab.manifest(job_id)
+    assert m.code == code
+    assert m.registration_id == "reg-7"
