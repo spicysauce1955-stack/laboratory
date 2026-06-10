@@ -143,3 +143,20 @@ class LocalQueueStore:
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(text)
         os.replace(tmp, path)
+
+
+def default_queue() -> QueueStore:
+    """Queue selection: ``LAB_QUEUE_DIR`` (tests/laptop-only) > R2 (if configured) > repo-local."""
+    import os
+
+    from lab.manifest import repo_root
+
+    env_dir = os.environ.get("LAB_QUEUE_DIR")
+    if env_dir:
+        return LocalQueueStore(Path(env_dir))
+    from lab.scheduler.r2queue import R2QueueStore
+
+    r2 = R2QueueStore.from_env()
+    if r2 is not None:
+        return r2
+    return LocalQueueStore(repo_root() / "queue")
