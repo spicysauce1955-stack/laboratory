@@ -89,9 +89,13 @@ class Scheduler:
             if manifest.status not in self._TERMINAL_MAP and self.queue.cancel_requested(
                 reg.reg_id
             ):
-                lab = self.make_lab(self.home / "_bundles" / reg.reg_id)
-                lab.cancel(reg.job_id)
-                manifest = self.store.read_manifest(reg.job_id)
+                try:
+                    lab = self.make_lab(self.home / "_bundles" / reg.reg_id)
+                    lab.cancel(reg.job_id)
+                    manifest = self.store.read_manifest(reg.job_id)
+                except Exception as e:  # noqa: BLE001 — a bad entry must not kill the tick (§5)
+                    rep.errors.append(f"{reg.reg_id}: cancel error: {e}"[:300])
+                    continue
             self.queue.mirror_manifest(manifest)  # laptop visibility + stateless host (spec §4.3)
             new_state = self._TERMINAL_MAP.get(manifest.status)
             if new_state is not None:
