@@ -319,7 +319,10 @@ def _repo() -> Path:
 def _parse_expires(value: str) -> datetime:
     """``+3d``/``+12h`` (relative) or an ISO timestamp."""
     if value.startswith("+"):
-        secs = parse_duration(value[1:])
+        try:
+            secs = parse_duration(value[1:])
+        except ValueError as e:
+            raise typer.BadParameter(f"bad relative expiry {value!r}") from e
         if secs is None:
             raise typer.BadParameter(f"bad relative expiry {value!r}")
         return now() + timedelta(seconds=secs)
@@ -426,6 +429,14 @@ def _heartbeat_age_s(queue: QueueStore) -> float | None:
     return max(0.0, (now() - at).total_seconds())
 
 
+def _require_entry(queue: QueueStore, reg_id: str) -> None:
+    try:
+        queue.get_entry(reg_id)
+    except FileNotFoundError:
+        _emit({"error": f"unknown registration {reg_id!r}"})
+        raise typer.Exit(code=2) from None
+
+
 @queue_app.command(name="list")
 def queue_list() -> None:
     """Entries + state + skip reason, plus scheduler heartbeat age (spec §6)."""
@@ -455,14 +466,16 @@ def queue_list() -> None:
 @queue_app.command(name="show")
 def queue_show(reg_id: str) -> None:
     """Full registration record."""
-    _emit(json.loads(default_queue().get_entry(reg_id).model_dump_json()))
+    queue = default_queue()
+    _require_entry(queue, reg_id)
+    _emit(json.loads(queue.get_entry(reg_id).model_dump_json()))
 
 
 @queue_app.command(name="cancel")
 def queue_cancel(reg_id: str) -> None:
     """Write the cancel marker; the scheduler applies it on its next tick (spec §5)."""
     queue = default_queue()
-    queue.get_entry(reg_id)  # fail-loud on unknown id (FR-F3)
+    _require_entry(queue, reg_id)
     queue.request_cancel(reg_id)
     _emit({"reg_id": reg_id, "cancel_requested": True})
 
@@ -471,7 +484,7 @@ def queue_cancel(reg_id: str) -> None:
 def queue_hold(reg_id: str) -> None:
     """Hold a pending entry (skipped until released)."""
     queue = default_queue()
-    queue.get_entry(reg_id)
+    _require_entry(queue, reg_id)
     queue.hold(reg_id)
     _emit({"reg_id": reg_id, "held": True})
 

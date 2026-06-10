@@ -91,3 +91,23 @@ def test_queue_show_includes_skip_reason(tmp_path: Path):
     res = runner.invoke(app, ["queue", "show", out["reg_id"]], env=env)
     shown = json.loads(res.output)
     assert "not_before" in shown["last_skip_reason"]
+
+
+def test_queue_ops_on_unknown_reg_fail_structured(tmp_path: Path):
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, repo)
+    for cmd in (["queue", "cancel", "reg-nope"], ["queue", "hold", "reg-nope"],
+                ["queue", "show", "reg-nope"]):
+        res = runner.invoke(app, cmd, env=env)
+        assert res.exit_code == 2, cmd
+        assert "unknown registration" in res.output
+
+
+def test_register_bad_expires_is_usage_error(tmp_path: Path):
+    repo = _make_repo(tmp_path)
+    res = runner.invoke(
+        app, ["register", "--command", "python x.py", "--expires", "+bad"],
+        env=_env(tmp_path, repo),
+    )
+    assert res.exit_code != 0
+    assert "bad relative expiry" in res.output
