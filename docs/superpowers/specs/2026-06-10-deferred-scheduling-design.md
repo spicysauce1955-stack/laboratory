@@ -101,7 +101,10 @@ class Registration(BaseModel):
     last_skip_reason: str | None = None  # why the last tick didn't launch it
 ```
 
-Trigger semantics: **all present triggers must hold simultaneously** (AND). The window gates
+Trigger semantics: **all present triggers must hold simultaneously** (AND). A registration with
+**no triggers is eligible immediately** — this is the supported way to run an "ASAP" job under
+Droplet supervision instead of a laptop-bound supervisor (laptop power/network loss then cannot
+orphan it). The window gates
 **starting only** — a job may start near the window's end; its own wall-clock timeout (FR-I1)
 bounds cost. Once `job_id` is set the job is an ordinary lab job: `status`, `logs`, `metrics`,
 `fetch`, `cancel`, `wait`, `reconcile` work unchanged. The scheduler's responsibility ends at
@@ -114,8 +117,18 @@ Each tick:
 1. **Heartbeat** — write `queue/heartbeat.json` (timestamp + host id). `lab queue list` warns if
    the heartbeat is stale (>10 min).
 2. **Load control** — `queue/control.json`. If `paused`: stop (heartbeat still written).
-3. **Sync** — for each `launched` registration, read the job manifest and mirror terminal state
-   (`succeeded`/`failed`/…) back onto the registration. This is what advances `after` chains.
+3. **Sync & watchdog** — for each `launched` registration:
+   - Read the job manifest; mirror terminal state (`succeeded`/`failed`/…) back onto the
+     registration (this is what advances `after` chains) and **copy the manifest to
+     `queue/jobs/<job_id>.json`** so the laptop can `status`/inspect scheduler-launched jobs and
+     the Droplet stays truly stateless.
+   - If the manifest is non-terminal but the supervisor is dead (`runner_pid` no longer alive —
+     the backend already records it), **adopt the job**: the cluster name derives from `job_id`
+     (`cluster_name_for`), so query the cluster; if the instance is gone, mark the job `failed`
+     (`"supervisor died"`); if it is still running and within `started_at + timeout`, respawn the
+     supervisor in adopt mode (re-wait, rsync, teardown); past the timeout, tear down via the
+     existing robust path and mark `timed_out`. A Droplet reboot mid-run therefore costs at most
+     one tick interval of supervision, never an orphaned rental.
 4. **Expire** — `pending`/`held` entries past `expires_at` → `expired` (with reason).
 5. **Evaluate triggers** for `pending` entries:
    - *Clock:* `now >= not_before`; if `window` set, local time (in `window.tz`) is inside it
@@ -157,6 +170,15 @@ model.
 - **Single writer for claims:** only the scheduler transitions `pending → launching → launched`;
   the laptop only creates entries and writes cancel/hold markers and control. No concurrent-writer
   conflict on the same key.
+- **Registration write ordering:** `lab register` uploads the **bundle first**, then writes the
+  queue entry — the entry is the commit point, so the scheduler can never see an entry whose code
+  is missing. An interrupted registration (laptop lost network mid-upload) leaves at most an
+  unreferenced bundle, never a broken entry.
+- **Reconcile sweep:** every ~30 ticks the scheduler runs the existing reconcile check (Vast
+  `lab-*` rentals vs. known jobs) and records orphans in the tick report / heartbeat. Flag-only by
+  default; `control.json: auto_reconcile=true` lets it destroy confirmed orphans (`reconcile
+  --apply` semantics). `lab reconcile` from the laptop remains the independent ground truth for
+  "what is billing me right now" regardless of any state-file loss.
 
 ## 6. User surface
 
@@ -188,9 +210,12 @@ registrations (it already is the cost bound, FR-I1).
   smallest droplet — tick is tiny and I/O-bound) + an Ansible role that:
   installs uv, clones laboratory, `uv sync`, writes `/etc/lab/scheduler.env` (Vast API key, R2
   credentials — delivered via Ansible, never in repo/manifests/logs, FR-J1), installs
-  `lab-scheduler.service` + `lab-scheduler.timer` (60s, `lab scheduler tick`).
-- The Droplet is **stateless** — everything re-derivable from R2 — so destroy/recreate
-  (`playground suspend` / `apply`) is always safe. ~$4–6/mo; suspend when the queue is idle.
+  `lab-scheduler.service` + `lab-scheduler.timer` (60s, `Persistent=true`, after
+  `network-online.target` — ticks resume automatically after a Droplet reboot).
+- The Droplet is **stateless** — queue entries, control, bundles, and (via the §4 manifest
+  mirroring) job manifests all live in R2 — so destroy/recreate (`playground suspend` / `apply`)
+  is always safe: a fresh Droplet reads R2 and the watchdog re-adopts any still-running clusters.
+  ~$4–6/mo; suspend when the queue is idle.
 - The laptop never needs the Droplet to be reachable; all interaction goes through R2.
 
 ## 8. Testing
@@ -199,7 +224,9 @@ registrations (it already is the cost bound, FR-I1).
   local/fake backend — table-driven over: window edges incl. midnight crossing and timezones;
   price below/at/above threshold; dependency success and failure propagation; budget exhaustion
   and recovery; concurrency cap; expiry; pause/hold; cancel race; orphaned-`launching` repair;
-  post-launch price-verify rollback. Mirrors the fake-cloud style of `tests/test_skypilot.py`.
+  post-launch price-verify rollback; watchdog adoption (dead supervisor × instance
+  alive/gone/over-timeout); manifest mirroring. Mirrors the fake-cloud style of
+  `tests/test_skypilot.py`.
 - **Integration:** bundle round-trip (archive + dirty diff → extract → `Lab.submit` on the `local`
   backend); end-to-end `not_before`-in-the-past → tick → job succeeds → dependent launches on the
   next tick.
@@ -207,7 +234,22 @@ registrations (it already is the cost bound, FR-I1).
   verifying heartbeat, launch, price verify, teardown, artifact fetch.
 - `mypy --strict` on `src/lab`, ruff line-length 100, as project-wide.
 
-## 9. Build order (suggested)
+## 9. Scenario coverage (failure walkthroughs)
+
+| Scenario | What happens | Covered by |
+|---|---|---|
+| Laptop loses power/internet **after registering** | Nothing — Droplet launches and supervises; artifacts land in R2 | Cloud-side scheduler (§2) |
+| Laptop dies mid **direct `lab submit`** (non-scheduled) | Pre-existing weakness: laptop supervisor dies; remote autostop/in-instance timeout + `lab reconcile` are the nets | Unchanged; mitigation: register with **no triggers** → ASAP launch under Droplet supervision (§3) |
+| Laptop offline during `lab register` | Bundle-first write ordering → at worst an unreferenced bundle, never a code-less entry | §5 |
+| **Droplet** reboots/dies mid-run | Timer resumes (`Persistent=true`); watchdog detects dead `runner_pid`, adopts the cluster, enforces timeout, tears down, records true state | §4.3, §7 |
+| Droplet destroyed permanently | All state in R2; recreate via playground, watchdog re-adopts live clusters | §7 |
+| Vast instance dies / preempted mid-run | Supervisor sees terminal/missing job → `failed`, robust teardown; registration mirrors it; dependents fail fast. No auto-retry in v1 | §4.3, §5 (existing sky_runner) |
+| Scheduler silently broken | Heartbeat age shown in `lab queue list`; `last_skip_reason` per entry | §4.1, §6 |
+| "What is actually billing me right now?" | `lab reconcile` queries Vast directly — independent of every state file | §5 |
+| "Which experiments are still running?" | `lab queue list` (registrations) + R2-mirrored manifests (`lab status <job_id>` works from the laptop) + reconcile sweep for orphans | §4.3, §5 |
+| R2 unreachable from Droplet | Tick logs and exits without action; in-flight jobs unaffected (supervisor is local); next tick retries | §5 |
+
+## 10. Build order (suggested)
 
 1. Models + QueueStore (tmpdir backend) + bundle create/extract — pure, fully unit-testable.
 2. `tick()` with clock/dependency/expiry/pause + local backend launches (no price, no R2).
