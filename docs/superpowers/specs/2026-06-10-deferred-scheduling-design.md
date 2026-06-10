@@ -29,13 +29,13 @@ same queue only), multi-user quotas.
 ```
 laptop                          R2 (bus + source of truth)      Droplet (playground-provisioned)
 ──────                          ──────────────────────────      ────────────────────────────────
-lab register ──writes──▶  queue/pending/<reg_id>.json      systemd timer (60s)
-             ──uploads─▶  queue/bundles/<reg_id>.tar.zst        │
+lab register ──writes──▶  queue/entries/<reg_id>.json      systemd timer (60s)
+             ──uploads─▶  queue/bundles/<reg_id>.tar.gz         │
 lab queue list/cancel/    queue/control.json                    ▼
   pause ◀──reads/writes──   {paused, budget_usd_per_day,   lab scheduler tick
                              max_concurrent}                    │ claims, launches via the
-                          queue/launched/<reg_id>.json  ◀───────┘ existing SkyPilot backend
-                          queue/cancelled/<reg_id>  (markers)
+                          queue/entries/… (state updates) ◀─────┘ existing SkyPilot backend
+                          queue/cancelled/, queue/held/  (laptop-owned markers)
                           queue/heartbeat.json
                           (job manifests + artifacts as today)
                                                                 ▼
@@ -62,7 +62,10 @@ New module `src/lab/scheduler/` (CLI and MCP stay thin shells over it):
   patterns. Also a local-filesystem implementation for tests and laptop-only mode.
 - **`tick.py`** — `tick(queue, lab, clock, price_feed) -> TickReport`: all scheduling logic,
   dependency-injected (fake clock/prices/store in tests).
-- **`bundle.py`** — create/extract code bundles (`git archive` + dirty diff → `.tar.zst`).
+- **`bundle.py`** — create/extract code bundles (`git archive` + dirty diff + untracked
+  non-ignored files → `.tar.gz`; stdlib `tarfile`, no new dependency). Registration state lives
+  **inside** each `entries/<reg_id>.json` (flat layout) — object stores have no atomic move, so
+  state-as-prefix would race; the laptop only ever writes markers, never entry state.
 
 ### Data model
 
@@ -149,9 +152,11 @@ Each tick:
 7. **Launch** survivors oldest-first: re-check the cancel marker, mark `launching`, download +
    extract bundle to a workdir, `Lab.submit()` via the SkyPilot backend, record `job_id`, mark
    `launched`.
-8. **Post-launch price verify** — via the existing `vast_hourly_for_cluster`: if the actual
-   rental's `dph_total` exceeds `max_hourly_usd` by >15% (offer raced away), cancel + teardown
-   (existing FR-C2 path) and return the entry to `pending` with a skip reason.
+8. **Post-launch price verify** — performed during step 3 of **subsequent ticks** (the rental's
+   real `dph_total` is only known once provisioning completes, and the tick must never block):
+   if a `launched` entry's manifest shows `cost.hourly_usd` exceeding `max_hourly_usd` by >15%
+   (offer raced away), cancel + teardown (existing FR-C2 path) and return the entry to `pending`
+   with a skip reason.
 
 Budget arithmetic reuses the `estimated_usd` the manifest already records (FR-I2) — no new cost
 model.
