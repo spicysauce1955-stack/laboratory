@@ -1,5 +1,6 @@
 """QueueStore contract via the local-dir implementation (R2 implements the same protocol)."""
 
+import pytest
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -75,3 +76,8 @@ def test_manifest_mirror(tmp_path: Path):
     got = q.read_mirrored("j1")
     assert got is not None and got.job_id == "j1"
     assert [x.job_id for x in q.list_mirrored()] == ["j1"]
+
+
+def test_get_entry_missing_raises(tmp_path: Path):
+    with pytest.raises(FileNotFoundError):
+        LocalQueueStore(tmp_path).get_entry("reg-nope")

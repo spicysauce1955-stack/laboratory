@@ -63,6 +63,7 @@ class LocalQueueStore:
         d = self.root / "entries"
         if not d.exists():
             return []
+        # sorted() is chronological because reg ids are timestamp-prefixed (register._new_reg_id)
         return [
             Registration.model_validate_json(p.read_text()) for p in sorted(d.glob("*.json"))
         ]
@@ -108,7 +109,9 @@ class LocalQueueStore:
     def put_bundle(self, reg_id: str, src: Path) -> str:
         dest = self.root / "bundles" / f"{reg_id}.tar.gz"
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dest)
+        tmp = dest.parent / f"{reg_id}.tar.gz.tmp"
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dest)  # atomic — a half-copied bundle is never visible
         return f"bundles/{reg_id}.tar.gz"
 
     def fetch_bundle(self, reg_id: str, dest_dir: Path) -> Path:
