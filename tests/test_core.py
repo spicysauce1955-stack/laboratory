@@ -257,3 +257,14 @@ def test_submit_with_code_override_skips_git(tmp_path: Path):
     m = lab.manifest(job_id)
     assert m.code == code
     assert m.registration_id == "reg-7"
+
+
+def test_submit_code_override_respects_allow_dirty(tmp_path: Path):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "uv.lock").write_text("lock")
+    home = tmp_path / "runs"
+    lab = Lab(backend=LocalBackend(home=home, repo=bundle), repo=bundle, home=home)
+    dirty_code = CodeRef(git_commit="a" * 40, git_dirty=True)
+    with pytest.raises(LabError):
+        lab.submit(JobSpec(command="python x.py"), code=dirty_code, allow_dirty=False)

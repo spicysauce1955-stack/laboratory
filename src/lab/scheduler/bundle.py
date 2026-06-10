@@ -34,7 +34,7 @@ def create_bundle(repo: Path, dest_dir: Path) -> tuple[Path, CodeRef]:
         stage.mkdir()
         # Committed tree.
         archive = _git(repo, "archive", "--format=tar", commit)
-        with tempfile.NamedTemporaryFile(suffix=".tar") as tf:
+        with tempfile.NamedTemporaryFile(suffix=".tar", dir=td) as tf:
             tf.write(archive)
             tf.flush()
             with tarfile.open(tf.name) as t:

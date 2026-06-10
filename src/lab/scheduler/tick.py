@@ -80,11 +80,11 @@ class Scheduler:
         import sys
 
         job_dir = self.store.job_dir(job_id)
-        logf = self.store.logs_path(job_id).open("a")
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "lab.sky_runner", str(job_dir), "--adopt"],
-            stdout=logf, stderr=subprocess.STDOUT, start_new_session=True,
-        )
+        with self.store.logs_path(job_id).open("a") as logf:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "lab.sky_runner", str(job_dir), "--adopt"],
+                stdout=logf, stderr=subprocess.STDOUT, start_new_session=True,
+            )
         self.store.write_runtime(job_id, runner_pid=proc.pid)
 
     def _teardown(self, cluster: str, job_id: str) -> bool:
@@ -97,7 +97,7 @@ class Scheduler:
 
     def _reconcile(self, apply: bool) -> dict[str, object]:
         """FR-C2 sweep. Test seam."""
-        lab = self.make_lab(self.home)
+        lab = self.make_lab(self.home)  # repo=self.home is a dummy; reconcile never reads repo
         return lab.reconcile(apply=apply)
 
     def tick(self) -> TickReport:
@@ -142,6 +142,10 @@ class Scheduler:
             return JobState.failed
 
     def _spend_last_24h(self, entries: list[Registration]) -> float:
+        """Sum estimated spend from jobs launched in the last 24 h.
+
+        Counts completed jobs too — money spent in the window is spent, regardless of job state.
+        """
         cutoff = self.now_fn() - timedelta(hours=24)
         total = 0.0
         for r in entries:
@@ -162,6 +166,10 @@ class Scheduler:
         if hourly is None or secs is None:
             return None
         return hourly * secs / 3600.0
+
+    def _skip(self, reg: Registration, rep: TickReport, reason: str) -> None:
+        self.queue.put_entry(reg.model_copy(update={"last_skip_reason": reason}))
+        rep.skipped[reg.reg_id] = reason
 
     # ------------------------------------------------------------------ phases
     def _sync(self, entries: list[Registration], rep: TickReport) -> None:
@@ -277,26 +285,22 @@ class Scheduler:
             blocked = self._trigger_block(reg, by_id, rep)
             if blocked is not None:
                 if blocked != "":  # "" => dependency hard-failure already handled
-                    self.queue.put_entry(reg.model_copy(update={"last_skip_reason": blocked}))
-                    rep.skipped[reg.reg_id] = blocked
+                    self._skip(reg, rep, blocked)
                 continue
             est = self._estimate_cost(reg)
             cap = reg.guardrails.max_cost_usd
             if est is not None and cap is not None and est > cap:
-                reason = f"estimated ${est:.2f} exceeds max_cost ${cap:.2f}"
-                self.queue.put_entry(reg.model_copy(update={"last_skip_reason": reason}))
-                rep.skipped[reg.reg_id] = reason
+                self._skip(reg, rep, f"estimated ${est:.2f} exceeds max_cost ${cap:.2f}")
                 continue
             budget = control.budget_usd_per_day
             if budget is not None and est is not None and committed + est > budget:
-                reason = f"daily budget: committed ${committed:.2f} + ${est:.2f} > ${budget:.2f}"
-                self.queue.put_entry(reg.model_copy(update={"last_skip_reason": reason}))
-                rep.skipped[reg.reg_id] = reason
+                self._skip(
+                    reg, rep,
+                    f"daily budget: committed ${committed:.2f} + ${est:.2f} > ${budget:.2f}",
+                )
                 continue
             if n_running >= control.max_concurrent:
-                reason = f"max_concurrent={control.max_concurrent} reached"
-                self.queue.put_entry(reg.model_copy(update={"last_skip_reason": reason}))
-                rep.skipped[reg.reg_id] = reason
+                self._skip(reg, rep, f"max_concurrent={control.max_concurrent} reached")
                 continue
             self._launch(reg, rep)
             if reg.reg_id in rep.launched:

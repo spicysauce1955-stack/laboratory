@@ -309,6 +309,25 @@ def test_price_feed_deduped_per_tick(tmp_path: Path):
     assert feed.calls == 1  # same accelerator spec -> one search_offers call (spec §4.5)
 
 
+def test_price_trigger_without_feed_skips(tmp_path: Path):
+    sched, q = make_sched(tmp_path)  # no price_feed
+    _gpu_reg(q, tmp_path, "reg-a", max_hourly=0.25)
+    rep = sched.tick()
+    assert rep.launched == [] and "no price feed" in rep.skipped["reg-a"]
+
+
+def test_price_feed_error_skips_and_reports(tmp_path: Path):
+    class BoomFeed:
+        def best_hourly(self, accelerators, extra_query=None):
+            raise RuntimeError("api down")
+
+    sched, q = make_sched(tmp_path, price_feed=BoomFeed())
+    _gpu_reg(q, tmp_path, "reg-a", max_hourly=0.25)
+    rep = sched.tick()
+    assert rep.launched == []
+    assert any("api down" in e for e in rep.errors)
+
+
 def test_per_job_cost_cap(tmp_path: Path):
     sched, q = make_sched(tmp_path, price_feed=FakePrices(0.50))
     _gpu_reg(q, tmp_path, "reg-a", max_hourly=1.0)
@@ -401,6 +420,7 @@ def test_watchdog_respawns_when_cluster_alive_within_timeout(tmp_path: Path):
     sched._respawn_supervisor = lambda job_id: events.append(f"respawn:{job_id}")  # type: ignore[method-assign]
     sched.tick()
     assert events == ["respawn:j-sky"]
+    assert q.get_entry("reg-a").state is RegState.launched
 
 
 def test_watchdog_times_out_overdue_job(tmp_path: Path):
