@@ -9,7 +9,7 @@ Use the playground project's `cloud-digitalocean` backend to create the smallest
 (the tick is tiny and I/O-bound), then run the steps below (manually or via an Ansible role in
 that repo):
 
-1. Install uv + git; `git clone <laboratory remote> /opt/laboratory && cd /opt/laboratory && uv sync --extra skypilot`.
+1. Install uv + git; `git clone <laboratory remote> /opt/laboratory && cd /opt/laboratory && uv sync --extra skypilot --extra r2`.
 2. Create user `lab`; `cp deploy/scheduler/scheduler.env.example /etc/lab/scheduler.env` and fill
    in real credentials (mode 0600, owner `lab`).
 3. `cp deploy/scheduler/lab-scheduler.{service,timer} /etc/systemd/system/`

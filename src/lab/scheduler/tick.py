@@ -160,7 +160,11 @@ class Scheduler:
         return total
 
     def _estimate_cost(self, reg: Registration) -> float | None:
-        """Worst-case launch cost: best offer $/h x wall-clock timeout (FR-I2 arithmetic)."""
+        """Worst-case launch cost: best offer $/h x wall-clock timeout (FR-I2 arithmetic).
+
+        None when no price trigger ran (CPU/local jobs) — such launches bypass the budget
+        PRE-check and are only counted after launch via the manifest's estimated_usd.
+        """
         hourly = self._best_hourly_seen.get(reg.reg_id)
         secs = parse_duration(reg.spec.resources.timeout)
         if hourly is None or secs is None:
@@ -189,7 +193,9 @@ class Scheduler:
                 rt = self.store.read_runtime(reg.job_id)
                 pid = rt.get("runner_pid")
                 if pid and not _pid_alive(int(pid)):
-                    cluster = str(rt.get("cluster") or f"lab-{reg.job_id}")
+                    from lab.backends.skypilot import cluster_name_for
+
+                    cluster = str(rt.get("cluster") or cluster_name_for(reg.job_id))
                     deadline_s = parse_duration(manifest.resources.timeout) or 3600.0
                     started = manifest.started_at or manifest.created_at
                     overdue = (self.now_fn() - started).total_seconds() > deadline_s + 300

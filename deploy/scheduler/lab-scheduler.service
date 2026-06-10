@@ -9,3 +9,4 @@ User=lab
 WorkingDirectory=/opt/laboratory
 EnvironmentFile=/etc/lab/scheduler.env
 ExecStart=/usr/local/bin/uv run lab scheduler tick --backend skypilot
+TimeoutStartSec=300
