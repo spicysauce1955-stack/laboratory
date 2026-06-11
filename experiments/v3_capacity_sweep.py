@@ -185,6 +185,9 @@ def _forward(s: torch.Tensor, w: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     return vmax, targ
 
 
+EXP_DECAY_K: float = 5.0  # 'exp' schedule: lr*exp(-K*t); at t=1 -> ~0.0067*lr (treated as "->0")
+
+
 def scheduled_lr(
     lr: float,
     ep: int,
@@ -194,24 +197,43 @@ def scheduled_lr(
     warmup: int = 0,
     step_size: int = 0,
     gamma: float = 0.1,
+    floor: float = 0.0,
+    n_cycles: int = 1,
+    exp_k: float = EXP_DECAY_K,
 ) -> float:
-    """Scheduled learning rate at epoch ``ep`` (V10: the tuned nuisance LR schedule).
+    """Scheduled learning rate at epoch ``ep`` (V10/V11: the tuned nuisance LR schedule).
 
     A linear **warmup** over the first ``warmup`` epochs (``lr*(ep+1)/warmup``) precedes the chosen
-    decay. After warmup:
+    decay. After warmup (``t`` is the fraction of the post-warmup budget elapsed):
     - ``"none"`` (constant): ``lr``.
-    - ``"cosine"``: half-cosine anneal to 0 over ``[warmup, epochs]``.
+    - ``"cosine"``: half-cosine anneal ``lr -> floor*lr`` over ``[warmup, epochs]`` (V11: ``floor``).
+      With ``n_cycles>1`` (V11 SGDR warm restarts) the cosine repeats over ``n_cycles`` equal cycles,
+      each resetting to the peak; restarts are exact only when ``span=epochs-warmup`` divides evenly
+      by ``n_cycles`` (otherwise the cycle boundary lands mid-step and the reset is approximate).
+    - ``"linear"`` (V11): linear anneal ``lr -> floor*lr``.
+    - ``"exp"`` (V11): ``lr * exp(-exp_k*t)`` (default ``exp_k=EXP_DECAY_K=5`` ends at ~``0.0067*lr``).
+      Smaller ``exp_k`` decays gently (longer high-LR exploration); larger settles faster. NOTE: ``exp``
+      does **not** apply ``floor`` -- its tail is set by ``exp_k`` alone.
     - ``"step"``: ``lr * gamma**floor(ep/step_size)`` (no decay if ``step_size<=0``).
+    Defaults ``floor=0.0`` / ``n_cycles=1`` make cosine/linear anneal to 0 in a single cycle, i.e.
+    they preserve the pre-V11 behaviour exactly.
 
     Extracted as a module function so the schedule is unit-testable in isolation
-    (``tests/test_v10_minibatch.py``); ``train_batch`` calls it once per epoch.
+    (``experiments/test_v10_minibatch.py``); ``train_batch`` calls it once per epoch.
     """
     if warmup and ep < warmup:
         return lr * (ep + 1) / warmup
+    span = max(1, epochs - warmup)
+    t = min(1.0, max(0.0, (ep - warmup) / span))
     if schedule == "cosine":
-        t = (ep - warmup) / max(1, epochs - warmup)
-        t = min(1.0, max(0.0, t))
-        return lr * 0.5 * (1.0 + math.cos(math.pi * t))
+        if n_cycles > 1:
+            tc = span / n_cycles                      # cycle length (epochs)
+            t = ((ep - warmup) % tc) / tc             # phase within the current SGDR cycle
+        return lr * (floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * t)))
+    if schedule == "linear":
+        return lr * (floor + (1.0 - floor) * (1.0 - t))
+    if schedule == "exp":
+        return lr * math.exp(-exp_k * t)
     if schedule == "step":
         if step_size <= 0:
             return lr
@@ -243,6 +265,9 @@ def train_batch(
     optimizer: str = "momentum",  # V9 batch mode: momentum | adam | rmsprop (findability probe)
     lr_schedule: str = "none",    # V9 batch mode: none | cosine (decay lr -> 0 over the budget)
     lr_warmup: int = 0,           # V9 batch mode: linear lr warmup over the first this-many epochs
+    lr_floor: float = 0.0,        # V11: anneal cosine/linear to lr_floor*lr instead of 0
+    lr_cycles: int = 1,           # V11: SGDR warm-restart cycle count for the cosine schedule
+    lr_exp_k: float = EXP_DECAY_K,  # V11: exp-schedule decay rate (smaller = gentler/more exploration)
     # --- V10 unified minibatch path (mode='minibatch'): tuned optimizer/schedule/batch HPs ---
     batch_size: int = 0,          # minibatch size b (1=online .. P=full); required for mode='minibatch'
     lr_step_size: int = 0,        # 'step' schedule: epochs between gamma-decays (tuned)
@@ -323,9 +348,10 @@ def train_batch(
     report_set = set(int(e) for e in report_epochs)  # V10: rung epochs (epochs-run = ep+1)
 
     def _lr_at(ep: int) -> float:
-        """Scheduled learning rate for this epoch (V10 ``scheduled_lr``: warmup + none/cosine/step)."""
+        """Scheduled learning rate for this epoch (V10/V11 scheduled_lr)."""
         return scheduled_lr(lr, ep, epochs=epochs, schedule=lr_schedule, warmup=lr_warmup,
-                            step_size=lr_step_size, gamma=lr_gamma)
+                            step_size=lr_step_size, gamma=lr_gamma,
+                            floor=lr_floor, n_cycles=lr_cycles, exp_k=lr_exp_k)
 
     if cap:
         err_buf = torch.full((sb, epochs), float("nan"), device=dev)
@@ -687,6 +713,16 @@ def _alpha_grid(ov: dict[str, str]) -> list[float]:
     return [round(a0 + i * step, 4) for i in range(n)]
 
 
+def _git_sha() -> str | None:
+    """Repo HEAD sha for provenance manifests (None when git is unavailable)."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parent,
+            stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return None
+
+
 def main() -> int:
     run_dir = Path(os.environ.get("LAB_RUN_DIR", "runs/local-dev"))
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1046,12 +1082,7 @@ def main() -> int:
     if capture:
         # Self-describing manifest for the raw store: provenance + the cell-file index, so the offline
         # pipeline (analysis/v9_*.py) can load and verify the dataset without any other state.
-        try:
-            git_sha = subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parent,
-                stderr=subprocess.DEVNULL).decode().strip()
-        except Exception:
-            git_sha = None
+        git_sha = _git_sha()
         cells = sorted(str(p.relative_to(run_dir)) for p in (run_dir / "cells").glob("*.npz")) \
             if (run_dir / "cells").exists() else []
         manifest = {
