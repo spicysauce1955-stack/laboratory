@@ -10,3 +10,7 @@ WorkingDirectory=/opt/laboratory
 EnvironmentFile=/etc/lab/scheduler.env
 ExecStart=/usr/local/bin/uv run lab scheduler tick --backend skypilot
 TimeoutStartSec=300
+# The tick spawns detached sky_runner supervisors that must OUTLIVE this
+# oneshot. Default KillMode=control-group SIGKILLs the whole cgroup the
+# moment the tick exits — silently murdering every supervisor it launched.
+KillMode=process
