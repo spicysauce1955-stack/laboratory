@@ -7,14 +7,14 @@ and tears the instance down (FR-C2). ``sky.launch(down=True, idle_minutes_to_aut
 cost-safety guarantee even if the supervisor dies (NFR-7).
 
 P0 limitations (tracked): artifacts are rsynced from the live instance before teardown — durable
-object storage (R2/S3) is a P1 item (research/15); a wall-clock timeout surfaces as ``failed``
-(the remote ``timeout`` kills the job) rather than ``timed_out``.
+object storage (R2/S3) is a P1 item (research/15).
 """
 
 from __future__ import annotations
 
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -84,19 +84,45 @@ def build_setup_script() -> str:
     )
 
 
+def _wall_clock_wrap(cmd: str, wall: int) -> list[str]:
+    """Lines that run ``cmd`` under GNU ``timeout`` so the wall-clock cap holds on the instance.
+
+    ``timeout`` is the *primary* enforcement (FR-I1, §6) and is deliberately self-contained: it is
+    a single coreutils binary that needs no working ``setsid --wait``, no hand-rolled
+    ``kill -$$`` process-group arithmetic, and no assumptions about the remote bash/util-linux
+    version — the previous in-shell timer relied on all three lining up on an unknown Vast image
+    and overran by hours in production (LAB-BUGS §1). Run in ``timeout``'s default (non-foreground)
+    mode it places the entrypoint in its OWN process group and signals the *whole* group on expiry,
+    so the ``uv``→``python``→worker tree dies together; ``--kill-after`` escalates TERM→KILL for a
+    child that ignores TERM (the ``b=1`` online loop). All of this runs on the box, independent of
+    the local supervisor — the exact failure mode (supervisor dies → nothing enforces the cap).
+
+    ``timeout`` exits ``124`` when it had to TERM the job and ``137`` (128+SIGKILL) when it escalated
+    to KILL; either is a cap hit, so we drop the sentinel for :func:`promote_timeout` to relabel the
+    run ``timed_out``. A clean finish keeps the entrypoint's own exit code.
+    """
+    grace = TIMEOUT_KILL_GRACE_S
+    sentinel = f"{REMOTE_RUN_DIR}/{TIMEOUT_SENTINEL}"
+    return [
+        f"timeout --kill-after={grace}s {wall}s bash -c {shlex.quote(cmd)}",
+        "rc=$?",
+        f'if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then touch "{sentinel}"; fi',
+        'exit "$rc"',
+    ]
+
+
 def build_run_script(manifest: JobManifest) -> str:
     """Activate the env, then run the entrypoint under an instance-side wall-clock cap (FR-I1, §6).
 
-    The cap must hold even if the local supervisor dies, so enforcement is entirely on the box:
+    The cap must hold even if the local supervisor dies (it runs in the agent's sandbox, which can
+    be suspended), so enforcement is entirely on the box, in two layers:
 
-    * the entrypoint runs under ``setsid --wait`` in its OWN session/process group; an in-session
-      timer ``kill``s ``-$$`` (the whole group) on timeout, so the orphaned ``uv``→``python``→
-      worker tree dies too → the host goes idle → SkyPilot's autostop tears it down with no
-      supervisor involved. The killer drops a sentinel so ``promote_timeout`` labels it
-      ``timed_out`` (not just ``failed``) regardless of the exit code.
-    * a detached ``poweroff`` watchdog at ``wall + SELF_DESTRUCT_MARGIN_S`` is a hard backstop:
-      if both the wrapper and autostop somehow fail, the instance powers itself off so GPU
-      billing can never run far past the cap.
+    * **Primary:** the entrypoint runs under GNU ``timeout`` — see :func:`_wall_clock_wrap` for the
+      group-kill/sentinel mechanics. When it fires the host goes idle and SkyPilot's autostop /
+      ``down=True`` tears it down with no supervisor involved.
+    * **Backstop:** a detached ``poweroff`` watchdog at ``wall + SELF_DESTRUCT_MARGIN_S``. This is
+      best-effort only — it is a no-op inside an unprivileged container — so it is defence in depth
+      behind ``timeout``, not the mechanism we rely on.
     """
     timeout = parse_duration(manifest.resources.timeout)
     lines = [
@@ -109,29 +135,14 @@ def build_run_script(manifest: JobManifest) -> str:
         return "\n".join(lines) + "\n"
 
     wall = int(timeout)
-    grace = TIMEOUT_KILL_GRACE_S
-    sentinel = f"{REMOTE_RUN_DIR}/{TIMEOUT_SENTINEL}"
-    cmd = manifest.run.entrypoint_command
-    # Inner script runs inside a fresh session (setsid). $$ there is the session/group leader,
-    # so `kill -<sig> -$$` signals the entire group. $! / $child expand in the inner shell too —
-    # they are inside the single-quoted bash -c body, untouched by the outer shell.
-    inner = (
-        f"{cmd} &\n"
-        "child=$!\n"
-        f'( sleep {wall}; touch "{sentinel}"; '
-        "kill -TERM -$$ 2>/dev/null; "
-        f"sleep {grace}; kill -KILL -$$ 2>/dev/null ) &\n"
-        'wait "$child"\n'
-    )
     lines += [
-        # Hard backstop: power the box off at wall+margin no matter what (§6 cost cap).
+        # Best-effort backstop (a no-op in unprivileged containers): power the box off at
+        # wall+margin so billing can't run far past the cap if teardown is wedged. Detached in its
+        # own session so `timeout`'s group-kill above never touches it (§6 cost cap).
         f"nohup setsid bash -c 'sleep {wall + SELF_DESTRUCT_MARGIN_S}; "
         "sudo poweroff -f || poweroff -f || sudo shutdown -h now || shutdown -h now' "
         ">/dev/null 2>&1 </dev/null &",
-        # Foreground, blocking, group-killable run of the entrypoint.
-        f"setsid --wait bash -c '{inner}'",
-        "rc=$?",
-        'exit "$rc"',
+        *_wall_clock_wrap(manifest.run.entrypoint_command, wall),
     ]
     return "\n".join(lines) + "\n"
 

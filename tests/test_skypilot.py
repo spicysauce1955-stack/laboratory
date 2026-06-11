@@ -1,3 +1,5 @@
+import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -49,23 +51,46 @@ def test_build_scripts_and_timeout():
 
     m = make_manifest("j1", "python experiments/example_capacity.py", timeout="30m")
     run = build_run_script(m)
-    # Entrypoint runs in its own session so the timer can group-kill the whole tree (§6).
-    assert "setsid --wait bash -c" in run
+    # The wall-clock cap is enforced on the instance by GNU `timeout` (§6, LAB-BUGS §1).
+    assert "timeout --kill-after" in run
     assert "python experiments/example_capacity.py" in run
     assert "source .venv/bin/activate" in run
     # No timeout scaffolding when there is no cap.
     bare = build_run_script(make_manifest("j2", "python x.py"))
-    assert "setsid --wait" not in bare and "poweroff" not in bare
+    assert "timeout --kill-after" not in bare and "poweroff" not in bare
     assert "python x.py" in bare
 
 
-def test_run_script_group_kill_and_sentinel():
+def test_run_script_timeout_and_sentinel():
     run = build_run_script(make_manifest("j", "python x.py", timeout="30m"))
-    assert "sleep 1800" in run  # 30m wall
-    assert "kill -TERM -$$" in run  # TERM the whole process group
-    assert "kill -KILL -$$" in run  # then KILL after the grace
-    assert f"sleep {skypilot_mod.TIMEOUT_KILL_GRACE_S}" in run
-    assert TIMEOUT_SENTINEL in run  # killer drops the sentinel for promote_timeout
+    grace = skypilot_mod.TIMEOUT_KILL_GRACE_S
+    # `timeout` enforces a 30m wall and escalates TERM->KILL after the grace.
+    assert f"timeout --kill-after={grace}s 1800s bash -c" in run
+    # 124 (TERM on timeout) / 137 (KILL after grace) both mean "capped" -> drop the sentinel
+    # so promote_timeout relabels failed -> timed_out.
+    assert '"$rc" = 124' in run and '"$rc" = 137' in run
+    assert TIMEOUT_SENTINEL in run
+
+
+def test_timeout_wrap_actually_kills_term_ignoring_tree(tmp_path, monkeypatch):
+    """Behavioural regression for LAB-BUGS §1: a wall-heavy child that *ignores* SIGTERM (the
+    tempotron b=1 online loop) must still be force-killed at the cap, not run for hours."""
+    monkeypatch.setattr(skypilot_mod, "REMOTE_RUN_DIR", str(tmp_path))
+    monkeypatch.setattr(skypilot_mod, "TIMEOUT_KILL_GRACE_S", 1)
+    # Child traps (ignores) TERM and would run 30s; records its PID so we can prove it died.
+    cmd = f'trap "" TERM; echo $$ > {tmp_path}/child.pid; sleep 30'
+    script = "\n".join(skypilot_mod._wall_clock_wrap(cmd, wall=2)) + "\n"
+
+    start = time.time()
+    rc = subprocess.run(["bash", "-c", script]).returncode
+    elapsed = time.time() - start
+
+    assert elapsed < 10, f"cap did not hold — ran {elapsed:.1f}s (the runaway bug)"
+    assert rc in (124, 137)  # timed out (TERM) / escalated (KILL)
+    assert (tmp_path / TIMEOUT_SENTINEL).exists()  # sentinel dropped -> promote_timeout
+    pid = int((tmp_path / "child.pid").read_text().strip())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)  # the TERM-ignoring tree was force-killed, not orphaned
 
 
 def test_run_script_self_destruct_watchdog():
