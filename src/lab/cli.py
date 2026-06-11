@@ -44,6 +44,24 @@ def _lab_for(job_id: str) -> Lab:
     return default_lab(home=home, backend=provisioner)
 
 
+def _lab_for_or_fail(job_id: str) -> Lab:
+    """`_lab_for`, but a job missing from the local store is a structured error (FR-F3) —
+    scheduler-launched jobs mirror only their manifest, so logs/metrics/fetch live on the
+    scheduler host; `lab status` is the command that reads the mirror."""
+    try:
+        return _lab_for(job_id)
+    except FileNotFoundError:
+        _emit(
+            {
+                "error": (
+                    f"unknown job id {job_id!r} — not in local runs/ "
+                    "(for scheduler-launched jobs only `lab status` reads the mirrored manifest)"
+                )
+            }
+        )
+        raise typer.Exit(code=2) from None
+
+
 def _emit(obj: Any) -> None:
     typer.echo(json.dumps(obj, indent=2, default=str))
 
@@ -177,7 +195,7 @@ def status(job_id: str) -> None:
 @app.command()
 def logs(job_id: str, tail: int = typer.Option(100)) -> None:
     """Tail a job's logs (FR-D1)."""
-    for line in _lab_for(job_id).logs(job_id, tail=tail):
+    for line in _lab_for_or_fail(job_id).logs(job_id, tail=tail):
         typer.echo(line)
 
 
@@ -188,20 +206,20 @@ def metrics(
     since_step: int | None = typer.Option(None, help="only points with step > since_step"),
 ) -> None:
     """Query a job's incremental metric series (FR-D2 — the early-kill loop)."""
-    _emit({"series": _lab_for(job_id).metrics(job_id, names=name or None, since_step=since_step)})
+    _emit({"series": _lab_for_or_fail(job_id).metrics(job_id, names=name or None, since_step=since_step)})
 
 
 @app.command()
 def fetch(job_id: str) -> None:
     """Collect artifacts into runs/<job_id>/; prints local paths (FR-E2)."""
-    arts = _lab_for(job_id).fetch_artifacts(job_id)
+    arts = _lab_for_or_fail(job_id).fetch_artifacts(job_id)
     _emit({"local_paths": [a.path for a in arts], "artifacts": [a.model_dump() for a in arts]})
 
 
 @app.command()
 def cancel(job_id: str) -> None:
     """Cancel a job and tear down its machine (FR-A3, FR-C2)."""
-    _emit({"job_id": job_id, "state": _lab_for(job_id).cancel(job_id).value})
+    _emit({"job_id": job_id, "state": _lab_for_or_fail(job_id).cancel(job_id).value})
 
 
 @app.command(name="list")

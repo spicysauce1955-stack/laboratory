@@ -457,3 +457,29 @@ def test_reconcile_sweep_every_n_ticks(tmp_path: Path):
     sched.tick()
     sched.tick()  # tick_count 6 -> sweep with apply=True
     assert calls[-1] is True
+
+
+def test_local_watchdog_fails_dead_runner(tmp_path: Path):
+    """A dead local runner must not leave the reg `launched` forever (slot starvation)."""
+    sched, q = _watchdog_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a", command="python x.py")
+    m = make_manifest("j-loc", "python x.py", timeout="1h").model_copy(
+        update={
+            "status": JobState.running,
+            "started_at": utc_now(),
+            "registration_id": "reg-a",
+        }
+    )  # make_manifest defaults to provisioner="local"
+    sched.store.create(m)
+    sched.store.write_runtime("j-loc", runner_pid=99999999, command_pgid=99999998)
+    q.put_entry(
+        q.get_entry("reg-a").model_copy(
+            update={"state": RegState.launched, "job_id": "j-loc", "launched_at": utc_now()}
+        )
+    )
+    rep = sched.tick()
+    final = sched.store.read_manifest("j-loc")
+    assert final.status is JobState.failed
+    assert "runner died" in (final.end_reason or "")
+    assert q.get_entry("reg-a").state is RegState.failed
+    assert rep.synced["reg-a"] == "failed"

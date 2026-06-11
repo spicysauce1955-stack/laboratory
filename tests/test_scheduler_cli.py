@@ -143,3 +143,13 @@ def test_budget_rejects_negative_and_clears(tmp_path: Path):
         app, ["queue", "budget", "--clear-budget", "--per-day", "3"], env=env
     )
     assert conflict.exit_code != 0
+
+
+def test_logs_metrics_fetch_cancel_unknown_job_fail_structured(tmp_path: Path):
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, repo)
+    for cmd in ("logs", "metrics", "fetch", "cancel"):
+        res = runner.invoke(app, [cmd, "20990101-000000-abcdef"], env=env)
+        assert res.exit_code == 2, (cmd, res.output)
+        assert "unknown job id" in res.output
+        assert "Traceback" not in res.output

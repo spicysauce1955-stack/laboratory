@@ -6,7 +6,9 @@ Every tick re-derives everything from the QueueStore; a crashed tick costs nothi
 
 from __future__ import annotations
 
+import os
 import platform
+import signal
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -23,8 +25,6 @@ from lab.store import JobStore
 
 
 def _pid_alive(pid: int) -> bool:
-    import os
-
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -186,6 +186,26 @@ class Scheduler:
             except FileNotFoundError:
                 rep.errors.append(f"{reg.reg_id}: manifest {reg.job_id} missing")
                 continue
+            if (
+                manifest.status not in self._TERMINAL_MAP
+                and manifest.backend.provisioner == "local"
+            ):
+                # Local watchdog: a dead runner means the job is gone (no remote machine to
+                # adopt) — without this, the entry stays `launched` forever and starves
+                # max_concurrent after a host crash/reboot.
+                rt = self.store.read_runtime(reg.job_id)
+                pid = rt.get("runner_pid")
+                if pid and not _pid_alive(int(pid)):
+                    pgid = rt.get("command_pgid")
+                    if pgid:  # orphaned experiment process: nothing enforces its timeout now
+                        try:
+                            os.killpg(int(pgid), signal.SIGTERM)
+                        except (ProcessLookupError, PermissionError):
+                            pass
+                    manifest = self.store.update_manifest(
+                        reg.job_id, status=JobState.failed, ended_at=self.now_fn(),
+                        end_reason="runner died; marked failed by scheduler watchdog",
+                    )
             if (
                 manifest.status not in self._TERMINAL_MAP
                 and manifest.backend.provisioner == "skypilot"
