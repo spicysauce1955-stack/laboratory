@@ -483,3 +483,20 @@ def test_local_watchdog_fails_dead_runner(tmp_path: Path):
     assert "runner died" in (final.end_reason or "")
     assert q.get_entry("reg-a").state is RegState.failed
     assert rep.synced["reg-a"] == "failed"
+
+
+def test_sync_remirrors_recently_terminal_manifests(tmp_path: Path):
+    """teardown_status lands after the terminal status write — the mirror must catch up."""
+    sched, q = _watchdog_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a")
+    sched.tick()
+    e = q.get_entry("reg-a")
+    backend = LocalBackend(home=tmp_path / "runs", repo=tmp_path)
+    wait_terminal(backend, e.job_id)
+    sched.tick()  # reg goes terminal; first mirror has no teardown_status yet
+    mirrored = q.read_mirrored(e.job_id)
+    assert mirrored is not None and mirrored.teardown_status is None
+    sched.store.update_manifest(e.job_id, teardown_status="succeeded")  # late supervisor write
+    sched.tick()
+    refreshed = q.read_mirrored(e.job_id)
+    assert refreshed is not None and refreshed.teardown_status == "succeeded"

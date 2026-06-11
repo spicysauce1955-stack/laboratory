@@ -176,15 +176,31 @@ class Scheduler:
         rep.skipped[reg.reg_id] = reason
 
     # ------------------------------------------------------------------ phases
+    RE_MIRROR_TERMINAL_S = 900.0  # late manifest fields (teardown_status) land post-terminal
+
     def _sync(self, entries: list[Registration], rep: TickReport) -> None:
         """Mirror launched jobs' state back onto registrations (Task 7)."""
         for reg in entries:
-            if reg.state is not RegState.launched or reg.job_id is None:
+            if reg.job_id is None:
+                continue
+            recently_terminal = (
+                reg.state in (RegState.succeeded, RegState.failed, RegState.cancelled)
+                and reg.state_changed_at is not None
+                and (self.now_fn() - reg.state_changed_at).total_seconds()
+                < self.RE_MIRROR_TERMINAL_S
+            )
+            if reg.state is not RegState.launched and not recently_terminal:
                 continue
             try:
                 manifest = self.store.read_manifest(reg.job_id)
             except FileNotFoundError:
-                rep.errors.append(f"{reg.reg_id}: manifest {reg.job_id} missing")
+                if reg.state is RegState.launched:
+                    rep.errors.append(f"{reg.reg_id}: manifest {reg.job_id} missing")
+                continue
+            if recently_terminal:
+                # The supervisor writes teardown_status/artifacts AFTER terminal status — keep
+                # the mirror fresh for a grace window so the laptop sees the complete record.
+                self.queue.mirror_manifest(manifest)
                 continue
             if (
                 manifest.status not in self._TERMINAL_MAP
