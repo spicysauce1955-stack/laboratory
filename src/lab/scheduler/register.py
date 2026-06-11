@@ -6,12 +6,14 @@ the scheduler can never see an entry whose code is missing.
 
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import uuid
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
 from lab._util import now, parse_duration
+from lab.core import LabError
 from lab.models import JobSpec, ResourceRequest
 from lab.scheduler.bundle import create_bundle
 from lab.scheduler.models import DailyWindow, Guardrails, Registration, Triggers
@@ -68,7 +70,12 @@ def register(
 ) -> Registration:
     reg_id = _new_reg_id()
     with tempfile.TemporaryDirectory() as td:
-        tar, code = create_bundle(Path(repo), Path(td))
+        try:
+            tar, code = create_bundle(Path(repo), Path(td))
+        except subprocess.CalledProcessError as e:  # fail-loud, not a traceback (FR-F3)
+            raise LabError(
+                f"cannot snapshot {repo}: not a git repository (or git failed: {e})"
+            ) from e
         bundle_key = queue.put_bundle(reg_id, tar)
     reg = Registration(
         reg_id=reg_id,

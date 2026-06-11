@@ -111,3 +111,35 @@ def test_register_bad_expires_is_usage_error(tmp_path: Path):
     )
     assert res.exit_code != 0
     assert "bad relative expiry" in res.output
+
+
+def test_register_outside_git_repo_fails_structured(tmp_path: Path):
+    nogit = tmp_path / "nogit"
+    nogit.mkdir()
+    res = runner.invoke(
+        app, ["register", "--command", "python x.py", "--expires", "+1d"],
+        env={"LAB_QUEUE_DIR": str(tmp_path / "queue"), "LAB_REPO_DIR": str(nogit)},
+    )
+    assert res.exit_code == 1
+    assert "not a git repository" in res.output
+    assert "Traceback" not in res.output
+    assert LocalQueueStore(tmp_path / "queue").list_entries() == []  # nothing half-written
+
+
+def test_budget_rejects_negative_and_clears(tmp_path: Path):
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, repo)
+    assert runner.invoke(app, ["queue", "budget", "--per-day", "-5"], env=env).exit_code != 0
+    assert (
+        runner.invoke(app, ["queue", "budget", "--max-concurrent", "0"], env=env).exit_code != 0
+    )
+    runner.invoke(app, ["queue", "budget", "--per-day", "5"], env=env)
+    q = LocalQueueStore(tmp_path / "queue")
+    assert q.read_control().budget_usd_per_day == 5.0
+    res = runner.invoke(app, ["queue", "budget", "--clear-budget"], env=env)
+    assert res.exit_code == 0
+    assert q.read_control().budget_usd_per_day is None
+    conflict = runner.invoke(
+        app, ["queue", "budget", "--clear-budget", "--per-day", "3"], env=env
+    )
+    assert conflict.exit_code != 0

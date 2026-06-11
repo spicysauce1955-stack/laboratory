@@ -383,7 +383,11 @@ def register(
         ),
         submitted_by="human",
     )
-    reg = sched_register(_repo(), queue, spec, triggers, guardrails)
+    try:
+        reg = sched_register(_repo(), queue, spec, triggers, guardrails)
+    except LabError as e:  # fail-loud, actionable (FR-F3)
+        _emit({"error": str(e)})
+        raise typer.Exit(code=1) from e
     if hold:
         queue.hold(reg.reg_id)
     _emit(
@@ -494,17 +498,26 @@ def queue_resume() -> None:
 @queue_app.command(name="budget")
 def queue_budget(
     per_day: float | None = typer.Option(
-        None, "--per-day", help="trailing-24h estimated-spend cap, USD"
+        None, "--per-day", min=0.0, help="trailing-24h estimated-spend cap, USD (>= 0)"
     ),
-    max_concurrent: int | None = typer.Option(None, "--max-concurrent"),
+    clear_budget: bool = typer.Option(
+        False, "--clear-budget", help="remove the daily cap (budget_usd_per_day -> null)"
+    ),
+    max_concurrent: int | None = typer.Option(
+        None, "--max-concurrent", min=1, help="max scheduler-launched jobs running at once (>= 1)"
+    ),
     auto_reconcile: bool | None = typer.Option(
         None, "--auto-reconcile/--no-auto-reconcile"
     ),
 ) -> None:
     """Edit control.json guardrails."""
+    if clear_budget and per_day is not None:
+        raise typer.BadParameter("--clear-budget conflicts with --per-day")
     queue = default_queue()
     control = queue.read_control()
     updates: dict[str, object] = {}
+    if clear_budget:
+        updates["budget_usd_per_day"] = None
     if per_day is not None:
         updates["budget_usd_per_day"] = per_day
     if max_concurrent is not None:
