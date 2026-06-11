@@ -30,3 +30,10 @@ def test_best_hourly_no_offers(monkeypatch):
 
     monkeypatch.setattr(price_mod, "_get_vast_client", lambda: FakeClient())
     assert VastPriceFeed().best_hourly("RTX_4090:1") is None
+
+
+def test_offer_query_translates_sky_catalog_names():
+    # sky's v8 vast catalog says RTX4090; Vast's API wants RTX_4090 — accept both spellings
+    assert "gpu_name=RTX_4090" in offer_query("RTX4090:1", None)
+    assert "gpu_name=RTX_4090" in offer_query("RTX_4090:1", None)
+    assert "gpu_name=A100" in offer_query("A100:1", None)  # non-RTX names pass through

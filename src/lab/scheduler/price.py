@@ -6,9 +6,19 @@ billed rate (see ``vast_hourly_for_cluster``); the cheapest matching offer gates
 
 from __future__ import annotations
 
+import re
 from typing import Any, Protocol
 
 _DEFAULTS = ["rentable=true", "rented=false", "reliability>0.95"]
+
+
+def _vast_gpu_name(name: str) -> str:
+    """Translate a SkyPilot catalog accelerator name to Vast's API ``gpu_name``.
+
+    sky's v8 vast catalog says ``RTX4090``; Vast's own API wants ``RTX_4090``. Accept either
+    spelling so a registration works with whatever the user typed.
+    """
+    return re.sub(r"^RTX_?(\d{4}\w*)$", r"RTX_\1", name)
 
 
 def _get_vast_client() -> Any:
@@ -30,7 +40,7 @@ def offer_query(accelerators: str | None, extra: str | None = None) -> str:
     parts = list(_DEFAULTS)
     if accelerators:
         name, _, count = accelerators.partition(":")
-        parts.append(f"gpu_name={name}")
+        parts.append(f"gpu_name={_vast_gpu_name(name)}")
         parts.append(f"num_gpus>={count or 1}")
     if extra:
         parts.append(extra)
