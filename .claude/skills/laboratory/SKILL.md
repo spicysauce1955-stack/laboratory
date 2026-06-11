@@ -1,9 +1,9 @@
 ---
 name: laboratory
-description: "Run/execute a reproducible ML or compute experiment via the lab runner (MCP tools / `lab` CLI) — in this repo this is the right way to actually launch a training/experiment job, not running the script directly. Use when the user wants the work done, not just discussed: run, launch, submit, or kick off an experiment file; sweep or grid over hyperparameters, seeds, alpha, K, learning rate, or batch size and report which config won; put a job on a remote GPU (e.g. an RTX 4090 on Vast.ai via SkyPilot), cap its cost or runtime, or fan out many parallel trials cheaply without babysitting; keep a long job alive past disconnect and notify with final metrics; stream live metrics and kill a diverging run early; fetch a finished job's results, artifacts, or plots; reproduce a prior run; or diagnose a billing/teardown leak ('am I still being charged?', a stuck Vast rental, `lab wait` exit code 3). Also covers tempotron-capacity experiments. Triggers: lab submit, lab sweep, lab wait. Skip for merely writing an experiment script, reading a saved result file, or plotting existing metrics."
+description: "Run/execute a reproducible ML or compute experiment via the lab runner (MCP tools / `lab` CLI) — in this repo this is the right way to actually launch a training/experiment job, not running the script directly. Use when the user wants the work done, not just discussed: run, submit, or kick off an experiment; sweep a grid over hyperparameters/seeds and report which config won; put a job on a remote GPU (RTX 4090 on Vast.ai via SkyPilot), cap its cost or runtime; REGISTER/schedule an experiment for later — run tonight/off-hours, run when a GPU price drops, run after another job, queue/hold/cancel deferred runs while the laptop is closed; stream live metrics and kill a diverging run early; fetch results/artifacts; reproduce a prior run; or diagnose a billing/teardown leak ('am I still being charged?', stuck Vast rental, `lab wait` exit 3). Triggers: lab submit, lab sweep, lab wait, lab register, lab queue, lab scheduler. Skip for merely writing an experiment script or reading saved results."
 metadata:
-  version: "0.2.0"
-  last_updated: "2026-06-02"
+  version: "0.3.0"
+  last_updated: "2026-06-11"
   status: active
 ---
 
@@ -195,6 +195,66 @@ mode (re-run with `--apply`), `2` on error.
 
 Live table of all jobs with state, cost, latest metric, and a **`teardown`**
 column that flags `LEAK` rows loudly. Ctrl-C to exit.
+
+## 5b. Deferred scheduling — `lab register` / `lab queue` / `lab scheduler`
+
+For "run this **tonight** / when a GPU is **cheap** / **after** that job — and let me close
+the laptop." A *registration* = a normal job spec + triggers + guardrails, written to an R2
+queue; an always-on droplet evaluates triggers every 60s and launches via skypilot. Spec:
+`docs/superpowers/specs/2026-06-10-deferred-scheduling-design.md`; host runbook:
+`deploy/scheduler/README.md`.
+
+**Prereq:** export `LAB_R2_ENDPOINT` (+ `LAB_R2_BUCKET=lab-artifacts`) — register/queue talk
+to R2, not the local store. The scheduler host is a playground-repo lab:
+`playground apply lab-scheduler` (re)creates it; `playground suspend lab-scheduler` destroys
+it when idle (~$6/mo while up; stateless — all state in R2, recreate-safe).
+
+**The canonical "run tonight" command:**
+
+```bash
+uv run lab register -c "uv run experiments/v3_capacity_sweep.py" \
+    --gpu RTX4090:1 --timeout 2h \
+    --window 23:00-07:00 --tz Europe/Berlin \
+    --max-hourly 1.50 --max-cost 3 --expires +2d
+# -> {reg_id, worst_case_cost_usd}; then just close the laptop.
+```
+
+| Trigger / guardrail | Flag | Notes |
+|---|---|---|
+| daily window | `--window HH:MM-HH:MM --tz <IANA>` | gates *start* only; may cross midnight |
+| absolute earliest | `--not-before <ISO>` | |
+| price gate | `--max-hourly <$/h>` (+ `--offer-query`) | see headroom gotcha below |
+| dependency | `--after <reg_id>` (repeatable) | dead/typo'd dep ⇒ auto-cancel, so get the id right |
+| run-by deadline | `--expires +2d` / ISO | **required**; entry expires, never fires late |
+| per-job cap | `--max-cost <$>` | vs best-offer×timeout |
+| no triggers | (none) | = launch ASAP under droplet supervision |
+
+**Manage:** `lab queue list` (states, skip reasons, `heartbeat_age_s` — >120s means the
+scheduler is down) · `queue show <reg_id>` · `queue cancel|hold|release <reg_id>` ·
+`queue pause|resume` · `queue budget --per-day 5 --max-concurrent 4 [--clear-budget]`.
+MCP mirrors: `register`, `queue_list/show/cancel/pause`.
+
+**Next morning:** `lab queue list` → `lab status <job_id>` (works from the laptop via the
+R2-mirrored manifest, incl. cost) → `lab fetch <job_id>` (artifacts come from R2) →
+`lab reconcile` if anything looks off.
+
+**Live-learned gotchas (these cost real money to discover):**
+
+- **GPU names: use the sky-catalog form `RTX4090:1`** (no underscore). Vast's own API says
+  `RTX_4090` — the price feed translates automatically, but sky's launcher does NOT: an
+  underscored name fails with "Catalog does not contain any instances".
+- **Set `--max-hourly` ~2× the cheapest live offer.** Sky picks hosts by its *stale catalog*
+  price; the actual Vast rental often bills 2–6× the cheapest offer. Too-tight caps trigger
+  the post-launch price-verify **rollback loop** (rent → detect over-price → teardown →
+  retry), each cycle costing cents until `--expires`. The real cost bound is
+  `--timeout` × actual hourly, capped by `--max-cost`.
+- **`lab logs` / `lab metrics` do NOT work from the laptop for scheduler-launched jobs**
+  (only the manifest is mirrored to R2; they exit 2 with a structured error). Use
+  `lab status` + `lab fetch` from the laptop; for live logs,
+  `ssh ubuntu@<droplet-ip> sudo tail /opt/laboratory/runs/<job_id>/logs.txt`.
+- **Cancel applies on the next tick** (≤60s), including killing an already-launched job.
+- **Mirror lag:** `teardown_status` may read `null` from the laptop for a tick or two after
+  success; the droplet manifest is authoritative, `lab reconcile` is ground truth.
 
 ## 6. Canonical workflows
 
