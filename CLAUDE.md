@@ -21,6 +21,9 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   (sky.down retries → vastai-sdk fallback). A persistent failure flips `teardown_status="failed"`
   on the manifest and makes `lab wait` exit 3. **Recovery: `uv run lab reconcile [--apply]`**
   finds orphaned `lab-*` Vast rentals not tied to a running job and destroys them.
+- **Deferred scheduling:** `lab register` + `lab queue …` queue jobs (night window / price /
+  dependency triggers); an always-on host runs `lab scheduler tick` every 60s (systemd timer,
+  `deploy/scheduler/`). Spec: `docs/superpowers/specs/2026-06-10-deferred-scheduling-design.md`.
 
 ## Conventions
 - `ruff` (line length 100), `mypy --strict` on `src/lab`. CLI and MCP server are thin shells over

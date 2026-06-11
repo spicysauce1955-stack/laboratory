@@ -12,6 +12,7 @@ manifest), mirroring the CLI. ``build_server(lab)`` lets tests inject a Lab at a
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -167,6 +168,127 @@ def build_server(lab: Lab) -> FastMCP:
                 for j in _lab().list_jobs()
             ]
         }
+
+    from lab.scheduler.models import Guardrails, RegState, Triggers
+    from lab.scheduler.queue import default_queue
+    from lab.scheduler.register import parse_expires, parse_window
+    from lab.scheduler.register import register as sched_register
+    from lab.scheduler.register import worst_case_cost
+
+    @mcp.tool
+    def register(
+        command: str,
+        expires: str,
+        seed: int | None = None,
+        cpus: int | None = None,
+        memory: str | None = None,
+        accelerators: str | None = None,
+        timeout: str | None = None,
+        window: str | None = None,
+        tz: str = "UTC",
+        not_before: str | None = None,
+        max_hourly: float | None = None,
+        offer_query: str | None = None,
+        max_cost: float | None = None,
+        after: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Register a deferred job: launched by the scheduler when all triggers hold (time window HH:MM-HH:MM, Vast price <= max_hourly $/h, after=reg_ids succeeded). expires (+3d / ISO) is the required run-by guardrail; worst-case cost = max_hourly x timeout."""
+        from datetime import datetime
+
+        if accelerators and timeout is None:
+            raise ToolError("timeout is required for GPU registrations (it is the cost bound)")
+        try:
+            expires_at = parse_expires(expires)
+            win = parse_window(window, tz) if window else None
+            not_before_dt = (
+                datetime.fromisoformat(not_before.replace("Z", "+00:00")) if not_before else None
+            )
+        except ValueError as e:
+            raise ToolError(str(e)) from e
+        triggers = Triggers(
+            not_before=not_before_dt,
+            window=win,
+            max_hourly_usd=max_hourly,
+            offer_query=offer_query,
+            after=list(after or []),
+        )
+        spec = JobSpec(
+            command=command,
+            seed=seed,
+            resources=ResourceRequest(
+                cpus=cpus, memory=memory, accelerators=accelerators, timeout=timeout
+            ),
+            submitted_by="agent",
+        )
+        try:
+            reg = sched_register(
+                lab.repo, default_queue(), spec, triggers,
+                Guardrails(expires_at=expires_at, max_cost_usd=max_cost),
+            )
+        except Exception as e:  # noqa: BLE001
+            raise ToolError(str(e)) from e
+        return {
+            "reg_id": reg.reg_id,
+            "state": reg.state.value,
+            "expires_at": _iso(reg.guardrails.expires_at),
+            "worst_case_cost_usd": worst_case_cost(triggers, spec.resources),
+        }
+
+    @mcp.tool
+    def queue_list() -> dict[str, Any]:
+        """List deferred registrations: state, job_id, last skip reason, scheduler heartbeat age."""
+        queue = default_queue()
+        hb = queue.read_heartbeat()
+        age = None
+        if hb and "at" in hb:
+            from lab._util import now
+
+            age = max(0.0, (now() - datetime.fromisoformat(str(hb["at"]))).total_seconds())
+        return {
+            "heartbeat_age_s": age,
+            "control": queue.read_control().model_dump(),
+            "entries": [
+                {
+                    "reg_id": r.reg_id,
+                    "state": "held" if (r.state is RegState.pending and queue.held(r.reg_id))
+                    else r.state.value,
+                    "job_id": r.job_id,
+                    "last_skip_reason": r.last_skip_reason,
+                    "expires_at": _iso(r.guardrails.expires_at),
+                }
+                for r in queue.list_entries()
+            ],
+        }
+
+    @mcp.tool
+    def queue_show(reg_id: str) -> dict[str, Any]:
+        """Full registration record (triggers, guardrails, provenance, state history fields)."""
+        import json as _json
+
+        try:
+            reg = default_queue().get_entry(reg_id)
+        except FileNotFoundError as e:
+            raise ToolError(f"registration '{reg_id}' not found") from e
+        loaded: dict[str, Any] = _json.loads(reg.model_dump_json())
+        return loaded
+
+    @mcp.tool
+    def queue_cancel(reg_id: str) -> dict[str, Any]:
+        """Request cancellation; the scheduler applies it on its next tick (also cancels a launched job)."""
+        queue = default_queue()
+        try:
+            queue.get_entry(reg_id)
+        except FileNotFoundError as e:
+            raise ToolError(f"registration '{reg_id}' not found") from e
+        queue.request_cancel(reg_id)
+        return {"reg_id": reg_id, "cancel_requested": True}
+
+    @mcp.tool
+    def queue_pause(paused: bool = True) -> dict[str, Any]:
+        """Pause/resume all scheduler launches (global switch; heartbeat keeps beating)."""
+        queue = default_queue()
+        queue.write_control(queue.read_control().model_copy(update={"paused": paused}))
+        return {"paused": paused}
 
     return mcp
 

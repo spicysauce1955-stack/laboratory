@@ -102,6 +102,7 @@ class JobManifest(BaseModel):
 
     job_id: str
     sweep_id: str | None = None
+    registration_id: str | None = None  # set when launched by the scheduler (spec §4.5 repair)
     created_at: datetime
     submitted_by: Submitter
     code: CodeRef

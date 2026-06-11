@@ -1,0 +1,12 @@
+[Unit]
+Description=Laboratory deferred-scheduler tick (one idempotent pass)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=lab
+WorkingDirectory=/opt/laboratory
+EnvironmentFile=/etc/lab/scheduler.env
+ExecStart=/usr/local/bin/uv run lab scheduler tick --backend skypilot
+TimeoutStartSec=300

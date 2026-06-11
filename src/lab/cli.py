@@ -6,15 +6,23 @@ Wired to the local backend by default; structured JSON output mirrors the MCP §
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import typer
 
-from lab._util import wrap_with_extras
+from lab._util import now, wrap_with_extras
 from lab.core import Lab, LabError, default_lab
 from lab.manifest import repo_root
 from lab.models import JobSpec, JobState, ResourceRequest
+from lab.scheduler.models import Guardrails, RegState, Triggers
+from lab.scheduler.price import PriceFeed
+from lab.scheduler.queue import QueueStore, default_queue
+from lab.scheduler.register import parse_expires, parse_window
+from lab.scheduler.register import register as sched_register
+from lab.scheduler.register import worst_case_cost
+from lab.scheduler.tick import Scheduler
 from lab.store import JobStore
 
 _TERMINAL = {JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out}
@@ -133,7 +141,25 @@ def sweep(
 @app.command()
 def status(job_id: str) -> None:
     """Show a job's state + cost + teardown_status (FR-A2, FR-I2, FR-C2)."""
-    lab = _lab_for(job_id)
+    try:
+        lab = _lab_for(job_id)
+    except FileNotFoundError:
+        mirrored = default_queue().read_mirrored(job_id)  # scheduler-launched job (spec §4.3)
+        if mirrored is None:
+            _emit({"error": f"unknown job id {job_id!r}"})
+            raise typer.Exit(code=2) from None
+        _emit(
+            {
+                "job_id": job_id,
+                "state": mirrored.status.value,
+                "exit_code": mirrored.exit_code,
+                "cost": mirrored.cost.model_dump() if mirrored.cost else None,
+                "teardown_status": mirrored.teardown_status,
+                "end_reason": mirrored.end_reason,
+                "mirrored": True,  # may be up to one tick stale
+            }
+        )
+        return
     state = lab.status(job_id)
     m = lab.manifest(job_id)
     _emit(
@@ -281,6 +307,235 @@ def reconcile(
     _emit(report)
     if report["orphans"] and not apply:
         raise typer.Exit(code=3)  # action required: re-run with --apply
+
+
+def _repo() -> Path:
+    import os
+
+    env = os.environ.get("LAB_REPO_DIR")
+    return Path(env) if env else repo_root()
+
+
+@app.command()
+def register(
+    command: str = typer.Option(
+        ..., "--command", "-c", help="entrypoint, e.g. 'uv run experiments/x.py'"
+    ),
+    expires: str = typer.Option(
+        ...,
+        "--expires",
+        help="run-by deadline: +3d / +12h / ISO timestamp (required guardrail)",
+    ),
+    seed: int | None = typer.Option(None),
+    cpus: int | None = typer.Option(None),
+    memory: str | None = typer.Option(None),
+    gpus: int | None = typer.Option(None),
+    accelerators: str | None = typer.Option(
+        None, "--gpu", "--accelerators", help="e.g. RTX_4090:1"
+    ),
+    timeout: str | None = typer.Option(
+        None, help="wall-clock limit per job, e.g. 2h (cost bound, FR-I1)"
+    ),
+    window: str | None = typer.Option(
+        None, "--window", help="daily launch window, e.g. 23:00-07:00"
+    ),
+    tz: str = typer.Option("UTC", "--tz", help="IANA timezone for --window"),
+    not_before: str | None = typer.Option(
+        None, "--not-before", help="absolute earliest start (ISO)"
+    ),
+    max_hourly: float | None = typer.Option(
+        None, "--max-hourly", help="launch only if a matching Vast offer is at/below this $/h"
+    ),
+    offer_query: str | None = typer.Option(
+        None, "--offer-query", help="extra vastai search filter"
+    ),
+    max_cost: float | None = typer.Option(None, "--max-cost", help="per-job worst-case $ cap"),
+    after: list[str] = typer.Option(
+        None, "--after", help="reg_id(s) that must succeed first (repeatable)"
+    ),
+    hold: bool = typer.Option(False, "--hold", help="register held; release with `lab queue release`"),
+) -> None:
+    """Register a deferred job; the scheduler launches it when all triggers hold (spec §6)."""
+    if accelerators and timeout is None:
+        _emit({"error": "--timeout is required for GPU registrations (it is the cost bound)"})
+        raise typer.Exit(code=1)
+    queue = default_queue()
+    try:
+        expires_at = parse_expires(expires)
+        win = parse_window(window, tz) if window else None
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+    triggers = Triggers(
+        not_before=(
+            datetime.fromisoformat(not_before.replace("Z", "+00:00")) if not_before else None
+        ),
+        window=win,
+        max_hourly_usd=max_hourly,
+        offer_query=offer_query,
+        after=list(after or []),
+    )
+    guardrails = Guardrails(expires_at=expires_at, max_cost_usd=max_cost)
+    spec = JobSpec(
+        command=command,
+        seed=seed,
+        resources=ResourceRequest(
+            cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout
+        ),
+        submitted_by="human",
+    )
+    reg = sched_register(_repo(), queue, spec, triggers, guardrails)
+    if hold:
+        queue.hold(reg.reg_id)
+    _emit(
+        {
+            "reg_id": reg.reg_id,
+            "state": "held" if hold else reg.state.value,
+            "bundle_key": reg.bundle_key,
+            "expires_at": reg.guardrails.expires_at,
+            "worst_case_cost_usd": worst_case_cost(triggers, spec.resources),
+        }
+    )
+
+
+queue_app = typer.Typer(help="Manage deferred registrations (spec §6).", no_args_is_help=True)
+app.add_typer(queue_app, name="queue")
+
+
+def _heartbeat_age_s(queue: QueueStore) -> float | None:
+    hb = queue.read_heartbeat()
+    if not hb or "at" not in hb:
+        return None
+    at = datetime.fromisoformat(str(hb["at"]))
+    return max(0.0, (now() - at).total_seconds())
+
+
+def _require_entry(queue: QueueStore, reg_id: str) -> None:
+    try:
+        queue.get_entry(reg_id)
+    except FileNotFoundError:
+        _emit({"error": f"unknown registration {reg_id!r}"})
+        raise typer.Exit(code=2) from None
+
+
+@queue_app.command(name="list")
+def queue_list() -> None:
+    """Entries + state + skip reason, plus scheduler heartbeat age (spec §6)."""
+    queue = default_queue()
+    entries = queue.list_entries()
+    _emit(
+        {
+            "heartbeat_age_s": _heartbeat_age_s(queue),
+            "control": queue.read_control().model_dump(),
+            "entries": [
+                {
+                    "reg_id": r.reg_id,
+                    "state": "held"
+                    if (r.state is RegState.pending and queue.held(r.reg_id))
+                    else r.state.value,
+                    "cancel_requested": queue.cancel_requested(r.reg_id),
+                    "job_id": r.job_id,
+                    "last_skip_reason": r.last_skip_reason,
+                    "expires_at": r.guardrails.expires_at,
+                }
+                for r in entries
+            ],
+        }
+    )
+
+
+@queue_app.command(name="show")
+def queue_show(reg_id: str) -> None:
+    """Full registration record."""
+    queue = default_queue()
+    _require_entry(queue, reg_id)
+    _emit(json.loads(queue.get_entry(reg_id).model_dump_json()))
+
+
+@queue_app.command(name="cancel")
+def queue_cancel(reg_id: str) -> None:
+    """Write the cancel marker; the scheduler applies it on its next tick (spec §5)."""
+    queue = default_queue()
+    _require_entry(queue, reg_id)
+    queue.request_cancel(reg_id)
+    _emit({"reg_id": reg_id, "cancel_requested": True})
+
+
+@queue_app.command(name="hold")
+def queue_hold(reg_id: str) -> None:
+    """Hold a pending entry (skipped until released)."""
+    queue = default_queue()
+    _require_entry(queue, reg_id)
+    queue.hold(reg_id)
+    _emit({"reg_id": reg_id, "held": True})
+
+
+@queue_app.command(name="release")
+def queue_release(reg_id: str) -> None:
+    """Release a held entry."""
+    default_queue().release(reg_id)
+    _emit({"reg_id": reg_id, "held": False})
+
+
+@queue_app.command(name="pause")
+def queue_pause() -> None:
+    """Globally stop the scheduler from launching (heartbeat keeps beating)."""
+    queue = default_queue()
+    queue.write_control(queue.read_control().model_copy(update={"paused": True}))
+    _emit({"paused": True})
+
+
+@queue_app.command(name="resume")
+def queue_resume() -> None:
+    queue = default_queue()
+    queue.write_control(queue.read_control().model_copy(update={"paused": False}))
+    _emit({"paused": False})
+
+
+@queue_app.command(name="budget")
+def queue_budget(
+    per_day: float | None = typer.Option(
+        None, "--per-day", help="trailing-24h estimated-spend cap, USD"
+    ),
+    max_concurrent: int | None = typer.Option(None, "--max-concurrent"),
+    auto_reconcile: bool | None = typer.Option(
+        None, "--auto-reconcile/--no-auto-reconcile"
+    ),
+) -> None:
+    """Edit control.json guardrails."""
+    queue = default_queue()
+    control = queue.read_control()
+    updates: dict[str, object] = {}
+    if per_day is not None:
+        updates["budget_usd_per_day"] = per_day
+    if max_concurrent is not None:
+        updates["max_concurrent"] = max_concurrent
+    if auto_reconcile is not None:
+        updates["auto_reconcile"] = auto_reconcile
+    control = control.model_copy(update=updates)
+    queue.write_control(control)
+    _emit(control.model_dump())
+
+
+scheduler_app = typer.Typer(help="Scheduler host commands (spec §4).", no_args_is_help=True)
+app.add_typer(scheduler_app, name="scheduler")
+
+
+@scheduler_app.command(name="tick")
+def scheduler_tick(
+    backend: str = typer.Option(
+        "local", "--backend", help="local | skypilot (droplet uses skypilot)"
+    ),
+) -> None:
+    """One idempotent scheduling pass — what the systemd timer runs every ~60s."""
+    price_feed: PriceFeed | None = None
+    if backend == "skypilot":
+        from lab.scheduler.price import VastPriceFeed
+
+        price_feed = VastPriceFeed()
+    sched = Scheduler(
+        default_queue(), home=_repo() / "runs", backend=backend, price_feed=price_feed
+    )
+    _emit(json.loads(sched.tick().model_dump_json()))
 
 
 if __name__ == "__main__":

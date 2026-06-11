@@ -137,7 +137,7 @@ def provision_failure_reason(generic: str) -> str:
     return generic
 
 
-def run_job(job_dir: Path) -> int:
+def run_job(job_dir: Path, adopt: bool = False) -> int:
     job_dir = Path(job_dir)
     store = JobStore(job_dir.parent)
     job_id = job_dir.name
@@ -145,39 +145,62 @@ def run_job(job_dir: Path) -> int:
     manifest = store.read_manifest(job_id)
     cluster = cluster_name_for(job_id)
 
-    started = now()
-    store.update_manifest(job_id, status=JobState.running, started_at=started)
+    if not adopt:
+        started = now()
+        store.update_manifest(job_id, status=JobState.running, started_at=started)
+    else:
+        started = manifest.started_at or now()
+        print(f"[lab] adopting running cluster {cluster} (supervisor restart)")
 
     import sky
 
+    # provision_s is only set in the non-adopt branch (ProvisionTimeout can only be raised
+    # from sky.launch / provision_with_watchdog, which are also non-adopt only).  Initialise
+    # to 0.0 so the except-ProvisionTimeout error message below is always bound.
+    provision_s: float = 0.0
+
     try:
-        task = build_task(manifest, workdir=Path.cwd())
-        request_id = sky.launch(
-            task,
-            cluster_name=cluster,
-            down=True,
-            idle_minutes_to_autostop=DEFAULT_AUTOSTOP_MIN,
-        )
-        # stream_and_get blocks until the job is submitted (0.12), i.e. until the host is UP. Bound
-        # it so a dead Vast offer stuck in "loading" can't hang the supervisor forever (FR-I1).
-        provision_s = (
-            parse_duration(manifest.resources.provision_timeout)
-            or DEFAULT_PROVISION_TIMEOUT_MIN * 60
-        )
-        sky_job_id, handle = provision_with_watchdog(sky, request_id, timeout_s=provision_s)
-        # Record cost up-front so a running job already shows it (FR-I2). The host is UP now, so
-        # the Vast rental exists — bill at its real dph_total, not SkyPilot's low catalog estimate.
-        hourly_usd = _resolve_hourly(cluster, handle)
-        estimated_usd = actual_cost(hourly_usd, parse_duration(manifest.resources.timeout))
-        store.update_manifest(
-            job_id, cost=CostInfo(hourly_usd=hourly_usd, estimated_usd=estimated_usd)
-        )
+        if not adopt:
+            task = build_task(manifest, workdir=Path.cwd())
+            request_id = sky.launch(
+                task,
+                cluster_name=cluster,
+                down=True,
+                idle_minutes_to_autostop=DEFAULT_AUTOSTOP_MIN,
+            )
+            # stream_and_get blocks until the job is submitted (0.12), i.e. until the host is UP.
+            # Bound it so a dead Vast offer stuck in "loading" can't hang the supervisor forever
+            # (FR-I1).
+            provision_s = (
+                parse_duration(manifest.resources.provision_timeout)
+                or DEFAULT_PROVISION_TIMEOUT_MIN * 60
+            )
+            sky_job_id, handle = provision_with_watchdog(sky, request_id, timeout_s=provision_s)
+            # Record cost up-front so a running job already shows it (FR-I2). The host is UP now,
+            # so the Vast rental exists — bill at its real dph_total, not SkyPilot's low catalog
+            # estimate.
+            hourly_usd = _resolve_hourly(cluster, handle)
+            estimated_usd = actual_cost(hourly_usd, parse_duration(manifest.resources.timeout))
+            store.update_manifest(
+                job_id, cost=CostInfo(hourly_usd=hourly_usd, estimated_usd=estimated_usd)
+            )
+        else:
+            hourly_usd = _resolve_hourly(cluster, None)
+            estimated_usd = manifest.cost.estimated_usd if manifest.cost else None
+            sky_job_id = None  # match any job in the cluster queue
+
         # Wait for the run to actually finish before fetching artifacts / tearing down.
         try:
             sky.tail_logs(cluster, sky_job_id, follow=True)  # streams run logs; blocks till done
         except Exception as e:  # noqa: BLE001
             print(f"[lab] tail_logs issue: {e}")
-        max_wait = (parse_duration(manifest.resources.timeout) or 3600) + 300
+
+        if not adopt:
+            max_wait = (parse_duration(manifest.resources.timeout) or 3600) + 300
+        else:
+            total = (parse_duration(manifest.resources.timeout) or 3600) + 300
+            elapsed = duration_seconds(started, now()) or 0.0
+            max_wait = max(60.0, total - elapsed)
 
         def _heartbeat() -> None:
             # Best-effort: pull partial results so a late/failed teardown can't lose them (§6c).
@@ -256,6 +279,14 @@ def run_job(job_dir: Path) -> int:
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    raise SystemExit(run_job(Path(sys.argv[1])))
+    ap = argparse.ArgumentParser()
+    ap.add_argument("job_dir", type=Path)
+    ap.add_argument(
+        "--adopt",
+        action="store_true",
+        help="re-attach to an already-launched cluster (scheduler watchdog)",
+    )
+    ns = ap.parse_args()
+    raise SystemExit(run_job(ns.job_dir, adopt=ns.adopt))

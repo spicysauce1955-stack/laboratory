@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the lab scheduler tick every 60s (spec §4)
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target
