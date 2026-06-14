@@ -15,7 +15,7 @@ from typing import Any
 
 from lab._util import now, parse_duration
 from lab.core import LabError, build_sweep_point_spec, check_sweep_admission, expand_grid
-from lab.models import JobSpec, ResourceRequest
+from lab.models import CodeRef, JobSpec, ResourceRequest
 from lab.scheduler.bundle import create_bundle
 from lab.scheduler.models import DailyWindow, Guardrails, Registration, Triggers
 from lab.scheduler.queue import QueueStore
@@ -66,6 +66,18 @@ def parse_window(value: str, tz: str) -> DailyWindow:
         raise ValueError(f"window expects HH:MM-HH:MM (got {value!r})") from e
 
 
+def _snapshot_bundle(repo: Path, td: Path, key: str, queue: QueueStore) -> tuple[str, CodeRef]:
+    """Snapshot ``repo`` into the queue under ``key`` (bundle-before-entry, FR-F3 fail-loud)."""
+    try:
+        tar, code = create_bundle(Path(repo), Path(td))
+    except subprocess.CalledProcessError as e:  # fail-loud, not a traceback (FR-F3)
+        raise LabError(
+            f"cannot snapshot {repo}: not a git repository (or git failed: {e})"
+        ) from e
+    bundle_key = queue.put_bundle(key, tar)
+    return bundle_key, code
+
+
 def register(
     repo: Path,
     queue: QueueStore,
@@ -75,13 +87,7 @@ def register(
 ) -> Registration:
     reg_id = _new_reg_id()
     with tempfile.TemporaryDirectory() as td:
-        try:
-            tar, code = create_bundle(Path(repo), Path(td))
-        except subprocess.CalledProcessError as e:  # fail-loud, not a traceback (FR-F3)
-            raise LabError(
-                f"cannot snapshot {repo}: not a git repository (or git failed: {e})"
-            ) from e
-        bundle_key = queue.put_bundle(reg_id, tar)
+        bundle_key, code = _snapshot_bundle(repo, Path(td), reg_id, queue)
     reg = Registration(
         reg_id=reg_id,
         created_at=now(),
@@ -138,14 +144,8 @@ def register_sweep(
     resolved_ceiling = sweep_max_cost if sweep_max_cost is not None else worst
 
     sweep_id = _new_sweep_id()
-    with tempfile.TemporaryDirectory() as td:
-        try:
-            tar, code = create_bundle(Path(repo), Path(td))
-        except subprocess.CalledProcessError as e:  # fail-loud, not a traceback (FR-F3)
-            raise LabError(
-                f"cannot snapshot {repo}: not a git repository (or git failed: {e})"
-            ) from e
-        bundle_key = queue.put_bundle(sweep_id, tar)  # bundle first (integrity ordering)
+    with tempfile.TemporaryDirectory() as td:  # bundle first (integrity ordering)
+        bundle_key, code = _snapshot_bundle(repo, Path(td), sweep_id, queue)
 
     regs: list[Registration] = []
     for point in points:
