@@ -58,8 +58,10 @@ def build_server(lab: Lab) -> FastMCP:
         timeout: str | None = None,
         provision_timeout: str | None = None,
         with_pkg: list[str] | None = None,
+        use_spot: bool = False,
+        spot_fallback: bool = True,
     ) -> dict[str, Any]:
-        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP."""
+        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only."""
         the_lab = _lab(backend)
         spec = JobSpec(
             code_ref=code_ref,
@@ -67,7 +69,7 @@ def build_server(lab: Lab) -> FastMCP:
             seed=seed,
             resources=ResourceRequest(
                 cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
-                provision_timeout=provision_timeout,
+                provision_timeout=provision_timeout, use_spot=use_spot, spot_fallback=spot_fallback,
             ),
             submitted_by="agent",
         )
@@ -92,8 +94,10 @@ def build_server(lab: Lab) -> FastMCP:
         timeout: str | None = None,
         provision_timeout: str | None = None,
         with_pkg: list[str] | None = None,
+        use_spot: bool = False,
+        spot_fallback: bool = True,
     ) -> dict[str, Any]:
-        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5). with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP."""
+        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5). with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only."""
         the_lab = _lab(backend)
         try:
             sweep_id, job_ids = the_lab.sweep(
@@ -102,7 +106,8 @@ def build_server(lab: Lab) -> FastMCP:
                 seed=seed,
                 resources=ResourceRequest(
                     cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
-                    provision_timeout=provision_timeout,
+                    provision_timeout=provision_timeout, use_spot=use_spot,
+                    spot_fallback=spot_fallback,
                 ),
             )
         except LabError as e:
