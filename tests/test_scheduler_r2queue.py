@@ -98,7 +98,7 @@ def test_bundle_and_manifest_mirror(tmp_path: Path):
     src.write_bytes(b"bytes")
     key = q.put_bundle("reg-a", src)
     assert key == "queue/bundles/reg-a.tar.gz"
-    assert q.fetch_bundle("reg-a", tmp_path / "dl").read_bytes() == b"bytes"
+    assert q.fetch_bundle(key, tmp_path / "dl").read_bytes() == b"bytes"
     q.mirror_manifest(make_manifest("j1", "python x.py"))
     got = q.read_mirrored("j1")
     assert got is not None and got.job_id == "j1"

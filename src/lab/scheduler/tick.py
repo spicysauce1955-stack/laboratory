@@ -493,7 +493,7 @@ class Scheduler:
             return
         try:
             bundle_dir = self.home / "_bundles" / reg.reg_id
-            tar = self.queue.fetch_bundle(reg.reg_id, self.home / "_bundles")
+            tar = self.queue.fetch_bundle(reg.bundle_key, self.home / "_bundles")
             extract_bundle(tar, bundle_dir)
             lab = self.make_lab(bundle_dir)
             job_id = lab.submit(

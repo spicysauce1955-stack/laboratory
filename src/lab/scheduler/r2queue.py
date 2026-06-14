@@ -85,9 +85,9 @@ class R2QueueStore:
         self.store.upload_file(src, key)
         return key
 
-    def fetch_bundle(self, reg_id: str, dest_dir: Path) -> Path:
-        out = Path(dest_dir) / f"{reg_id}.tar.gz"
-        self.store.download_file(self._k("bundles", f"{reg_id}.tar.gz"), out)
+    def fetch_bundle(self, bundle_key: str, dest_dir: Path) -> Path:
+        out = Path(dest_dir) / Path(bundle_key).name
+        self.store.download_file(bundle_key, out)  # bundle_key is the full stored key
         return out
 
     # -- mirrored manifests -------------------------------------------------------

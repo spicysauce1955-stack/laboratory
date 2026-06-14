@@ -64,7 +64,7 @@ def test_bundle_roundtrip(tmp_path: Path):
     src.write_bytes(b"tarball-bytes")
     key = q.put_bundle("reg-a", src)
     assert key.endswith("reg-a.tar.gz")
-    out = q.fetch_bundle("reg-a", tmp_path / "dl")
+    out = q.fetch_bundle(key, tmp_path / "dl")
     assert out.read_bytes() == b"tarball-bytes"
 
 

@@ -24,7 +24,7 @@ def test_register_creates_bundle_then_entry(tmp_path: Path):
     )
     assert reg.state is RegState.pending and reg.code.git_dirty
     assert q.get_entry(reg.reg_id) == reg
-    got = q.fetch_bundle(reg.reg_id, tmp_path / "dl")
+    got = q.fetch_bundle(reg.bundle_key, tmp_path / "dl")
     assert got.stat().st_size > 0
 
 
