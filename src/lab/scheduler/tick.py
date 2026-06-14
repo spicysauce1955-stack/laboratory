@@ -308,6 +308,8 @@ class Scheduler:
     ) -> None:
         """Spot preemption (Task 9): auto-resubmit, bounded by per-point retries AND a
         cumulative budget ceiling. Money-critical — never resubmit on ambiguous billing."""
+        rep.preempted.append(reg.reg_id)
+
         def fail(reg_state_reason: str, synced_label: str) -> None:
             updated = self._transition(reg, RegState.failed, reason=reg_state_reason)
             entries[entries.index(reg)] = updated  # keep this tick's view consistent

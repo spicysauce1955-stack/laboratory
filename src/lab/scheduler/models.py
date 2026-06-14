@@ -102,3 +102,4 @@ class TickReport(BaseModel):
     synced: dict[str, str] = Field(default_factory=dict)  # reg_id -> new state
     errors: list[str] = Field(default_factory=list)
     reconcile: dict[str, object] | None = None
+    preempted: list[str] = Field(default_factory=list)  # regs that hit spot preemption this tick

@@ -573,3 +573,18 @@ def test_preempted_with_failed_teardown_is_not_resubmitted(tmp_path):
     rep = sched.tick()
     assert q.get_entry("reg-a").state is RegState.failed
     assert "teardown" in rep.synced["reg-a"]
+
+
+def test_tick_report_lists_preempted(tmp_path):
+    sched, q = _watchdog_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a", command="python x.py",
+            expires=utc_now() + timedelta(days=1), max_cost=100.0)
+    m = make_manifest("j-spot", "python x.py").model_copy(update={
+        "status": JobState.preempted, "registration_id": "reg-a", "teardown_status": "succeeded",
+        "cost": CostInfo(actual_usd=0.1)})
+    sched.store.create(m)
+    q.put_entry(q.get_entry("reg-a").model_copy(update={
+        "state": RegState.launched, "job_id": "j-spot", "launched_at": utc_now()}))
+    sched._relaunch_preempted = lambda reg: None  # type: ignore[method-assign]
+    rep = sched.tick()
+    assert "reg-a" in rep.preempted
