@@ -594,6 +594,47 @@ def test_tick_report_lists_preempted(tmp_path):
     assert "reg-a" in rep.preempted
 
 
+def test_preemption_resubmit_loop_accumulates_then_hits_retry_cap(tmp_path):
+    """Drive preempt -> resubmit -> preempt -> resubmit -> retry-cap through the REAL
+    _handle_preempted (only _relaunch_preempted / _launch are stubbed, to stay deterministic):
+    preempt_count and cumulative_usd must accumulate across attempts, and the per-point retry cap
+    (default 2) must stop the loop by FAILING the reg — never killing a running job."""
+    sched, q = _watchdog_sched(tmp_path)
+    # high per-point cap so the retry cap (not the budget) is the binding limit
+    put_reg(q, tmp_path, "reg-a", command="python x.py",
+            expires=utc_now() + timedelta(days=1), max_cost=100.0)
+    relaunched: list[str] = []
+    sched._relaunch_preempted = lambda reg: relaunched.append(reg.reg_id)  # type: ignore[method-assign]
+    sched._launch = lambda reg, rep: None  # type: ignore[method-assign]  # no real same-tick relaunch
+
+    def preempt(job_id: str, actual: float) -> None:
+        """Point reg-a at a freshly-preempted attempt, preserving its accumulated counters."""
+        sched.store.create(make_manifest(job_id, "python x.py", timeout="1h").model_copy(update={
+            "status": JobState.preempted, "registration_id": "reg-a", "teardown_status": "succeeded",
+            "cost": CostInfo(actual_usd=actual, estimated_usd=0.1)}))
+        q.put_entry(q.get_entry("reg-a").model_copy(update={
+            "state": RegState.launched, "job_id": job_id, "launched_at": utc_now()}))
+
+    preempt("j1", 0.3)  # attempt 1 -> resubmit
+    sched.tick()
+    e = q.get_entry("reg-a")
+    assert e.preempt_count == 1 and e.cumulative_usd == 0.3
+    assert relaunched == ["reg-a"] and e.state is RegState.pending
+
+    preempt("j2", 0.4)  # attempt 2 -> resubmit (counters carried forward)
+    sched.tick()
+    e = q.get_entry("reg-a")
+    assert e.preempt_count == 2 and e.cumulative_usd == 0.7
+    assert relaunched == ["reg-a", "reg-a"]
+
+    preempt("j3", 0.5)  # attempt 3 -> retry cap reached -> fail, no further relaunch
+    rep = sched.tick()
+    e = q.get_entry("reg-a")
+    assert e.state is RegState.failed and "retry cap" in rep.synced["reg-a"]
+    assert relaunched == ["reg-a", "reg-a"]  # never relaunched a third time
+    assert e.preempt_count == 2 and e.cumulative_usd == 0.7  # unchanged once the cap fires
+
+
 # ------------------------------------------------------------------ Task 12: sweep ceiling
 
 
