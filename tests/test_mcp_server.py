@@ -40,6 +40,7 @@ def test_tools_registered(tmp_path: Path):
         "status",
         "submit",
         "sweep",
+        "sweep_status",
     ]
 
 

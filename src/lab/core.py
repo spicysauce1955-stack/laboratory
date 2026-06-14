@@ -289,6 +289,33 @@ class Lab:
     def jobs_in_sweep(self, sweep_id: str) -> list[str]:
         return [j.job_id for j in self.list_jobs() if j.sweep_id == sweep_id]
 
+    def sweep_summary(self, sweep_id: str) -> dict[str, Any]:
+        """Aggregate a sweep's outcomes for trustworthy reporting (preemptions, fallback, spend)."""
+        ms = [m for m in self.list_jobs() if m.sweep_id == sweep_id]
+
+        def spend(m: JobManifest) -> float:
+            return m.cost.actual_usd if m.cost and m.cost.actual_usd else 0.0
+
+        return {
+            "sweep_id": sweep_id,
+            "total": len(ms),
+            "succeeded": int(sum(int(m.status is JobState.succeeded) for m in ms)),
+            "preempted": int(sum(int(m.status is JobState.preempted) for m in ms)),
+            "failed": int(sum(int(m.status is JobState.failed) for m in ms)),
+            "fell_back_to_on_demand": int(
+                sum(int(m.resources.use_spot and m.backend.launched_spot is False) for m in ms)
+            ),
+            "total_usd": round(sum(spend(m) for m in ms), 6),
+            "per_point": {
+                m.job_id: {
+                    "state": m.status.value,
+                    "usd": round(spend(m), 6),
+                    "launched_spot": m.backend.launched_spot,
+                }
+                for m in ms
+            },
+        }
+
     def reconcile(self, *, apply: bool = False) -> dict[str, Any]:
         """Cross-check Vast.ai rentals against the local job DB (FR-C2 leak detection).
 

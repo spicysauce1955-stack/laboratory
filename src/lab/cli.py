@@ -236,6 +236,12 @@ def cancel(job_id: str) -> None:
     _emit({"job_id": job_id, "state": _lab_for_or_fail(job_id).cancel(job_id).value})
 
 
+@app.command(name="sweep-status")
+def sweep_status(sweep_id: str) -> None:
+    """Summarize a sweep's outcomes: preemptions, on-demand fallback, per-point spend."""
+    _emit(_lab().sweep_summary(sweep_id))
+
+
 @app.command(name="list")
 def list_jobs() -> None:
     """List jobs (FR-H1)."""

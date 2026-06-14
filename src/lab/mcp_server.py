@@ -161,6 +161,11 @@ def build_server(lab: Lab) -> FastMCP:
         _require(job_id)
         return {"job_id": job_id, "state": _lab_for(job_id).cancel(job_id).value}
 
+    @mcp.tool
+    def sweep_status(sweep_id: str) -> dict[str, Any]:
+        """Summarize a sweep's outcomes: preemptions, on-demand fallback, per-point spend."""
+        return _lab().sweep_summary(sweep_id)
+
     @mcp.tool(name="list")
     def list_jobs() -> dict[str, Any]:
         """List jobs; returns {jobs: [...]} (FR-H1)."""
