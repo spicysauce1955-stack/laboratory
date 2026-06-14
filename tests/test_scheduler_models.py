@@ -71,3 +71,17 @@ def test_window_rejects_naive_datetime():
     w = DailyWindow(start=time(9, 0), end=time(17, 0), tz="UTC")
     with pytest.raises(ValueError, match="tz-aware"):
         w.contains(datetime(2026, 6, 10, 12, 0))
+
+
+def test_guardrails_retry_default():
+    g = Guardrails(expires_at=datetime(2030, 1, 1, tzinfo=timezone.utc))
+    assert g.max_preempt_retries == 2  # retries PER POINT
+
+
+def test_registration_tracks_cumulative_and_retries():
+    g = Guardrails(expires_at=datetime(2030, 1, 1, tzinfo=timezone.utc), max_cost_usd=5.0)
+    r = Registration(reg_id="r", created_at=datetime(2030, 1, 1, tzinfo=timezone.utc),
+                     spec=JobSpec(command="x"), guardrails=g, bundle_key="b",
+                     code=CodeRef(git_commit="0" * 40))
+    assert r.preempt_count == 0
+    assert r.cumulative_usd == 0.0

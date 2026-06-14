@@ -61,7 +61,8 @@ class Triggers(BaseModel):
 
 class Guardrails(BaseModel):
     expires_at: datetime  # required — past this the entry expires, never launches
-    max_cost_usd: float | None = None  # per-job: best hourly x timeout must fit
+    max_cost_usd: float | None = None  # CUMULATIVE ceiling for the logical job (all retries)
+    max_preempt_retries: int = 2  # per-point spot-preemption resubmits
 
 
 class Registration(BaseModel):
@@ -77,6 +78,8 @@ class Registration(BaseModel):
     launched_at: datetime | None = None
     state_changed_at: datetime | None = None  # drives orphaned-`launching` repair (spec §5)
     last_skip_reason: str | None = None
+    preempt_count: int = 0  # spot-preemption resubmits used so far
+    cumulative_usd: float = 0.0  # summed actual spend across this job's attempts
 
 
 class ControlConfig(BaseModel):
