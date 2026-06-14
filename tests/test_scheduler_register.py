@@ -5,10 +5,11 @@ from pathlib import Path
 
 import pytest
 
+from lab.core import LabError
 from lab.models import JobSpec, ResourceRequest
 from lab.scheduler.models import Guardrails, RegState, Triggers
 from lab.scheduler.queue import LocalQueueStore
-from lab.scheduler.register import register, worst_case_cost
+from lab.scheduler.register import register, register_sweep, worst_case_cost
 from test_scheduler_bundle import _make_repo  # reuse the tiny-repo factory
 
 
@@ -62,6 +63,70 @@ def test_parse_expires_relative_and_iso():
     for bad in ("+bad", "not-a-date"):
         with pytest.raises(ValueError):
             parse_expires(bad)
+
+
+def test_register_sweep_creates_shared_entries(tmp_path: Path):
+    repo = _make_repo(tmp_path)
+    q = LocalQueueStore(tmp_path / "q")
+    sweep_id, regs = register_sweep(
+        repo, q, "python exp.py", {"K": ["1", "2"], "seed": ["7"]},
+        resources=ResourceRequest(),
+        triggers=Triggers(),
+        guardrails=Guardrails(expires_at=datetime.now(timezone.utc) + timedelta(days=1)),
+    )
+    assert sweep_id.startswith("sweep-")
+    assert len(regs) == 2
+    assert {r.sweep_id for r in regs} == {sweep_id}
+    assert len({r.bundle_key for r in regs}) == 1            # one shared bundle (Decision A)
+    assert len({r.reg_id for r in regs}) == 2                # distinct reg ids
+    assert sorted(r.spec.config["K"] for r in regs) == ["1", "2"]
+    assert all(r.spec.seed == 7 for r in regs)               # seed grid key applied per point
+    assert {q.get_entry(r.reg_id).reg_id for r in regs} == {r.reg_id for r in regs}  # persisted
+    assert q.fetch_bundle(regs[0].bundle_key, tmp_path / "dl").stat().st_size > 0
+
+
+def test_register_sweep_respects_max_jobs(tmp_path: Path):
+    repo = _make_repo(tmp_path)
+    q = LocalQueueStore(tmp_path / "q")
+    with pytest.raises(LabError, match="max_jobs"):
+        register_sweep(
+            repo, q, "python exp.py", {"a": [str(i) for i in range(20)]},
+            resources=ResourceRequest(),
+            triggers=Triggers(),
+            guardrails=Guardrails(expires_at=datetime.now(timezone.utc) + timedelta(days=1)),
+            max_jobs=5,
+        )
+
+
+def test_register_sweep_admission_refuses_over_budget(tmp_path: Path):
+    repo = _make_repo(tmp_path)
+    q = LocalQueueStore(tmp_path / "q")
+    # per-point cap = explicit max_cost_usd $10; 3 points => worst case $30 > $20 budget
+    with pytest.raises(LabError, match="daily budget"):
+        register_sweep(
+            repo, q, "python exp.py", {"a": ["1", "2", "3"]},
+            resources=ResourceRequest(),
+            triggers=Triggers(),
+            guardrails=Guardrails(
+                expires_at=datetime.now(timezone.utc) + timedelta(days=1), max_cost_usd=10.0
+            ),
+            daily_budget=20.0,
+        )
+
+
+def test_register_sweep_resolved_ceiling_defaults_to_worst_case(tmp_path: Path):
+    repo = _make_repo(tmp_path)
+    q = LocalQueueStore(tmp_path / "q")
+    # no sweep_max_cost; per-point cap = max_cost_usd $5; 2 points => default ceiling $10
+    _, regs = register_sweep(
+        repo, q, "python exp.py", {"a": ["1", "2"]},
+        resources=ResourceRequest(),
+        triggers=Triggers(),
+        guardrails=Guardrails(
+            expires_at=datetime.now(timezone.utc) + timedelta(days=1), max_cost_usd=5.0
+        ),
+    )
+    assert all(r.sweep_max_cost == 10.0 for r in regs)
 
 
 def test_parse_window_and_errors():
