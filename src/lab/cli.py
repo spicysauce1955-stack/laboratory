@@ -149,6 +149,7 @@ def sweep(
         False, "--no-fallback", "--spot-only",
         help="with --spot, do NOT fall back to on-demand if spot is scarce (wait/skip instead)",
     ),
+    sweep_max_cost: float | None = typer.Option(None, "--sweep-max-cost", help="cap total sweep spend in USD (cost-safety); refused if it exceeds the daily budget"),
 ) -> None:
     """Submit a parameter-grid sweep: one job per point under a sweep_id (FR-A5)."""
     lab = _lab(backend)
@@ -161,6 +162,7 @@ def sweep(
                 cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
                 provision_timeout=provision_timeout, use_spot=spot, spot_fallback=not no_fallback,
             ),
+            sweep_max_cost=sweep_max_cost,
         )
     except LabError as e:
         _emit({"error": str(e)})

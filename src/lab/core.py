@@ -87,6 +87,31 @@ def cache_key(commit: str, command: str, config: dict[str, Any] | None, seed: in
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def worst_case_sweep_cost(*, n_points: int, per_point_cap: float) -> float:
+    return round(n_points * per_point_cap, 6)
+
+
+def check_sweep_admission(
+    *,
+    n_points: int,
+    per_point_cap: float | None,
+    daily_budget: float | None,
+    committed: float,
+) -> float | None:
+    """Refuse a sweep whose worst case won't fit the daily budget. Returns the worst-case cost
+    (the default ceiling), or None when uncosted. Pure; no state (cost-safety, derived not metered)."""
+    if per_point_cap is None:
+        return None
+    worst = worst_case_sweep_cost(n_points=n_points, per_point_cap=per_point_cap)
+    if daily_budget is not None and committed + worst > daily_budget:
+        raise LabError(
+            f"sweep worst case ${worst:.2f} ({n_points} x ${per_point_cap:.2f}) + "
+            f"committed ${committed:.2f} exceeds daily budget ${daily_budget:.2f}; "
+            "narrow the grid, lower --max-cost, or raise the budget"
+        )
+    return worst
+
+
 class Lab:
     def __init__(self, backend: Backend, repo: Path, home: Path) -> None:
         self.backend = backend
@@ -175,6 +200,9 @@ class Lab:
         submitted_by: str = "agent",
         allow_dirty: bool = True,
         max_jobs: int = 256,
+        sweep_max_cost: float | None = None,
+        daily_budget: float | None = None,
+        committed: float = 0.0,
     ) -> tuple[str, list[str]]:
         """Submit one job per grid point under a shared sweep_id (FR-A5).
 
@@ -182,6 +210,9 @@ class Lab:
         (injection-safe) and recorded in the job's ``resolved_config``; jobs stay independently
         monitorable by ``job_id``. A ``seed`` key in the grid sets each job's seed (varying
         ``$LAB_SEED`` per point). Refuses to fan out beyond ``max_jobs`` (cost-safety).
+
+        ``sweep_max_cost`` caps total sweep spend; ``daily_budget`` + ``committed`` enforce an
+        up-front admission check (cost-safety, derived not metered). All default to no-op.
         """
         points = expand_grid(grid)
         if len(points) > max_jobs:
@@ -189,6 +220,17 @@ class Lab:
                 f"sweep would submit {len(points)} jobs (> max_jobs={max_jobs}); "
                 "narrow the grid or raise max_jobs"
             )
+        # Derive per-point cap from a whole-sweep ceiling, if provided. No live price at
+        # immediate-submit time, so an explicit cap is the only cost signal; uncosted -> no-op.
+        per_point_cap: float | None = (
+            sweep_max_cost / len(points) if sweep_max_cost is not None and len(points) > 0 else None
+        )
+        check_sweep_admission(
+            n_points=len(points),
+            per_point_cap=per_point_cap,
+            daily_budget=daily_budget,
+            committed=committed,
+        )
         sweep_id = f"sweep-{_new_job_id()}"
         job_ids: list[str] = []
         for point in points:

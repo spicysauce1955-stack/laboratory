@@ -80,7 +80,7 @@ def test_sweep_spot_no_fallback():
     resources_seen: list[ResourceRequest] = []
 
     fake_lab = MagicMock()
-    fake_lab.sweep.side_effect = lambda cmd, grid, seed=None, resources=None: (
+    fake_lab.sweep.side_effect = lambda cmd, grid, seed=None, resources=None, **_kw: (
         resources_seen.append(resources) or ("sweep-1", ["job-1", "job-2"])
     )
 
