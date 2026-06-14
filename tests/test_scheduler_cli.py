@@ -42,6 +42,25 @@ def test_register_and_list(tmp_path: Path):
     assert listed["heartbeat_age_s"] is None  # no scheduler has ever ticked
 
 
+def test_register_sweep_cli(tmp_path: Path):
+    repo = _make_repo(tmp_path)
+    res = runner.invoke(
+        app,
+        ["register-sweep", "-c", "python exp.py", "--grid", "K=1,2",
+         "--expires", "+1d", "--sweep-max-cost", "5"],
+        env=_env(tmp_path, repo),
+    )
+    assert res.exit_code == 0, res.output
+    out = json.loads(res.output)
+    assert out["count"] == 2
+    assert out["sweep_id"].startswith("sweep-")
+    assert len(out["reg_ids"]) == 2
+    q = LocalQueueStore(tmp_path / "queue")
+    regs = q.list_entries()
+    assert {r.sweep_id for r in regs} == {out["sweep_id"]}
+    assert all(r.sweep_max_cost == 5.0 for r in regs)
+
+
 def test_register_window_and_after(tmp_path: Path):
     repo = _make_repo(tmp_path)
     first = _register(tmp_path, repo)

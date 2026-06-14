@@ -21,6 +21,7 @@ from lab.scheduler.price import PriceFeed
 from lab.scheduler.queue import QueueStore, default_queue
 from lab.scheduler.register import parse_expires, parse_window
 from lab.scheduler.register import register as sched_register
+from lab.scheduler.register import register_sweep as sched_register_sweep
 from lab.scheduler.register import worst_case_cost
 from lab.scheduler.tick import Scheduler
 from lab.store import JobStore
@@ -443,6 +444,89 @@ def register(
             "worst_case_cost_usd": worst_case_cost(triggers, spec.resources),
         }
     )
+
+
+@app.command(name="register-sweep")
+def register_sweep(
+    command: str = typer.Option(
+        ..., "--command", "-c", help="entrypoint, e.g. 'uv run experiments/x.py'"
+    ),
+    grid: list[str] = typer.Option(..., "--grid", "-g", help="key=v1,v2,... (repeatable)"),
+    expires: str = typer.Option(
+        ..., "--expires", help="run-by deadline: +3d / +12h / ISO timestamp (required guardrail)"
+    ),
+    seed: int | None = typer.Option(None),
+    cpus: int | None = typer.Option(None),
+    memory: str | None = typer.Option(None),
+    gpus: int | None = typer.Option(None),
+    accelerators: str | None = typer.Option(
+        None, "--gpu", "--accelerators", help="e.g. RTX_4090:1"
+    ),
+    timeout: str | None = typer.Option(
+        None, help="wall-clock limit per job, e.g. 2h (cost bound, FR-I1)"
+    ),
+    with_pkg: list[str] = typer.Option(
+        None, "--with", help="extra runtime package(s) per job (repeatable; uv run --with)"
+    ),
+    window: str | None = typer.Option(
+        None, "--window", help="daily launch window, e.g. 23:00-07:00"
+    ),
+    tz: str = typer.Option("UTC", "--tz", help="IANA timezone for --window"),
+    not_before: str | None = typer.Option(
+        None, "--not-before", help="absolute earliest start (ISO)"
+    ),
+    max_hourly: float | None = typer.Option(
+        None, "--max-hourly", help="launch only if a matching Vast offer is at/below this $/h"
+    ),
+    offer_query: str | None = typer.Option(
+        None, "--offer-query", help="extra vastai search filter"
+    ),
+    max_cost: float | None = typer.Option(None, "--max-cost", help="per-point worst-case $ cap"),
+    sweep_max_cost: float | None = typer.Option(
+        None, "--sweep-max-cost",
+        help="cap total sweep spend in USD; refused if worst case exceeds the daily budget",
+    ),
+    spot: bool = typer.Option(False, "--spot", help="use spot/interruptible instances (skypilot)"),
+    no_fallback: bool = typer.Option(
+        False, "--no-fallback", "--spot-only",
+        help="with --spot, do NOT fall back to on-demand if spot is scarce (wait/skip instead)",
+    ),
+) -> None:
+    """Register a grid as N deferred points sharing one sweep_id + ceiling; the scheduler paces them."""
+    if accelerators and timeout is None:
+        _emit({"error": "--timeout is required for GPU registrations (it is the cost bound)"})
+        raise typer.Exit(code=1)
+    queue = default_queue()
+    try:
+        expires_at = parse_expires(expires)
+        win = parse_window(window, tz) if window else None
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+    triggers = Triggers(
+        not_before=(
+            datetime.fromisoformat(not_before.replace("Z", "+00:00")) if not_before else None
+        ),
+        window=win,
+        max_hourly_usd=max_hourly,
+        offer_query=offer_query,
+    )
+    guardrails = Guardrails(expires_at=expires_at, max_cost_usd=max_cost)
+    resources = ResourceRequest(
+        cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
+        use_spot=spot, spot_fallback=not no_fallback,
+    )
+    try:
+        sweep_id, regs = sched_register_sweep(
+            _repo(), queue, wrap_with_extras(command, with_pkg), _parse_grid(grid),
+            resources=resources, triggers=triggers, guardrails=guardrails, seed=seed,
+            sweep_max_cost=sweep_max_cost,
+            daily_budget=queue.read_control().budget_usd_per_day,
+            submitted_by="human",
+        )
+    except LabError as e:  # fail-loud, actionable (FR-F3)
+        _emit({"error": str(e)})
+        raise typer.Exit(code=1) from e
+    _emit({"sweep_id": sweep_id, "count": len(regs), "reg_ids": [r.reg_id for r in regs]})
 
 
 queue_app = typer.Typer(help="Manage deferred registrations (spec §6).", no_args_is_help=True)
