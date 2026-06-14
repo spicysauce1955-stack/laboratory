@@ -38,3 +38,11 @@ def test_spot_cluster_vanished_without_terminal_is_preempted():
 
 def test_on_demand_cluster_gone_is_failed_not_preempted():
     assert classify_terminal(**base(use_spot=False, cluster_gone=True)) is JobState.failed
+
+
+def test_requested_spot_but_launched_on_demand_is_not_preempted():
+    # spot_fallback launched on-demand (launched_spot False) -> caller passes use_spot=False
+    # This documents the wiring contract: sky_runner.run_job must pass launched_spot, not
+    # resources.use_spot, so that on-demand fallback instances aren't mis-classified as preempted.
+    assert classify_terminal(**base(use_spot=False, cluster_gone=True,
+                                    reached_terminal=False)) is JobState.failed

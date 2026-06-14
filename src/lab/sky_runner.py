@@ -292,8 +292,13 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
     # success-sentinel integrity downgrade (succeeded->failed without .lab_success) is preserved —
     # the classifier only ever *trusts* a succeeded/failed terminal, never invents one.
     timed_out = (store.output_dir(job_id) / TIMEOUT_SENTINEL).exists()
-    cancel_requested = store.read_manifest(job_id).status == JobState.cancelled  # fresh from disk
-    use_spot = manifest.resources.use_spot
+    fresh = store.read_manifest(job_id)
+    cancel_requested = fresh.status == JobState.cancelled
+    use_spot = (
+        fresh.backend.launched_spot
+        if fresh.backend.launched_spot is not None
+        else manifest.resources.use_spot
+    )
     cluster_gone = not _cluster_up(sky, cluster)
     final = classify_terminal(
         sky_state=final,
