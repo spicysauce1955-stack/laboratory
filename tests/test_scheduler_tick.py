@@ -488,7 +488,9 @@ def test_local_watchdog_fails_dead_runner(tmp_path: Path):
 def test_sync_remirrors_recently_terminal_manifests(tmp_path: Path):
     """teardown_status lands after the terminal status write — the mirror must catch up."""
     sched, q = _watchdog_sched(tmp_path)
-    put_reg(q, tmp_path, "reg-a")
+    # This test runs on the real clock (utc_now), so anchor the expiry to real-now —
+    # the default T0-relative expiry would be in the past and the reg would expire pre-launch.
+    put_reg(q, tmp_path, "reg-a", expires=utc_now() + timedelta(days=1))
     sched.tick()
     e = q.get_entry("reg-a")
     backend = LocalBackend(home=tmp_path / "runs", repo=tmp_path)
