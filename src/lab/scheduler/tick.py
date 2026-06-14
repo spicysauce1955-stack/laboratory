@@ -496,7 +496,9 @@ class Scheduler:
             tar = self.queue.fetch_bundle(reg.reg_id, self.home / "_bundles")
             extract_bundle(tar, bundle_dir)
             lab = self.make_lab(bundle_dir)
-            job_id = lab.submit(reg.spec, code=reg.code, registration_id=reg.reg_id)
+            job_id = lab.submit(
+                reg.spec, code=reg.code, registration_id=reg.reg_id, sweep_id=reg.sweep_id
+            )
         except Exception as e:  # noqa: BLE001 — a bad entry must not kill the tick (spec §5)
             self._transition(reg, RegState.pending, reason=f"launch error: {e}"[:300])
             rep.errors.append(f"{reg.reg_id}: {e}")

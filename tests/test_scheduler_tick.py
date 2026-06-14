@@ -621,3 +621,16 @@ def test_sweep_under_ceiling_still_launches(tmp_path):
     sched._launch = lambda reg, rep: launched.append(reg.reg_id)  # type: ignore[method-assign]
     sched.tick()
     assert launched == ["reg-d"]
+
+
+def test_launch_forwards_sweep_id(tmp_path: Path):
+    """A scheduler-launched point carries its sweep_id onto the manifest (so sweep_spend sees it)."""
+    sched, q = make_sched(tmp_path)
+    reg = put_reg(q, tmp_path, "reg-sw")
+    # mark this registration as a sweep point (register_sweep will do this for real later)
+    q.put_entry(reg.model_copy(update={"sweep_id": "sweep-test", "sweep_max_cost": 100.0}))
+    rep = sched.tick()
+    assert rep.launched == ["reg-sw"]
+    job_id = q.get_entry("reg-sw").job_id
+    assert job_id is not None
+    assert sched.store.read_manifest(job_id).sweep_id == "sweep-test"
