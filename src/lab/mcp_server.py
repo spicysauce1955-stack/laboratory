@@ -185,6 +185,7 @@ def build_server(lab: Lab) -> FastMCP:
     from lab.scheduler.queue import default_queue
     from lab.scheduler.register import parse_expires, parse_window
     from lab.scheduler.register import register as sched_register
+    from lab.scheduler.register import register_sweep as sched_register_sweep
     from lab.scheduler.register import worst_case_cost
 
     @mcp.tool
@@ -245,6 +246,64 @@ def build_server(lab: Lab) -> FastMCP:
             "expires_at": _iso(reg.guardrails.expires_at),
             "worst_case_cost_usd": worst_case_cost(triggers, spec.resources),
         }
+
+    @mcp.tool
+    def register_sweep(
+        command: str,
+        grid: dict[str, list[Any]],
+        expires: str,
+        seed: int | None = None,
+        cpus: int | None = None,
+        memory: str | None = None,
+        accelerators: str | None = None,
+        timeout: str | None = None,
+        window: str | None = None,
+        tz: str = "UTC",
+        not_before: str | None = None,
+        max_hourly: float | None = None,
+        offer_query: str | None = None,
+        max_cost: float | None = None,
+        sweep_max_cost: float | None = None,
+    ) -> dict[str, Any]:
+        """Register a parameter grid as N deferred points sharing one sweep_id + ceiling + bundle;
+        the scheduler paces them (triggers, max_concurrent) and stops launching once finished-spend
+        hits sweep_max_cost (it never kills a running point). grid is {key: [values]}. expires
+        (+3d / ISO) is the required run-by guardrail. Returns {sweep_id, count, reg_ids}."""
+        from datetime import datetime
+
+        if accelerators and timeout is None:
+            raise ToolError("timeout is required for GPU registrations (it is the cost bound)")
+        try:
+            expires_at = parse_expires(expires)
+            win = parse_window(window, tz) if window else None
+            not_before_dt = (
+                datetime.fromisoformat(not_before.replace("Z", "+00:00")) if not_before else None
+            )
+        except ValueError as e:
+            raise ToolError(str(e)) from e
+        triggers = Triggers(
+            not_before=not_before_dt,
+            window=win,
+            max_hourly_usd=max_hourly,
+            offer_query=offer_query,
+        )
+        queue = default_queue()
+        try:
+            sweep_id, regs = sched_register_sweep(
+                lab.repo, queue, command, grid,
+                resources=ResourceRequest(
+                    cpus=cpus, memory=memory, accelerators=accelerators, timeout=timeout
+                ),
+                triggers=triggers,
+                guardrails=Guardrails(expires_at=expires_at, max_cost_usd=max_cost),
+                seed=seed,
+                sweep_max_cost=sweep_max_cost,
+                daily_budget=queue.read_control().budget_usd_per_day,
+                submitted_by="agent",
+            )
+        except Exception as e:  # noqa: BLE001
+            raise ToolError(str(e)) from e
+        return {"sweep_id": sweep_id, "count": len(regs), "reg_ids": [r.reg_id for r in regs]}
 
     @mcp.tool
     def queue_list() -> dict[str, Any]:

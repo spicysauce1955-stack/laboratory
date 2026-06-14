@@ -37,6 +37,7 @@ def test_tools_registered(tmp_path: Path):
         "queue_pause",
         "queue_show",
         "register",
+        "register_sweep",
         "status",
         "submit",
         "sweep",
@@ -152,6 +153,24 @@ def test_register_and_queue_tools(tmp_path: Path, monkeypatch):
     assert shown["state"] == "pending"
     assert cancelled["cancel_requested"] is True
     assert paused["paused"] is True
+
+
+def test_register_sweep_tool(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LAB_QUEUE_DIR", str(tmp_path / "queue"))
+    _, server = _make_with_repo(tmp_path)
+
+    async def go():
+        async with Client(server) as c:
+            return (await c.call_tool(
+                "register_sweep",
+                {"command": "python exp.py", "grid": {"K": ["1", "2"]},
+                 "expires": "+1d", "sweep_max_cost": 5.0},
+            )).data
+
+    out = asyncio.run(go())
+    assert out["count"] == 2
+    assert out["sweep_id"].startswith("sweep-")
+    assert len(out["reg_ids"]) == 2
 
 
 def test_register_unknown_queue_ops_fail_loud(tmp_path: Path, monkeypatch):
