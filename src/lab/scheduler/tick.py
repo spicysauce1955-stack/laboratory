@@ -132,6 +132,10 @@ class Scheduler:
         JobState.succeeded: RegState.succeeded,
         JobState.failed: RegState.failed,
         JobState.timed_out: RegState.failed,
+        # `preempted` MUST stay here: the `status not in _TERMINAL_MAP` guards above (watchdog/
+        # cancel/price-verify) rely on it to skip preempted manifests so they reach the dedicated
+        # `_handle_preempted` interception in `_sync`. The generic mapping below is never used for
+        # preempted (the interception `continue`s first); the fallback value is a safe last resort.
         JobState.preempted: RegState.failed,
         JobState.cancelled: RegState.cancelled,
     }
