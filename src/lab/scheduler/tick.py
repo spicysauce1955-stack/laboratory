@@ -326,7 +326,15 @@ class Scheduler:
 
         actual = manifest.cost.actual_usd if manifest.cost and manifest.cost.actual_usd else 0.0
         spent = reg.cumulative_usd + actual
-        nxt = self._estimate_cost(reg) or 0.0
+        # Next-attempt look-ahead: _handle_preempted runs inside _sync, BEFORE _evaluate_and_launch
+        # populates _best_hourly_seen, so _estimate_cost would see an empty cache and return None.
+        # Derive the estimate from the just-preempted attempt's own persisted estimate instead (same
+        # resources/timeout) — derived, not metered (cost-safety). Fall back to _estimate_cost.
+        nxt = (
+            manifest.cost.estimated_usd
+            if manifest.cost and manifest.cost.estimated_usd
+            else (self._estimate_cost(reg) or 0.0)
+        )
         cap = reg.guardrails.max_cost_usd
 
         if reg.preempt_count >= reg.guardrails.max_preempt_retries:

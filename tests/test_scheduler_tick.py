@@ -543,17 +543,18 @@ def test_preempted_stops_at_retry_cap(tmp_path):
 
 def test_preempted_stops_when_budget_exhausted(tmp_path):
     sched, q = _watchdog_sched(tmp_path)
-    # cap 0.5; already spent 0.4; next attempt est would push over -> stop
+    # cap 0.5; already spent 0.4; the next attempt's estimate would push over -> stop. The look-ahead
+    # is derived from the preempted manifest's OWN estimated_usd (the real resubmit path): _sync runs
+    # _handle_preempted before _evaluate_and_launch, so _best_hourly_seen is empty and _estimate_cost
+    # returns None at this point. No _estimate_cost stub -> this exercises the production look-ahead.
     put_reg(q, tmp_path, "reg-a", command="python x.py",
             expires=utc_now() + timedelta(days=1), max_cost=0.5)
     m = make_manifest("j-spot", "python x.py", timeout="1h").model_copy(update={
         "status": JobState.preempted, "registration_id": "reg-a", "teardown_status": "succeeded",
-        "cost": CostInfo(actual_usd=0.4)})
+        "cost": CostInfo(actual_usd=0.4, estimated_usd=0.4)})
     sched.store.create(m)
     q.put_entry(q.get_entry("reg-a").model_copy(update={
         "state": RegState.launched, "job_id": "j-spot", "cumulative_usd": 0.0}))
-    # force a non-trivial next-attempt estimate so spent(0.4)+est > cap(0.5)
-    sched._estimate_cost = lambda reg: 0.4  # type: ignore[method-assign]
     sched._relaunch_preempted = lambda reg: (_ for _ in ()).throw(AssertionError("must not relaunch"))  # type: ignore[method-assign]
     rep = sched.tick()
     assert q.get_entry("reg-a").state is RegState.failed
