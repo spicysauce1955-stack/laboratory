@@ -210,7 +210,7 @@ def confirm_no_rental(cluster: str) -> bool:
     except Exception:  # noqa: BLE001 — uncertainty must read as "still maybe billing"
         return False
     needle = cluster.lower()
-    return not any(needle in _instance_label(inst).lower() for inst in instances)
+    return not any(needle in _instance_label(inst) for inst in instances)  # _instance_label is lower
 
 
 def vast_hourly_for_cluster(cluster: str, client: Any | None = None) -> float | None:
