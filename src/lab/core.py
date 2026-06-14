@@ -39,7 +39,10 @@ from lab.models import (
 from lab.store import JobStore
 
 _TERMINAL_STATES = frozenset(
-    {JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out, JobState.preempted}
+    {
+        JobState.succeeded, JobState.failed, JobState.cancelled,
+        JobState.timed_out, JobState.preempted,
+    }
 )
 
 

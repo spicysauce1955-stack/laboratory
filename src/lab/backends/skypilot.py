@@ -45,7 +45,9 @@ DEFAULT_PROVISION_TIMEOUT_MIN = 8
 # Long enough to ride out a transient DNS/API hiccup; short enough that a cluster that's
 # genuinely stuck still gets nuked via the vast-sdk fallback in well under 5 minutes.
 TEARDOWN_BACKOFFS = (5, 15, 30, 60, 120)
-_TERMINAL = {JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out, JobState.preempted}
+_TERMINAL = {
+    JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out, JobState.preempted
+}
 
 # SkyPilot JobStatus name -> lab JobState (pure; unit-tested).
 _STATUS_MAP = {

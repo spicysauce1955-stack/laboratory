@@ -25,7 +25,9 @@ from lab.scheduler.register import worst_case_cost
 from lab.scheduler.tick import Scheduler
 from lab.store import JobStore
 
-_TERMINAL = {JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out, JobState.preempted}
+_TERMINAL = {
+    JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out, JobState.preempted
+}
 
 app = typer.Typer(
     help="Laboratory — remote experiment runner (CLI mirror of the MCP tools, spec §9).",
