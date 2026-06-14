@@ -93,14 +93,16 @@ def compare_final_metrics(
     new: dict[str, float],
     *,
     names: Iterable[str] | None,
-    rtol: float,
-    atol: float,
+    rtol: float = 1e-3,
+    atol: float = 1e-12,
 ) -> tuple[str, dict[str, dict[str, Any]]]:
     """Judge a re-run's final metrics against the original's snapshot (the reproducibility gate).
 
     Returns ``("match" | "drift", deltas)``. ``names`` restricts which baseline metrics are judged
     (``None`` = all). A baseline metric absent from the re-run can't be re-derived → counts as drift.
-    Tolerance is ``math.isclose`` semantics (relative ``rtol`` + absolute ``atol``).
+    Tolerance is ``math.isclose`` semantics (relative ``rtol`` + absolute ``atol``). The small default
+    ``atol`` is a float noise floor so a metric of exactly 0.0 doesn't false-drift against a tiny
+    re-run value — ``math.isclose``'s relative tolerance collapses to zero at zero.
     """
     selected = list(names) if names is not None else list(orig)
     deltas: dict[str, dict[str, Any]] = {}
@@ -337,7 +339,7 @@ class Lab:
         *,
         metrics: Iterable[str] | None = None,
         rtol: float = 1e-3,
-        atol: float = 0.0,
+        atol: float = 1e-12,
         wait: bool = True,
         timeout: float | None = None,
     ) -> dict[str, Any]:
@@ -402,6 +404,12 @@ class Lab:
             result["verdict"] = "pending"
             return result
         (rerun,) = self.wait([confirm_id], timeout=timeout)
+        if rerun.status not in _TERMINAL_STATES:
+            # wait gave up before the re-run finished — it's still alive (and, on a remote backend,
+            # still billing until it tears down). Don't call a running job failed.
+            result["verdict"] = "timed_out_waiting"
+            result["rerun_status"] = rerun.status.value
+            return result
         if rerun.status is not JobState.succeeded:
             result["verdict"] = "rerun_failed"
             result["rerun_status"] = rerun.status.value

@@ -139,7 +139,7 @@ def confirm(
         None, "--metric", help="metric(s) to judge (repeatable; default: every baseline metric)"
     ),
     rtol: float = typer.Option(1e-3, "--rtol", help="relative tolerance for a match"),
-    atol: float = typer.Option(0.0, "--atol", help="absolute tolerance for a match"),
+    atol: float = typer.Option(1e-12, "--atol", help="absolute tolerance for a match (float noise floor)"),
     no_wait: bool = typer.Option(
         False, "--no-wait", help="submit the fresh re-run and return its id without comparing"
     ),

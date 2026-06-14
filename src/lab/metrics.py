@@ -78,8 +78,12 @@ def final_values(points: list[dict[str, Any]]) -> dict[str, float]:
         name, step, value = pt["name"], pt["step"], pt["value"]
         if value is None:
             continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue  # a non-numeric point can't be a baseline; skip it, never crash finalize
         if name not in best or step >= best[name][0]:
-            best[name] = (step, float(value))
+            best[name] = (step, numeric)
     return {name: value for name, (_, value) in best.items()}
 
 

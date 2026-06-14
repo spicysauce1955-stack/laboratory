@@ -34,6 +34,16 @@ def test_final_values_empty():
     assert final_values([]) == {}
 
 
+def test_final_values_skips_non_numeric_values(tmp_path: Path):
+    """A non-coercible metric value (e.g. a stray string) is skipped, not raised — so one bad
+    line can't crash the finalize snapshot and leave the job stuck non-terminal (#3)."""
+    points = [
+        {"name": "loss", "value": "not-a-number", "step": 1, "wall_time": 0.0},
+        {"name": "acc", "value": 0.9, "step": 1, "wall_time": 0.0},
+    ]
+    assert final_values(points) == {"acc": 0.9}
+
+
 def test_final_values_ignores_none_and_breaks_ties_by_last_seen():
     points = [
         {"name": "loss", "value": 0.4, "step": 3, "wall_time": 0.0},
@@ -79,6 +89,15 @@ def test_compare_absolute_tolerance_allows_small_diff():
         {"x": 1.0}, {"x": 1.1}, names=None, rtol=0.0, atol=0.2
     )
     assert verdict == "match"
+
+
+def test_compare_zero_valued_metric_does_not_false_drift():
+    """A baseline of exactly 0.0 vs a tiny non-zero re-run value must not report drift under the
+    default tolerances — math.isclose's relative tolerance collapses to 0 at zero (#2)."""
+    # default atol (no atol passed) tolerates float noise around zero
+    assert compare_final_metrics({"x": 0.0}, {"x": 1e-13}, names=None)[0] == "match"
+    # a real, meaningful difference from zero still drifts
+    assert compare_final_metrics({"x": 0.0}, {"x": 0.5}, names=None)[0] == "drift"
 
 
 def test_compare_zero_tolerance_requires_exact_match():
@@ -245,6 +264,21 @@ def test_confirm_drift_when_baseline_differs(tmp_path: Path):
     result = lab.confirm(orig, timeout=60)
     assert result["verdict"] == "drift"
     assert result["deltas"]["demo_metric"]["within_tol"] is False
+
+
+def test_confirm_timeout_while_rerun_still_running(tmp_path: Path):
+    """If the re-run hasn't reached a terminal state before the wait timeout, the verdict is
+    'timed_out_waiting' (NOT 'rerun_failed') — the job is still alive, not failed (#1)."""
+    lab, backend = _lab(tmp_path)
+    orig = _seed_original(
+        lab, command=f'{PYTHON} -c "import time; time.sleep(30)"', seed=1,
+        final_metrics={"demo_metric": 0.5},
+    )
+    result = lab.confirm(orig, timeout=0.5)
+    assert result["verdict"] == "timed_out_waiting"
+    assert result["rerun_status"] in {"running", "queued"}
+    assert "deltas" not in result
+    backend.cancel(result["confirm_id"])  # clean up the sleeper
 
 
 def test_confirm_rerun_failed(tmp_path: Path):

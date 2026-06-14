@@ -86,7 +86,7 @@ def build_server(lab: Lab) -> FastMCP:
         run_id: str,
         metric: list[str] | None = None,
         rtol: float = 1e-3,
-        atol: float = 0.0,
+        atol: float = 1e-12,
         wait: bool = True,
         timeout: float | None = None,
     ) -> dict[str, Any]:
