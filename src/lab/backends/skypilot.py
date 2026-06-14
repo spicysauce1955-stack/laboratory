@@ -202,6 +202,17 @@ def list_vast_instances(client: Any | None = None) -> list[dict[str, Any]]:
     return list(client.show_instances())
 
 
+def confirm_no_rental(cluster: str) -> bool:
+    """True iff no Vast rental labelled for this cluster remains. Best-effort: returns False on any
+    match OR if the listing fails — we never claim 'gone' under uncertainty (FR-C2)."""
+    try:
+        instances = list_vast_instances()
+    except Exception:  # noqa: BLE001 — uncertainty must read as "still maybe billing"
+        return False
+    needle = cluster.lower()
+    return not any(needle in _instance_label(inst).lower() for inst in instances)
+
+
 def vast_hourly_for_cluster(cluster: str, client: Any | None = None) -> float | None:
     """Actual billed USD/hour (``dph_total``) for the Vast rental backing ``cluster``, or None.
 

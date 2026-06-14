@@ -24,6 +24,7 @@ from lab.backends.skypilot import (
     ProvisionTimeout,
     build_task,
     cluster_name_for,
+    confirm_no_rental,
     confirm_success,
     map_job_status,
     promote_timeout,
@@ -343,6 +344,16 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         )
 
     teardown_ok = tear_down_and_record(sky, cluster, store, job_id)
+    if final is JobState.preempted and not confirm_no_rental(cluster):
+        # The instance vanished (preemption inferred), but we can't confirm the Vast rental is
+        # actually gone — flag it so `lab wait` exits 3 and the operator can run `lab reconcile`
+        # before any auto-resubmitter builds on a potentially-still-billing orphan (FR-C2).
+        store.update_manifest(
+            job_id,
+            teardown_status="failed",
+            end_reason="preempted but teardown unconfirmed — see `lab reconcile`",
+        )
+        teardown_ok = False
     return 0 if teardown_ok else 2  # 2 = ran ok but teardown leaked — manifest has details
 
 
