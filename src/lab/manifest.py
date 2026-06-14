@@ -30,6 +30,18 @@ def current_commit(repo: Path) -> str:
     ).strip()
 
 
+def commit_exists(repo: Path, commit: str) -> bool:
+    """True if ``commit`` is present in ``repo`` (so it can be archived/checked out)."""
+    return (
+        subprocess.run(
+            ["git", "-C", str(repo), "cat-file", "-e", f"{commit}^{{commit}}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0
+    )
+
+
 def is_dirty(repo: Path) -> bool:
     """True if the working tree has uncommitted changes (drives the FR-B1 refuse/snapshot policy)."""
     out = subprocess.check_output(["git", "-C", str(repo), "status", "--porcelain"], text=True)

@@ -107,6 +107,7 @@ class JobManifest(BaseModel):
     job_id: str
     sweep_id: str | None = None
     registration_id: str | None = None  # set when launched by the scheduler (spec §4.5 repair)
+    confirms: str | None = None  # the run-id this job was launched to re-derive (lab confirm)
     created_at: datetime
     submitted_by: Submitter
     code: CodeRef
@@ -125,3 +126,4 @@ class JobManifest(BaseModel):
     logs_uri: str | None = None
     artifacts_uri: str | None = None  # durable object-store prefix, e.g. r2://lab-artifacts/<id>
     artifacts: list[ArtifactRecord] = Field(default_factory=list)
+    final_metrics: dict[str, float] = Field(default_factory=dict)  # last value per series (FR-B4)

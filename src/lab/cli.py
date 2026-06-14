@@ -133,6 +133,40 @@ def submit(
 
 
 @app.command()
+def confirm(
+    run_id: str = typer.Argument(..., help="the run to re-derive and verify"),
+    metric: list[str] = typer.Option(
+        None, "--metric", help="metric(s) to judge (repeatable; default: every baseline metric)"
+    ),
+    rtol: float = typer.Option(1e-3, "--rtol", help="relative tolerance for a match"),
+    atol: float = typer.Option(0.0, "--atol", help="absolute tolerance for a match"),
+    no_wait: bool = typer.Option(
+        False, "--no-wait", help="submit the fresh re-run and return its id without comparing"
+    ),
+    timeout: float | None = typer.Option(
+        None, help="seconds to wait for the re-run (default: no limit)"
+    ),
+) -> None:
+    """Re-derive a prior result from its pinned provenance and check it still holds (FR-B).
+
+    Relaunches the run fresh (no cache) and compares its final metric(s) against the original within
+    tolerance: match / drift / rerun_failed. Refuses a non-succeeded or dirty producer outright.
+    Exits non-zero unless the verdict is 'match' (or '--no-wait'), so it can gate a writeup.
+    """
+    lab = _lab_for_or_fail(run_id)
+    try:
+        result = lab.confirm(
+            run_id, metrics=metric or None, rtol=rtol, atol=atol, wait=not no_wait, timeout=timeout
+        )
+    except LabError as e:  # the gate (non-succeeded/dirty) and missing-baseline are fail-loud
+        _emit({"error": str(e)})
+        raise typer.Exit(code=1) from e
+    _emit(result)
+    if result["verdict"] not in {"match", "pending"}:
+        raise typer.Exit(code=1)
+
+
+@app.command()
 def sweep(
     command: str = typer.Option(..., "--command", "-c", help="entrypoint, e.g. 'python experiments/x.py'"),
     grid: list[str] = typer.Option(..., "--grid", "-g", help="key=v1,v2,... (repeatable)"),

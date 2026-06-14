@@ -82,6 +82,24 @@ def build_server(lab: Lab) -> FastMCP:
         return {"job_id": job_id, "cached": False, "status": the_lab.status(job_id).value}
 
     @mcp.tool
+    def confirm(
+        run_id: str,
+        metric: list[str] | None = None,
+        rtol: float = 1e-3,
+        atol: float = 0.0,
+        wait: bool = True,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Reproducibility gate (FR-B): re-derive a prior result from its pinned provenance and check it still holds. Relaunches run_id fresh (no cache) from its committed commit, then compares the re-run's final metric(s) against the original's snapshot within tolerance -> verdict 'match'|'drift'|'rerun_failed' with per-metric deltas. Raises ToolError for a non-succeeded or dirty producer (no honest result to re-derive) or a missing baseline. metric restricts which metrics are judged (default: all). wait=False submits the re-run and returns {confirm_id, verdict:'pending'}."""
+        _require(run_id)
+        try:
+            return _lab_for(run_id).confirm(
+                run_id, metrics=metric or None, rtol=rtol, atol=atol, wait=wait, timeout=timeout
+            )
+        except LabError as e:
+            raise ToolError(str(e)) from e
+
+    @mcp.tool
     def sweep(
         command: str,
         grid: dict[str, list[Any]],

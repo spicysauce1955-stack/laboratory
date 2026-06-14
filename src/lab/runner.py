@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 from lab._util import duration_seconds, now, parse_duration
+from lab.metrics import snapshot_final_metrics
 from lab.models import CostInfo, JobState
 from lab.store import JobStore
 
@@ -86,9 +87,12 @@ def run_job(job_dir: Path) -> int:
     else:
         status, reason = JobState.failed, f"exit code {exit_code}"
 
-    store.update_manifest(
-        job_id, status=status, ended_at=ended, exit_code=exit_code, end_reason=reason, cost=cost
+    fields: dict[str, object] = dict(
+        status=status, ended_at=ended, exit_code=exit_code, end_reason=reason, cost=cost
     )
+    if status is JobState.succeeded:  # durable reproducibility baseline (FR-B4)
+        fields["final_metrics"] = snapshot_final_metrics(output)
+    store.update_manifest(job_id, **fields)
     return exit_code if exit_code is not None else 1
 
 
