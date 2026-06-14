@@ -9,7 +9,7 @@ import pytest
 from helpers import PYTHON, make_manifest, wait_terminal
 
 from lab.backends.local import LocalBackend
-from lab.core import Lab, LabError, compare_final_metrics
+from lab.core import Lab, LabError, build_backend, compare_final_metrics
 from lab.manifest import current_commit, repo_root
 from lab.metrics import final_values
 from lab.models import CodeRef, JobSpec, JobState
@@ -131,6 +131,14 @@ def test_compare_missing_metric_is_drift():
 # ---------------------------------------------------------------------------
 
 
+def test_create_bundle_rejects_dirty_with_explicit_commit(tmp_path: Path):
+    """include_dirty captures the working tree (a diff vs HEAD), so it's incoherent with an
+    explicit historical commit — guard the contradictory combo rather than corrupt the bundle (#4)."""
+    repo = repo_root(Path.cwd())
+    with pytest.raises(ValueError, match="include_dirty"):
+        create_bundle(repo, tmp_path, commit=current_commit(repo), include_dirty=True)
+
+
 def test_create_bundle_pins_given_commit_without_dirty(tmp_path: Path):
     repo = repo_root(Path.cwd())
     commit = current_commit(repo)
@@ -160,6 +168,40 @@ def test_submit_records_confirms_link(tmp_path: Path):
         confirms="orig-123",
     )
     assert lab.manifest(jid).confirms == "orig-123"
+
+
+def test_build_backend_maps_names(tmp_path: Path):
+    """The single name->backend factory both Lab construction paths and the scheduler share (#7)."""
+    repo = repo_root(Path.cwd())
+    assert type(build_backend("local", home=tmp_path, repo=repo)).__name__ == "LocalBackend"
+    assert type(build_backend("skypilot", home=tmp_path, repo=repo)).__name__ == "SkyPilotBackend"
+    # unknown name falls back to local (preserves prior default_lab behavior)
+    assert type(build_backend("bogus", home=tmp_path, repo=repo)).__name__ == "LocalBackend"
+
+
+def test_update_manifest_snapshots_final_metrics_centrally(tmp_path: Path):
+    """The FR-B4 baseline invariant lives in store.update_manifest: any transition to succeeded
+    snapshots final_metrics, so no backend's finalize path can forget it (#8)."""
+    import json
+
+    repo = repo_root(Path.cwd())
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
+
+    def _seed_with_metrics(job_id: str) -> None:
+        lab.store.create(make_manifest(job_id, f"{PYTHON} {EXAMPLE}", seed=1))
+        with (lab.store.output_dir(job_id) / "metrics.jsonl").open("w") as f:
+            f.write(json.dumps({"name": "loss", "value": 0.25, "step": 0, "wall_time": 0.0}) + "\n")
+
+    # transition -> succeeded auto-snapshots from the output dir
+    _seed_with_metrics("j-ok")
+    assert lab.store.update_manifest("j-ok", status=JobState.succeeded).final_metrics == {"loss": 0.25}
+    # an explicitly-supplied snapshot is respected, not overwritten
+    _seed_with_metrics("j-explicit")
+    got = lab.store.update_manifest("j-explicit", status=JobState.succeeded, final_metrics={"loss": 9.0})
+    assert got.final_metrics == {"loss": 9.0}
+    # a non-succeeded transition never snapshots
+    _seed_with_metrics("j-fail")
+    assert lab.store.update_manifest("j-fail", status=JobState.failed).final_metrics == {}
 
 
 def test_succeeded_run_snapshots_final_metrics(tmp_path: Path):

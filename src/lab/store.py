@@ -14,7 +14,8 @@ import os
 from pathlib import Path
 from typing import Any
 
-from lab.models import JobManifest
+from lab.metrics import snapshot_final_metrics
+from lab.models import JobManifest, JobState
 
 
 class JobStore:
@@ -50,8 +51,17 @@ class JobStore:
         return JobManifest.model_validate_json(self.manifest_path(job_id).read_text())
 
     def update_manifest(self, job_id: str, **fields: Any) -> JobManifest:
-        """Read-modify-write the manifest's mutable fields (used by runner/backend)."""
+        """Read-modify-write the manifest's mutable fields (used by runner/backend).
+
+        On any transition to ``succeeded``, snapshot the run's final metric values into the manifest
+        (FR-B4 durable baseline) unless the caller supplied them — so every backend's finalize path
+        captures the baseline ``lab confirm`` compares against, without having to remember to.
+        """
         updated = self.read_manifest(job_id).model_copy(update=fields)
+        if updated.status is JobState.succeeded and not updated.final_metrics:
+            fm = snapshot_final_metrics(self.output_dir(job_id))
+            if fm:
+                updated = updated.model_copy(update={"final_metrics": fm})
         self.write_manifest(updated)
         return updated
 

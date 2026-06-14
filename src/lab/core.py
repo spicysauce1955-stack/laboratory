@@ -324,14 +324,11 @@ class Lab:
     def _sibling_lab(self, repo: Path) -> Lab:
         """A Lab rooted at ``repo`` (e.g. an extracted bundle) over the same backend kind, sharing
         this lab's home/store — mirrors the scheduler's ``make_lab`` for confirm relaunches."""
-        be: Backend
-        if self.backend.name == "skypilot":
-            from lab.backends.skypilot import SkyPilotBackend
-
-            be = SkyPilotBackend(home=self.home, repo=repo)
-        else:
-            be = LocalBackend(home=self.home, repo=repo)
-        return Lab(backend=be, repo=repo, home=self.home)
+        return Lab(
+            backend=build_backend(self.backend.name, home=self.home, repo=repo),
+            repo=repo,
+            home=self.home,
+        )
 
     def confirm(
         self,
@@ -583,17 +580,22 @@ class Lab:
         return [self.manifest(j) for j in job_ids]
 
 
+def build_backend(name: str, *, home: Path, repo: Path) -> Backend:
+    """The single name->backend mapping. Both Lab construction paths (``default_lab``,
+    ``Lab._sibling_lab``) and the scheduler (``Scheduler.make_lab``) route through here, so a new
+    backend is wired in one place instead of three. Unknown names fall back to ``local``.
+    """
+    if name == "skypilot":
+        from lab.backends.skypilot import SkyPilotBackend  # optional extra; import lazily
+
+        return SkyPilotBackend(home=home, repo=repo)
+    return LocalBackend(home=home, repo=repo)
+
+
 def default_lab(home: Path | None = None, backend: str = "local") -> Lab:
     """Construct a Lab rooted at the current git repo, over the named backend
     (``local`` or ``skypilot``). Shared by the CLI and MCP so both drive the identical core.
     """
     repo = repo_root()
     resolved_home = Path(home) if home else repo / "runs"
-    be: Backend
-    if backend == "skypilot":
-        from lab.backends.skypilot import SkyPilotBackend
-
-        be = SkyPilotBackend(home=resolved_home, repo=repo)
-    else:
-        be = LocalBackend(home=resolved_home, repo=repo)
-    return Lab(backend=be, repo=repo, home=resolved_home)
+    return Lab(backend=build_backend(backend, home=resolved_home, repo=repo), repo=repo, home=resolved_home)

@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any
 
 from lab._util import actual_cost, duration_seconds, now, parse_duration
-from lab.metrics import snapshot_final_metrics
 from lab.backends.skypilot import (
     DEFAULT_AUTOSTOP_MIN,
     DEFAULT_PROVISION_TIMEOUT_MIN,
@@ -334,9 +333,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
 
     # Respect a concurrent cancel (backend set status=cancelled before killing us).
     if store.read_manifest(job_id).status != JobState.cancelled:
-        extra: dict[str, object] = {}
-        if final is JobState.succeeded:  # durable reproducibility baseline (FR-B4)
-            extra["final_metrics"] = snapshot_final_metrics(store.output_dir(job_id))
+        # final_metrics is snapshotted centrally by the store on the succeeded transition (FR-B4).
         store.update_manifest(
             job_id,
             status=final,
@@ -345,7 +342,6 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             end_reason=final.value,
             artifacts_uri=artifacts_uri,
             cost=cost,
-            **extra,
         )
 
     teardown_ok = tear_down_and_record(sky, cluster, store, job_id)

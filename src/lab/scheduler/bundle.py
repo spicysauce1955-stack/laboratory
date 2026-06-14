@@ -34,6 +34,14 @@ def create_bundle(
     Pass ``commit`` to archive an arbitrary historical commit and ``include_dirty=False`` to capture
     only that committed tree — used by ``lab confirm`` to re-derive a past run from its pinned commit.
     """
+    if include_dirty and commit is not None:
+        # The dirty diff + untracked files are captured relative to the working tree's HEAD, so
+        # they're only coherent with HEAD. Archiving an explicit historical commit while folding in
+        # HEAD's uncommitted changes would build a tree matching neither — refuse the combo.
+        raise ValueError(
+            "create_bundle: include_dirty=True is only valid for the current HEAD (commit=None); "
+            "pass include_dirty=False to archive an explicit commit"
+        )
     repo = Path(repo)
     commit = commit if commit is not None else current_commit(repo)
     dirty = is_dirty(repo) if include_dirty else False
