@@ -22,6 +22,7 @@ class JobState(str, Enum):
     failed = "failed"
     cancelled = "cancelled"
     timed_out = "timed_out"
+    preempted = "preempted"  # spot instance reclaimed mid-run (retryable, not a failure)
 
 
 class ResourceRequest(BaseModel):

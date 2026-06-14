@@ -17,7 +17,7 @@ from lab.models import (
 )
 
 PYTHON = sys.executable
-TERMINAL = {JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out}
+TERMINAL = {JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out, JobState.preempted}
 
 
 def make_manifest(

@@ -131,6 +131,7 @@ class Scheduler:
         JobState.succeeded: RegState.succeeded,
         JobState.failed: RegState.failed,
         JobState.timed_out: RegState.failed,
+        JobState.preempted: RegState.failed,
         JobState.cancelled: RegState.cancelled,
     }
 
