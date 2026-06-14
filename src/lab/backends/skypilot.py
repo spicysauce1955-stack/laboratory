@@ -415,14 +415,27 @@ def build_task(manifest: JobManifest, workdir: Path) -> sky.Task:
     )
     # Vast is GPU-only in SkyPilot's catalog, so `accelerators` (e.g. "RTX_3070:1") is typically
     # required; cpus/memory further constrain. If accelerators is None SkyPilot cost-optimises.
-    task.set_resources(
-        sky.Resources(
-            cloud=sky.Vast(),
-            cpus=manifest.resources.cpus,
-            memory=manifest.resources.memory,
-            accelerators=manifest.resources.accelerators or None,
+    _cloud = sky.Vast()
+    _cpus = manifest.resources.cpus
+    _memory = manifest.resources.memory
+    _accels = manifest.resources.accelerators or None
+
+    def _res(*, use_spot: bool | None = None) -> sky.Resources:
+        return sky.Resources(
+            cloud=_cloud,
+            cpus=_cpus,
+            memory=_memory,
+            accelerators=_accels,
+            use_spot=use_spot,
         )
-    )
+
+    if not manifest.resources.use_spot:
+        task.set_resources(_res())
+    elif manifest.resources.spot_fallback:
+        # Prefer spot (cheaper); SkyPilot's optimizer fails over to on-demand if spot is scarce.
+        task.set_resources([_res(use_spot=True), _res(use_spot=False)])
+    else:
+        task.set_resources(_res(use_spot=True))  # spot-only, no fallback
     return task
 
 
