@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
 REMOTE_RUN_DIR = "/tmp/lab_run"
 TIMEOUT_SENTINEL = ".lab_timed_out"  # written by the run script when `timeout` kills the job
+SUCCESS_SENTINEL = ".lab_success"  # written only on a clean exit-0; gates the `succeeded` label
 TIMEOUT_KILL_GRACE_S = 30  # SIGTERM -> wait -> SIGKILL grace for a process that ignores TERM
 SELF_DESTRUCT_MARGIN_S = 600  # instance self-poweroff backstop fires at wall + this (§6)
 DEFAULT_AUTOSTOP_MIN = 5  # safety-net teardown if the supervisor process dies
@@ -104,11 +105,13 @@ def _wall_clock_wrap(cmd: str, wall: int) -> list[str]:
     run ``timed_out``. A clean finish keeps the entrypoint's own exit code.
     """
     grace = TIMEOUT_KILL_GRACE_S
-    sentinel = f"{REMOTE_RUN_DIR}/{TIMEOUT_SENTINEL}"
+    timeout_sentinel = f"{REMOTE_RUN_DIR}/{TIMEOUT_SENTINEL}"
+    success_sentinel = f"{REMOTE_RUN_DIR}/{SUCCESS_SENTINEL}"
     return [
         f"timeout --kill-after={grace}s {wall}s bash -c {shlex.quote(cmd)}",
         "rc=$?",
-        f'if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then touch "{sentinel}"; fi',
+        f'if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then touch "{timeout_sentinel}"; fi',
+        f'if [ "$rc" = 0 ]; then touch "{success_sentinel}"; fi',
         'exit "$rc"',
     ]
 
@@ -133,7 +136,13 @@ def build_run_script(manifest: JobManifest) -> str:
         f'mkdir -p "{REMOTE_RUN_DIR}"',
     ]
     if not timeout:
-        lines.append(manifest.run.entrypoint_command)
+        success_sentinel = f"{REMOTE_RUN_DIR}/{SUCCESS_SENTINEL}"
+        lines += [
+            manifest.run.entrypoint_command,
+            "rc=$?",
+            f'if [ "$rc" = 0 ]; then touch "{success_sentinel}"; fi',
+            'exit "$rc"',
+        ]
         return "\n".join(lines) + "\n"
 
     wall = int(timeout)
@@ -154,6 +163,13 @@ def promote_timeout(final: JobState, output_dir: Path) -> JobState:
     if final == JobState.failed and (Path(output_dir) / TIMEOUT_SENTINEL).exists():
         return JobState.timed_out
     return final
+
+
+def confirm_success(state: JobState, run_dir: Path) -> JobState:
+    """Downgrade succeeded->failed unless the clean-exit sentinel is present (FR-B5 integrity)."""
+    if state is JobState.succeeded and not (run_dir / SUCCESS_SENTINEL).exists():
+        return JobState.failed
+    return state
 
 
 # ---------------------------------------------------------------------------

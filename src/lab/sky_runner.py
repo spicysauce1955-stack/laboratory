@@ -23,6 +23,7 @@ from lab.backends.skypilot import (
     ProvisionTimeout,
     build_task,
     cluster_name_for,
+    confirm_success,
     map_job_status,
     promote_timeout,
     provision_with_watchdog,
@@ -240,6 +241,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         print(f"[lab] artifact rsync failed: {e}")
 
     final = promote_timeout(final, store.output_dir(job_id))  # failed -> timed_out if sentinel
+    final = confirm_success(final, store.output_dir(job_id))  # succeeded only if .lab_success present
 
     # Push the fetched outputs to durable storage (survives teardown / other machines).
     artifacts_uri = None
