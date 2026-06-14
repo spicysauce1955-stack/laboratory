@@ -9,7 +9,7 @@ import lab.backends.skypilot as skypilot_mod
 from lab.backends.local import LocalBackend
 from lab.core import Lab, LabError, build_sweep_point_spec, cache_key, expand_grid
 from lab.manifest import is_dirty, repo_root
-from lab.models import CodeRef, JobSpec, JobState
+from lab.models import CodeRef, JobSpec, JobState, ResourceRequest
 
 
 def test_end_to_end_submit_and_fetch(tmp_path: Path):
@@ -271,8 +271,6 @@ def test_submit_code_override_respects_allow_dirty(tmp_path: Path):
 
 
 def test_build_sweep_point_spec_matches_sweep_semantics():
-    from lab.models import ResourceRequest
-
     res = ResourceRequest()
     # plain override: shell-quoted key=value appended, config recorded, seed falls back to default
     s = build_sweep_point_spec("python x.py", {"a": "b c"}, seed=7, resources=res)
@@ -285,10 +283,15 @@ def test_build_sweep_point_spec_matches_sweep_semantics():
     # empty point -> bare command, no trailing space
     s3 = build_sweep_point_spec("python x.py", {}, seed=None, resources=res)
     assert s3.command == "python x.py"
+    # code_ref and submitted_by pass through unchanged (drift guard for the deferred path)
+    s4 = build_sweep_point_spec(
+        "python x.py", {"a": "1"}, seed=None, resources=res,
+        code_ref="abc123", submitted_by="human",
+    )
+    assert s4.code_ref == "abc123"
+    assert s4.submitted_by == "human"
 
 
 def test_build_sweep_point_spec_rejects_non_int_seed():
-    from lab.models import ResourceRequest
-
     with pytest.raises(LabError, match="seed"):
         build_sweep_point_spec("python x.py", {"seed": "x"}, seed=None, resources=ResourceRequest())

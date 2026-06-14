@@ -117,7 +117,7 @@ def build_sweep_point_spec(
     point: dict[str, Any],
     *,
     seed: int | None,
-    resources: ResourceRequest,
+    resources: ResourceRequest | None = None,
     code_ref: str = "HEAD",
     submitted_by: str = "agent",
 ) -> JobSpec:
@@ -143,7 +143,7 @@ def build_sweep_point_spec(
         command=full_command,
         seed=job_seed,
         config=point,
-        resources=resources,
+        resources=resources or ResourceRequest(),
         submitted_by=submitted_by,  # type: ignore[arg-type]
     )
 
@@ -274,7 +274,7 @@ class Lab:
                 command,
                 point,
                 seed=seed,
-                resources=resources or ResourceRequest(),
+                resources=resources,
                 code_ref=code_ref,
                 submitted_by=submitted_by,
             )
