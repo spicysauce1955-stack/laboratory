@@ -90,6 +90,12 @@ class R2QueueStore:
         self.store.download_file(bundle_key, out)  # bundle_key is the full stored key
         return out
 
+    def list_bundle_keys(self) -> list[str]:
+        return sorted(self.store.list_keys(self._k("bundles") + "/"))
+
+    def delete_bundle(self, bundle_key: str) -> None:
+        self.store.delete(bundle_key)  # bundle_key is the full stored key
+
     # -- mirrored manifests -------------------------------------------------------
     def mirror_manifest(self, manifest: JobManifest) -> None:
         self.store.put_text(self._k("jobs", f"{manifest.job_id}.json"), manifest.model_dump_json())

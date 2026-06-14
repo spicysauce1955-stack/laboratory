@@ -73,6 +73,24 @@ def test_register_window_and_after(tmp_path: Path):
     assert reg.triggers.after == [first["reg_id"]]
 
 
+def test_queue_gc_cli(tmp_path: Path):
+    repo = _make_repo(tmp_path)
+    out = _register(tmp_path, repo)  # a live (pending) reg -> its bundle must be kept
+    env = _env(tmp_path, repo)
+    q = LocalQueueStore(tmp_path / "queue")
+    live_key = q.get_entry(out["reg_id"]).bundle_key
+    src = tmp_path / "orphan.tar.gz"
+    src.write_bytes(b"x")
+    orphan_key = q.put_bundle("orphan", src)  # referenced by no entry -> orphaned
+
+    dry = json.loads(runner.invoke(app, ["queue", "gc"], env=env).output)
+    assert dry["orphaned"] == [orphan_key] and dry["deleted"] == [] and dry["applied"] is False
+
+    applied = json.loads(runner.invoke(app, ["queue", "gc", "--apply"], env=env).output)
+    assert applied["deleted"] == [orphan_key] and applied["applied"] is True
+    assert q.list_bundle_keys() == [live_key]  # the live reg's bundle survived
+
+
 def test_queue_cancel_hold_pause(tmp_path: Path):
     repo = _make_repo(tmp_path)
     out = _register(tmp_path, repo)

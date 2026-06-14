@@ -41,6 +41,8 @@ class QueueStore(Protocol):
         (its structure differs per store and must not be interpreted by callers)."""
         ...
     def fetch_bundle(self, bundle_key: str, dest_dir: Path) -> Path: ...
+    def list_bundle_keys(self) -> list[str]: ...
+    def delete_bundle(self, bundle_key: str) -> None: ...
     def mirror_manifest(self, manifest: JobManifest) -> None: ...
     def read_mirrored(self, job_id: str) -> JobManifest | None: ...
     def list_mirrored(self) -> list[JobManifest]: ...
@@ -123,6 +125,15 @@ class LocalQueueStore:
         out = dest_dir / Path(bundle_key).name
         shutil.copy2(self.root / bundle_key, out)  # bundle_key is relative to the queue root
         return out
+
+    def list_bundle_keys(self) -> list[str]:
+        d = self.root / "bundles"
+        if not d.exists():
+            return []
+        return sorted(f"bundles/{p.name}" for p in d.glob("*.tar.gz"))
+
+    def delete_bundle(self, bundle_key: str) -> None:
+        (self.root / bundle_key).unlink(missing_ok=True)  # bundle_key is relative to the queue root
 
     # -- mirrored job manifests (spec §4.3) ---------------------------------------
     def mirror_manifest(self, manifest: JobManifest) -> None:

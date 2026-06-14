@@ -593,6 +593,21 @@ def queue_cancel(reg_id: str) -> None:
     _emit({"reg_id": reg_id, "cancel_requested": True})
 
 
+@queue_app.command(name="gc")
+def queue_gc(
+    apply: bool = typer.Option(
+        False, "--apply", help="actually delete orphaned bundles (default: dry-run report)"
+    ),
+) -> None:
+    """Delete code bundles no live registration references (dry-run unless --apply).
+
+    A shared sweep bundle is kept until all of its points are terminal.
+    """
+    from lab.scheduler.gc import gc_bundles
+
+    _emit(gc_bundles(default_queue(), apply=apply))
+
+
 @queue_app.command(name="hold")
 def queue_hold(reg_id: str) -> None:
     """Hold a pending entry (skipped until released)."""

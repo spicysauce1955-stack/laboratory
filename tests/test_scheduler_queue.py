@@ -68,6 +68,19 @@ def test_bundle_roundtrip(tmp_path: Path):
     assert out.read_bytes() == b"tarball-bytes"
 
 
+def test_list_and_delete_bundle(tmp_path: Path):
+    q = LocalQueueStore(tmp_path / "q")
+    src = tmp_path / "code.tar.gz"
+    src.write_bytes(b"x")
+    k1 = q.put_bundle("reg-a", src)
+    k2 = q.put_bundle("sweep-1", src)
+    assert q.list_bundle_keys() == sorted([k1, k2])
+    q.delete_bundle(k1)
+    assert q.list_bundle_keys() == [k2]
+    q.delete_bundle("bundles/nope.tar.gz")  # idempotent: deleting a missing bundle is a no-op
+    assert q.list_bundle_keys() == [k2]
+
+
 def test_manifest_mirror(tmp_path: Path):
     q = LocalQueueStore(tmp_path)
     assert q.read_mirrored("j1") is None

@@ -106,6 +106,17 @@ def test_bundle_and_manifest_mirror(tmp_path: Path):
     assert [m.job_id for m in q.list_mirrored()] == ["j1"]
 
 
+def test_list_and_delete_bundle(tmp_path: Path):
+    q, _ = make_q()
+    src = tmp_path / "b.tar.gz"
+    src.write_bytes(b"x")
+    k1 = q.put_bundle("reg-a", src)
+    k2 = q.put_bundle("sweep-1", src)
+    assert q.list_bundle_keys() == sorted([k1, k2])
+    q.delete_bundle(k1)
+    assert q.list_bundle_keys() == [k2]
+
+
 def test_state_update_overwrites():
     q, _ = make_q()
     q.put_entry(_reg("reg-a"))

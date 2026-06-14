@@ -33,6 +33,14 @@ class RegState(str, Enum):
     held = "held"
 
 
+# A reg in one of these states will never launch (or relaunch) again, so its code bundle is no
+# longer needed. Used by bundle GC to decide a tarball is safe to delete. ``held`` is omitted: it
+# is display-only and a held entry is stored as ``pending`` (still live).
+TERMINAL_REG_STATES = frozenset(
+    {RegState.succeeded, RegState.failed, RegState.expired, RegState.cancelled}
+)
+
+
 class DailyWindow(BaseModel):
     """Recurring daily eligibility window, tz-aware; may cross midnight. End-exclusive."""
 
