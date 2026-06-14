@@ -20,9 +20,12 @@ from lab.backends.skypilot import (
     DEFAULT_AUTOSTOP_MIN,
     DEFAULT_PROVISION_TIMEOUT_MIN,
     REMOTE_RUN_DIR,
+    TIMEOUT_SENTINEL,
     ProvisionTimeout,
     build_task,
     cluster_name_for,
+    confirm_no_rental,
+    confirm_success,
     map_job_status,
     promote_timeout,
     provision_with_watchdog,
@@ -30,7 +33,8 @@ from lab.backends.skypilot import (
     vast_balance,
     vast_hourly_for_cluster,
 )
-from lab.models import CostInfo, JobState
+from lab.models import BackendInfo, CostInfo, JobState
+from lab.preemption import classify_terminal
 from lab.redact import install_log_redaction
 from lab.storage import R2Store, r2_enabled
 from lab.store import JobStore
@@ -62,23 +66,30 @@ def _wait_terminal(
     poll_s: float = 10.0,
     heartbeat_s: float | None = None,
     on_heartbeat: Callable[[], None] | None = None,
-) -> JobState:
+) -> tuple[JobState, bool]:
     """Poll the remote job until terminal — sky.launch (0.12) returns at submit time, not
     completion, so we must wait before fetching artifacts and tearing down.
 
     If ``heartbeat_s``/``on_heartbeat`` are given, ``on_heartbeat`` is called roughly every
     ``heartbeat_s`` of polling so the supervisor can fetch partial results mid-run; a callback
     error is logged, never fatal (§6c — don't lose ``results.csv`` to a late teardown).
+
+    Returns ``(mapped_state, reached_terminal)`` where ``reached_terminal`` is True iff the loop
+    broke because the cloud reported a terminal status (name in ``_TERMINAL_NAMES``); it is False
+    when the loop exited via the deadline. The spot classifier needs to distinguish "the cloud
+    told us it ended" from "we gave up waiting" (the latter, on spot, can mean preemption).
     """
     deadline = time.time() + max_wait
     name: str | None = None
     since_beat = 0.0
+    reached = False
     while time.time() < deadline:
         try:
             name = _job_status_name(sky_mod, cluster, sky_job_id)
         except Exception as e:  # noqa: BLE001
             print(f"[lab] queue poll error: {e}")
         if name in _TERMINAL_NAMES:
+            reached = True
             break
         time.sleep(poll_s)
         if heartbeat_s and on_heartbeat is not None:
@@ -89,7 +100,30 @@ def _wait_terminal(
                     on_heartbeat()
                 except Exception as e:  # noqa: BLE001
                     print(f"[lab] heartbeat rsync skipped: {e}")
-    return map_job_status(name or "FAILED")
+    return map_job_status(name or "FAILED"), reached
+
+
+def _cluster_up(sky_mod: Any, cluster: str) -> bool:
+    """Best-effort: is the SkyPilot cluster still UP?
+
+    Used by the spot classifier to detect a vanished box (an unmanaged spot preemption tears the
+    instance away, so ``sky.status`` no longer reports it UP). Deliberately conservative on
+    uncertainty: ANY exception or an empty/non-UP result reads as "gone" (returns False). That is
+    safe because the classifier only *infers* preemption when there was ALSO no terminal cloud
+    status AND the job was spot AND it wasn't a cancel/timeout — every authoritative outcome wins
+    first, so a false "gone" can never mislabel a real success/failure/cancel/timeout.
+    """
+    try:
+        recs = sky_mod.get(sky_mod.status(cluster_names=[cluster]))  # 0.12: RequestId -> list
+    except Exception as e:  # noqa: BLE001
+        print(f"[lab] cluster status check failed (treating as gone): {e}")
+        return False
+    for rec in recs or []:
+        status = _rec_field(rec, "status")
+        name = getattr(status, "name", str(status).split(".")[-1])
+        if name == "UP":
+            return True
+    return False
 
 
 def _rsync_down(cluster: str, remote_dir: str, local_dir: Path) -> None:
@@ -181,8 +215,16 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             # estimate.
             hourly_usd = _resolve_hourly(cluster, handle)
             estimated_usd = actual_cost(hourly_usd, parse_duration(manifest.resources.timeout))
+            # Record which instance kind SkyPilot actually launched (spot vs on-demand) — with
+            # spot_fallback the optimizer may pick on-demand, and the classifier must only infer
+            # preemption for a genuinely-spot launch. None when unknown / on-demand-only.
+            launched_spot = getattr(
+                getattr(handle, "launched_resources", None), "use_spot", None
+            )
             store.update_manifest(
-                job_id, cost=CostInfo(hourly_usd=hourly_usd, estimated_usd=estimated_usd)
+                job_id,
+                cost=CostInfo(hourly_usd=hourly_usd, estimated_usd=estimated_usd),
+                backend=BackendInfo(provisioner="skypilot", launched_spot=launched_spot),
             )
         else:
             hourly_usd = _resolve_hourly(cluster, None)
@@ -206,7 +248,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             # Best-effort: pull partial results so a late/failed teardown can't lose them (§6c).
             _rsync_down(cluster, REMOTE_RUN_DIR, store.output_dir(job_id))
 
-        final = _wait_terminal(
+        raw_final, reached_terminal = _wait_terminal(
             sky,
             cluster,
             sky_job_id,
@@ -214,6 +256,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             heartbeat_s=HEARTBEAT_S,
             on_heartbeat=_heartbeat,
         )
+        final = raw_final
     except ProvisionTimeout:
         store.update_manifest(
             job_id,
@@ -240,6 +283,32 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         print(f"[lab] artifact rsync failed: {e}")
 
     final = promote_timeout(final, store.output_dir(job_id))  # failed -> timed_out if sentinel
+    final = confirm_success(final, store.output_dir(job_id))  # succeeded only if .lab_success present
+
+    # Safety-critical: reconcile the observed terminal state with explicit/authoritative outcomes
+    # so an unmanaged-spot preemption is *inferred* only as the lowest-precedence fallback — never
+    # over a real cloud terminal, a user cancel, or a timeout (FR spot path). The classifier is a
+    # pure function; we compute its six inputs from disk + a single defensive cloud status probe.
+    # We pass the *confirmed* state (post promote_timeout/confirm_success) as ``sky_state`` so the
+    # success-sentinel integrity downgrade (succeeded->failed without .lab_success) is preserved —
+    # the classifier only ever *trusts* a succeeded/failed terminal, never invents one.
+    timed_out = (store.output_dir(job_id) / TIMEOUT_SENTINEL).exists()
+    fresh = store.read_manifest(job_id)
+    cancel_requested = fresh.status == JobState.cancelled
+    use_spot = (
+        fresh.backend.launched_spot
+        if fresh.backend.launched_spot is not None
+        else manifest.resources.use_spot
+    )
+    cluster_gone = not _cluster_up(sky, cluster)
+    final = classify_terminal(
+        sky_state=final,
+        timed_out=timed_out,
+        cancel_requested=cancel_requested,
+        use_spot=use_spot,
+        cluster_gone=cluster_gone,
+        reached_terminal=reached_terminal,
+    )
 
     # Push the fetched outputs to durable storage (survives teardown / other machines).
     artifacts_uri = None
@@ -275,6 +344,16 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         )
 
     teardown_ok = tear_down_and_record(sky, cluster, store, job_id)
+    if final is JobState.preempted and not confirm_no_rental(cluster):
+        # The instance vanished (preemption inferred), but we can't confirm the Vast rental is
+        # actually gone — flag it so `lab wait` exits 3 and the operator can run `lab reconcile`
+        # before any auto-resubmitter builds on a potentially-still-billing orphan (FR-C2).
+        store.update_manifest(
+            job_id,
+            teardown_status="failed",
+            end_reason="preempted but teardown unconfirmed — see `lab reconcile`",
+        )
+        teardown_ok = False
     return 0 if teardown_ok else 2  # 2 = ran ok but teardown leaked — manifest has details
 
 

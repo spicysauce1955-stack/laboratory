@@ -22,6 +22,7 @@ class JobState(str, Enum):
     failed = "failed"
     cancelled = "cancelled"
     timed_out = "timed_out"
+    preempted = "preempted"  # spot instance reclaimed mid-run (retryable, not a failure)
 
 
 class ResourceRequest(BaseModel):
@@ -31,6 +32,8 @@ class ResourceRequest(BaseModel):
     accelerators: str | None = None  # SkyPilot accelerator spec, e.g. "RTX_3070:1" (remote)
     timeout: str | None = None  # wall-clock limit, e.g. "2h" (FR-I1)
     provision_timeout: str | None = None  # max time to reach UP, e.g. "10m" (default 8m; skypilot)
+    use_spot: bool = False  # opt into spot/interruptible instances (skypilot)
+    spot_fallback: bool = True  # if spot capacity is unavailable, fall back to on-demand
 
 
 class CodeRef(BaseModel):
@@ -54,6 +57,7 @@ class BackendInfo(BaseModel):
     provisioner: str  # "local" | "skypilot" | ...
     machine_type: str | None = None
     region: str | None = None
+    launched_spot: bool | None = None  # actual kind launched (None = local/on-demand-only)
 
 
 class CostInfo(BaseModel):

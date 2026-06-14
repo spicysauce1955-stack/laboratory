@@ -16,7 +16,7 @@ from pathlib import Path
 from lab._util import now, parse_duration
 from lab.backends.local import LocalBackend
 from lab.core import Lab
-from lab.models import JobState
+from lab.models import JobManifest, JobState
 from lab.scheduler.bundle import extract_bundle
 from lab.scheduler.models import ControlConfig, Registration, RegState, TickReport
 from lab.scheduler.price import PriceFeed
@@ -102,6 +102,7 @@ class Scheduler:
 
     def tick(self) -> TickReport:
         rep = TickReport(at=self.now_fn())
+        self._rep = rep  # used by _relaunch_preempted (single-arg, reuses _launch)
         tick_count = int((self.queue.read_heartbeat() or {}).get("tick_count", 0)) + 1
         self._price_cache: dict[tuple[str | None, str | None], float | None] = {}
         self._best_hourly_seen: dict[str, float] = {}
@@ -131,6 +132,11 @@ class Scheduler:
         JobState.succeeded: RegState.succeeded,
         JobState.failed: RegState.failed,
         JobState.timed_out: RegState.failed,
+        # `preempted` MUST stay here: the `status not in _TERMINAL_MAP` guards above (watchdog/
+        # cancel/price-verify) rely on it to skip preempted manifests so they reach the dedicated
+        # `_handle_preempted` interception in `_sync`. The generic mapping below is never used for
+        # preempted (the interception `continue`s first); the fallback value is a safe last resort.
+        JobState.preempted: RegState.failed,
         JobState.cancelled: RegState.cancelled,
     }
 
@@ -284,11 +290,84 @@ class Scheduler:
                     rep.errors.append(f"{reg.reg_id}: cancel error: {e}"[:300])
                     continue
             self.queue.mirror_manifest(manifest)  # laptop visibility + stateless host (spec §4.3)
+            if manifest.status is JobState.preempted:
+                self._handle_preempted(reg, manifest, entries, rep)
+                continue
             new_state = self._TERMINAL_MAP.get(manifest.status)
             if new_state is not None:
                 updated = self._transition(reg, new_state, reason=manifest.end_reason)
                 entries[entries.index(reg)] = updated  # dependents see it this tick's eval
                 rep.synced[reg.reg_id] = new_state.value
+
+    def _handle_preempted(
+        self,
+        reg: Registration,
+        manifest: JobManifest,
+        entries: list[Registration],
+        rep: TickReport,
+    ) -> None:
+        """Spot preemption (Task 9): auto-resubmit, bounded by per-point retries AND a
+        cumulative budget ceiling. Money-critical — never resubmit on ambiguous billing."""
+        rep.preempted.append(reg.reg_id)
+
+        def fail(reg_state_reason: str, synced_label: str) -> None:
+            updated = self._transition(reg, RegState.failed, reason=reg_state_reason)
+            entries[entries.index(reg)] = updated  # keep this tick's view consistent
+            rep.synced[reg.reg_id] = synced_label
+
+        if manifest.teardown_status == "failed":
+            # Ambiguous billing — the box may still be running and charging. Never relaunch;
+            # surface for `lab reconcile` instead (FR-C2).
+            fail(
+                "preempted; teardown unconfirmed (see reconcile)",
+                "preempted (teardown unconfirmed)",
+            )
+            return
+
+        actual = manifest.cost.actual_usd if manifest.cost and manifest.cost.actual_usd else 0.0
+        spent = reg.cumulative_usd + actual
+        nxt = self._estimate_cost(reg) or 0.0
+        cap = reg.guardrails.max_cost_usd
+
+        if reg.preempt_count >= reg.guardrails.max_preempt_retries:
+            fail("preempted: per-point retry cap reached", "preempted (retry cap reached)")
+            return
+        if cap is not None and spent + nxt > cap:
+            fail(
+                f"preempted: cumulative budget ${cap:.2f} would be exceeded "
+                f"(spent ${spent:.2f} + next ~${nxt:.2f})",
+                "preempted (budget exhausted)",
+            )
+            return
+
+        # Resubmit: carry the incremented counter + accumulated spend forward so the NEXT
+        # preemption sees them.
+        updated = reg.model_copy(
+            update={
+                "preempt_count": reg.preempt_count + 1,
+                "cumulative_usd": spent,
+                "state": RegState.pending,
+                "job_id": None,
+                "launched_at": None,
+                "state_changed_at": self.now_fn(),
+                "last_skip_reason": "resubmitting after spot preemption",
+            }
+        )
+        self.queue.put_entry(updated)
+        entries[entries.index(reg)] = updated  # rest of the tick sees the pending, counter-bumped reg
+        try:
+            self._relaunch_preempted(updated)
+        except Exception as e:  # noqa: BLE001 — a bad entry must not kill the tick (spec §5)
+            rep.errors.append(f"{reg.reg_id}: relaunch error: {e}"[:300])
+        rep.synced[reg.reg_id] = "resubmitted (preempted)"
+
+    def _relaunch_preempted(self, reg: Registration) -> None:
+        """Relaunch a counter-bumped, pending reg via the SAME path as a normal launch.
+
+        ``_launch`` model_copies from the passed reg, so the incremented ``preempt_count`` and
+        accumulated ``cumulative_usd`` carried by ``reg`` survive the launched transition.
+        """
+        self._launch(reg, self._rep)
 
     def _expire(self, entries: list[Registration], rep: TickReport) -> None:
         nowt = self.now_fn()
@@ -344,6 +423,12 @@ class Scheduler:
             if n_running >= control.max_concurrent:
                 self._skip(reg, rep, f"max_concurrent={control.max_concurrent} reached")
                 continue
+            if reg.sweep_id and reg.sweep_max_cost is not None:
+                spent = self.store.sweep_spend(reg.sweep_id)
+                if spent >= reg.sweep_max_cost:
+                    self._skip(reg, rep,
+                               f"sweep budget: ${spent:.2f} >= ceiling ${reg.sweep_max_cost:.2f}")
+                    continue
             self._launch(reg, rep)
             if reg.reg_id in rep.launched:
                 n_running += 1

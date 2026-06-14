@@ -22,7 +22,9 @@ from lab.metrics import METRICS_FILE, read_points
 from lab.models import ArtifactRecord, JobManifest, JobState
 from lab.store import JobStore
 
-_TERMINAL = {JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out}
+_TERMINAL = {
+    JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out, JobState.preempted
+}
 
 
 def _alive(pid: int | None) -> bool:

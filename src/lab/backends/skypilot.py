@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
 REMOTE_RUN_DIR = "/tmp/lab_run"
 TIMEOUT_SENTINEL = ".lab_timed_out"  # written by the run script when `timeout` kills the job
+SUCCESS_SENTINEL = ".lab_success"  # written only on a clean exit-0; gates the `succeeded` label
 TIMEOUT_KILL_GRACE_S = 30  # SIGTERM -> wait -> SIGKILL grace for a process that ignores TERM
 SELF_DESTRUCT_MARGIN_S = 600  # instance self-poweroff backstop fires at wall + this (§6)
 DEFAULT_AUTOSTOP_MIN = 5  # safety-net teardown if the supervisor process dies
@@ -45,7 +46,9 @@ DEFAULT_PROVISION_TIMEOUT_MIN = 8
 # Long enough to ride out a transient DNS/API hiccup; short enough that a cluster that's
 # genuinely stuck still gets nuked via the vast-sdk fallback in well under 5 minutes.
 TEARDOWN_BACKOFFS = (5, 15, 30, 60, 120)
-_TERMINAL = {JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out}
+_TERMINAL = {
+    JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out, JobState.preempted
+}
 
 # SkyPilot JobStatus name -> lab JobState (pure; unit-tested).
 _STATUS_MAP = {
@@ -102,11 +105,13 @@ def _wall_clock_wrap(cmd: str, wall: int) -> list[str]:
     run ``timed_out``. A clean finish keeps the entrypoint's own exit code.
     """
     grace = TIMEOUT_KILL_GRACE_S
-    sentinel = f"{REMOTE_RUN_DIR}/{TIMEOUT_SENTINEL}"
+    timeout_sentinel = f"{REMOTE_RUN_DIR}/{TIMEOUT_SENTINEL}"
+    success_sentinel = f"{REMOTE_RUN_DIR}/{SUCCESS_SENTINEL}"
     return [
         f"timeout --kill-after={grace}s {wall}s bash -c {shlex.quote(cmd)}",
         "rc=$?",
-        f'if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then touch "{sentinel}"; fi',
+        f'if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then touch "{timeout_sentinel}"; fi',
+        f'if [ "$rc" = 0 ]; then touch "{success_sentinel}"; fi',
         'exit "$rc"',
     ]
 
@@ -131,7 +136,13 @@ def build_run_script(manifest: JobManifest) -> str:
         f'mkdir -p "{REMOTE_RUN_DIR}"',
     ]
     if not timeout:
-        lines.append(manifest.run.entrypoint_command)
+        success_sentinel = f"{REMOTE_RUN_DIR}/{SUCCESS_SENTINEL}"
+        lines += [
+            manifest.run.entrypoint_command,
+            "rc=$?",
+            f'if [ "$rc" = 0 ]; then touch "{success_sentinel}"; fi',
+            'exit "$rc"',
+        ]
         return "\n".join(lines) + "\n"
 
     wall = int(timeout)
@@ -152,6 +163,13 @@ def promote_timeout(final: JobState, output_dir: Path) -> JobState:
     if final == JobState.failed and (Path(output_dir) / TIMEOUT_SENTINEL).exists():
         return JobState.timed_out
     return final
+
+
+def confirm_success(state: JobState, run_dir: Path) -> JobState:
+    """Downgrade succeeded->failed unless the clean-exit sentinel is present (FR-B5 integrity)."""
+    if state is JobState.succeeded and not (run_dir / SUCCESS_SENTINEL).exists():
+        return JobState.failed
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +200,17 @@ def list_vast_instances(client: Any | None = None) -> list[dict[str, Any]]:
     if client is None:
         client = _get_vast_client()
     return list(client.show_instances())
+
+
+def confirm_no_rental(cluster: str) -> bool:
+    """True iff no Vast rental labelled for this cluster remains. Best-effort: returns False on any
+    match OR if the listing fails — we never claim 'gone' under uncertainty (FR-C2)."""
+    try:
+        instances = list_vast_instances()
+    except Exception:  # noqa: BLE001 — uncertainty must read as "still maybe billing"
+        return False
+    needle = cluster.lower()
+    return not any(needle in _instance_label(inst) for inst in instances)  # _instance_label is lower
 
 
 def vast_hourly_for_cluster(cluster: str, client: Any | None = None) -> float | None:
@@ -415,14 +444,27 @@ def build_task(manifest: JobManifest, workdir: Path) -> sky.Task:
     )
     # Vast is GPU-only in SkyPilot's catalog, so `accelerators` (e.g. "RTX_3070:1") is typically
     # required; cpus/memory further constrain. If accelerators is None SkyPilot cost-optimises.
-    task.set_resources(
-        sky.Resources(
-            cloud=sky.Vast(),
-            cpus=manifest.resources.cpus,
-            memory=manifest.resources.memory,
-            accelerators=manifest.resources.accelerators or None,
+    _cloud = sky.Vast()
+    _cpus = manifest.resources.cpus
+    _memory = manifest.resources.memory
+    _accels = manifest.resources.accelerators or None
+
+    def _res(*, use_spot: bool | None = None) -> sky.Resources:
+        return sky.Resources(
+            cloud=_cloud,
+            cpus=_cpus,
+            memory=_memory,
+            accelerators=_accels,
+            use_spot=use_spot,
         )
-    )
+
+    if not manifest.resources.use_spot:
+        task.set_resources(_res())
+    elif manifest.resources.spot_fallback:
+        # Prefer spot (cheaper); SkyPilot's optimizer fails over to on-demand if spot is scarce.
+        task.set_resources([_res(use_spot=True), _res(use_spot=False)])
+    else:
+        task.set_resources(_res(use_spot=True))  # spot-only, no fallback
     return task
 
 

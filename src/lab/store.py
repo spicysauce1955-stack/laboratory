@@ -70,6 +70,15 @@ class JobStore:
             return []
         return sorted(d.name for d in self.home.iterdir() if (d / "manifest.json").exists())
 
+    def sweep_spend(self, sweep_id: str) -> float:
+        """Sum actual spend of FINISHED points of a sweep (derived ceiling input; no meter)."""
+        total = 0.0
+        for jid in self.list_job_ids():
+            m = self.read_manifest(jid)
+            if m.sweep_id == sweep_id and m.cost and m.cost.actual_usd:
+                total += m.cost.actual_usd
+        return round(total, 6)
+
     @staticmethod
     def _atomic_write(path: Path, text: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

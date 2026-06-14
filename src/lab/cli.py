@@ -25,7 +25,9 @@ from lab.scheduler.register import worst_case_cost
 from lab.scheduler.tick import Scheduler
 from lab.store import JobStore
 
-_TERMINAL = {JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out}
+_TERMINAL = {
+    JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out, JobState.preempted
+}
 
 app = typer.Typer(
     help="Laboratory — remote experiment runner (CLI mirror of the MCP tools, spec §9).",
@@ -100,6 +102,11 @@ def submit(
     timeout: str | None = typer.Option(None, help="wall-clock limit, e.g. 2h / 30m / 45s"),
     provision_timeout: str | None = typer.Option(None, "--provision-timeout", help="abort if the host doesn't reach UP in time, e.g. 10m (skypilot; default 8m)"),
     with_pkg: list[str] = typer.Option(None, "--with", help="extra runtime package(s) for this job (repeatable; layered via uv run --with)"),
+    spot: bool = typer.Option(False, "--spot", help="use spot/interruptible instances (skypilot)"),
+    no_fallback: bool = typer.Option(
+        False, "--no-fallback", "--spot-only",
+        help="with --spot, do NOT fall back to on-demand if spot is scarce (wait/skip instead)",
+    ),
 ) -> None:
     """Submit a job without blocking; prints {job_id, cached, status} (FR-A1)."""
     lab = _lab(backend)
@@ -109,7 +116,7 @@ def submit(
         seed=seed,
         resources=ResourceRequest(
             cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
-            provision_timeout=provision_timeout,
+            provision_timeout=provision_timeout, use_spot=spot, spot_fallback=not no_fallback,
         ),
         submitted_by="human",
     )
@@ -137,6 +144,12 @@ def sweep(
     timeout: str | None = typer.Option(None, help="wall-clock per job, e.g. 2h"),
     provision_timeout: str | None = typer.Option(None, "--provision-timeout", help="abort a host that doesn't reach UP in time, e.g. 10m (skypilot; default 8m)"),
     with_pkg: list[str] = typer.Option(None, "--with", help="extra runtime package(s) per job (repeatable; layered via uv run --with)"),
+    spot: bool = typer.Option(False, "--spot", help="use spot/interruptible instances (skypilot)"),
+    no_fallback: bool = typer.Option(
+        False, "--no-fallback", "--spot-only",
+        help="with --spot, do NOT fall back to on-demand if spot is scarce (wait/skip instead)",
+    ),
+    sweep_max_cost: float | None = typer.Option(None, "--sweep-max-cost", help="cap total sweep spend in USD (cost-safety); refused if it exceeds the daily budget"),
 ) -> None:
     """Submit a parameter-grid sweep: one job per point under a sweep_id (FR-A5)."""
     lab = _lab(backend)
@@ -147,8 +160,9 @@ def sweep(
             seed=seed,
             resources=ResourceRequest(
                 cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
-                provision_timeout=provision_timeout,
+                provision_timeout=provision_timeout, use_spot=spot, spot_fallback=not no_fallback,
             ),
+            sweep_max_cost=sweep_max_cost,
         )
     except LabError as e:
         _emit({"error": str(e)})
@@ -220,6 +234,12 @@ def fetch(job_id: str) -> None:
 def cancel(job_id: str) -> None:
     """Cancel a job and tear down its machine (FR-A3, FR-C2)."""
     _emit({"job_id": job_id, "state": _lab_for_or_fail(job_id).cancel(job_id).value})
+
+
+@app.command(name="sweep-status")
+def sweep_status(sweep_id: str) -> None:
+    """Summarize a sweep's outcomes: preemptions, on-demand fallback, per-point spend."""
+    _emit(_lab().sweep_summary(sweep_id))
 
 
 @app.command(name="list")
@@ -372,6 +392,11 @@ def register(
         None, "--after", help="reg_id(s) that must succeed first (repeatable)"
     ),
     hold: bool = typer.Option(False, "--hold", help="register held; release with `lab queue release`"),
+    spot: bool = typer.Option(False, "--spot", help="use spot/interruptible instances (skypilot)"),
+    no_fallback: bool = typer.Option(
+        False, "--no-fallback", "--spot-only",
+        help="with --spot, do NOT fall back to on-demand if spot is scarce (wait/skip instead)",
+    ),
 ) -> None:
     """Register a deferred job; the scheduler launches it when all triggers hold (spec §6)."""
     if accelerators and timeout is None:
@@ -397,7 +422,8 @@ def register(
         command=command,
         seed=seed,
         resources=ResourceRequest(
-            cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout
+            cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
+            use_spot=spot, spot_fallback=not no_fallback,
         ),
         submitted_by="human",
     )
