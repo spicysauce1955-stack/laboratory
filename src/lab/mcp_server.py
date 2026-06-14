@@ -113,7 +113,11 @@ def build_server(lab: Lab) -> FastMCP:
                     spot_fallback=spot_fallback,
                 ),
                 sweep_max_cost=sweep_max_cost,
-                daily_budget=default_queue().read_control().budget_usd_per_day,
+                daily_budget=(
+                    default_queue().read_control().budget_usd_per_day
+                    if sweep_max_cost is not None
+                    else None
+                ),
             )
         except LabError as e:
             raise ToolError(str(e)) from e

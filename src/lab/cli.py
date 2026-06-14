@@ -164,7 +164,13 @@ def sweep(
                 provision_timeout=provision_timeout, use_spot=spot, spot_fallback=not no_fallback,
             ),
             sweep_max_cost=sweep_max_cost,
-            daily_budget=default_queue().read_control().budget_usd_per_day,
+            # only consult the control budget when there's a cap to admit against (avoids an
+            # unnecessary queue read on every plain sweep)
+            daily_budget=(
+                default_queue().read_control().budget_usd_per_day
+                if sweep_max_cost is not None
+                else None
+            ),
         )
     except LabError as e:
         _emit({"error": str(e)})
