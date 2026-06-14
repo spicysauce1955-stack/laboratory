@@ -66,7 +66,7 @@ def test_wait_terminal_fires_heartbeat(monkeypatch):
     monkeypatch.setattr(sky_runner.time, "sleep", lambda _s: None)  # no real waiting
     beats = {"n": 0}
 
-    final = sky_runner._wait_terminal(
+    final, reached = sky_runner._wait_terminal(
         _FakeSky(),
         "lab-x",
         1,
@@ -78,5 +78,42 @@ def test_wait_terminal_fires_heartbeat(monkeypatch):
     from lab.models import JobState
 
     assert final == JobState.succeeded
+    assert reached is True  # broke on SUCCEEDED, not the deadline
     # 6 RUNNING polls before terminal, heartbeat every 3 polls -> fired at poll 3 and 6.
     assert beats["n"] == 2
+
+
+class _StatusRec:
+    def __init__(self, name):
+        self.status = type("S", (), {"name": name})()
+
+
+class _StatusSky:
+    def __init__(self, recs=None, raise_exc=False):
+        self._recs = recs
+        self._raise = raise_exc
+
+    def get(self, x):
+        if self._raise:
+            raise RuntimeError("api down")
+        return x
+
+    def status(self, cluster_names=None):
+        return self._recs
+
+
+def test_cluster_up_true_when_record_up():
+    assert sky_runner._cluster_up(_StatusSky([_StatusRec("UP")]), "lab-x") is True
+
+
+def test_cluster_up_false_when_empty():
+    assert sky_runner._cluster_up(_StatusSky([]), "lab-x") is False
+
+
+def test_cluster_up_false_when_not_up():
+    assert sky_runner._cluster_up(_StatusSky([_StatusRec("STOPPED")]), "lab-x") is False
+
+
+def test_cluster_up_false_on_exception_conservative():
+    # Uncertainty must read as "gone" (False) so the classifier can fall through to its safe paths.
+    assert sky_runner._cluster_up(_StatusSky(raise_exc=True), "lab-x") is False

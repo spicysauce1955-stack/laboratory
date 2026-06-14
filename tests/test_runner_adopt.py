@@ -30,7 +30,7 @@ def test_adopt_skips_launch_and_finishes(tmp_path: Path, monkeypatch):
         fake_sky, "launch", lambda *a, **k: launched.append(1), raising=False
     )
     monkeypatch.setattr(runner_mod, "_wait_terminal",
-                        lambda *a, **k: JobState.succeeded)
+                        lambda *a, **k: (JobState.succeeded, True))
     monkeypatch.setattr(runner_mod, "_rsync_down", lambda *a, **k: None)
     monkeypatch.setattr(runner_mod, "tear_down_and_record", lambda *a, **k: True)
     monkeypatch.setattr(runner_mod, "vast_hourly_for_cluster", lambda c: 0.2)
