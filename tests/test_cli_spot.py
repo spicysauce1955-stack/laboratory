@@ -103,6 +103,34 @@ def test_sweep_spot_no_fallback():
     assert res.spot_fallback is False
 
 
+def test_sweep_passes_daily_budget_from_control(tmp_path: Path):
+    """lab sweep wires the scheduler control's daily budget into the admission check, so
+    --sweep-max-cost is actually enforced ('refused if it would exceed the daily budget')."""
+    from lab.scheduler.models import ControlConfig
+    from lab.scheduler.queue import LocalQueueStore
+
+    q = LocalQueueStore(tmp_path / "queue")
+    q.write_control(ControlConfig(budget_usd_per_day=2.0))
+    env = {"LAB_QUEUE_DIR": str(tmp_path / "queue")}
+
+    kwargs_seen: list[dict] = []
+    fake_lab = MagicMock()
+    fake_lab.sweep.side_effect = lambda cmd, grid, **kw: (
+        kwargs_seen.append(kw) or ("sweep-1", ["job-1"])
+    )
+    with patch.object(cli_mod, "_lab", return_value=fake_lab):
+        result = runner.invoke(
+            app,
+            ["sweep", "--command", "echo hi", "--grid", "lr=0.1", "--sweep-max-cost", "1"],
+            env=env,
+        )
+
+    assert result.exit_code == 0, f"Exit {result.exit_code}: {result.output}"
+    assert len(kwargs_seen) == 1
+    assert kwargs_seen[0]["daily_budget"] == 2.0
+    assert kwargs_seen[0]["sweep_max_cost"] == 1.0
+
+
 def test_register_spot_no_fallback(tmp_path: Path):
     """lab register --spot --no-fallback stores use_spot=True and spot_fallback=False."""
     from test_scheduler_bundle import _make_repo

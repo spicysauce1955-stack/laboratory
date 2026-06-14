@@ -98,7 +98,9 @@ def build_server(lab: Lab) -> FastMCP:
         spot_fallback: bool = True,
         sweep_max_cost: float | None = None,
     ) -> dict[str, Any]:
-        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5). with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. sweep_max_cost caps total sweep spend (cost-safety)."""
+        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5). with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. sweep_max_cost is an up-front admission cap: the sweep is refused if its total would exceed the daily budget (during-run enforcement is on register_sweep)."""
+        from lab.scheduler.queue import default_queue
+
         the_lab = _lab(backend)
         try:
             sweep_id, job_ids = the_lab.sweep(
@@ -111,6 +113,7 @@ def build_server(lab: Lab) -> FastMCP:
                     spot_fallback=spot_fallback,
                 ),
                 sweep_max_cost=sweep_max_cost,
+                daily_budget=default_queue().read_control().budget_usd_per_day,
             )
         except LabError as e:
             raise ToolError(str(e)) from e
