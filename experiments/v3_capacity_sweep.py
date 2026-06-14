@@ -178,11 +178,19 @@ def precompute_traces(
 # --------------------------------------------------------------------------------------------
 # Forward pass + Gutig-Sompolinsky training (online by default; batch-mode optional)
 # --------------------------------------------------------------------------------------------
-def _forward(s: torch.Tensor, w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """``V[b,p,g] = sum_i s[b,p,g,i] w[b,i]``; return ``(vmax, argmax_t)`` each ``(Sb, P)``."""
+def _forward(s: torch.Tensor, w: torch.Tensor,
+             tfixed: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """``V[b,p,g] = sum_i s[b,p,g,i] w[b,i]``; return ``(vmax, argmax_t)`` each ``(Sb, P)``.
+
+    ``tfixed`` (Sb,P): if given, read out at this fixed time per pattern instead of argmax_t V
+    (the drive-peak readout for the GS-2006 synchrony control; see ``readout`` in ``train_batch``).
+    """
     v = torch.einsum("bpgn,bn->bpg", s, w)
-    vmax, targ = v.max(dim=2)
-    return vmax, targ
+    if tfixed is None:
+        vmax, targ = v.max(dim=2)
+        return vmax, targ
+    vmax = v.gather(2, tfixed.unsqueeze(2)).squeeze(2)
+    return vmax, tfixed
 
 
 EXP_DECAY_K: float = 5.0  # 'exp' schedule: lr*exp(-K*t); at t=1 -> ~0.0067*lr (treated as "->0")
@@ -255,6 +263,7 @@ def train_batch(
     kappa_target: float = 0.0,    # V5 margin band: require signed margin >= kappa_target*|U_th|
     noise_sigmas: tuple[float, ...] = (),  # V6 output-noise levels for the robust-capacity probe
     vthr_fixed: float | None = None,  # V8 faithful-GS: fix V_thr (=1) and rescale init weights to it
+    readout: str = "vmax",  # 'vmax' (tempotron argmax_t V) | 'drive_peak' (GS synchrony control)
     log_every: int = 0,    # V8: if >0, print converged-fraction every log_every epochs (live monitor)
     patience: int = 0,     # V8: if >0, stop a cell after this many epochs with no new convergence
     log_tag: str = "",
@@ -303,7 +312,14 @@ def train_batch(
     sb, p, _, n = s.shape
     dev = s.device
     w = w_init.clone()
-    vmax, _ = _forward(s, w)
+    # Drive-peak readout (GS-2006 synchrony control): read out at the fixed per-pattern time of
+    # maximal *total* PSP drive (argmax_t sum_i s_i(t)) instead of argmax_t V(t). For a coincident
+    # volley this is the volley peak, so the gradient s(t*) never collapses into the causal
+    # dead-zone (the V_max=0 atom) that makes the bare rule blind to half the +patterns. This
+    # makes the timing-removed ensemble a faithful perceptron; for the generic ensembles the
+    # tempotron's argmax_t V readout is the intended one, so this is opt-in (online mode only).
+    tdrive = s.sum(dim=3).argmax(dim=2) if readout == "drive_peak" else None  # (Sb,P) or None
+    vmax, _ = _forward(s, w, tdrive)
 
     def _vmax_median(v: torch.Tensor) -> torch.Tensor:
         """Per-seed median V_max over *valid* patterns (mask=None => over all P)."""
@@ -311,11 +327,38 @@ def train_batch(
             return v.median(dim=1).values
         return torch.stack([v[i][valid_mask[i] > 0].median() for i in range(sb)])
 
+    def _vmax_balance(v: torch.Tensor) -> torch.Tensor:
+        """Per-seed init-rescale target for the fixed-V_thr gauge.
+
+        Default: the median V_max (the P(fire)=1/2 operating point). But the median is
+        ill-posed for a *degenerate* V_max distribution. In ``synchrony_half`` every active
+        afferent of a pattern fires at one coincident time, so V(t)=S*K(t-t_common) with a
+        single scalar S=sum_active w_i; the causal PSP kernel makes V_max>=0, so the ~half of
+        patterns with S<=0 collapse to an atom at V_max=0. The median then sits on that atom
+        (~0) and rescaling ``vthr/median`` drives ||w||->~1e12 (the J3/J3b divergence). Detect
+        the atom (median << upper-quantile scale) and rescale on the median of the strictly
+        -positive V_max (its continuous support) instead. For the validated continuous ensembles
+        (single/poisson) the median is well above 0, so the guard never fires and their
+        calibration is byte-for-byte unchanged.
+        """
+        out = torch.empty(sb, device=dev, dtype=v.dtype)
+        for i in range(sb):
+            vi = v[i] if valid_mask is None else v[i][valid_mask[i] > 0]
+            med_i = vi.median()
+            q_hi = torch.quantile(vi, 0.75)
+            if bool(med_i <= 1e-3 * q_hi):  # atom at ~0 dominates the lower half
+                pos = vi[vi > 0]
+                out[i] = pos.median() if pos.numel() > 0 else med_i
+            else:
+                out[i] = med_i
+        return out
+
     if vthr_fixed is not None:
-        # Faithful GS: fixed threshold, rescale init weights so median V_max == vthr_fixed.
-        med = _vmax_median(vmax).clamp(min=1e-12)  # (Sb,)
+        # Faithful GS: fixed threshold, rescale init weights so a balanced fraction fires
+        # (median V_max -> V_thr; guarded for degenerate ensembles, see _vmax_balance).
+        med = _vmax_balance(vmax).clamp(min=1e-12)  # (Sb,)
         w = w * (vthr_fixed / med)[:, None]
-        vmax, _ = _forward(s, w)
+        vmax, _ = _forward(s, w, tdrive)
         threshold = torch.full((sb,), float(vthr_fixed), device=dev)
     elif threshold is None:
         threshold = _vmax_median(vmax)  # (Sb,)
@@ -376,7 +419,11 @@ def train_batch(
             for pi in order:
                 sp = s[:, pi]                               # (Sb, G, N) contiguous
                 vp = torch.einsum("bgn,bn->bg", sp, w)
-                vmx, tg = vp.max(dim=1)                     # (Sb,)
+                if tdrive is None:
+                    vmx, tg = vp.max(dim=1)                 # (Sb,) tempotron argmax_t V
+                else:
+                    tg = tdrive[:, pi]                      # fixed drive-peak readout
+                    vmx = vp[arange_sb, tg]
                 # update when the signed margin is below the band (band=0 => bare zero-error rule)
                 smarg = (vmx - threshold) * labels[:, pi]
                 if record_history or cap:
@@ -749,6 +796,7 @@ def main() -> int:
     lr_gs_coeff = float(ov.get("lr_gs_coeff", "3e-3"))  # GS Fig-4 capacity schedule coefficient
     vthr_fixed_ov = ov.get("vthr_fixed", "")  # faithful GS fixes V_thr (e.g. 1.0); '' => calibrate U_th
     vthr_fixed = float(vthr_fixed_ov) if vthr_fixed_ov else None
+    readout = ov.get("readout", "vmax")  # 'vmax' | 'drive_peak' (GS-2006 synchrony control)
     # Live learning-curve logging cadence (epochs). Default ON (~50 points/cell) so EVERY run streams
     # its training error+loss to metrics.jsonl -- captured live and surviving a teardown/rsync failure.
     log_every = int(ov.get("log_every", "0"))
@@ -876,7 +924,7 @@ def main() -> int:
                         emit(f"trainloss_N{_n}_a{_a:.2f}", lossm, ep)
                     res = train_batch(s, lab_b, w0, lr=lr_cell, momentum=momentum, epochs=epochs,
                                       mode=mode, uth_scale=uth_scale, kappa_target=kappa_target,
-                                      noise_sigmas=noise_sigmas, vthr_fixed=vthr_fixed,
+                                      noise_sigmas=noise_sigmas, vthr_fixed=vthr_fixed, readout=readout,
                                       log_every=log_every, patience=patience,
                                       log_tag=f"K{round(k)}N{n_aff}a{alpha:.2f}b{b0}",
                                       record_history=bool(history_flag) and b0 == 0,
