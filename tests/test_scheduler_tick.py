@@ -4,12 +4,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from helpers import PYTHON, make_manifest, wait_terminal
+from test_scheduler_bundle import _make_repo
+
 from lab._util import now as utc_now
 from lab.backends.local import LocalBackend
 from lab.models import BackendInfo, CostInfo, JobSpec, JobState, ResourceRequest
 from lab.scheduler.bundle import create_bundle
 from lab.scheduler.models import ControlConfig, Guardrails, Registration, RegState, Triggers
 from lab.scheduler.queue import LocalQueueStore
+from lab.scheduler.register import register_sweep
 from lab.scheduler.tick import Scheduler
 
 T0 = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
@@ -634,3 +637,43 @@ def test_launch_forwards_sweep_id(tmp_path: Path):
     job_id = q.get_entry("reg-sw").job_id
     assert job_id is not None
     assert sched.store.read_manifest(job_id).sweep_id == "sweep-test"
+
+
+def test_sweep_ceiling_stops_launching_remaining_points(tmp_path: Path):
+    """register_sweep -> scheduler launches points one at a time (max_concurrent=1); once a
+    finished point's actual_usd reaches the ceiling, remaining points are skipped (never killed).
+    Exercises the during-sweep ceiling through the real register_sweep -> launch path."""
+    clock = FakeClock()
+    sched, q = make_sched(tmp_path, clock)
+    q.write_control(ControlConfig(max_concurrent=1))  # pace one at a time so the ceiling can bite
+
+    repo = _make_repo(tmp_path)
+    sweep_id, regs = register_sweep(
+        repo, q, f"{PYTHON} -c 'print(42)'", {"K": ["1", "2", "3"]},
+        resources=ResourceRequest(),
+        triggers=Triggers(),
+        guardrails=Guardrails(expires_at=clock.t + timedelta(days=1)),
+        sweep_max_cost=1.0,  # below worst case; bites after the first finished point
+    )
+    assert len(regs) == 3
+    assert len({r.bundle_key for r in regs}) == 1  # Decision A: one shared bundle
+
+    # Tick 1: launches exactly one point (max_concurrent=1).
+    rep1 = sched.tick()
+    assert len(rep1.launched) == 1
+    launched_id = rep1.launched[0]
+    job_id = q.get_entry(launched_id).job_id
+    assert job_id is not None
+    backend = LocalBackend(home=tmp_path / "runs", repo=repo)
+    wait_terminal(backend, job_id)
+
+    # The finished point's spend reaches the ceiling.
+    sched.store.update_manifest(job_id, cost=CostInfo(actual_usd=1.5))
+    assert sched.store.sweep_spend(sweep_id) >= 1.0
+
+    # Tick 2: the point is terminal (frees the slot), but sweep_spend >= ceiling, so the scheduler
+    # skips the remaining points with the sweep-budget reason (it never kills anything).
+    rep2 = sched.tick()
+    assert rep2.launched == []
+    remaining = [r.reg_id for r in regs if r.reg_id != launched_id]
+    assert any("sweep budget" in rep2.skipped.get(rid, "") for rid in remaining)
