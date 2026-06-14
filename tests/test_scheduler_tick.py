@@ -6,7 +6,7 @@ from pathlib import Path
 from helpers import PYTHON, make_manifest, wait_terminal
 from lab._util import now as utc_now
 from lab.backends.local import LocalBackend
-from lab.models import BackendInfo, JobSpec, JobState, ResourceRequest
+from lab.models import BackendInfo, CostInfo, JobSpec, JobState, ResourceRequest
 from lab.scheduler.bundle import create_bundle
 from lab.scheduler.models import ControlConfig, Guardrails, Registration, RegState, Triggers
 from lab.scheduler.queue import LocalQueueStore
@@ -502,3 +502,74 @@ def test_sync_remirrors_recently_terminal_manifests(tmp_path: Path):
     sched.tick()
     refreshed = q.read_mirrored(e.job_id)
     assert refreshed is not None and refreshed.teardown_status == "succeeded"
+
+
+def test_preempted_registered_job_is_resubmitted_under_budget(tmp_path):
+    sched, q = _watchdog_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a", command="python x.py",
+            expires=utc_now() + timedelta(days=1), max_cost=100.0)
+    m = make_manifest("j-spot", "python x.py", timeout="1h").model_copy(update={
+        "status": JobState.preempted, "ended_at": utc_now(), "registration_id": "reg-a",
+        "teardown_status": "succeeded",
+        "cost": CostInfo(actual_usd=0.4, hourly_usd=0.4, estimated_usd=0.4)})
+    sched.store.create(m)
+    q.put_entry(q.get_entry("reg-a").model_copy(update={
+        "state": RegState.launched, "job_id": "j-spot", "launched_at": utc_now()}))
+    relaunched: list[str] = []
+    sched._relaunch_preempted = lambda reg: relaunched.append(reg.reg_id)  # type: ignore[method-assign]
+    sched.tick()
+    e = q.get_entry("reg-a")
+    assert relaunched == ["reg-a"]
+    assert e.preempt_count == 1
+    assert e.cumulative_usd == 0.4
+
+
+def test_preempted_stops_at_retry_cap(tmp_path):
+    sched, q = _watchdog_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a", command="python x.py",
+            expires=utc_now() + timedelta(days=1), max_cost=100.0)
+    m = make_manifest("j-spot", "python x.py", timeout="1h").model_copy(update={
+        "status": JobState.preempted, "ended_at": utc_now(), "registration_id": "reg-a",
+        "teardown_status": "succeeded", "cost": CostInfo(actual_usd=0.4)})
+    sched.store.create(m)
+    q.put_entry(q.get_entry("reg-a").model_copy(update={
+        "state": RegState.launched, "job_id": "j-spot", "launched_at": utc_now(),
+        "preempt_count": 2}))  # cap reached (default max_preempt_retries=2)
+    sched._relaunch_preempted = lambda reg: (_ for _ in ()).throw(AssertionError("must not relaunch"))  # type: ignore[method-assign]
+    rep = sched.tick()
+    assert q.get_entry("reg-a").state is RegState.failed
+    assert rep.synced["reg-a"] == "preempted (retry cap reached)"
+
+
+def test_preempted_stops_when_budget_exhausted(tmp_path):
+    sched, q = _watchdog_sched(tmp_path)
+    # cap 0.5; already spent 0.4; next attempt est would push over -> stop
+    put_reg(q, tmp_path, "reg-a", command="python x.py",
+            expires=utc_now() + timedelta(days=1), max_cost=0.5)
+    m = make_manifest("j-spot", "python x.py", timeout="1h").model_copy(update={
+        "status": JobState.preempted, "registration_id": "reg-a", "teardown_status": "succeeded",
+        "cost": CostInfo(actual_usd=0.4)})
+    sched.store.create(m)
+    q.put_entry(q.get_entry("reg-a").model_copy(update={
+        "state": RegState.launched, "job_id": "j-spot", "cumulative_usd": 0.0}))
+    # force a non-trivial next-attempt estimate so spent(0.4)+est > cap(0.5)
+    sched._estimate_cost = lambda reg: 0.4  # type: ignore[method-assign]
+    sched._relaunch_preempted = lambda reg: (_ for _ in ()).throw(AssertionError("must not relaunch"))  # type: ignore[method-assign]
+    rep = sched.tick()
+    assert q.get_entry("reg-a").state is RegState.failed
+    assert "budget" in rep.synced["reg-a"]
+
+
+def test_preempted_with_failed_teardown_is_not_resubmitted(tmp_path):
+    sched, q = _watchdog_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a", command="python x.py", expires=utc_now() + timedelta(days=1))
+    m = make_manifest("j-spot", "python x.py").model_copy(update={
+        "status": JobState.preempted, "registration_id": "reg-a",
+        "teardown_status": "failed"})  # ambiguous billing — never relaunch
+    sched.store.create(m)
+    q.put_entry(q.get_entry("reg-a").model_copy(update={
+        "state": RegState.launched, "job_id": "j-spot"}))
+    sched._relaunch_preempted = lambda reg: (_ for _ in ()).throw(AssertionError("must not relaunch"))  # type: ignore[method-assign]
+    rep = sched.tick()
+    assert q.get_entry("reg-a").state is RegState.failed
+    assert "teardown" in rep.synced["reg-a"]
