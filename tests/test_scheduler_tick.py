@@ -662,6 +662,7 @@ def test_sweep_ceiling_stops_launching_remaining_points(tmp_path: Path):
     rep1 = sched.tick()
     assert len(rep1.launched) == 1
     launched_id = rep1.launched[0]
+    assert launched_id in {r.reg_id for r in regs}
     job_id = q.get_entry(launched_id).job_id
     assert job_id is not None
     backend = LocalBackend(home=tmp_path / "runs", repo=repo)
@@ -669,6 +670,7 @@ def test_sweep_ceiling_stops_launching_remaining_points(tmp_path: Path):
 
     # The finished point's spend reaches the ceiling.
     sched.store.update_manifest(job_id, cost=CostInfo(actual_usd=1.5))
+    assert sched.store.read_manifest(job_id).cost.actual_usd == 1.5  # fixture sanity
     assert sched.store.sweep_spend(sweep_id) >= 1.0
 
     # Tick 2: the point is terminal (frees the slot), but sweep_spend >= ceiling, so the scheduler
@@ -676,4 +678,4 @@ def test_sweep_ceiling_stops_launching_remaining_points(tmp_path: Path):
     rep2 = sched.tick()
     assert rep2.launched == []
     remaining = [r.reg_id for r in regs if r.reg_id != launched_id]
-    assert any("sweep budget" in rep2.skipped.get(rid, "") for rid in remaining)
+    assert all("sweep budget" in rep2.skipped.get(rid, "") for rid in remaining)
