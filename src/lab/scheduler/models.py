@@ -80,6 +80,8 @@ class Registration(BaseModel):
     last_skip_reason: str | None = None
     preempt_count: int = 0  # spot-preemption resubmits used so far
     cumulative_usd: float = 0.0  # summed actual spend across this job's attempts
+    sweep_id: str | None = None  # set when this reg is one point of a deferred sweep
+    sweep_max_cost: float | None = None  # derived sweep ceiling (cost-safety, Task 12)
 
 
 class ControlConfig(BaseModel):

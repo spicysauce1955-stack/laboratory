@@ -423,6 +423,12 @@ class Scheduler:
             if n_running >= control.max_concurrent:
                 self._skip(reg, rep, f"max_concurrent={control.max_concurrent} reached")
                 continue
+            if reg.sweep_id and reg.sweep_max_cost is not None:
+                spent = self.store.sweep_spend(reg.sweep_id)
+                if spent >= reg.sweep_max_cost:
+                    self._skip(reg, rep,
+                               f"sweep budget: ${spent:.2f} >= ceiling ${reg.sweep_max_cost:.2f}")
+                    continue
             self._launch(reg, rep)
             if reg.reg_id in rep.launched:
                 n_running += 1

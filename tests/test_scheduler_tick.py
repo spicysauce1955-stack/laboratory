@@ -588,3 +588,35 @@ def test_tick_report_lists_preempted(tmp_path):
     sched._relaunch_preempted = lambda reg: None  # type: ignore[method-assign]
     rep = sched.tick()
     assert "reg-a" in rep.preempted
+
+
+# ------------------------------------------------------------------ Task 12: sweep ceiling
+
+
+def test_sweep_ceiling_stops_launching_new_points(tmp_path):
+    sched, q = _watchdog_sched(tmp_path)
+    # two finished points cost 9.0 total; ceiling 8.0 -> the third point must not launch
+    for jid, cost in (("p1", 5.0), ("p2", 4.0)):
+        sched.store.create(make_manifest(jid, "x").model_copy(update={
+            "status": JobState.succeeded, "sweep_id": "sw-1", "cost": CostInfo(actual_usd=cost)}))
+    put_reg(q, tmp_path, "reg-c", command="python x.py", expires=utc_now() + timedelta(days=1))
+    q.put_entry(q.get_entry("reg-c").model_copy(update={
+        "sweep_id": "sw-1", "sweep_max_cost": 8.0}))
+    launched: list[str] = []
+    sched._launch = lambda reg, rep: launched.append(reg.reg_id)  # type: ignore[method-assign]
+    rep = sched.tick()
+    assert launched == []
+    assert "sweep budget" in rep.skipped["reg-c"]
+
+
+def test_sweep_under_ceiling_still_launches(tmp_path):
+    sched, q = _watchdog_sched(tmp_path)
+    sched.store.create(make_manifest("p1", "x").model_copy(update={
+        "status": JobState.succeeded, "sweep_id": "sw-2", "cost": CostInfo(actual_usd=1.0)}))
+    put_reg(q, tmp_path, "reg-d", command="python x.py", expires=utc_now() + timedelta(days=1))
+    q.put_entry(q.get_entry("reg-d").model_copy(update={
+        "sweep_id": "sw-2", "sweep_max_cost": 8.0}))
+    launched: list[str] = []
+    sched._launch = lambda reg, rep: launched.append(reg.reg_id)  # type: ignore[method-assign]
+    sched.tick()
+    assert launched == ["reg-d"]
