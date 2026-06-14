@@ -66,12 +66,12 @@ def _emit(obj: Any) -> None:
     typer.echo(json.dumps(obj, indent=2, default=str))
 
 
-def _parse_grid(items: list[str]) -> dict[str, list]:
+def _parse_grid(items: list[str]) -> dict[str, list[str]]:
     """Parse repeated `--grid key=v1,v2,...` options into {key: [values]}.
 
     Values stay strings — the experiment (e.g. Hydra) coerces types, so the lab doesn't guess.
     """
-    grid: dict[str, list] = {}
+    grid: dict[str, list[str]] = {}
     for item in items:
         if "=" not in item:
             raise typer.BadParameter(f"--grid expects key=v1,v2,... (got {item!r})")

@@ -58,7 +58,7 @@ def build_server(lab: Lab) -> FastMCP:
         timeout: str | None = None,
         provision_timeout: str | None = None,
         with_pkg: list[str] | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP."""
         the_lab = _lab(backend)
         spec = JobSpec(
@@ -82,7 +82,7 @@ def build_server(lab: Lab) -> FastMCP:
     @mcp.tool
     def sweep(
         command: str,
-        grid: dict[str, list],
+        grid: dict[str, list[Any]],
         backend: str = "local",
         seed: int | None = None,
         cpus: int | None = None,
@@ -92,7 +92,7 @@ def build_server(lab: Lab) -> FastMCP:
         timeout: str | None = None,
         provision_timeout: str | None = None,
         with_pkg: list[str] | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5). with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP."""
         the_lab = _lab(backend)
         try:
@@ -110,7 +110,7 @@ def build_server(lab: Lab) -> FastMCP:
         return {"sweep_id": sweep_id, "job_ids": job_ids}
 
     @mcp.tool
-    def status(job_id: str) -> dict:
+    def status(job_id: str) -> dict[str, Any]:
         """Return a job's state + timing (FR-A2); cheap to poll (FR-G2)."""
         m = _require(job_id)
         state = _lab_for(job_id).status(job_id)
@@ -127,19 +127,19 @@ def build_server(lab: Lab) -> FastMCP:
     @mcp.tool
     def metrics(
         job_id: str, names: list[str] | None = None, since_step: int | None = None
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Query incremental metric series; returns {series:{name:[{step,value,wall_time}]}} (FR-D2)."""
         _require(job_id)
         return {"series": _lab_for(job_id).metrics(job_id, names=names, since_step=since_step)}
 
     @mcp.tool
-    def logs(job_id: str, tail: int | None = 100) -> dict:
+    def logs(job_id: str, tail: int | None = 100) -> dict[str, Any]:
         """Tail a job's logs; returns {lines: [...]} (FR-D1)."""
         _require(job_id)
         return {"lines": _lab_for(job_id).logs(job_id, tail=tail)}
 
     @mcp.tool
-    def fetch_artifacts(job_id: str) -> dict:
+    def fetch_artifacts(job_id: str) -> dict[str, Any]:
         """Collect artifacts into runs/<job_id>/; returns {local_paths, artifacts} (FR-E2)."""
         _require(job_id)
         arts = _lab_for(job_id).fetch_artifacts(job_id)
@@ -149,13 +149,13 @@ def build_server(lab: Lab) -> FastMCP:
         }
 
     @mcp.tool
-    def cancel(job_id: str) -> dict:
+    def cancel(job_id: str) -> dict[str, Any]:
         """Cancel a job and tear down its machine; returns {state} (FR-A3, FR-C2)."""
         _require(job_id)
         return {"job_id": job_id, "state": _lab_for(job_id).cancel(job_id).value}
 
     @mcp.tool(name="list")
-    def list_jobs() -> dict:
+    def list_jobs() -> dict[str, Any]:
         """List jobs; returns {jobs: [...]} (FR-H1)."""
         return {
             "jobs": [

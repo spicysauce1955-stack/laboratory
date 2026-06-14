@@ -32,7 +32,7 @@ class R2Store:
         if client is not None:
             self._s3 = client
             return
-        import boto3
+        import boto3  # type: ignore[import-untyped]
 
         # Let boto3 read the R2 creds file unless AWS creds are already in the env.
         if not os.environ.get("AWS_ACCESS_KEY_ID") and R2_CREDENTIALS_FILE.exists():

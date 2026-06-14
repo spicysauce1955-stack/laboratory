@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -46,7 +46,7 @@ class EnvInfo(BaseModel):
 
 class RunSpec(BaseModel):
     entrypoint_command: str
-    resolved_config: dict = Field(default_factory=dict)
+    resolved_config: dict[str, Any] = Field(default_factory=dict)
     seed: int  # explicit + recorded (FR-B4)
 
 
@@ -90,7 +90,7 @@ class JobSpec(BaseModel):
 
     code_ref: str = "HEAD"
     command: str
-    config: dict | None = None
+    config: dict[str, Any] | None = None
     seed: int | None = None
     resources: ResourceRequest = Field(default_factory=ResourceRequest)
     submitted_by: Submitter = "agent"

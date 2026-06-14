@@ -61,6 +61,14 @@ packages = ["src/lab"]
 [tool.ruff]
 line-length = 100
 
+[tool.ruff.lint.per-file-ignores]
+# Research/workload scripts are deliberately terse (semicolon stanzas, scratch variables) and
+# aren't lab source. Keep correctness checks (undefined names, syntax) but waive the import- and
+# statement-style rules `src/lab` is held to.
+"experiments/*" = ["E4", "E7", "F401", "F541", "F841"]
+"collect_v10.py" = ["E4", "E7", "F401", "F541", "F841"]
+".claude/**" = ["E4", "E7", "F401", "F541", "F841"]
+
 [tool.mypy]
 strict = true
 files = ["src/lab"]

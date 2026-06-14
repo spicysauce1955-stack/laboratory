@@ -40,11 +40,11 @@ _TERMINAL_NAMES = {"SUCCEEDED", "FAILED", "FAILED_SETUP", "FAILED_DRIVER", "CANC
 HEARTBEAT_S = 60.0  # how often the supervisor rsyncs partial results down mid-run (§6c)
 
 
-def _rec_field(rec, key: str):
+def _rec_field(rec: Any, key: str) -> Any:
     return rec.get(key) if isinstance(rec, dict) else getattr(rec, key, None)
 
 
-def _job_status_name(sky_mod, cluster: str, sky_job_id: int | None) -> str | None:
+def _job_status_name(sky_mod: Any, cluster: str, sky_job_id: int | None) -> str | None:
     recs = sky_mod.get(sky_mod.queue(cluster, skip_finished=False))  # 0.12: RequestId
     for rec in recs:
         if sky_job_id is None or _rec_field(rec, "job_id") == sky_job_id:
@@ -54,7 +54,7 @@ def _job_status_name(sky_mod, cluster: str, sky_job_id: int | None) -> str | Non
 
 
 def _wait_terminal(
-    sky_mod,
+    sky_mod: Any,
     cluster: str,
     sky_job_id: int | None,
     max_wait: float,
@@ -101,7 +101,7 @@ def _rsync_down(cluster: str, remote_dir: str, local_dir: Path) -> None:
     )
 
 
-def _hourly_cost(handle) -> float | None:
+def _hourly_cost(handle: Any) -> float | None:
     """USD/hour for the launched cluster, or None if unavailable (best-effort, FR-I2)."""
     try:
         launched = getattr(handle, "launched_resources", None)
