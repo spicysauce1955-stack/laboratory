@@ -56,7 +56,7 @@ class BackendInfo(BaseModel):
     provisioner: str  # "local" | "skypilot" | ...
     machine_type: str | None = None
     region: str | None = None
-    launched_spot: bool | None = None  # which kind actually launched (None for local/on-demand-only)
+    launched_spot: bool | None = None  # actual kind launched (None = local/on-demand-only)
 
 
 class CostInfo(BaseModel):
