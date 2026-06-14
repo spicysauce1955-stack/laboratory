@@ -112,6 +112,42 @@ def check_sweep_admission(
     return worst
 
 
+def build_sweep_point_spec(
+    command: str,
+    point: dict[str, Any],
+    *,
+    seed: int | None,
+    resources: ResourceRequest,
+    code_ref: str = "HEAD",
+    submitted_by: str = "agent",
+) -> JobSpec:
+    """One grid point -> a JobSpec, identical for immediate (``Lab.sweep``) and deferred
+    (``register_sweep``) paths so they can't drift.
+
+    Point params are appended to the command as **shell-quoted** ``key=value`` overrides
+    (injection-safe) and recorded in ``config``. A ``seed`` key in the point sets the per-point
+    seed (must be int); otherwise the sweep-level ``seed`` default applies.
+    """
+    overrides = " ".join(shlex.quote(f"{k}={v}") for k, v in point.items())
+    full_command = f"{command} {overrides}".strip()
+    point_seed = point.get("seed")
+    if point_seed is not None:
+        try:
+            job_seed: int | None = int(point_seed)
+        except (TypeError, ValueError) as e:
+            raise LabError(f"grid 'seed' values must be integers, got {point_seed!r}") from e
+    else:
+        job_seed = seed
+    return JobSpec(
+        code_ref=code_ref,
+        command=full_command,
+        seed=job_seed,
+        config=point,
+        resources=resources,
+        submitted_by=submitted_by,  # type: ignore[arg-type]
+    )
+
+
 class Lab:
     def __init__(self, backend: Backend, repo: Path, home: Path) -> None:
         self.backend = backend
@@ -234,23 +270,13 @@ class Lab:
         sweep_id = f"sweep-{_new_job_id()}"
         job_ids: list[str] = []
         for point in points:
-            overrides = " ".join(shlex.quote(f"{k}={v}") for k, v in point.items())
-            full_command = f"{command} {overrides}".strip()
-            point_seed = point.get("seed")
-            if point_seed is not None:
-                try:
-                    job_seed: int | None = int(point_seed)
-                except (TypeError, ValueError) as e:
-                    raise LabError(f"grid 'seed' values must be integers, got {point_seed!r}") from e
-            else:
-                job_seed = seed
-            spec = JobSpec(
-                code_ref=code_ref,
-                command=full_command,
-                seed=job_seed,
-                config=point,
+            spec = build_sweep_point_spec(
+                command,
+                point,
+                seed=seed,
                 resources=resources or ResourceRequest(),
-                submitted_by=submitted_by,  # type: ignore[arg-type]
+                code_ref=code_ref,
+                submitted_by=submitted_by,
             )
             job_ids.append(self.submit(spec, allow_dirty=allow_dirty, sweep_id=sweep_id))
         return sweep_id, job_ids

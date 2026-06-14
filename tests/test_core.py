@@ -7,7 +7,7 @@ from helpers import PYTHON, TERMINAL, make_manifest, wait_terminal
 
 import lab.backends.skypilot as skypilot_mod
 from lab.backends.local import LocalBackend
-from lab.core import Lab, LabError, cache_key, expand_grid
+from lab.core import Lab, LabError, build_sweep_point_spec, cache_key, expand_grid
 from lab.manifest import is_dirty, repo_root
 from lab.models import CodeRef, JobSpec, JobState
 
@@ -268,3 +268,27 @@ def test_submit_code_override_respects_allow_dirty(tmp_path: Path):
     dirty_code = CodeRef(git_commit="a" * 40, git_dirty=True)
     with pytest.raises(LabError):
         lab.submit(JobSpec(command="python x.py"), code=dirty_code, allow_dirty=False)
+
+
+def test_build_sweep_point_spec_matches_sweep_semantics():
+    from lab.models import ResourceRequest
+
+    res = ResourceRequest()
+    # plain override: shell-quoted key=value appended, config recorded, seed falls back to default
+    s = build_sweep_point_spec("python x.py", {"a": "b c"}, seed=7, resources=res)
+    assert s.command == "python x.py 'a=b c'"
+    assert s.config == {"a": "b c"}
+    assert s.seed == 7
+    # a 'seed' grid key overrides the per-point seed (coerced to int)
+    s2 = build_sweep_point_spec("python x.py", {"seed": "3"}, seed=7, resources=res)
+    assert s2.seed == 3
+    # empty point -> bare command, no trailing space
+    s3 = build_sweep_point_spec("python x.py", {}, seed=None, resources=res)
+    assert s3.command == "python x.py"
+
+
+def test_build_sweep_point_spec_rejects_non_int_seed():
+    from lab.models import ResourceRequest
+
+    with pytest.raises(LabError, match="seed"):
+        build_sweep_point_spec("python x.py", {"seed": "x"}, seed=None, resources=ResourceRequest())
