@@ -171,6 +171,7 @@ def test_register_sweep_tool(tmp_path: Path, monkeypatch):
     assert out["count"] == 2
     assert out["sweep_id"].startswith("sweep-")
     assert len(out["reg_ids"]) == 2
+    assert all(r.startswith("reg-") for r in out["reg_ids"])
 
 
 def test_register_unknown_queue_ops_fail_loud(tmp_path: Path, monkeypatch):

@@ -266,9 +266,10 @@ def build_server(lab: Lab) -> FastMCP:
         sweep_max_cost: float | None = None,
     ) -> dict[str, Any]:
         """Register a parameter grid as N deferred points sharing one sweep_id + ceiling + bundle;
-        the scheduler paces them (triggers, max_concurrent) and stops launching once finished-spend
-        hits sweep_max_cost (it never kills a running point). grid is {key: [values]}. expires
-        (+3d / ISO) is the required run-by guardrail. Returns {sweep_id, count, reg_ids}."""
+        the always-on scheduler paces them (subject to triggers and the queue-wide max_concurrent
+        control) and stops launching once finished-spend hits sweep_max_cost (it never kills a
+        running point). grid is {key: [values]}. expires (+3d / ISO) is the required run-by
+        guardrail. Returns {sweep_id, count, reg_ids}."""
         from datetime import datetime
 
         if accelerators and timeout is None:
