@@ -778,6 +778,15 @@ def main() -> int:
     master_seed = int(os.environ.get("LAB_SEED", "0"))
 
     ov = dict(t.split("=", 1) for t in sys.argv[1:] if "=" in t)
+    # GS Fig-4 used per-N membrane constants (tau=10ms for N=500; 4ms/3ms for N=1000/1500). Allow
+    # overriding tau_m (tau_s held at the GS tau/4 ratio); recompute the dependent constants. Default
+    # tau_m=15 preserves prior behaviour exactly.
+    if "tau_m" in ov:
+        global TAU_M, TAU_S, SQRT_TAU, PSP_V0
+        TAU_M = float(ov["tau_m"])
+        TAU_S = float(ov.get("tau_s", str(TAU_M / 4.0)))
+        SQRT_TAU = math.sqrt(TAU_S * TAU_M)
+        PSP_V0 = _psp_v0()
     k_list = [float(x) for x in ov.get("K_list", "16,64,256,1024").split(",")]
     n_list = [int(x) for x in ov.get("N_list", "100,200").split(",")]
     alphas = _alpha_grid(ov)
