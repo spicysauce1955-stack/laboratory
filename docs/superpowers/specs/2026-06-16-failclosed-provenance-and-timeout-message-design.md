@@ -93,15 +93,23 @@ The `code is not None` branch (scheduler/confirm callers passing an explicit `Co
 unchanged here — see A3 for the register-path update that makes those `CodeRef`s satisfy the
 invariant.
 
-### A3. Invariant enforced by construction
+### A3. Invariant enforced at the write path (legacy reads stay tolerant)
 
-Add a `model_validator(mode="after")` to `CodeRef` in `src/lab/models.py`:
+The guarantee: `git_commit` non-empty (no `git_sha: null`) and `git_dirty is True` ⇒
+`diff_ref is not None` (no `git_dirty: true, diff_ref: null`).
 
-- `git_commit` must be a non-empty string (no `git_sha: null`).
-- `git_dirty is True` ⇒ `diff_ref is not None` (no `git_dirty: true, diff_ref: null`).
+**Enforce on write, not on load.** A `model_validator(mode="after")` on `CodeRef` would also run
+on `model_validate_json`, so `store.read_manifest` would then *fail to load* Stage-1's existing
+Gap-B manifests — breaking `lab list`/`status`/`reconcile` over old runs. Instead:
 
-This makes a Gap-B manifest **unconstructable** — a `ValidationError` is raised before any such
-manifest can be written, anywhere in the codebase, by any path.
+- A pure `CodeRef.assert_fail_closed()` method (or a module-level `assert_fail_closed(code)`)
+  encodes the two checks and raises `LabError`/`ValueError`.
+- `JobStore.write_manifest` (and `create`) call it before persisting — so no *new* Gap-B manifest
+  can be written by any path, while legacy manifests still **read** fine.
+
+This keeps the by-construction guarantee for everything the lab writes going forward without a
+migration, and leaves historical runs loadable (they remain honestly marked as the Gap-B records
+they are).
 
 **Consequence — register/deferred path must populate `diff_ref`.** `scheduler/register.py`
 builds a `CodeRef` from `create_bundle` (which returns `diff_ref=None`). After the validator
@@ -168,8 +176,9 @@ All offline, fitting `tests/` and the `ruff` (line length 100) / `mypy --strict`
 - `capture_diff` / `apply_diff` round-trip: dirty tracked edit + a deleted tracked file + a new
   untracked file → capture → `git checkout <commit>` into a fresh tree → `apply_diff` → tree
   matches the original dirty tree byte-for-byte.
-- `CodeRef` validator rejects `git_commit=""`, and rejects `git_dirty=True, diff_ref=None`;
-  accepts clean (`git_dirty=False, diff_ref=None`) and dirty-with-ref.
+- `assert_fail_closed` rejects `git_commit=""` and `git_dirty=True, diff_ref=None`; accepts clean
+  (`git_dirty=False, diff_ref=None`) and dirty-with-ref. `store.write_manifest` raises on a Gap-B
+  `CodeRef`; `store.read_manifest` still loads a legacy Gap-B manifest without error.
 - `Lab.submit` from a dirty tree (local backend, tmp git repo) produces a manifest whose
   `code.diff_ref` resolves to an existing blob; `--no-dirty` raises `LabError`.
 - Register/deferred path: a dirty registration produces a `CodeRef` that passes validation
@@ -192,7 +201,8 @@ All offline, fitting `tests/` and the `ruff` (line length 100) / `mypy --strict`
 | File | Change |
 |------|--------|
 | `src/lab/manifest.py` | add `capture_diff`, `apply_diff` |
-| `src/lab/models.py` | `CodeRef` `model_validator` (non-null SHA; dirty ⇒ diff_ref) |
+| `src/lab/models.py` | `CodeRef.assert_fail_closed` (non-null SHA; dirty ⇒ diff_ref) |
+| `src/lab/store.py` | `write_manifest`/`create` call `assert_fail_closed` (write-path guard) |
 | `src/lab/core.py` | `Lab.submit`: capture diff + set `diff_ref` (+ R2 mirror) on dirty |
 | `src/lab/cli.py` | `submit --no-dirty` flag |
 | `src/lab/mcp_server.py` | `submit` `allow_dirty` arg |
