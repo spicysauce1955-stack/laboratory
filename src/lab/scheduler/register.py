@@ -88,6 +88,10 @@ def register(
     reg_id = _new_reg_id()
     with tempfile.TemporaryDirectory() as td:
         bundle_key, code = _snapshot_bundle(repo, Path(td), reg_id, queue)
+    if code.git_dirty:
+        # The bundle tarball IS this run's captured dirty state — point diff_ref at it so the
+        # deferred submit satisfies the fail-closed invariant (FR-B1).
+        code = code.model_copy(update={"diff_ref": bundle_key})
     reg = Registration(
         reg_id=reg_id,
         created_at=now(),
@@ -146,6 +150,10 @@ def register_sweep(
     sweep_id = _new_sweep_id()
     with tempfile.TemporaryDirectory() as td:  # bundle first (integrity ordering)
         bundle_key, code = _snapshot_bundle(repo, Path(td), sweep_id, queue)
+    if code.git_dirty:
+        # The bundle tarball IS this sweep's captured dirty state — point diff_ref at it so the
+        # deferred submit satisfies the fail-closed invariant (FR-B1).
+        code = code.model_copy(update={"diff_ref": bundle_key})
 
     regs: list[Registration] = []
     for point in points:
