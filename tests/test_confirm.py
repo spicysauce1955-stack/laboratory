@@ -253,7 +253,11 @@ def _seed_original(
     job_id = f"orig-{seed}-{status.value}"
     m = make_manifest(job_id, command, seed=seed).model_copy(
         update={
-            "code": CodeRef(git_commit=current_commit(repo), git_dirty=git_dirty),
+            "code": CodeRef(
+                git_commit=current_commit(repo),
+                git_dirty=git_dirty,
+                diff_ref="test" if git_dirty else None,
+            ),
             "status": status,
             "final_metrics": final_metrics or {},
         }

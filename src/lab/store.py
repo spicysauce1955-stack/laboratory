@@ -45,6 +45,7 @@ class JobStore:
         return self.job_dir(manifest.job_id)
 
     def write_manifest(self, manifest: JobManifest) -> None:
+        manifest.code.assert_fail_closed()  # fail-closed on write; reads stay tolerant (FR-B1)
         self._atomic_write(self.manifest_path(manifest.job_id), manifest.model_dump_json(indent=2))
 
     def read_manifest(self, job_id: str) -> JobManifest:

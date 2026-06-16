@@ -250,7 +250,7 @@ def test_submit_with_code_override_skips_git(tmp_path: Path):
     (bundle / "uv.lock").write_text("lock")
     home = tmp_path / "runs"
     lab = Lab(backend=LocalBackend(home=home, repo=bundle), repo=bundle, home=home)
-    code = CodeRef(git_commit="a" * 40, git_dirty=True)
+    code = CodeRef(git_commit="a" * 40, git_dirty=True, diff_ref="test")
     job_id = lab.submit(
         JobSpec(command=f"{PYTHON} -c 'print(1)'"), code=code, registration_id="reg-7"
     )
