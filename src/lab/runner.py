@@ -80,7 +80,8 @@ def run_job(job_dir: Path) -> int:
         return exit_code if exit_code is not None else 1
 
     if timed_out:
-        status, reason = JobState.timed_out, "wall-clock timeout"
+        wall = int(timeout) if timeout else 0
+        status, reason = JobState.timed_out, f"timed out after {wall}s wall-clock cap"
     elif exit_code == 0:
         status, reason = JobState.succeeded, "completed"
     else:
