@@ -41,6 +41,18 @@ class CodeRef(BaseModel):
     git_dirty: bool = False
     diff_ref: str | None = None  # blob ref of the snapshotted diff if dirty (FR-B1)
 
+    def assert_fail_closed(self) -> None:
+        """The fail-closed provenance invariant (FR-B1): a job's code state must always be
+        reconstructable from its manifest. Enforced at the store write path, NOT on load, so
+        legacy Gap-B manifests still read."""
+        if not self.git_commit:
+            raise ValueError("CodeRef.git_commit must be a non-null commit SHA (FR-B1)")
+        if self.git_dirty and self.diff_ref is None:
+            raise ValueError(
+                "CodeRef is dirty but diff_ref is None — a dirty run must capture its diff so "
+                "the exact code state is reconstructable (FR-B1, Gap B)"
+            )
+
 
 class EnvInfo(BaseModel):
     uv_lock_sha256: str  # FR-B2
