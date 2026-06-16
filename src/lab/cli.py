@@ -108,6 +108,10 @@ def submit(
         False, "--no-fallback", "--spot-only",
         help="with --spot, do NOT fall back to on-demand if spot is scarce (wait/skip instead)",
     ),
+    no_dirty: bool = typer.Option(
+        False, "--no-dirty",
+        help="refuse to launch from a dirty working tree (default: snapshot the diff, FR-B1)",
+    ),
 ) -> None:
     """Submit a job without blocking; prints {job_id, cached, status} (FR-A1)."""
     lab = _lab(backend)
@@ -125,7 +129,7 @@ def submit(
         _emit({"job_id": cached_id, "cached": True, "status": lab.status(cached_id).value})
         return
     try:
-        job_id = lab.submit(spec)
+        job_id = lab.submit(spec, allow_dirty=not no_dirty)
     except LabError as e:  # fail-loud, actionable (FR-F3)
         _emit({"error": str(e)})
         raise typer.Exit(code=1) from e

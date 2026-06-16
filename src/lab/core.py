@@ -23,7 +23,14 @@ from typing import Any
 from lab._util import now
 from lab.backends.base import Backend
 from lab.backends.local import LocalBackend
-from lab.manifest import commit_exists, current_commit, is_dirty, repo_root, uv_lock_sha256
+from lab.manifest import (
+    capture_diff,
+    commit_exists,
+    current_commit,
+    is_dirty,
+    repo_root,
+    uv_lock_sha256,
+)
 from lab.metrics import final_values, group_series
 from lab.storage import R2Store, r2_enabled
 from lab.models import (
@@ -208,15 +215,31 @@ class Lab:
         ``code`` overrides git introspection — used by the scheduler, which submits from an
         extracted bundle (not a git repo) with provenance captured at registration time.
         """
+        job_id = _new_job_id()
         if code is None:
             dirty = is_dirty(self.repo)
             if dirty and not allow_dirty:
                 raise LabError("working tree is dirty; commit or pass allow_dirty=True (FR-B1)")
-            code = CodeRef(git_commit=current_commit(self.repo), git_dirty=dirty)
+            diff_ref: str | None = None
+            if dirty:
+                # Capture into the job dir, then mirror to R2 (if enabled) for durability — the
+                # local runs/ dir is git-ignored and may be lost. diff_ref points at the durable
+                # copy when one exists, else the local path.
+                self.store.job_dir(job_id).mkdir(parents=True, exist_ok=True)
+                blob = capture_diff(self.repo, self.store.job_dir(job_id))
+                diff_ref = blob
+                if blob is not None and r2_enabled():
+                    r2 = R2Store.from_env()
+                    if r2 is not None:
+                        key = f"{job_id}/code_diff.tar.gz"
+                        r2.upload_file(Path(blob), key)
+                        diff_ref = r2.uri(job_id) + "/code_diff.tar.gz"
+            code = CodeRef(
+                git_commit=current_commit(self.repo), git_dirty=dirty, diff_ref=diff_ref
+            )
         elif code.git_dirty and not allow_dirty:
             raise LabError("bundle captured a dirty tree but allow_dirty=False (FR-B1)")
         seed = spec.seed if spec.seed is not None else 0  # explicit + recorded (FR-B4)
-        job_id = _new_job_id()
         manifest = JobManifest(
             job_id=job_id,
             sweep_id=sweep_id,

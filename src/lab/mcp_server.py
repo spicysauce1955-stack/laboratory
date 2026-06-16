@@ -60,8 +60,9 @@ def build_server(lab: Lab) -> FastMCP:
         with_pkg: list[str] | None = None,
         use_spot: bool = False,
         spot_fallback: bool = True,
+        allow_dirty: bool = True,
     ) -> dict[str, Any]:
-        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only."""
+        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. allow_dirty=False refuses a dirty working tree (default snapshots the diff, FR-B1)."""
         the_lab = _lab(backend)
         spec = JobSpec(
             code_ref=code_ref,
@@ -76,7 +77,7 @@ def build_server(lab: Lab) -> FastMCP:
         if cache and (cached_id := the_lab.find_cached(spec)) is not None:
             return {"job_id": cached_id, "cached": True, "status": the_lab.status(cached_id).value}
         try:
-            job_id = the_lab.submit(spec)
+            job_id = the_lab.submit(spec, allow_dirty=allow_dirty)
         except LabError as e:
             raise ToolError(str(e)) from e
         return {"job_id": job_id, "cached": False, "status": the_lab.status(job_id).value}

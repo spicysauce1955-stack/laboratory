@@ -19,7 +19,7 @@ def _make_fake_lab(submitted_specs: list[JobSpec]) -> MagicMock:
     """Return a fake Lab that captures submitted JobSpec objects."""
     fake = MagicMock()
     fake.find_cached.return_value = None
-    fake.submit.side_effect = lambda spec: (submitted_specs.append(spec) or "job-test-1")
+    fake.submit.side_effect = lambda spec, **kw: (submitted_specs.append(spec) or "job-test-1")
     fake.status.return_value = MagicMock(value="queued")
     return fake
 
