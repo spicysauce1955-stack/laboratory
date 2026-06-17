@@ -1,3 +1,7 @@
+import pytest
+
+from lab.backends.skypilot import SkyPilotBackend
+from lab.core import LabError, build_backend, resolve_backend_profile
 from lab.models import ResourceRequest
 
 
@@ -9,12 +13,6 @@ def test_cloud_roundtrips():
     r = ResourceRequest(cloud="do", cpus=8)
     assert r.cloud == "do" and r.cpus == 8
     assert ResourceRequest.model_validate_json(r.model_dump_json()).cloud == "do"
-
-
-import pytest  # noqa: E402
-
-from lab.core import LabError, build_backend, resolve_backend_profile  # noqa: E402
-from lab.backends.skypilot import SkyPilotBackend  # noqa: E402
 
 
 def test_profile_cpu_sets_do_and_defaults():
