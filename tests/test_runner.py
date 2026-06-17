@@ -43,7 +43,7 @@ def test_timeout_terminates(tmp_path: Path):
     run_job(store.job_dir("t1"))
     m = store.read_manifest("t1")
     assert m.status == JobState.timed_out
-    assert m.end_reason == "wall-clock timeout"
+    assert m.end_reason == "timed out after 1s wall-clock cap"
 
 
 def test_wait_terminal_fires_heartbeat(monkeypatch):

@@ -14,8 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from lab._util import now, parse_duration
-from lab.backends.local import LocalBackend
-from lab.core import Lab
+from lab.core import Lab, build_backend
 from lab.models import JobManifest, JobState
 from lab.scheduler.bundle import extract_bundle
 from lab.scheduler.models import ControlConfig, Registration, RegState, TickReport
@@ -59,11 +58,11 @@ class Scheduler:
 
     def make_lab(self, repo: Path) -> Lab:
         """Lab over the launch backend, rooted at an extracted bundle. Test seam."""
-        if self.backend_name == "skypilot":
-            from lab.backends.skypilot import SkyPilotBackend
-
-            return Lab(backend=SkyPilotBackend(home=self.home, repo=repo), repo=repo, home=self.home)
-        return Lab(backend=LocalBackend(home=self.home, repo=repo), repo=repo, home=self.home)
+        return Lab(
+            backend=build_backend(self.backend_name, home=self.home, repo=repo),
+            repo=repo,
+            home=self.home,
+        )
 
     def _cluster_alive(self, cluster: str) -> bool:
         """Does a Vast rental back this cluster? Test seam."""

@@ -60,8 +60,9 @@ def build_server(lab: Lab) -> FastMCP:
         with_pkg: list[str] | None = None,
         use_spot: bool = False,
         spot_fallback: bool = True,
+        allow_dirty: bool = True,
     ) -> dict[str, Any]:
-        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only."""
+        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. allow_dirty=False refuses a dirty working tree (default snapshots the diff, FR-B1)."""
         the_lab = _lab(backend)
         spec = JobSpec(
             code_ref=code_ref,
@@ -76,10 +77,28 @@ def build_server(lab: Lab) -> FastMCP:
         if cache and (cached_id := the_lab.find_cached(spec)) is not None:
             return {"job_id": cached_id, "cached": True, "status": the_lab.status(cached_id).value}
         try:
-            job_id = the_lab.submit(spec)
+            job_id = the_lab.submit(spec, allow_dirty=allow_dirty)
         except LabError as e:
             raise ToolError(str(e)) from e
         return {"job_id": job_id, "cached": False, "status": the_lab.status(job_id).value}
+
+    @mcp.tool
+    def confirm(
+        run_id: str,
+        metric: list[str] | None = None,
+        rtol: float = 1e-3,
+        atol: float = 1e-12,
+        wait: bool = True,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Reproducibility gate (FR-B): re-derive a prior result from its pinned provenance and check it still holds. Relaunches run_id fresh (no cache) from its committed commit, then compares the re-run's final metric(s) against the original's snapshot within tolerance -> verdict 'match'|'drift'|'rerun_failed' with per-metric deltas. Raises ToolError for a non-succeeded or dirty producer (no honest result to re-derive) or a missing baseline. metric restricts which metrics are judged (default: all). wait=False submits the re-run and returns {confirm_id, verdict:'pending'}."""
+        _require(run_id)
+        try:
+            return _lab_for(run_id).confirm(
+                run_id, metrics=metric or None, rtol=rtol, atol=atol, wait=wait, timeout=timeout
+            )
+        except LabError as e:
+            raise ToolError(str(e)) from e
 
     @mcp.tool
     def sweep(

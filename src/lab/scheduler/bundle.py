@@ -21,11 +21,30 @@ def _git(repo: Path, *args: str) -> bytes:
     return subprocess.check_output(["git", "-C", str(repo), *args])
 
 
-def create_bundle(repo: Path, dest_dir: Path) -> tuple[Path, CodeRef]:
-    """Snapshot ``repo`` into ``dest_dir/<commit12>[-dirty].tar.gz``; returns (path, CodeRef)."""
+def create_bundle(
+    repo: Path,
+    dest_dir: Path,
+    *,
+    commit: str | None = None,
+    include_dirty: bool = True,
+) -> tuple[Path, CodeRef]:
+    """Snapshot ``repo`` into ``dest_dir/<commit12>[-dirty].tar.gz``; returns (path, CodeRef).
+
+    Defaults to the working tree's current commit + its dirty diff (the deferred-scheduling path).
+    Pass ``commit`` to archive an arbitrary historical commit and ``include_dirty=False`` to capture
+    only that committed tree — used by ``lab confirm`` to re-derive a past run from its pinned commit.
+    """
+    if include_dirty and commit is not None:
+        # The dirty diff + untracked files are captured relative to the working tree's HEAD, so
+        # they're only coherent with HEAD. Archiving an explicit historical commit while folding in
+        # HEAD's uncommitted changes would build a tree matching neither — refuse the combo.
+        raise ValueError(
+            "create_bundle: include_dirty=True is only valid for the current HEAD (commit=None); "
+            "pass include_dirty=False to archive an explicit commit"
+        )
     repo = Path(repo)
-    commit = current_commit(repo)
-    dirty = is_dirty(repo)
+    commit = commit if commit is not None else current_commit(repo)
+    dirty = is_dirty(repo) if include_dirty else False
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     tar_path = dest_dir / f"{commit[:12]}{'-dirty' if dirty else ''}.tar.gz"

@@ -227,7 +227,8 @@ def scheduled_lr(
     they preserve the pre-V11 behaviour exactly.
 
     Extracted as a module function so the schedule is unit-testable in isolation
-    (``experiments/test_v10_minibatch.py``); ``train_batch`` calls it once per epoch.
+    (``tests/test_v10_minibatch.py``, ``tests/test_v11_schedule.py``); ``train_batch`` calls it once
+    per epoch.
     """
     if warmup and ep < warmup:
         return lr * (ep + 1) / warmup
@@ -236,8 +237,11 @@ def scheduled_lr(
     if schedule == "cosine":
         if n_cycles > 1:
             tc = span / n_cycles                      # cycle length (epochs)
-            t = ((ep - warmup) % tc) / tc             # phase within the current SGDR cycle
-        return lr * (floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * t)))
+            tcur = ((ep - warmup) % tc) / tc if tc > 0 else 0.0
+            cos = 0.5 * (1.0 + math.cos(math.pi * tcur))
+        else:
+            cos = 0.5 * (1.0 + math.cos(math.pi * t))
+        return lr * (floor + (1.0 - floor) * cos)
     if schedule == "linear":
         return lr * (floor + (1.0 - floor) * (1.0 - t))
     if schedule == "exp":
@@ -263,6 +267,8 @@ def train_batch(
     kappa_target: float = 0.0,    # V5 margin band: require signed margin >= kappa_target*|U_th|
     noise_sigmas: tuple[float, ...] = (),  # V6 output-noise levels for the robust-capacity probe
     vthr_fixed: float | None = None,  # V8 faithful-GS: fix V_thr (=1) and rescale init weights to it
+    rescale_init: bool = True,    # T2-A: if False, keep w_init as-is (no median rescale) -- the GS
+                                  # Suppl-Methods sigma_w=1e-3 faithful init that starts silent
     readout: str = "vmax",  # 'vmax' (tempotron argmax_t V) | 'drive_peak' (GS synchrony control)
     log_every: int = 0,    # V8: if >0, print converged-fraction every log_every epochs (live monitor)
     patience: int = 0,     # V8: if >0, stop a cell after this many epochs with no new convergence
@@ -354,11 +360,14 @@ def train_batch(
         return out
 
     if vthr_fixed is not None:
-        # Faithful GS: fixed threshold, rescale init weights so a balanced fraction fires
-        # (median V_max -> V_thr; guarded for degenerate ensembles, see _vmax_balance).
-        med = _vmax_balance(vmax).clamp(min=1e-12)  # (Sb,)
-        w = w * (vthr_fixed / med)[:, None]
-        vmax, _ = _forward(s, w, tdrive)
+        # Fixed threshold V_thr. By default (rescale_init=True) rescale init weights so a balanced
+        # fraction fires (median V_max -> V_thr; guarded for degenerate ensembles, see _vmax_balance).
+        # rescale_init=False is the GS Suppl-Methods faithful init: keep the sigma_w=1e-3 weights
+        # as-is (no rescale), so the net starts essentially silent at the fixed threshold.
+        if rescale_init:
+            med = _vmax_balance(vmax).clamp(min=1e-12)  # (Sb,)
+            w = w * (vthr_fixed / med)[:, None]
+            vmax, _ = _forward(s, w, tdrive)
         threshold = torch.full((sb,), float(vthr_fixed), device=dev)
     elif threshold is None:
         threshold = _vmax_median(vmax)  # (Sb,)
@@ -552,7 +561,10 @@ def train_batch(
                 ep_kp = (signed * (labels > 0).float()).sum(dim=1) / npos
                 ep_km = (signed * (labels < 0).float()).sum(dim=1) / nneg
             newly = (err.sum(dim=1) == 0) & (~converged)
-        epochs_run = torch.where(newly, torch.tensor(ep, device=dev), epochs_run)
+        # Record epochs *executed* to converge = ep + 1 (epochs 0..ep ran). Matches the reference
+        # package's epoch+1 convention and the unconverged ``last_ep + 1`` count below, so converged
+        # and unconverged learning times share one scale for GS Fig.4a comparisons (audit fix).
+        epochs_run = torch.where(newly, torch.tensor(ep + 1, device=dev), epochs_run)
         converged = converged | newly
         last_ep = ep
         if cap:
@@ -760,22 +772,21 @@ def _alpha_grid(ov: dict[str, str]) -> list[float]:
     return [round(a0 + i * step, 4) for i in range(n)]
 
 
-def _git_sha() -> str | None:
-    """Repo HEAD sha for provenance manifests (None when git is unavailable)."""
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parent,
-            stderr=subprocess.DEVNULL).decode().strip()
-    except Exception:
-        return None
-
-
 def main() -> int:
     run_dir = Path(os.environ.get("LAB_RUN_DIR", "runs/local-dev"))
     run_dir.mkdir(parents=True, exist_ok=True)
     master_seed = int(os.environ.get("LAB_SEED", "0"))
 
     ov = dict(t.split("=", 1) for t in sys.argv[1:] if "=" in t)
+    # GS Fig-4 used per-N membrane constants (tau=10ms for N=500; 4ms/3ms for N=1000/1500). Allow
+    # overriding tau_m (tau_s held at the GS tau/4 ratio); recompute the dependent constants. Default
+    # tau_m=15 preserves prior behaviour exactly.
+    if "tau_m" in ov:
+        global TAU_M, TAU_S, SQRT_TAU, PSP_V0
+        TAU_M = float(ov["tau_m"])
+        TAU_S = float(ov.get("tau_s", str(TAU_M / 4.0)))
+        SQRT_TAU = math.sqrt(TAU_S * TAU_M)
+        PSP_V0 = _psp_v0()
     k_list = [float(x) for x in ov.get("K_list", "16,64,256,1024").split(",")]
     n_list = [int(x) for x in ov.get("N_list", "100,200").split(",")]
     alphas = _alpha_grid(ov)
@@ -797,6 +808,8 @@ def main() -> int:
     vthr_fixed_ov = ov.get("vthr_fixed", "")  # faithful GS fixes V_thr (e.g. 1.0); '' => calibrate U_th
     vthr_fixed = float(vthr_fixed_ov) if vthr_fixed_ov else None
     readout = ov.get("readout", "vmax")  # 'vmax' | 'drive_peak' (GS-2006 synchrony control)
+    sigma_w = float(ov.get("sigma_w", "1.0"))  # T2-A faithful GS: init efficacy std (GS Suppl: 1e-3)
+    rescale_init = ov.get("rescale_init", "true").lower() != "false"  # T2-A: False keeps w0 as-is (no rescale)
     # Live learning-curve logging cadence (epochs). Default ON (~50 points/cell) so EVERY run streams
     # its training error+loss to metrics.jsonl -- captured live and surviving a teardown/rsync failure.
     log_every = int(ov.get("log_every", "0"))
@@ -916,7 +929,7 @@ def main() -> int:
                     lab_b = labels[b0:b1]
                     wrng = np.random.default_rng(cell_seed(master_seed, n_aff, alpha, k, tag=1) + b0)
                     w0 = torch.from_numpy(
-                        wrng.standard_normal((b1 - b0, n_aff), dtype=np.float32)).to(device)
+                        (sigma_w * wrng.standard_normal((b1 - b0, n_aff))).astype(np.float32)).to(device)
                     # stream the seed-averaged learning curve (error+loss vs epoch) to metrics.jsonl
                     # for the representative first seed-batch -- live and survives a teardown/rsync loss.
                     def _mcb(ep: int, errm: float, lossm: float, _a: float = alpha, _n: int = n_aff) -> None:
@@ -924,7 +937,8 @@ def main() -> int:
                         emit(f"trainloss_N{_n}_a{_a:.2f}", lossm, ep)
                     res = train_batch(s, lab_b, w0, lr=lr_cell, momentum=momentum, epochs=epochs,
                                       mode=mode, uth_scale=uth_scale, kappa_target=kappa_target,
-                                      noise_sigmas=noise_sigmas, vthr_fixed=vthr_fixed, readout=readout,
+                                      noise_sigmas=noise_sigmas, vthr_fixed=vthr_fixed,
+                                      rescale_init=rescale_init, readout=readout,
                                       log_every=log_every, patience=patience,
                                       log_tag=f"K{round(k)}N{n_aff}a{alpha:.2f}b{b0}",
                                       record_history=bool(history_flag) and b0 == 0,
@@ -973,11 +987,11 @@ def main() -> int:
                             rrng = np.random.default_rng(
                                 cell_seed(master_seed, n_aff, alpha, k, tag=2 + r) + b0)
                             wr = torch.from_numpy(
-                                rrng.standard_normal((b1 - b0, n_aff), dtype=np.float32)).to(device)
+                                (sigma_w * rrng.standard_normal((b1 - b0, n_aff))).astype(np.float32)).to(device)
                             rr = train_batch(s, lab_b, wr, lr=lr_cell, momentum=momentum,
                                              epochs=epochs, threshold=thr, mode=mode,
                                              uth_scale=1.0, kappa_target=kappa_target,
-                                             vthr_fixed=vthr_fixed)
+                                             vthr_fixed=vthr_fixed, rescale_init=rescale_init)
                             any_conv = any_conv | rr["converged"]
                             ws.append(rr["weights"]); cs.append(rr["converged"])
                             if (not overlap_probe) and bool(any_conv.all()):
@@ -1130,7 +1144,12 @@ def main() -> int:
     if capture:
         # Self-describing manifest for the raw store: provenance + the cell-file index, so the offline
         # pipeline (analysis/v9_*.py) can load and verify the dataset without any other state.
-        git_sha = _git_sha()
+        try:
+            git_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parent,
+                stderr=subprocess.DEVNULL).decode().strip()
+        except Exception:
+            git_sha = None
         cells = sorted(str(p.relative_to(run_dir)) for p in (run_dir / "cells").glob("*.npz")) \
             if (run_dir / "cells").exists() else []
         manifest = {

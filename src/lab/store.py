@@ -14,7 +14,8 @@ import os
 from pathlib import Path
 from typing import Any
 
-from lab.models import JobManifest
+from lab.metrics import snapshot_final_metrics
+from lab.models import JobManifest, JobState
 
 
 class JobStore:
@@ -37,7 +38,14 @@ class JobStore:
         return self.job_dir(job_id) / "_runtime.json"
 
     def create(self, manifest: JobManifest) -> Path:
-        """Create the run dir (incl. output/) and persist the initial manifest."""
+        """Create the run dir (incl. output/) and persist the initial manifest.
+
+        The fail-closed provenance guard lives here — at the single new-manifest chokepoint —
+        not in ``write_manifest``: ``code`` is immutable after create, so validating once at
+        creation prevents any new Gap-B manifest, while later status ``update_manifest`` writes
+        (including on legacy Gap-B manifests already on disk) never re-validate and so never
+        crash (FR-B1)."""
+        manifest.code.assert_fail_closed()
         self.output_dir(manifest.job_id).mkdir(parents=True, exist_ok=True)
         self.logs_path(manifest.job_id).touch()
         self.write_manifest(manifest)
@@ -50,8 +58,17 @@ class JobStore:
         return JobManifest.model_validate_json(self.manifest_path(job_id).read_text())
 
     def update_manifest(self, job_id: str, **fields: Any) -> JobManifest:
-        """Read-modify-write the manifest's mutable fields (used by runner/backend)."""
+        """Read-modify-write the manifest's mutable fields (used by runner/backend).
+
+        On any transition to ``succeeded``, snapshot the run's final metric values into the manifest
+        (FR-B4 durable baseline) unless the caller supplied them — so every backend's finalize path
+        captures the baseline ``lab confirm`` compares against, without having to remember to.
+        """
         updated = self.read_manifest(job_id).model_copy(update=fields)
+        if updated.status is JobState.succeeded and not updated.final_metrics:
+            fm = snapshot_final_metrics(self.output_dir(job_id))
+            if fm:
+                updated = updated.model_copy(update={"final_metrics": fm})
         self.write_manifest(updated)
         return updated
 

@@ -66,6 +66,32 @@ def read_points(
     return points
 
 
+def final_values(points: list[dict[str, Any]]) -> dict[str, float]:
+    """Reduce flat points to the last value per metric series (by max ``step``).
+
+    The durable per-job baseline a reproducibility re-run is judged against (FR-B4): the manifest
+    snapshots this at terminal time so an old run stays confirmable even after its run dir / object
+    store copy is pruned.
+    """
+    best: dict[str, tuple[int, float]] = {}
+    for pt in points:
+        name, step, value = pt["name"], pt["step"], pt["value"]
+        if value is None:
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue  # a non-numeric point can't be a baseline; skip it, never crash finalize
+        if name not in best or step >= best[name][0]:
+            best[name] = (step, numeric)
+    return {name: value for name, (_, value) in best.items()}
+
+
+def snapshot_final_metrics(run_dir: str | Path) -> dict[str, float]:
+    """Read ``<run_dir>/metrics.jsonl`` and reduce to the final value per series (empty if none)."""
+    return final_values(read_points(Path(run_dir) / METRICS_FILE))
+
+
 def group_series(points: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     """Group flat points into ``{name: [{step, value, wall_time}, ...]}`` (spec §9)."""
     series: dict[str, list[dict[str, Any]]] = {}

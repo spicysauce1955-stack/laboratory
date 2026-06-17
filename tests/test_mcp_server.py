@@ -28,6 +28,7 @@ def test_tools_registered(tmp_path: Path):
 
     assert asyncio.run(go()) == [
         "cancel",
+        "confirm",
         "fetch_artifacts",
         "list",
         "logs",

@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import math
 import platform
 import shlex
 import time
@@ -22,8 +23,15 @@ from typing import Any
 from lab._util import now
 from lab.backends.base import Backend
 from lab.backends.local import LocalBackend
-from lab.manifest import current_commit, is_dirty, repo_root, uv_lock_sha256
-from lab.metrics import group_series
+from lab.manifest import (
+    capture_diff,
+    commit_exists,
+    current_commit,
+    is_dirty,
+    repo_root,
+    uv_lock_sha256,
+)
+from lab.metrics import final_values, group_series
 from lab.storage import R2Store, r2_enabled
 from lab.models import (
     ArtifactRecord,
@@ -85,6 +93,43 @@ def cache_key(commit: str, command: str, config: dict[str, Any] | None, seed: in
         sort_keys=True,
     )
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def compare_final_metrics(
+    orig: dict[str, float],
+    new: dict[str, float],
+    *,
+    names: Iterable[str] | None,
+    rtol: float = 1e-3,
+    atol: float = 1e-12,
+) -> tuple[str, dict[str, dict[str, Any]]]:
+    """Judge a re-run's final metrics against the original's snapshot (the reproducibility gate).
+
+    Returns ``("match" | "drift", deltas)``. ``names`` restricts which baseline metrics are judged
+    (``None`` = all). A baseline metric absent from the re-run can't be re-derived → counts as drift.
+    Tolerance is ``math.isclose`` semantics (relative ``rtol`` + absolute ``atol``). The small default
+    ``atol`` is a float noise floor so a metric of exactly 0.0 doesn't false-drift against a tiny
+    re-run value — ``math.isclose``'s relative tolerance collapses to zero at zero.
+    """
+    selected = list(names) if names is not None else list(orig)
+    deltas: dict[str, dict[str, Any]] = {}
+    verdict = "match"
+    for name in selected:
+        ov = orig.get(name)
+        nv = new.get(name)
+        if ov is None or nv is None:
+            within = False
+        else:
+            within = math.isclose(ov, nv, rel_tol=rtol, abs_tol=atol)
+        deltas[name] = {
+            "orig": ov,
+            "new": nv,
+            "abs_delta": (abs(nv - ov) if ov is not None and nv is not None else None),
+            "within_tol": within,
+        }
+        if not within:
+            verdict = "drift"
+    return verdict, deltas
 
 
 def worst_case_sweep_cost(*, n_points: int, per_point_cap: float) -> float:
@@ -163,25 +208,53 @@ class Lab:
         sweep_id: str | None = None,
         code: CodeRef | None = None,
         registration_id: str | None = None,
+        confirms: str | None = None,
     ) -> str:
         """Build + persist the manifest, then launch via the backend (FR-A1, FR-B).
 
         ``code`` overrides git introspection — used by the scheduler, which submits from an
         extracted bundle (not a git repo) with provenance captured at registration time.
         """
+        job_id = _new_job_id()
         if code is None:
             dirty = is_dirty(self.repo)
             if dirty and not allow_dirty:
                 raise LabError("working tree is dirty; commit or pass allow_dirty=True (FR-B1)")
-            code = CodeRef(git_commit=current_commit(self.repo), git_dirty=dirty)
+            diff_ref: str | None = None
+            if dirty:
+                # Capture into the job dir, then mirror to R2 (if enabled) for durability — the
+                # local runs/ dir is git-ignored and may be lost. diff_ref points at the durable
+                # copy when one exists, else the local path.
+                self.store.job_dir(job_id).mkdir(parents=True, exist_ok=True)
+                blob = capture_diff(self.repo, self.store.job_dir(job_id))
+                if blob is None:
+                    # is_dirty said dirty but capture found nothing — the tree changed under us
+                    # (e.g. a concurrent stash/checkout). Fail loud rather than write a Gap-B
+                    # manifest (which would surface as a raw ValueError at create) (FR-B1).
+                    raise LabError(
+                        "working tree changed during submit (no diff to capture); retry (FR-B1)"
+                    )
+                diff_ref = blob
+                if r2_enabled():
+                    r2 = R2Store.from_env()
+                    if r2 is not None:
+                        rel = f"{job_id}/code_diff.tar.gz"
+                        try:
+                            r2.upload_file(Path(blob), rel)
+                            diff_ref = r2.uri(rel)
+                        except Exception as e:  # noqa: BLE001 — local diff_ref stays fail-closed
+                            print(f"[lab] diff R2 upload failed, keeping local copy: {e}")
+            code = CodeRef(
+                git_commit=current_commit(self.repo), git_dirty=dirty, diff_ref=diff_ref
+            )
         elif code.git_dirty and not allow_dirty:
             raise LabError("bundle captured a dirty tree but allow_dirty=False (FR-B1)")
         seed = spec.seed if spec.seed is not None else 0  # explicit + recorded (FR-B4)
-        job_id = _new_job_id()
         manifest = JobManifest(
             job_id=job_id,
             sweep_id=sweep_id,
             registration_id=registration_id,
+            confirms=confirms,
             created_at=now(),
             submitted_by=spec.submitted_by,
             code=code,
@@ -280,6 +353,104 @@ class Lab:
             )
             job_ids.append(self.submit(spec, allow_dirty=allow_dirty, sweep_id=sweep_id))
         return sweep_id, job_ids
+
+    def _sibling_lab(self, repo: Path) -> Lab:
+        """A Lab rooted at ``repo`` (e.g. an extracted bundle) over the same backend kind, sharing
+        this lab's home/store — mirrors the scheduler's ``make_lab`` for confirm relaunches."""
+        return Lab(
+            backend=build_backend(self.backend.name, home=self.home, repo=repo),
+            repo=repo,
+            home=self.home,
+        )
+
+    def confirm(
+        self,
+        orig_id: str,
+        *,
+        metrics: Iterable[str] | None = None,
+        rtol: float = 1e-3,
+        atol: float = 1e-12,
+        wait: bool = True,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Re-derive a prior result from its pinned provenance and judge whether it still holds
+        (the reproducibility gate). Relaunches ``orig_id`` *fresh* from its committed commit (no
+        cache), then compares the re-run's final metric(s) against the original's snapshot within
+        tolerance → ``match`` / ``drift`` / ``rerun_failed``.
+
+        Refuses outright (``LabError``) to confirm a run that did not **succeed** or that ran from a
+        dirty tree — a non-succeeded or not-fully-captured run has no honest result to re-derive.
+        ``metrics`` restricts which metrics are judged (default: all in the baseline).
+        """
+        try:
+            m = self.manifest(orig_id)
+        except FileNotFoundError as e:
+            raise LabError(f"cannot confirm {orig_id!r}: run not found in {self.home}") from e
+        if m.status is not JobState.succeeded:
+            raise LabError(
+                f"cannot confirm {orig_id}: its producing run is '{m.status.value}', not "
+                "'succeeded' — a non-succeeded run has no result to re-derive (FR-B)"
+            )
+        if m.code.git_dirty:
+            raise LabError(
+                f"cannot confirm {orig_id}: it ran from a dirty working tree, so its code was not "
+                "fully captured and can't be honestly re-derived (FR-B1)"
+            )
+        # Baseline: prefer the durable manifest snapshot; fall back to the original's metrics file.
+        baseline = dict(m.final_metrics) or final_values(self.backend.read_metrics(orig_id))
+        if not baseline:
+            raise LabError(
+                f"cannot confirm {orig_id}: no baseline metrics — the manifest snapshot is empty "
+                "and metrics.jsonl is unavailable; nothing to compare against"
+            )
+        # Relaunch fresh from the pinned commit: committed tree only, never the cache.
+        from lab.scheduler.bundle import create_bundle, extract_bundle  # avoid import cycle
+
+        if not commit_exists(self.repo, m.code.git_commit):
+            raise LabError(
+                f"cannot confirm {orig_id}: its pinned commit {m.code.git_commit[:12]} is not in "
+                f"{self.repo} — fetch it (e.g. `git fetch --all`) then retry"
+            )
+        bundle_root = self.home / "_confirm"
+        tar, _ = create_bundle(
+            self.repo, bundle_root, commit=m.code.git_commit, include_dirty=False
+        )
+        bundle_dir = extract_bundle(tar, bundle_root / orig_id)
+        bundle_lab = self._sibling_lab(bundle_dir)
+        spec = JobSpec(
+            command=m.run.entrypoint_command,
+            config=m.run.resolved_config,
+            seed=m.run.seed,
+            resources=m.resources,
+            submitted_by="agent",
+        )
+        confirm_id = bundle_lab.submit(
+            spec,
+            code=CodeRef(git_commit=m.code.git_commit, git_dirty=False),
+            confirms=orig_id,
+        )
+        result: dict[str, Any] = {"orig_id": orig_id, "confirm_id": confirm_id}
+        if not wait:
+            result["verdict"] = "pending"
+            return result
+        (rerun,) = self.wait([confirm_id], timeout=timeout)
+        if rerun.status not in _TERMINAL_STATES:
+            # wait gave up before the re-run finished — it's still alive (and, on a remote backend,
+            # still billing until it tears down). Don't call a running job failed.
+            result["verdict"] = "timed_out_waiting"
+            result["rerun_status"] = rerun.status.value
+            return result
+        if rerun.status is not JobState.succeeded:
+            result["verdict"] = "rerun_failed"
+            result["rerun_status"] = rerun.status.value
+            return result
+        verdict, deltas = compare_final_metrics(
+            baseline, rerun.final_metrics, names=metrics, rtol=rtol, atol=atol
+        )
+        result["verdict"] = verdict
+        result["deltas"] = deltas
+        result["env_drift"] = rerun.env.uv_lock_sha256 != m.env.uv_lock_sha256
+        return result
 
     def status(self, job_id: str) -> JobState:
         return self.backend.status(job_id)
@@ -442,17 +613,22 @@ class Lab:
         return [self.manifest(j) for j in job_ids]
 
 
+def build_backend(name: str, *, home: Path, repo: Path) -> Backend:
+    """The single name->backend mapping. Both Lab construction paths (``default_lab``,
+    ``Lab._sibling_lab``) and the scheduler (``Scheduler.make_lab``) route through here, so a new
+    backend is wired in one place instead of three. Unknown names fall back to ``local``.
+    """
+    if name == "skypilot":
+        from lab.backends.skypilot import SkyPilotBackend  # optional extra; import lazily
+
+        return SkyPilotBackend(home=home, repo=repo)
+    return LocalBackend(home=home, repo=repo)
+
+
 def default_lab(home: Path | None = None, backend: str = "local") -> Lab:
     """Construct a Lab rooted at the current git repo, over the named backend
     (``local`` or ``skypilot``). Shared by the CLI and MCP so both drive the identical core.
     """
     repo = repo_root()
     resolved_home = Path(home) if home else repo / "runs"
-    be: Backend
-    if backend == "skypilot":
-        from lab.backends.skypilot import SkyPilotBackend
-
-        be = SkyPilotBackend(home=resolved_home, repo=repo)
-    else:
-        be = LocalBackend(home=resolved_home, repo=repo)
-    return Lab(backend=be, repo=repo, home=resolved_home)
+    return Lab(backend=build_backend(backend, home=resolved_home, repo=repo), repo=repo, home=resolved_home)

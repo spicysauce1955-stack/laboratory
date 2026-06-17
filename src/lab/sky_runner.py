@@ -15,7 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from lab._util import actual_cost, duration_seconds, now, parse_duration
+from lab._util import actual_cost, duration_seconds, now, parse_duration, timeout_reason
 from lab.backends.skypilot import (
     DEFAULT_AUTOSTOP_MIN,
     DEFAULT_PROVISION_TIMEOUT_MIN,
@@ -331,14 +331,21 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         actual_usd=actual_cost(hourly_usd, dur),
     )
 
+    if final is JobState.timed_out:
+        wall = int(parse_duration(manifest.resources.timeout) or 0)
+        end_reason = timeout_reason(wall)
+    else:
+        end_reason = final.value
+
     # Respect a concurrent cancel (backend set status=cancelled before killing us).
     if store.read_manifest(job_id).status != JobState.cancelled:
+        # final_metrics is snapshotted centrally by the store on the succeeded transition (FR-B4).
         store.update_manifest(
             job_id,
             status=final,
             ended_at=ended,
             exit_code=0 if final == JobState.succeeded else 1,
-            end_reason=final.value,
+            end_reason=end_reason,
             artifacts_uri=artifacts_uri,
             cost=cost,
         )

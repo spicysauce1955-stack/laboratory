@@ -13,7 +13,7 @@ import signal
 import subprocess
 from pathlib import Path
 
-from lab._util import duration_seconds, now, parse_duration
+from lab._util import duration_seconds, now, parse_duration, timeout_reason
 from lab.models import CostInfo, JobState
 from lab.store import JobStore
 
@@ -80,12 +80,14 @@ def run_job(job_dir: Path) -> int:
         return exit_code if exit_code is not None else 1
 
     if timed_out:
-        status, reason = JobState.timed_out, "wall-clock timeout"
+        wall = int(timeout) if timeout else 0
+        status, reason = JobState.timed_out, timeout_reason(wall)
     elif exit_code == 0:
         status, reason = JobState.succeeded, "completed"
     else:
         status, reason = JobState.failed, f"exit code {exit_code}"
 
+    # final_metrics is snapshotted centrally by the store on the succeeded transition (FR-B4).
     store.update_manifest(
         job_id, status=status, ended_at=ended, exit_code=exit_code, end_reason=reason, cost=cost
     )

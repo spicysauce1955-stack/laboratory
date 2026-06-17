@@ -75,6 +75,10 @@ def _snapshot_bundle(repo: Path, td: Path, key: str, queue: QueueStore) -> tuple
             f"cannot snapshot {repo}: not a git repository (or git failed: {e})"
         ) from e
     bundle_key = queue.put_bundle(key, tar)
+    if code.git_dirty:
+        # The bundle tarball IS the captured dirty state — point diff_ref at it so every deferred
+        # submit satisfies the fail-closed invariant by construction, in one place (FR-B1).
+        code = code.model_copy(update={"diff_ref": bundle_key})
     return bundle_key, code
 
 
