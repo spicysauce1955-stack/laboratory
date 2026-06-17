@@ -193,6 +193,33 @@ def build_sweep_point_spec(
     )
 
 
+CPU_DEFAULT_CLOUD = "do"
+CPU_DEFAULT_VCPUS = 8
+
+
+def resolve_backend_profile(
+    backend: str, resources: ResourceRequest
+) -> tuple[str, ResourceRequest]:
+    """Resolve the ``cpu`` convenience backend into (provisioner_name, resources).
+
+    ``cpu`` is sugar for the SkyPilot provisioner on a cheap CPU cloud (DigitalOcean): it clears
+    accelerators, defaults to ``CPU_DEFAULT_VCPUS`` vCPUs, and disables spot (DO has none). Other
+    backends pass through unchanged (identity), so the CLI and MCP stay thin shells. Pure; no I/O.
+    """
+    if backend != "cpu":
+        return backend, resources
+    if resources.accelerators:
+        raise LabError("--backend cpu provisions a CPU-only box; drop --accelerators")
+    return "skypilot", resources.model_copy(
+        update={
+            "cloud": CPU_DEFAULT_CLOUD,
+            "cpus": resources.cpus or CPU_DEFAULT_VCPUS,
+            "use_spot": False,
+            "spot_fallback": False,
+        }
+    )
+
+
 class Lab:
     def __init__(self, backend: Backend, repo: Path, home: Path) -> None:
         self.backend = backend
@@ -618,7 +645,7 @@ def build_backend(name: str, *, home: Path, repo: Path) -> Backend:
     ``Lab._sibling_lab``) and the scheduler (``Scheduler.make_lab``) route through here, so a new
     backend is wired in one place instead of three. Unknown names fall back to ``local``.
     """
-    if name == "skypilot":
+    if name in ("skypilot", "cpu"):
         from lab.backends.skypilot import SkyPilotBackend  # optional extra; import lazily
 
         return SkyPilotBackend(home=home, repo=repo)
