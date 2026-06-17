@@ -24,6 +24,12 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
 - **Deferred scheduling:** `lab register` + `lab queue …` queue jobs (night window / price /
   dependency triggers); an always-on host runs `lab scheduler tick` every 60s (systemd timer,
   `deploy/scheduler/`). Spec: `docs/superpowers/specs/2026-06-10-deferred-scheduling-design.md`.
+- **Fail-closed provenance (FR-B1):** `JobStore.create` rejects any manifest whose `code` can't
+  reproduce the run (null SHA, or `git_dirty` without a `diff_ref`) — enforced on create only, so
+  legacy manifests still read. A dirty `submit` auto-snapshots the diff+untracked into
+  `code_diff.tar.gz` (`capture_diff`/`apply_diff`), mirrored to R2; `--no-dirty`/`allow_dirty=false`
+  refuses instead. Deferred paths set `diff_ref` to the bundle key. Timeout `end_reason` carries the
+  wall ("timed out after Ns wall-clock cap"). Guide: `docs/guides/provenance-and-timeouts.md`.
 
 ## Conventions
 - `ruff` (line length 100), `mypy --strict` on `src/lab`. CLI and MCP server are thin shells over
