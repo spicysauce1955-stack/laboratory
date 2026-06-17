@@ -64,6 +64,12 @@ def parse_duration(value: str | None) -> float | None:
     return float(s)
 
 
+def timeout_reason(seconds: int) -> str:
+    """The manifest ``end_reason`` for a wall-clock timeout — one wording shared by the local
+    and skypilot runners so they can't drift (FR-I1)."""
+    return f"timed out after {seconds}s wall-clock cap"
+
+
 def infer_artifact_type(name: str) -> str:
     """Map a filename to an ArtifactType (FR-E3); defaults to ``"other"``."""
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""

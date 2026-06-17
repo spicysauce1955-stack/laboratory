@@ -15,7 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from lab._util import actual_cost, duration_seconds, now, parse_duration
+from lab._util import actual_cost, duration_seconds, now, parse_duration, timeout_reason
 from lab.backends.skypilot import (
     DEFAULT_AUTOSTOP_MIN,
     DEFAULT_PROVISION_TIMEOUT_MIN,
@@ -333,7 +333,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
 
     if final is JobState.timed_out:
         wall = int(parse_duration(manifest.resources.timeout) or 0)
-        end_reason = f"timed out after {wall}s wall-clock cap"
+        end_reason = timeout_reason(wall)
     else:
         end_reason = final.value
 

@@ -58,3 +58,38 @@ def test_no_dirty_refuses(tmp_path: Path, monkeypatch):
     lab = _lab(repo)
     with pytest.raises(LabError, match="dirty"):
         lab.submit(JobSpec(command="true"), allow_dirty=False)
+
+
+def test_toctou_dirty_then_clean_fails_loud(tmp_path: Path, monkeypatch):
+    # The tree reads dirty, but capture_diff finds nothing (a concurrent stash/checkout cleaned
+    # it). Rather than writing a Gap-B manifest (raw ValueError at create), submit fails loud.
+    repo = _repo_with_lockfile(tmp_path)
+    (repo / "tracked.txt").write_text("DIRTY\n")
+    monkeypatch.chdir(repo)
+    lab = _lab(repo)
+    monkeypatch.setattr("lab.core.capture_diff", lambda *a, **k: None)
+    with pytest.raises(LabError, match="changed during submit"):
+        lab.submit(JobSpec(command="true"))
+
+
+def test_r2_upload_failure_falls_back_to_local(tmp_path: Path, monkeypatch):
+    # A transient R2 error on the diff mirror must not fail the submit — the local diff_ref is
+    # still fail-closed-valid, so we keep it and warn.
+    repo = _repo_with_lockfile(tmp_path)
+    (repo / "tracked.txt").write_text("DIRTY\n")
+    monkeypatch.chdir(repo)
+    lab = _lab(repo)
+
+    class _BadR2:
+        def upload_file(self, local, key):
+            raise RuntimeError("network down")
+
+        def uri(self, prefix):  # pragma: no cover - never reached on failure
+            return f"r2://b/{prefix}"
+
+    monkeypatch.setattr("lab.core.r2_enabled", lambda: True)
+    monkeypatch.setattr("lab.core.R2Store.from_env", classmethod(lambda cls: _BadR2()))
+    job_id = lab.submit(JobSpec(command="true"))
+    m = lab.manifest(job_id)
+    assert m.code.git_dirty is True
+    assert m.code.diff_ref is not None and Path(m.code.diff_ref).exists()  # local fallback

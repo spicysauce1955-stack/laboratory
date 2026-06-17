@@ -38,14 +38,20 @@ class JobStore:
         return self.job_dir(job_id) / "_runtime.json"
 
     def create(self, manifest: JobManifest) -> Path:
-        """Create the run dir (incl. output/) and persist the initial manifest."""
+        """Create the run dir (incl. output/) and persist the initial manifest.
+
+        The fail-closed provenance guard lives here — at the single new-manifest chokepoint —
+        not in ``write_manifest``: ``code`` is immutable after create, so validating once at
+        creation prevents any new Gap-B manifest, while later status ``update_manifest`` writes
+        (including on legacy Gap-B manifests already on disk) never re-validate and so never
+        crash (FR-B1)."""
+        manifest.code.assert_fail_closed()
         self.output_dir(manifest.job_id).mkdir(parents=True, exist_ok=True)
         self.logs_path(manifest.job_id).touch()
         self.write_manifest(manifest)
         return self.job_dir(manifest.job_id)
 
     def write_manifest(self, manifest: JobManifest) -> None:
-        manifest.code.assert_fail_closed()  # fail-closed on write; reads stay tolerant (FR-B1)
         self._atomic_write(self.manifest_path(manifest.job_id), manifest.model_dump_json(indent=2))
 
     def read_manifest(self, job_id: str) -> JobManifest:

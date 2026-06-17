@@ -105,11 +105,11 @@ def apply_diff(tarball: Path, tree: Path) -> None:
         stage = Path(td)
         with tarfile.open(tarball) as t:
             t.extractall(stage, filter="data")
-        patch = stage / "tracked.patch"
-        if patch.read_bytes().strip():
+        patch_bytes = (stage / "tracked.patch").read_bytes()
+        if patch_bytes.strip():
             subprocess.run(
                 ["git", "apply", "--whitespace=nowarn"],
-                input=patch.read_bytes(),
+                input=patch_bytes,
                 cwd=tree,
                 check=True,
             )

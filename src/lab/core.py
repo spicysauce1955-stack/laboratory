@@ -227,13 +227,23 @@ class Lab:
                 # copy when one exists, else the local path.
                 self.store.job_dir(job_id).mkdir(parents=True, exist_ok=True)
                 blob = capture_diff(self.repo, self.store.job_dir(job_id))
+                if blob is None:
+                    # is_dirty said dirty but capture found nothing — the tree changed under us
+                    # (e.g. a concurrent stash/checkout). Fail loud rather than write a Gap-B
+                    # manifest (which would surface as a raw ValueError at create) (FR-B1).
+                    raise LabError(
+                        "working tree changed during submit (no diff to capture); retry (FR-B1)"
+                    )
                 diff_ref = blob
-                if blob is not None and r2_enabled():
+                if r2_enabled():
                     r2 = R2Store.from_env()
                     if r2 is not None:
-                        key = f"{job_id}/code_diff.tar.gz"
-                        r2.upload_file(Path(blob), key)
-                        diff_ref = r2.uri(job_id) + "/code_diff.tar.gz"
+                        rel = f"{job_id}/code_diff.tar.gz"
+                        try:
+                            r2.upload_file(Path(blob), rel)
+                            diff_ref = r2.uri(rel)
+                        except Exception as e:  # noqa: BLE001 — local diff_ref stays fail-closed
+                            print(f"[lab] diff R2 upload failed, keeping local copy: {e}")
             code = CodeRef(
                 git_commit=current_commit(self.repo), git_dirty=dirty, diff_ref=diff_ref
             )

@@ -13,7 +13,7 @@ import signal
 import subprocess
 from pathlib import Path
 
-from lab._util import duration_seconds, now, parse_duration
+from lab._util import duration_seconds, now, parse_duration, timeout_reason
 from lab.models import CostInfo, JobState
 from lab.store import JobStore
 
@@ -81,7 +81,7 @@ def run_job(job_dir: Path) -> int:
 
     if timed_out:
         wall = int(timeout) if timeout else 0
-        status, reason = JobState.timed_out, f"timed out after {wall}s wall-clock cap"
+        status, reason = JobState.timed_out, timeout_reason(wall)
     elif exit_code == 0:
         status, reason = JobState.succeeded, "completed"
     else:
