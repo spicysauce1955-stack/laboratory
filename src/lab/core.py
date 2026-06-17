@@ -540,6 +540,26 @@ class Lab:
             },
         }
 
+    def _sky_status_orphans(self, running_clusters: set[str]) -> list[str]:
+        """Cloud-agnostic orphan pass: ``lab-*`` clusters SkyPilot still tracks/that are still up
+        but are NOT tied to a running local job. Covers DO/GCP (and Vast) via SkyPilot's own state,
+        complementing the Vast-direct scan. Raises :class:`LabError` if the status query fails."""
+        import sky
+
+        try:
+            recs = sky.get(  # 0.12: RequestId -> list of cluster dicts
+                sky.status(refresh=True)  # type: ignore[arg-type]  # bool accepted at runtime
+            )
+        except Exception as e:  # noqa: BLE001
+            raise LabError(f"could not query SkyPilot cluster status: {e}") from e
+        orphans: list[str] = []
+        for rec in recs or []:
+            name = rec.get("name") if isinstance(rec, dict) else getattr(rec, "name", None)
+            if not name or not str(name).startswith("lab-") or name in running_clusters:
+                continue
+            orphans.append(name)
+        return orphans
+
     def reconcile(self, *, apply: bool = False) -> dict[str, Any]:
         """Cross-check Vast.ai rentals against the local job DB (FR-C2 leak detection).
 
@@ -607,11 +627,26 @@ class Lab:
                     print(f"[lab] reconcile destroy {inst_id} failed: {e}")
 
         ghosts = sorted(running_clusters.keys() - matched_clusters)
+
+        sky_orphans = self._sky_status_orphans(set(running_clusters))
+        sky_destroyed: list[str] = []
+        if apply and sky_orphans:
+            import sky
+
+            for cl in sky_orphans:
+                try:
+                    sky.get(sky.down(cl))
+                    sky_destroyed.append(cl)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[lab] reconcile sky.down {cl} failed: {e}")
+
         return {
             "instances_total": len(instances),
             "orphans": orphans,
             "destroyed": destroyed,
             "ghosts": ghosts,
+            "sky_orphans": sky_orphans,
+            "sky_destroyed": sky_destroyed,
             "applied": apply,
         }
 

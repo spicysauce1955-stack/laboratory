@@ -1,5 +1,7 @@
 import json
+import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -162,6 +164,15 @@ def _seed_running_job(lab: Lab, job_id: str) -> None:
     lab.store.create(m)
 
 
+def _patch_empty_sky(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inject a fake ``sky`` module so reconcile's cloud-agnostic status pass is hermetic."""
+    fake = types.ModuleType("sky")
+    fake.get = lambda x: x  # type: ignore[attr-defined]
+    fake.status = lambda refresh=False: []  # type: ignore[attr-defined]
+    fake.down = lambda cluster: cluster  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sky", fake)
+
+
 def test_reconcile_finds_orphans_dry_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """A Vast rental labeled lab-* with no matching running lab job is an orphan."""
     repo = repo_root(Path.cwd())
@@ -173,6 +184,7 @@ def test_reconcile_finds_orphans_dry_run(tmp_path: Path, monkeypatch: pytest.Mon
         {"id": 300, "label": "other-users-rental"},  # not ours -> ignored
     ]
     monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda: vast_instances)
+    _patch_empty_sky(monkeypatch)
 
     report = lab.reconcile(apply=False)
     assert report["instances_total"] == 3
@@ -196,6 +208,7 @@ def test_reconcile_apply_destroys_orphans(tmp_path: Path, monkeypatch: pytest.Mo
             return {"ok": True}
 
     monkeypatch.setattr(skypilot_mod, "_get_vast_client", lambda: _FakeClient())
+    _patch_empty_sky(monkeypatch)
     report = lab.reconcile(apply=True)
     assert report["destroyed"] == [42]
     assert destroyed_ids == [42]
@@ -208,6 +221,7 @@ def test_reconcile_finds_ghosts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
     _seed_running_job(lab, "job-ghost")
     monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda: [])
+    _patch_empty_sky(monkeypatch)
     report = lab.reconcile(apply=False)
     assert report["orphans"] == []
     assert report["ghosts"] == ["lab-job-ghost"]

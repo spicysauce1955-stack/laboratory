@@ -1,3 +1,5 @@
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -5,8 +7,9 @@ import sky
 
 import lab.sky_runner as sky_runner
 from helpers import make_manifest
+from lab.backends.local import LocalBackend
 from lab.backends.skypilot import SkyPilotBackend, _cloud_for, build_task, robust_teardown
-from lab.core import LabError, build_backend, resolve_backend_profile
+from lab.core import Lab, LabError, build_backend, resolve_backend_profile
 from lab.models import ResourceRequest
 
 
@@ -134,3 +137,22 @@ def test_robust_teardown_vast_uses_fallback(monkeypatch):
     monkeypatch.setattr("lab.backends.skypilot._vast_destroy_matching", lambda c: [123])
     out = robust_teardown(_SkyDownFails(), "lab-x", backoffs=(), cloud="vast")
     assert out["status"] == "succeeded" and out["vast_destroyed"] == [123]
+
+
+def test_sky_status_orphans_finds_untracked_lab_clusters(tmp_path, monkeypatch):
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=tmp_path), repo=tmp_path, home=tmp_path)
+
+    class _FakeSky:
+        def get(self, x):
+            return x
+
+        def status(self, refresh=False):
+            return [{"name": "lab-abc"}, {"name": "lab-running"}, {"name": "someone-else"}]
+
+    fake = types.ModuleType("sky")
+    fake.get = _FakeSky().get
+    fake.status = _FakeSky().status
+    monkeypatch.setitem(sys.modules, "sky", fake)
+
+    orphans = lab._sky_status_orphans(running_clusters={"lab-running"})
+    assert orphans == ["lab-abc"]  # lab-* not running; non-lab ignored
