@@ -37,7 +37,7 @@ def test_remote_timeout_reason_carries_wall_and_tears_down(tmp_path: Path, monke
 
     teardown_calls = {"n": 0}
 
-    def _spy(sky_mod, cluster, st, jid):
+    def _spy(sky_mod, cluster, st, jid, cloud="vast"):
         teardown_calls["n"] += 1
         st.update_manifest(jid, teardown_status="succeeded")
         return True

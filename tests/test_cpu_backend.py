@@ -5,7 +5,7 @@ import sky
 
 import lab.sky_runner as sky_runner
 from helpers import make_manifest
-from lab.backends.skypilot import SkyPilotBackend, _cloud_for, build_task
+from lab.backends.skypilot import SkyPilotBackend, _cloud_for, build_task, robust_teardown
 from lab.core import LabError, build_backend, resolve_backend_profile
 from lab.models import ResourceRequest
 
@@ -111,3 +111,26 @@ def test_provision_failure_reason_do_does_not_consult_vast_balance(monkeypatch):
     )
     msg = sky_runner.provision_failure_reason("launch error: boom", "do")
     assert "DigitalOcean" in msg or "doctl" in msg
+
+
+class _SkyDownFails:
+    def down(self, cluster):
+        raise RuntimeError("sky.down boom")
+
+    def get(self, x):
+        return x
+
+
+def test_robust_teardown_do_skips_vast_fallback(monkeypatch):
+    monkeypatch.setattr(
+        "lab.backends.skypilot._vast_destroy_matching",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("vast fallback used for DO")),
+    )
+    out = robust_teardown(_SkyDownFails(), "lab-x", backoffs=(), cloud="do")
+    assert out["status"] == "failed" and out["vast_fallback_used"] is False
+
+
+def test_robust_teardown_vast_uses_fallback(monkeypatch):
+    monkeypatch.setattr("lab.backends.skypilot._vast_destroy_matching", lambda c: [123])
+    out = robust_teardown(_SkyDownFails(), "lab-x", backoffs=(), cloud="vast")
+    assert out["status"] == "succeeded" and out["vast_destroyed"] == [123]

@@ -280,14 +280,14 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                 "(host never reached UP — likely a dead Vast offer; resubmit for a fresh host)"
             )[:300],
         )
-        tear_down_and_record(sky, cluster, store, job_id)
+        tear_down_and_record(sky, cluster, store, job_id, manifest.resources.cloud or "vast")
         return 1
     except Exception as e:  # noqa: BLE001
         reason = provision_failure_reason(f"launch error: {e}", manifest.resources.cloud or "vast")
         store.update_manifest(
             job_id, status=JobState.failed, ended_at=now(), end_reason=reason[:300]
         )
-        tear_down_and_record(sky, cluster, store, job_id)
+        tear_down_and_record(sky, cluster, store, job_id, manifest.resources.cloud or "vast")
         return 1
 
     try:
@@ -363,7 +363,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             cost=cost,
         )
 
-    teardown_ok = tear_down_and_record(sky, cluster, store, job_id)
+    teardown_ok = tear_down_and_record(sky, cluster, store, job_id, manifest.resources.cloud or "vast")
     if final is JobState.preempted and not confirm_no_rental(cluster):
         # The instance vanished (preemption inferred), but we can't confirm the Vast rental is
         # actually gone — flag it so `lab wait` exits 3 and the operator can run `lab reconcile`
