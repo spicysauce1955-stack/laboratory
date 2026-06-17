@@ -63,7 +63,7 @@ instead of snapshotting:
 
 ```bash
 uv run lab submit -c "python experiments/x.py" --no-dirty
-# error: working tree is dirty; commit or drop --no-dirty (FR-B1)
+# error: working tree is dirty; commit or pass allow_dirty=True (FR-B1)
 ```
 
 Via the MCP `submit` tool, pass `allow_dirty: false` (default is `true`).
