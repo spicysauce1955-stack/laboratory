@@ -152,6 +152,7 @@ def test_sky_status_orphans_finds_untracked_lab_clusters(tmp_path, monkeypatch):
     fake = types.ModuleType("sky")
     fake.get = _FakeSky().get
     fake.status = _FakeSky().status
+    fake.StatusRefreshMode = types.SimpleNamespace(AUTO="AUTO", FORCE="FORCE", NONE="NONE")
     monkeypatch.setitem(sys.modules, "sky", fake)
 
     orphans = lab._sky_status_orphans(running_clusters={"lab-running"})

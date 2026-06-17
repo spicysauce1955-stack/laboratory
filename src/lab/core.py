@@ -547,9 +547,7 @@ class Lab:
         import sky
 
         try:
-            recs = sky.get(  # 0.12: RequestId -> list of cluster dicts
-                sky.status(refresh=True)  # type: ignore[arg-type]  # bool accepted at runtime
-            )
+            recs = sky.get(sky.status(refresh=sky.StatusRefreshMode.AUTO))  # 0.12: RequestId -> list
         except Exception as e:  # noqa: BLE001
             raise LabError(f"could not query SkyPilot cluster status: {e}") from e
         orphans: list[str] = []

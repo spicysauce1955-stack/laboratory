@@ -170,6 +170,9 @@ def _patch_empty_sky(monkeypatch: pytest.MonkeyPatch) -> None:
     fake.get = lambda x: x  # type: ignore[attr-defined]
     fake.status = lambda refresh=False: []  # type: ignore[attr-defined]
     fake.down = lambda cluster: cluster  # type: ignore[attr-defined]
+    fake.StatusRefreshMode = types.SimpleNamespace(  # type: ignore[attr-defined]
+        AUTO="AUTO", FORCE="FORCE", NONE="NONE"
+    )
     monkeypatch.setitem(sys.modules, "sky", fake)
 
 
