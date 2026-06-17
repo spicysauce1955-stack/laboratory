@@ -193,6 +193,33 @@ def build_sweep_point_spec(
     )
 
 
+CPU_DEFAULT_CLOUD = "do"
+CPU_DEFAULT_VCPUS = 8
+
+
+def resolve_backend_profile(
+    backend: str, resources: ResourceRequest
+) -> tuple[str, ResourceRequest]:
+    """Resolve the ``cpu`` convenience backend into (provisioner_name, resources).
+
+    ``cpu`` is sugar for the SkyPilot provisioner on a cheap CPU cloud (DigitalOcean): it clears
+    accelerators, defaults to ``CPU_DEFAULT_VCPUS`` vCPUs, and disables spot (DO has none). Other
+    backends pass through unchanged (identity), so the CLI and MCP stay thin shells. Pure; no I/O.
+    """
+    if backend != "cpu":
+        return backend, resources
+    if resources.accelerators:
+        raise LabError("--backend cpu provisions a CPU-only box; drop --accelerators")
+    return "skypilot", resources.model_copy(
+        update={
+            "cloud": CPU_DEFAULT_CLOUD,
+            "cpus": resources.cpus or CPU_DEFAULT_VCPUS,
+            "use_spot": False,
+            "spot_fallback": False,
+        }
+    )
+
+
 class Lab:
     def __init__(self, backend: Backend, repo: Path, home: Path) -> None:
         self.backend = backend
@@ -513,6 +540,24 @@ class Lab:
             },
         }
 
+    def _sky_status_orphans(self, running_clusters: set[str]) -> list[str]:
+        """Cloud-agnostic orphan pass: ``lab-*`` clusters SkyPilot still tracks/that are still up
+        but are NOT tied to a running local job. Covers DO/GCP (and Vast) via SkyPilot's own state,
+        complementing the Vast-direct scan. Raises :class:`LabError` if the status query fails."""
+        import sky
+
+        try:
+            recs = sky.get(sky.status(refresh=sky.StatusRefreshMode.AUTO))  # 0.12: RequestId -> list
+        except Exception as e:  # noqa: BLE001
+            raise LabError(f"could not query SkyPilot cluster status: {e}") from e
+        orphans: list[str] = []
+        for rec in recs or []:
+            name = rec.get("name") if isinstance(rec, dict) else getattr(rec, "name", None)
+            if not name or not str(name).startswith("lab-") or name in running_clusters:
+                continue
+            orphans.append(name)
+        return orphans
+
     def reconcile(self, *, apply: bool = False) -> dict[str, Any]:
         """Cross-check Vast.ai rentals against the local job DB (FR-C2 leak detection).
 
@@ -580,11 +625,26 @@ class Lab:
                     print(f"[lab] reconcile destroy {inst_id} failed: {e}")
 
         ghosts = sorted(running_clusters.keys() - matched_clusters)
+
+        sky_orphans = self._sky_status_orphans(set(running_clusters))
+        sky_destroyed: list[str] = []
+        if apply and sky_orphans:
+            import sky
+
+            for cl in sky_orphans:
+                try:
+                    sky.get(sky.down(cl))
+                    sky_destroyed.append(cl)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[lab] reconcile sky.down {cl} failed: {e}")
+
         return {
             "instances_total": len(instances),
             "orphans": orphans,
             "destroyed": destroyed,
             "ghosts": ghosts,
+            "sky_orphans": sky_orphans,
+            "sky_destroyed": sky_destroyed,
             "applied": apply,
         }
 
@@ -618,7 +678,7 @@ def build_backend(name: str, *, home: Path, repo: Path) -> Backend:
     ``Lab._sibling_lab``) and the scheduler (``Scheduler.make_lab``) route through here, so a new
     backend is wired in one place instead of three. Unknown names fall back to ``local``.
     """
-    if name == "skypilot":
+    if name in ("skypilot", "cpu"):
         from lab.backends.skypilot import SkyPilotBackend  # optional extra; import lazily
 
         return SkyPilotBackend(home=home, repo=repo)

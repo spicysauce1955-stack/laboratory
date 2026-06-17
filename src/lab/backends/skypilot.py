@@ -281,7 +281,7 @@ def _vast_destroy_matching(cluster: str, client: Any | None = None) -> list[int]
 
 
 def robust_teardown(
-    sky_mod: Any, cluster: str, *, backoffs: tuple[int, ...] = TEARDOWN_BACKOFFS
+    sky_mod: Any, cluster: str, *, backoffs: tuple[int, ...] = TEARDOWN_BACKOFFS, cloud: str = "vast"
 ) -> dict[str, Any]:
     """Tear down a SkyPilot cluster with retry + vastai-sdk fallback.
 
@@ -327,7 +327,18 @@ def robust_teardown(
                 f"[lab] sky.down attempt {attempt}/{len(delays)} for {cluster} failed: {last_err}"
             )
 
-    # SkyPilot teardown didn't take. Talk to Vast directly — it's the source of truth.
+    # SkyPilot teardown didn't take.
+    if cloud != "vast":
+        # No provider-direct fallback for non-Vast clouds; sky.down + autostop + the poweroff
+        # backstop + `lab reconcile` (sky.status pass) are the safety net. Report the failure.
+        return {
+            "status": "failed",
+            "attempts": len(delays),
+            "vast_fallback_used": False,
+            "vast_destroyed": [],
+            "error": last_err,
+        }
+    # Talk to Vast directly — it's the source of truth.
     print(f"[lab] sky.down exhausted for {cluster}; falling back to vast-sdk direct destroy")
     try:
         destroyed = _vast_destroy_matching(cluster)
@@ -348,14 +359,16 @@ def robust_teardown(
         }
 
 
-def tear_down_and_record(sky_mod: Any, cluster: str, store: JobStore, job_id: str) -> bool:
+def tear_down_and_record(
+    sky_mod: Any, cluster: str, store: JobStore, job_id: str, cloud: str = "vast"
+) -> bool:
     """Call :func:`robust_teardown` and persist its outcome on the job manifest.
 
     Returns ``True`` iff teardown succeeded. On failure, ``teardown_status='failed'`` is
     written and ``end_reason`` is annotated with an actionable instruction so the leak is
     visible in ``lab status`` / ``lab dashboard`` / ``lab wait``.
     """
-    outcome = robust_teardown(sky_mod, cluster)
+    outcome = robust_teardown(sky_mod, cluster, cloud=cloud)
     succeeded: bool = outcome["status"] == "succeeded"
     fields: dict[str, Any] = {"teardown_status": "succeeded" if succeeded else "failed"}
     annotation: str | None = None
@@ -427,6 +440,17 @@ def provision_with_watchdog(sky_mod: Any, request_id: Any, *, timeout_s: float) 
     return value
 
 
+def _cloud_for(name: str | None) -> "sky.clouds.Cloud":
+    """Map a lab cloud name to a SkyPilot cloud object. Unknown/None -> Vast (the default)."""
+    import sky
+
+    return {
+        "vast": sky.clouds.Vast,
+        "do": sky.clouds.DO,
+        "gcp": sky.clouds.GCP,
+    }.get(name or "vast", sky.clouds.Vast)()
+
+
 def build_task(manifest: JobManifest, workdir: Path) -> sky.Task:
     """Translate a JobManifest into a SkyPilot Task (no cloud calls; unit-tested)."""
     import sky
@@ -442,9 +466,12 @@ def build_task(manifest: JobManifest, workdir: Path) -> sky.Task:
         },
         workdir=str(workdir),
     )
-    # Vast is GPU-only in SkyPilot's catalog, so `accelerators` (e.g. "RTX_3070:1") is typically
-    # required; cpus/memory further constrain. If accelerators is None SkyPilot cost-optimises.
-    _cloud = sky.Vast()
+    cloud_name = manifest.resources.cloud or "vast"
+    if cloud_name == "do" and manifest.resources.use_spot:
+        from lab.core import LabError  # lazy: avoid import cycle
+
+        raise LabError("DigitalOcean has no spot instances; drop --spot")
+    _cloud = _cloud_for(cloud_name)
     _cpus = manifest.resources.cpus
     _memory = manifest.resources.memory
     _accels = manifest.resources.accelerators or None
@@ -548,7 +575,7 @@ class SkyPilotBackend:
             pass
         import sky
 
-        tear_down_and_record(sky, cluster, self.store, job_id)
+        tear_down_and_record(sky, cluster, self.store, job_id, m.resources.cloud or "vast")
         return JobState.cancelled
 
     def collect_artifacts(self, job_id: str, dest: str) -> list[ArtifactRecord]:

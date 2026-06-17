@@ -30,6 +30,10 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   `code_diff.tar.gz` (`capture_diff`/`apply_diff`), mirrored to R2; `--no-dirty`/`allow_dirty=false`
   refuses instead. Deferred paths set `diff_ref` to the bundle key. Timeout `end_reason` carries the
   wall ("timed out after Ns wall-clock cap"). Guide: `docs/guides/provenance-and-timeouts.md`.
+- **CPU backend (FR P1-1):** `lab submit --backend cpu` provisions a cheap multi-core **DigitalOcean**
+  droplet (default 8 vCPU, up to 48; on-demand) via SkyPilot — sugar over skypilot + `cloud="do"`,
+  resolved in `resolve_backend_profile`. The cloud is configurable (`vast`/`do`/`gcp`). `lab reconcile`
+  is cloud-agnostic (a `sky.status` orphan pass). Guide: `docs/guides/cpu-backend.md`.
 
 ## Conventions
 - `ruff` (line length 100), `mypy --strict` on `src/lab`. CLI and MCP server are thin shells over

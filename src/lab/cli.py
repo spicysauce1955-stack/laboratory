@@ -13,7 +13,7 @@ from typing import Any
 import typer
 
 from lab._util import now, wrap_with_extras
-from lab.core import Lab, LabError, default_lab
+from lab.core import Lab, LabError, default_lab, resolve_backend_profile
 from lab.manifest import repo_root
 from lab.models import JobSpec, JobState, ResourceRequest
 from lab.scheduler.models import Guardrails, RegState, Triggers
@@ -92,7 +92,7 @@ def _parse_grid(items: list[str]) -> dict[str, list[str]]:
 @app.command()
 def submit(
     command: str = typer.Option(..., "--command", "-c", help="entrypoint, e.g. 'python experiments/x.py'"),
-    backend: str = typer.Option("local", "--backend", help="local | skypilot"),
+    backend: str = typer.Option("local", "--backend", help="local | skypilot | cpu"),
     cache: bool = typer.Option(False, "--cache", help="reuse a prior succeeded identical job (FR-B5)"),
     seed: int | None = typer.Option(None, help="explicit seed (recorded in the manifest)"),
     code_ref: str = typer.Option("HEAD", help="git ref to pin"),
@@ -123,15 +123,21 @@ def submit(
     the job is killed, the machine torn down, and the run marked timed_out with the wall in its
     end_reason.
     """
-    lab = _lab(backend)
+    resources = ResourceRequest(
+        cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
+        provision_timeout=provision_timeout, use_spot=spot, spot_fallback=not no_fallback,
+    )
+    try:
+        provisioner, resources = resolve_backend_profile(backend, resources)
+    except LabError as e:  # e.g. --backend cpu with --accelerators (FR-F3)
+        _emit({"error": str(e)})
+        raise typer.Exit(code=1) from e
+    lab = _lab(provisioner)
     spec = JobSpec(
         code_ref=code_ref,
         command=wrap_with_extras(command, with_pkg),
         seed=seed,
-        resources=ResourceRequest(
-            cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
-            provision_timeout=provision_timeout, use_spot=spot, spot_fallback=not no_fallback,
-        ),
+        resources=resources,
         submitted_by="human",
     )
     if cache and (cached_id := lab.find_cached(spec)) is not None:
@@ -183,7 +189,7 @@ def confirm(
 def sweep(
     command: str = typer.Option(..., "--command", "-c", help="entrypoint, e.g. 'python experiments/x.py'"),
     grid: list[str] = typer.Option(..., "--grid", "-g", help="key=v1,v2,... (repeatable)"),
-    backend: str = typer.Option("local", "--backend", help="local | skypilot"),
+    backend: str = typer.Option("local", "--backend", help="local | skypilot | cpu"),
     seed: int | None = typer.Option(None),
     cpus: int | None = typer.Option(None),
     memory: str | None = typer.Option(None),
@@ -200,16 +206,22 @@ def sweep(
     sweep_max_cost: float | None = typer.Option(None, "--sweep-max-cost", help="up-front admission cap in USD: refuse the sweep if its total would exceed your daily budget (cost-safety); during-run enforcement is on register-sweep"),
 ) -> None:
     """Submit a parameter-grid sweep: one job per point under a sweep_id (FR-A5)."""
-    lab = _lab(backend)
+    resources = ResourceRequest(
+        cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
+        provision_timeout=provision_timeout, use_spot=spot, spot_fallback=not no_fallback,
+    )
+    try:
+        provisioner, resources = resolve_backend_profile(backend, resources)
+    except LabError as e:  # e.g. --backend cpu with --accelerators (FR-F3)
+        _emit({"error": str(e)})
+        raise typer.Exit(code=1) from e
+    lab = _lab(provisioner)
     try:
         sweep_id, job_ids = lab.sweep(
             wrap_with_extras(command, with_pkg),
             _parse_grid(grid),
             seed=seed,
-            resources=ResourceRequest(
-                cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
-                provision_timeout=provision_timeout, use_spot=spot, spot_fallback=not no_fallback,
-            ),
+            resources=resources,
             sweep_max_cost=sweep_max_cost,
             # only consult the control budget when there's a cap to admit against (avoids an
             # unnecessary queue read on every plain sweep)
