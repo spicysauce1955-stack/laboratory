@@ -90,7 +90,7 @@ Submit one job. Non-blocking — returns immediately with the `job_id`.
 | Input            | Type           | Notes |
 |------------------|----------------|-------|
 | `command`        | str (required) | e.g. `"python experiments/example_capacity.py"` |
-| `backend`        | str            | `"local"` (default) or `"skypilot"` |
+| `backend`        | str            | `"local"` (default), `"skypilot"`, or `"cpu"` (cheap DO CPU droplet) |
 | `cloud`          | str            | SkyPilot cloud override; `cpu` backend sets `"do"`. Default `"vast"`. |
 | `cache`          | bool           | If true and a prior identical-`(commit, command, config, seed)` succeeded job exists on a clean tree, reuse it |
 | `seed`           | int            | Recorded + injected as `$LAB_SEED` |
