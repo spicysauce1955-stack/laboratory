@@ -18,7 +18,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
 from lab._util import wrap_with_extras
-from lab.core import Lab, LabError, default_lab
+from lab.core import Lab, LabError, default_lab, resolve_backend_profile
 from lab.models import JobManifest, JobSpec, ResourceRequest
 from lab.store import JobStore
 
@@ -62,16 +62,21 @@ def build_server(lab: Lab) -> FastMCP:
         spot_fallback: bool = True,
         allow_dirty: bool = True,
     ) -> dict[str, Any]:
-        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. allow_dirty=False refuses a dirty working tree (default snapshots the diff, FR-B1)."""
-        the_lab = _lab(backend)
+        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. allow_dirty=False refuses a dirty working tree (default snapshots the diff, FR-B1). backend="cpu" provisions a cheap DigitalOcean CPU droplet (default 8 vCPU, up to 48; --accelerators rejected)."""
+        resources = ResourceRequest(
+            cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
+            provision_timeout=provision_timeout, use_spot=use_spot, spot_fallback=spot_fallback,
+        )
+        try:
+            provisioner, resources = resolve_backend_profile(backend, resources)
+        except LabError as e:
+            raise ToolError(str(e)) from e
+        the_lab = _lab(provisioner)
         spec = JobSpec(
             code_ref=code_ref,
             command=wrap_with_extras(command, with_pkg),
             seed=seed,
-            resources=ResourceRequest(
-                cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
-                provision_timeout=provision_timeout, use_spot=use_spot, spot_fallback=spot_fallback,
-            ),
+            resources=resources,
             submitted_by="agent",
         )
         if cache and (cached_id := the_lab.find_cached(spec)) is not None:
@@ -117,20 +122,24 @@ def build_server(lab: Lab) -> FastMCP:
         spot_fallback: bool = True,
         sweep_max_cost: float | None = None,
     ) -> dict[str, Any]:
-        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5). with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. sweep_max_cost is an up-front admission cap: the sweep is refused if its total would exceed the daily budget (during-run enforcement is on register_sweep)."""
+        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5). with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. sweep_max_cost is an up-front admission cap: the sweep is refused if its total would exceed the daily budget (during-run enforcement is on register_sweep). backend="cpu" provisions a cheap DigitalOcean CPU droplet (default 8 vCPU, up to 48; --accelerators rejected)."""
         from lab.scheduler.queue import default_queue
 
-        the_lab = _lab(backend)
+        resources = ResourceRequest(
+            cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
+            provision_timeout=provision_timeout, use_spot=use_spot, spot_fallback=spot_fallback,
+        )
+        try:
+            provisioner, resources = resolve_backend_profile(backend, resources)
+        except LabError as e:
+            raise ToolError(str(e)) from e
+        the_lab = _lab(provisioner)
         try:
             sweep_id, job_ids = the_lab.sweep(
                 wrap_with_extras(command, with_pkg),
                 grid,
                 seed=seed,
-                resources=ResourceRequest(
-                    cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
-                    provision_timeout=provision_timeout, use_spot=use_spot,
-                    spot_fallback=spot_fallback,
-                ),
+                resources=resources,
                 sweep_max_cost=sweep_max_cost,
                 daily_budget=(
                     default_queue().read_control().budget_usd_per_day

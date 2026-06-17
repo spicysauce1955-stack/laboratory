@@ -1,16 +1,20 @@
 import sys
 import types
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 import sky
+from typer.testing import CliRunner
 
+import lab.cli as cli_mod
 import lab.sky_runner as sky_runner
 from helpers import make_manifest
 from lab.backends.local import LocalBackend
 from lab.backends.skypilot import SkyPilotBackend, _cloud_for, build_task, robust_teardown
+from lab.cli import app
 from lab.core import Lab, LabError, build_backend, resolve_backend_profile
-from lab.models import ResourceRequest
+from lab.models import JobSpec, ResourceRequest
 
 
 def test_cloud_defaults_none():
@@ -157,3 +161,75 @@ def test_sky_status_orphans_finds_untracked_lab_clusters(tmp_path, monkeypatch):
 
     orphans = lab._sky_status_orphans(running_clusters={"lab-running"})
     assert orphans == ["lab-abc"]  # lab-* not running; non-lab ignored
+
+
+def _make_fake_lab(submitted_specs: list[JobSpec]) -> MagicMock:
+    """A fake Lab that captures submitted JobSpec objects (no network)."""
+    fake = MagicMock()
+    fake.find_cached.return_value = None
+    fake.submit.side_effect = lambda spec, **kw: (submitted_specs.append(spec) or "job-1")
+    fake.status.return_value = MagicMock(value="queued")
+    return fake
+
+
+def test_cli_submit_cpu_stamps_do_profile():
+    """`lab submit --backend cpu` stamps the DO profile onto the spec without touching the
+    network and resolves the provisioner to skypilot (CLI stays a thin shell)."""
+    captured: list[JobSpec] = []
+    fake_lab = _make_fake_lab(captured)
+    seen_backends: list[str] = []
+
+    def _fake(backend: str = "local") -> MagicMock:
+        seen_backends.append(backend)
+        return fake_lab
+
+    with patch.object(cli_mod, "_lab", side_effect=_fake):
+        result = CliRunner().invoke(app, ["submit", "-c", "python x.py", "--backend", "cpu"])
+
+    assert result.exit_code == 0, f"Exit {result.exit_code}: {result.output}"
+    assert len(captured) == 1
+    res = captured[0].resources
+    assert res.cloud == "do" and res.cpus == 8
+    assert res.use_spot is False and res.spot_fallback is False
+    assert seen_backends == ["skypilot"]  # cpu resolved to the skypilot provisioner
+
+
+def test_cli_submit_cpu_rejects_accelerators():
+    """`--backend cpu` + `--accelerators` surfaces the LabError as a structured CLI error."""
+    captured: list[JobSpec] = []
+    fake_lab = _make_fake_lab(captured)
+
+    with patch.object(cli_mod, "_lab", return_value=fake_lab):
+        result = CliRunner().invoke(
+            app,
+            ["submit", "-c", "python x.py", "--backend", "cpu", "--accelerators", "RTX4090:1"],
+        )
+
+    assert result.exit_code == 1
+    assert "CPU-only" in result.output
+    assert captured == []  # never submitted
+
+
+def test_cli_sweep_cpu_stamps_do_profile():
+    """`lab sweep --backend cpu` stamps the DO profile onto the per-job resources."""
+    resources_seen: list[ResourceRequest] = []
+    fake_lab = MagicMock()
+    fake_lab.sweep.side_effect = lambda cmd, grid, seed=None, resources=None, **_kw: (
+        resources_seen.append(resources) or ("sweep-1", ["job-1", "job-2"])
+    )
+    seen_backends: list[str] = []
+
+    def _fake(backend: str = "local") -> MagicMock:
+        seen_backends.append(backend)
+        return fake_lab
+
+    with patch.object(cli_mod, "_lab", side_effect=_fake):
+        result = CliRunner().invoke(
+            app, ["sweep", "-c", "python x.py", "--grid", "lr=0.1,0.01", "--backend", "cpu"]
+        )
+
+    assert result.exit_code == 0, f"Exit {result.exit_code}: {result.output}"
+    assert len(resources_seen) == 1
+    res = resources_seen[0]
+    assert res.cloud == "do" and res.cpus == 8
+    assert seen_backends == ["skypilot"]
