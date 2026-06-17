@@ -2,7 +2,7 @@
 name: laboratory
 description: "Run/execute a reproducible ML or compute experiment via the lab runner (MCP tools / `lab` CLI) — in this repo this is the right way to actually launch a training/experiment job, not running the script directly. Use when the user wants the work done, not just discussed: run, submit, or kick off an experiment; sweep a grid over hyperparameters/seeds and report which config won; put a job on a remote GPU (RTX 4090 on Vast.ai via SkyPilot), cap its cost or runtime; REGISTER/schedule an experiment for later — run tonight/off-hours, run when a GPU price drops, run after another job, queue/hold/cancel deferred runs while the laptop is closed; stream live metrics and kill a diverging run early; fetch results/artifacts; reproduce a prior run; or diagnose a billing/teardown leak ('am I still being charged?', stuck Vast rental, `lab wait` exit 3). Triggers: lab submit, lab sweep, lab wait, lab register, lab queue, lab scheduler. Skip for merely writing an experiment script or reading saved results."
 metadata:
-  version: "0.4.0"
+  version: "0.5.0"
   last_updated: "2026-06-17"
   status: active
 ---
@@ -91,6 +91,7 @@ Submit one job. Non-blocking — returns immediately with the `job_id`.
 |------------------|----------------|-------|
 | `command`        | str (required) | e.g. `"python experiments/example_capacity.py"` |
 | `backend`        | str            | `"local"` (default) or `"skypilot"` |
+| `cloud`          | str            | SkyPilot cloud override; `cpu` backend sets `"do"`. Default `"vast"`. |
 | `cache`          | bool           | If true and a prior identical-`(commit, command, config, seed)` succeeded job exists on a clean tree, reuse it |
 | `seed`           | int            | Recorded + injected as `$LAB_SEED` |
 | `code_ref`       | str            | Git ref to pin; default `"HEAD"` |
@@ -313,6 +314,7 @@ that fails.
 |---------|-------------|-----------------|
 | `local` | Dev, smoke tests, CPU experiments on the local machine. Free. | none |
 | `skypilot` | GPU work, parallel jobs, anything that shouldn't tie up the local machine. Costs money (Vast.ai). | `accelerators` (e.g. `"RTX4090:1"`) AND `timeout` (e.g. `"30m"`) |
+| `cpu` | Remote CPU work on a cheap DigitalOcean droplet (8 vCPU default, up to 48); on-demand. | none (accelerators rejected) |
 
 If `accelerators` is omitted on `skypilot`, SkyPilot may land you on a non-GPU
 host — pass it explicitly. `timeout` is a hard wall-clock cap; the job is killed
@@ -376,6 +378,7 @@ record artifact **URIs**, never credentials (spec FR-J1).
 
 - **Full reference (human-facing):** `DELIVERY.md` at the repo root.
 - **Provenance & timeouts guide (human-facing):** `docs/guides/provenance-and-timeouts.md`.
+- **CPU backend guide:** `docs/guides/cpu-backend.md`.
 - **Spec:** `LAB-REQUIREMENTS.md` (RFC-2119, FR/AC/NFR).
 - **Design decisions:** `research/16-decisions.md`.
 - **MCP tool source:** `src/lab/mcp_server.py`.
