@@ -100,7 +100,10 @@ def submit(
     memory: str | None = typer.Option(None, help="e.g. 8 or 8+ (GB)"),
     gpus: int | None = typer.Option(None),
     accelerators: str | None = typer.Option(None, "--accelerators", help="e.g. RTX_3070:1 (required for Vast)"),
-    timeout: str | None = typer.Option(None, help="wall-clock limit, e.g. 2h / 30m / 45s"),
+    timeout: str | None = typer.Option(
+        None, help="hard wall-clock cap, e.g. 2h / 30m / 45s — on overrun the job is killed, the "
+        "machine torn down, and the run marked timed_out (FR-I1)"
+    ),
     provision_timeout: str | None = typer.Option(None, "--provision-timeout", help="abort if the host doesn't reach UP in time, e.g. 10m (skypilot; default 8m)"),
     with_pkg: list[str] = typer.Option(None, "--with", help="extra runtime package(s) for this job (repeatable; layered via uv run --with)"),
     spot: bool = typer.Option(False, "--spot", help="use spot/interruptible instances (skypilot)"),
@@ -113,7 +116,13 @@ def submit(
         help="refuse to launch from a dirty working tree (default: snapshot the diff, FR-B1)",
     ),
 ) -> None:
-    """Submit a job without blocking; prints {job_id, cached, status} (FR-A1)."""
+    """Submit a job without blocking; prints {job_id, cached, status} (FR-A1).
+
+    Provenance is fail-closed (FR-B1): the manifest always pins a real commit, and a dirty tree is
+    snapshotted into a reproducible diff (pass --no-dirty to refuse instead). On --timeout overrun
+    the job is killed, the machine torn down, and the run marked timed_out with the wall in its
+    end_reason.
+    """
     lab = _lab(backend)
     spec = JobSpec(
         code_ref=code_ref,

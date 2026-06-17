@@ -2,8 +2,8 @@
 name: laboratory
 description: "Run/execute a reproducible ML or compute experiment via the lab runner (MCP tools / `lab` CLI) — in this repo this is the right way to actually launch a training/experiment job, not running the script directly. Use when the user wants the work done, not just discussed: run, submit, or kick off an experiment; sweep a grid over hyperparameters/seeds and report which config won; put a job on a remote GPU (RTX 4090 on Vast.ai via SkyPilot), cap its cost or runtime; REGISTER/schedule an experiment for later — run tonight/off-hours, run when a GPU price drops, run after another job, queue/hold/cancel deferred runs while the laptop is closed; stream live metrics and kill a diverging run early; fetch results/artifacts; reproduce a prior run; or diagnose a billing/teardown leak ('am I still being charged?', stuck Vast rental, `lab wait` exit 3). Triggers: lab submit, lab sweep, lab wait, lab register, lab queue, lab scheduler. Skip for merely writing an experiment script or reading saved results."
 metadata:
-  version: "0.3.0"
-  last_updated: "2026-06-11"
+  version: "0.4.0"
+  last_updated: "2026-06-17"
   status: active
 ---
 
@@ -51,9 +51,15 @@ Run from the lab repo root.
 - **MCP server.** Registered by `.mcp.json` at the repo root. Opening the repo
   in Claude Code should offer the `lab` server; once enabled, the tools below
   appear as `mcp__lab__submit`, etc.
-- **Commit before submitting.** Manifests pin `HEAD`. The lab accepts a dirty
-  tree (records `git_dirty: true`), but the cache (`cache=true`) will not hit
-  on a dirty tree. Commit when you want reproducibility + cache reuse.
+- **Dirty trees are captured, not lost (fail-closed provenance, FR-B1).**
+  Manifests pin `HEAD`; if the tree is dirty the lab **auto-snapshots the
+  uncommitted changes** (tracked diff + untracked files) and records a
+  `diff_ref`, so the exact code is always reconstructable — it will never write
+  `git_commit: null` or `git_dirty: true, diff_ref: null`. Pass `--no-dirty`
+  (CLI) / `allow_dirty=false` (MCP) to refuse a dirty submit instead. Note the
+  cache (`cache=true`) still only hits on a **clean** tree, and `lab confirm`
+  still refuses a dirty producer — commit when you want cache reuse or
+  confirmability. See `docs/guides/provenance-and-timeouts.md`.
 
 ## 3. The Experiment Contract (spec §7)
 
@@ -90,8 +96,9 @@ Submit one job. Non-blocking — returns immediately with the `job_id`.
 | `code_ref`       | str            | Git ref to pin; default `"HEAD"` |
 | `cpus` / `memory`/ `gpus` | int/str/int | Resource hints (memory like `"8"` GB) |
 | `accelerators`   | str            | **Required for skypilot.** e.g. `"RTX4090:1"` |
-| `timeout`        | str            | Wall-clock cap; `"30m"`, `"2h"`, `"45s"` |
+| `timeout`        | str            | Wall-clock cap; `"30m"`, `"2h"`, `"45s"`. On overrun the job is killed, the machine torn down, and the manifest reads `status: timed_out`, `end_reason: "timed out after <N>s wall-clock cap"` |
 | `with_pkg`       | list[str]      | Per-job extra runtime deps (e.g. `["scipy", "scikit-learn>=1.4"]`) — layered via `uv run --with` |
+| `allow_dirty`    | bool           | Default `true` (dirty tree → snapshot the diff). Set `false` to **refuse** a dirty submit (FR-B1) |
 
 Returns: `{"job_id": "...", "cached": bool, "status": "queued"|"succeeded"|...}`.
 
@@ -137,7 +144,8 @@ the local output is empty (e.g. after a fresh clone).
 
 Every MCP tool has a matching CLI command (`uv run lab submit / sweep / status
 / logs / metrics / fetch / cancel / list`). The `lab` CLI prints JSON
-mirroring the MCP returns.
+mirroring the MCP returns. (`lab submit --no-dirty` is the CLI form of
+`allow_dirty=false` — refuse a dirty tree instead of snapshotting it.)
 
 Two commands are CLI-only by design:
 
@@ -313,12 +321,21 @@ and marked `timed_out` if it overruns, and the machine is torn down.
 ## 8. Reproducibility & manifests
 
 Every job writes `runs/<job_id>/manifest.json` (model in `src/lab/models.py`)
-recording: created_at, git commit (+ dirty flag), uv.lock sha256, command,
-resolved config, seed, backend + machine type + region, status timeline,
-exit code + end reason, cost (estimated + actual), artifact URIs, and
+recording: created_at, git commit (+ dirty flag + `diff_ref`), uv.lock sha256,
+command, resolved config, seed, backend + machine type + region, status
+timeline, exit code + end reason, cost (estimated + actual), artifact URIs, and
 **`teardown_status`** (`"succeeded" | "failed" | null`) — the FR-C2 leak
 signal. A `"failed"` value means a paid rental may still be billing; the
 `end_reason` field is annotated with an actionable instruction in that case.
+
+**Fail-closed provenance (FR-B1).** The store refuses to *create* a manifest
+whose `code` can't reproduce the run: `git_commit` is always a real SHA, and a
+dirty tree always carries a `diff_ref`. `diff_ref` points at the captured
+uncommitted changes — a local `runs/<job_id>/code_diff.tar.gz`, its durable
+`r2://…` mirror when R2 is enabled, or (for deferred `register`/`register-sweep`
+jobs) the code bundle key. To reconstruct a dirty run's exact tree:
+`git checkout <git_commit>` then `lab.manifest.apply_diff(<diff_ref blob>, ".")`.
+The guard is on *create* only, so old manifests still read; you never migrate.
 
 `runs/` is git-ignored. For artifacts that must survive a clean clone (and
 for cross-machine `mcp__lab__fetch_artifacts`), enable R2 (see §2). Manifests
@@ -358,6 +375,7 @@ record artifact **URIs**, never credentials (spec FR-J1).
 ## 10. Pointers
 
 - **Full reference (human-facing):** `DELIVERY.md` at the repo root.
+- **Provenance & timeouts guide (human-facing):** `docs/guides/provenance-and-timeouts.md`.
 - **Spec:** `LAB-REQUIREMENTS.md` (RFC-2119, FR/AC/NFR).
 - **Design decisions:** `research/16-decisions.md`.
 - **MCP tool source:** `src/lab/mcp_server.py`.
