@@ -1,6 +1,10 @@
-import pytest
+from pathlib import Path
 
-from lab.backends.skypilot import SkyPilotBackend
+import pytest
+import sky
+
+from helpers import make_manifest
+from lab.backends.skypilot import SkyPilotBackend, _cloud_for, build_task
 from lab.core import LabError, build_backend, resolve_backend_profile
 from lab.models import ResourceRequest
 
@@ -42,3 +46,28 @@ def test_profile_passthrough_for_other_backends():
 def test_build_backend_cpu_is_skypilot(tmp_path):
     b = build_backend("cpu", home=tmp_path, repo=tmp_path)
     assert isinstance(b, SkyPilotBackend)
+
+
+def test_cloud_for_maps_names():
+    assert isinstance(_cloud_for("do"), sky.clouds.DO)
+    assert isinstance(_cloud_for("vast"), sky.clouds.Vast)
+    assert isinstance(_cloud_for("gcp"), sky.clouds.GCP)
+    assert isinstance(_cloud_for("unknown"), sky.clouds.Vast)  # fallback
+
+
+def test_build_task_uses_do_cloud_no_accelerators(tmp_path: Path):
+    m = make_manifest("c1", "python x.py", timeout="10m")
+    m.resources.cloud = "do"
+    m.resources.cpus = 8
+    task = build_task(m, workdir=tmp_path)
+    res = list(task.resources)[0]
+    assert isinstance(res.cloud, sky.clouds.DO)
+    assert res.accelerators is None
+
+
+def test_build_task_rejects_do_spot(tmp_path: Path):
+    m = make_manifest("c2", "python x.py", timeout="10m")
+    m.resources.cloud = "do"
+    m.resources.use_spot = True
+    with pytest.raises(LabError, match="DigitalOcean has no spot"):
+        build_task(m, workdir=tmp_path)

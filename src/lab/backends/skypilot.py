@@ -427,6 +427,17 @@ def provision_with_watchdog(sky_mod: Any, request_id: Any, *, timeout_s: float) 
     return value
 
 
+def _cloud_for(name: str | None) -> "sky.clouds.Cloud":
+    """Map a lab cloud name to a SkyPilot cloud object. Unknown/None -> Vast (the default)."""
+    import sky
+
+    return {
+        "vast": sky.clouds.Vast,
+        "do": sky.clouds.DO,
+        "gcp": sky.clouds.GCP,
+    }.get(name or "vast", sky.clouds.Vast)()
+
+
 def build_task(manifest: JobManifest, workdir: Path) -> sky.Task:
     """Translate a JobManifest into a SkyPilot Task (no cloud calls; unit-tested)."""
     import sky
@@ -442,9 +453,12 @@ def build_task(manifest: JobManifest, workdir: Path) -> sky.Task:
         },
         workdir=str(workdir),
     )
-    # Vast is GPU-only in SkyPilot's catalog, so `accelerators` (e.g. "RTX_3070:1") is typically
-    # required; cpus/memory further constrain. If accelerators is None SkyPilot cost-optimises.
-    _cloud = sky.Vast()
+    cloud_name = manifest.resources.cloud or "vast"
+    if cloud_name == "do" and manifest.resources.use_spot:
+        from lab.core import LabError  # lazy: avoid import cycle
+
+        raise LabError("DigitalOcean has no spot instances; drop --spot")
+    _cloud = _cloud_for(cloud_name)
     _cpus = manifest.resources.cpus
     _memory = manifest.resources.memory
     _accels = manifest.resources.accelerators or None
