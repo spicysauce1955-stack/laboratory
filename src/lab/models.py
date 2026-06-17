@@ -30,6 +30,7 @@ class ResourceRequest(BaseModel):
     gpus: int | None = None
     memory: str | None = None  # e.g. "32GB"
     accelerators: str | None = None  # SkyPilot accelerator spec, e.g. "RTX_3070:1" (remote)
+    cloud: str | None = None  # SkyPilot cloud: "vast" (default) | "do" | "gcp"; None -> "vast"
     timeout: str | None = None  # wall-clock limit, e.g. "2h" (FR-I1)
     provision_timeout: str | None = None  # max time to reach UP, e.g. "10m" (default 8m; skypilot)
     use_spot: bool = False  # opt into spot/interruptible instances (skypilot)
