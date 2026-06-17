@@ -366,7 +366,9 @@ def test_provision_failure_reason_flags_negative_balance(monkeypatch):
     import lab.sky_runner as sr
 
     monkeypatch.setattr(sr, "vast_balance", lambda: -1.46)
-    reason = provision_failure_reason("launch error: Failed to provision all possible resources")
+    reason = provision_failure_reason(
+        "launch error: Failed to provision all possible resources", "vast"
+    )
     assert "balance is $-1.46" in reason and "top up" in reason
 
 
@@ -375,7 +377,7 @@ def test_provision_failure_reason_keeps_generic_when_funded(monkeypatch):
 
     monkeypatch.setattr(sr, "vast_balance", lambda: 25.0)
     generic = "launch error: Failed to provision all possible resources"
-    assert provision_failure_reason(generic) == generic
+    assert provision_failure_reason(generic, "vast") == generic
 
 
 def test_provision_failure_reason_keeps_generic_when_balance_unknown(monkeypatch):
@@ -383,4 +385,4 @@ def test_provision_failure_reason_keeps_generic_when_balance_unknown(monkeypatch
 
     monkeypatch.setattr(sr, "vast_balance", lambda: None)
     generic = "launch error: Failed to provision all possible resources"
-    assert provision_failure_reason(generic) == generic
+    assert provision_failure_reason(generic, "vast") == generic

@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 import sky
 
+import lab.sky_runner as sky_runner
 from helpers import make_manifest
 from lab.backends.skypilot import SkyPilotBackend, _cloud_for, build_task
 from lab.core import LabError, build_backend, resolve_backend_profile
@@ -71,3 +72,42 @@ def test_build_task_rejects_do_spot(tmp_path: Path):
     m.resources.use_spot = True
     with pytest.raises(LabError, match="DigitalOcean has no spot"):
         build_task(m, workdir=tmp_path)
+
+
+class _Launched:
+    def __init__(self, cost_per_hr, instance_type, region):
+        self._c = cost_per_hr
+        self.instance_type = instance_type
+        self.region = region
+        self.use_spot = False
+
+    def get_cost(self, seconds):  # SkyPilot Resources API
+        return self._c * seconds / 3600
+
+
+class _Handle:
+    def __init__(self, launched):
+        self.launched_resources = launched
+
+
+def test_resolve_hourly_do_uses_sky_estimate(monkeypatch):
+    handle = _Handle(_Launched(0.75, "g-16vcpu-64gb", "nyc3"))
+    monkeypatch.setattr(
+        sky_runner, "vast_hourly_for_cluster",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("vast path used for DO")),
+    )
+    assert sky_runner._resolve_hourly("lab-x", handle, "do") == 0.75
+
+
+def test_resolve_hourly_vast_prefers_dph(monkeypatch):
+    monkeypatch.setattr(sky_runner, "vast_hourly_for_cluster", lambda c: 0.16)
+    assert sky_runner._resolve_hourly("lab-x", _Handle(_Launched(9.9, "x", "y")), "vast") == 0.16
+
+
+def test_provision_failure_reason_do_does_not_consult_vast_balance(monkeypatch):
+    monkeypatch.setattr(
+        sky_runner, "vast_balance",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("vast_balance used for DO")),
+    )
+    msg = sky_runner.provision_failure_reason("launch error: boom", "do")
+    assert "DigitalOcean" in msg or "doctl" in msg

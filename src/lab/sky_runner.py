@@ -146,28 +146,34 @@ def _hourly_cost(handle: Any) -> float | None:
     return None
 
 
-def _resolve_hourly(cluster: str, handle: Any) -> float | None:
-    """Prefer the rental's real billed price (Vast ``dph_total``) over SkyPilot's catalog estimate,
-    which under-reports Vast ~4x. Falls back to the estimate if the live price is unavailable."""
-    try:
-        actual = vast_hourly_for_cluster(cluster)
-    except Exception as e:  # noqa: BLE001 — best-effort; the estimate is the fallback
-        print(f"[lab] vast price lookup failed, using estimate: {e}")
-        actual = None
-    if actual is not None:
-        return actual
+def _resolve_hourly(cluster: str, handle: Any, cloud: str) -> float | None:
+    """Prefer the rental's real billed price for Vast (``dph_total``, which SkyPilot under-reports
+    ~4x); for every other cloud (DO/GCP) SkyPilot's catalog estimate is accurate, so use it."""
+    if cloud == "vast":
+        try:
+            actual = vast_hourly_for_cluster(cluster)
+        except Exception as e:  # noqa: BLE001 — best-effort; the estimate is the fallback
+            print(f"[lab] vast price lookup failed, using estimate: {e}")
+            actual = None
+        if actual is not None:
+            return actual
     return _hourly_cost(handle)
 
 
-def provision_failure_reason(generic: str) -> str:
-    """Enrich a generic provision-failure message with the Vast balance when that's the cause (§8).
+def provision_failure_reason(generic: str, cloud: str) -> str:
+    """Enrich a generic provision-failure message per cloud (§8).
 
-    Vast returns 400 on rentals when the balance is depleted; SkyPilot reports that as a generic
-    "no resources" string. If the balance is known and not positive, say so instead.
-    """
-    bal = vast_balance()
-    if bal is not None and bal <= 0:
-        return f"Vast account balance is ${bal:.2f} — top up to provision"
+    Vast returns 400 on a depleted balance, surfaced generically — consult the balance and say so.
+    For DigitalOcean, point at the most common cause: DO not enabled / no doctl token / quota."""
+    if cloud == "do":
+        return (
+            f"{generic} — if this is a DigitalOcean setup issue, check `sky check` shows DO enabled "
+            "(doctl token at ~/.config/doctl/config.yaml) and your DO vCPU quota covers the size"
+        )
+    if cloud == "vast":
+        bal = vast_balance()
+        if bal is not None and bal <= 0:
+            return f"Vast account balance is ${bal:.2f} — top up to provision"
     return generic
 
 
@@ -213,21 +219,28 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             # Record cost up-front so a running job already shows it (FR-I2). The host is UP now,
             # so the Vast rental exists — bill at its real dph_total, not SkyPilot's low catalog
             # estimate.
-            hourly_usd = _resolve_hourly(cluster, handle)
+            cloud = manifest.resources.cloud or "vast"
+            hourly_usd = _resolve_hourly(cluster, handle, cloud)
             estimated_usd = actual_cost(hourly_usd, parse_duration(manifest.resources.timeout))
             # Record which instance kind SkyPilot actually launched (spot vs on-demand) — with
             # spot_fallback the optimizer may pick on-demand, and the classifier must only infer
             # preemption for a genuinely-spot launch. None when unknown / on-demand-only.
-            launched_spot = getattr(
-                getattr(handle, "launched_resources", None), "use_spot", None
-            )
+            launched = getattr(handle, "launched_resources", None)
+            launched_spot = getattr(launched, "use_spot", None)
+            machine_type = getattr(launched, "instance_type", None)
+            region = getattr(launched, "region", None)
             store.update_manifest(
                 job_id,
                 cost=CostInfo(hourly_usd=hourly_usd, estimated_usd=estimated_usd),
-                backend=BackendInfo(provisioner="skypilot", launched_spot=launched_spot),
+                backend=BackendInfo(
+                    provisioner="skypilot",
+                    machine_type=machine_type,
+                    region=region,
+                    launched_spot=launched_spot,
+                ),
             )
         else:
-            hourly_usd = _resolve_hourly(cluster, None)
+            hourly_usd = _resolve_hourly(cluster, None, manifest.resources.cloud or "vast")
             estimated_usd = manifest.cost.estimated_usd if manifest.cost else None
             sky_job_id = None  # match any job in the cluster queue
 
@@ -270,7 +283,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         tear_down_and_record(sky, cluster, store, job_id)
         return 1
     except Exception as e:  # noqa: BLE001
-        reason = provision_failure_reason(f"launch error: {e}")
+        reason = provision_failure_reason(f"launch error: {e}", manifest.resources.cloud or "vast")
         store.update_manifest(
             job_id, status=JobState.failed, ended_at=now(), end_reason=reason[:300]
         )
