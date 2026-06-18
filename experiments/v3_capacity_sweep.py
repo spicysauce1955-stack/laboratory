@@ -845,6 +845,19 @@ def main() -> int:
     noise_sigmas = tuple(float(x) for x in ov.get("noise_sigmas", "").split(",") if x)  # V6
     noise_tol = float(ov.get("noise_tol", "0.05"))  # V6: max noisy error for a task to count robust
     elem_budget = int(float(ov.get("elem_budget", "64e6")))
+    require_cuda = int(ov.get("require_cuda", "0"))  # fail-fast if a GPU job lands on a CUDA-less host
+
+    # Fail-closed on a CUDA-less host when a GPU run is expected. Without this the study would
+    # silently fall back to CPU and "smoke"-run a full capacity grid at GPU rental price (the
+    # A3-anchor 2026-06-18 incident: ~$6 burned running on CPU). require_cuda=1 -> exit 1 fast so
+    # the lab tears the rental down instead of paying for a doomed CPU run.
+    if require_cuda and not torch.cuda.is_available():
+        print(
+            "FATAL: require_cuda=1 but torch.cuda.is_available() is False — landed on a CUDA-less "
+            "host. Exiting non-zero so the lab tears this rental down (no CPU-smoke at GPU price).",
+            flush=True,
+        )
+        sys.exit(1)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Trace-tensor memory budget: adapt to the actual GPU (Vast hands out anything from a 24 GB
