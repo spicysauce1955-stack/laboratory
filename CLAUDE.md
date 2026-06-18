@@ -34,6 +34,12 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   droplet (default 8 vCPU, up to 48; on-demand) via SkyPilot — sugar over skypilot + `cloud="do"`,
   resolved in `resolve_backend_profile`. The cloud is configurable (`vast`/`do`/`gcp`). `lab reconcile`
   is cloud-agnostic (a `sky.status` orphan pass). Guide: `docs/guides/cpu-backend.md`.
+- **Sharded sweeps (FR P1-2):** `lab sweep --seeds 0-31 --shard-size 8` splits each grid cell's
+  seeds into independently-bounded shard jobs (own timeout + teardown), then `lab sweep-aggregate`
+  row-concatenates the succeeded shards into one per-cell `results.csv` (seed column overridable),
+  reporting `seeds_present` vs expected and naming missing seeds on partial failure;
+  `lab sweep-retry` resubmits only the missing shards. A `SweepPlan` under the `sweep_id` is the
+  cell→shards map. Guide: `docs/guides/sharded-sweeps.md`.
 
 ## Conventions
 - `ruff` (line length 100), `mypy --strict` on `src/lab`. CLI and MCP server are thin shells over
