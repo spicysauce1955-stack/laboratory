@@ -7,8 +7,8 @@ from __future__ import annotations
 def parse_seeds(spec: str | list[int]) -> list[int]:
     """Parse a seed declaration into a sorted, de-duplicated seed set.
 
-    Accepts an inclusive range string ``"0-31"`` or an explicit list ``[0, 1, 2]``.
-    Seeds must be non-negative.
+    Accepts an inclusive range string ``"0-31"``, a comma list / single int string
+    (``"0,1,2"`` / ``"5"``), or an explicit list ``[0, 1, 2]``. Seeds must be non-negative.
     """
     if isinstance(spec, str):
         if "-" in spec:
