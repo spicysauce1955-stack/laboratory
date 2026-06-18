@@ -46,6 +46,7 @@ from lab.models import (
     SweepCell,
     SweepPlan,
 )
+from lab.aggregate import merge_seed_rows
 from lab.sharding import parse_seeds, partition_seeds, seeds_to_arg
 from lab.store import JobStore, cell_id_for
 
@@ -473,6 +474,45 @@ class Lab:
         if not self.store.has_sweep_plan(sweep_id):
             raise LabError(f"no shard plan for {sweep_id!r} (not a sharded sweep?)")
         return self.store.read_sweep_plan(sweep_id)
+
+    def aggregate_sweep(self, sweep_id: str) -> SweepPlan:
+        """Row-concatenate each cell's succeeded shards into one per-cell result (P1-2, FR-SS-4..7).
+
+        Idempotent pull reducer: recomputes from current shard states each call, so it is safe to run
+        repeatedly as shards finish. A cell is ``complete`` iff every expected seed is present, else
+        ``incomplete`` with the missing seeds named — never presents a short aggregate as complete and
+        never discards recovered seeds (FR-SS-7).
+        """
+        plan = self.sweep_plan(sweep_id)
+        for cell in plan.cells:
+            texts: list[str] = []
+            for jid in cell.shard_job_ids:
+                if self.manifest(jid).status is not JobState.succeeded:
+                    continue
+                self.fetch_artifacts(jid)  # ensure the local copy exists (R2 fallback inside)
+                rf = self.store.output_dir(jid) / cell.results_file
+                if rf.exists():
+                    texts.append(rf.read_text())
+            merged, present = merge_seed_rows(texts, cell.seed_column)
+            cell.seeds_present = present
+            present_set = set(present)
+            cell.missing_seeds = [s for s in cell.seeds_expected if s not in present_set]
+            cell.status = "complete" if not cell.missing_seeds else "incomplete"
+            if merged:
+                dest = Path(cell.aggregate_ref)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(merged)
+                if r2_enabled():
+                    r2 = R2Store.from_env()
+                    if r2 is not None:
+                        try:
+                            r2.upload_file(
+                                dest, f"{sweep_id}/cells/{cell.cell_id}/{cell.results_file}"
+                            )
+                        except Exception as e:  # noqa: BLE001 — local aggregate stays authoritative
+                            print(f"[lab] aggregate R2 mirror failed, keeping local copy: {e}")
+        self.store.write_sweep_plan(plan)
+        return plan
 
     def _sibling_lab(self, repo: Path) -> Lab:
         """A Lab rooted at ``repo`` (e.g. an extracted bundle) over the same backend kind, sharing
