@@ -170,14 +170,20 @@ def milp_feasible(Phi, y, theta, delta=1e-2, wbound=1e3, time_limit=30.0) -> str
     rows, cols, data = [], [], []
     lb, ub = [], []
     r = 0
-    # +1 target-time constraints (one row per (mu, j)):  w.Phi + BigM*z >= theta+delta
+    # +1 target-time constraints (one row per (mu, j)), big-M indicator (z=1 => TIGHT):
+    #   w.Phi[mu,j] >= theta+delta - BigM*(1 - z[mu,j])
+    #   <=>  w.Phi[mu,j] - BigM*z[mu,j] >= (theta+delta) - BigM
+    # z=1 (chosen read-out time) => w.Phi >= theta+delta  (enforced);
+    # z=0 => w.Phi >= theta+delta - BigM (slack/vacuous). The earlier "+BigM*z, lb=theta+delta"
+    # wiring was inverted (made the chosen time vacuous and unchosen times tight) -> the
+    # perceptron self-gate read alpha_c=inf. Fixed 2026-06-18 after the gate caught it.
     for pi, mu in enumerate(pos):
         for j in range(M):
             phi = Phi[mu, j]
             nz = np.nonzero(phi)[0]
             rows.extend([r] * len(nz)); cols.extend(nz.tolist()); data.extend(phi[nz].tolist())
-            rows.append(r); cols.append(zcol(pi, j)); data.append(big_m)
-            lb.append(theta + delta); ub.append(np.inf)
+            rows.append(r); cols.append(zcol(pi, j)); data.append(-big_m)
+            lb.append(theta + delta - big_m); ub.append(np.inf)
             r += 1
     # +1 at-least-one-time:  sum_j z[mu,j] >= 1
     for pi, _ in enumerate(pos):
