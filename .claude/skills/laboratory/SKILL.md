@@ -1,9 +1,9 @@
 ---
 name: laboratory
-description: "Run/execute a reproducible ML or compute experiment via the lab runner (MCP tools / `lab` CLI) — in this repo this is the right way to actually launch a training/experiment job, not running the script directly. Use when the user wants the work done, not just discussed: run, submit, or kick off an experiment; sweep a grid over hyperparameters/seeds and report which config won; put a job on a remote GPU (RTX 4090 on Vast.ai via SkyPilot), cap its cost or runtime; REGISTER/schedule an experiment for later — run tonight/off-hours, run when a GPU price drops, run after another job, queue/hold/cancel deferred runs while the laptop is closed; stream live metrics and kill a diverging run early; fetch results/artifacts; reproduce a prior run; or diagnose a billing/teardown leak ('am I still being charged?', stuck Vast rental, `lab wait` exit 3). Triggers: lab submit, lab sweep, lab wait, lab register, lab queue, lab scheduler. Skip for merely writing an experiment script or reading saved results."
+description: "Run/execute a reproducible ML or compute experiment via the lab runner (MCP tools / `lab` CLI) — in this repo this is the right way to actually launch a training/experiment job, not running the script directly. Use when the user wants the work done, not just discussed: run, submit, or kick off an experiment; sweep a grid over hyperparameters/seeds and report which config won; shard a large-seed sweep into independently-bounded per-seed sub-jobs and aggregate one per-cell result (sweep-aggregate / sweep-retry); put a job on a remote GPU (RTX 4090 on Vast.ai via SkyPilot), cap its cost or runtime; REGISTER/schedule an experiment for later — run tonight/off-hours, run when a GPU price drops, run after another job, queue/hold/cancel deferred runs while the laptop is closed; stream live metrics and kill a diverging run early; fetch results/artifacts; reproduce a prior run; or diagnose a billing/teardown leak ('am I still being charged?', stuck Vast rental, `lab wait` exit 3). Triggers: lab submit, lab sweep, lab sweep-aggregate, lab sweep-retry, lab wait, lab register, lab queue, lab scheduler. Skip for merely writing an experiment script or reading saved results."
 metadata:
-  version: "0.5.0"
-  last_updated: "2026-06-17"
+  version: "0.6.0"
+  last_updated: "2026-06-18"
   status: active
 ---
 
@@ -25,6 +25,9 @@ Invoke this skill when the user asks (in any phrasing):
 
 - "Run / submit this experiment" (especially with a seed, grid, or GPU).
 - "Sweep over K / alpha / seeds" (parameter grid).
+- "Shard a big-seed sweep so each chunk has its own timeout" / "split the 32
+  seeds into sub-jobs and stitch one result back together" (sharded sweep — §4
+  `sweep(seeds=…, shard_size=…)` + `sweep-aggregate`).
 - "Watch the run live and stop it if it's off-track" (live early-kill).
 - "Fetch the results / artifacts of job `<id>`."
 - "Reproduce job `<id>` / re-run with the same config."
@@ -79,6 +82,14 @@ and the metrics tool will still read cleanly.
 
 **Reference template:** `experiments/example_capacity.py` (50 lines, contract-compliant).
 
+**For sharded sweeps (§4 `sweep` with `seeds`/`shard_size`)** the entrypoint additionally must:
+read its assigned seed subset from a config key (default `seeds`, a comma list like `seeds=0,1,2,3`)
+and emit **one row per seed** into a row-structured result file (default `results.csv`) that includes
+a column identifying the seed (default `seed`). The lab row-concatenates those per-shard files into one
+per-cell aggregate and uses the seed column to report present-vs-expected and name missing seeds. Both
+the file and the column are overridable (`--results-file` / `--seed-column`). Guide:
+`docs/guides/sharded-sweeps.md`.
+
 ## 4. The MCP tool surface
 
 All registered by `build_server` in `src/lab/mcp_server.py`. Each returns a
@@ -110,11 +121,36 @@ Submit a Cartesian-product grid of jobs under one `sweep_id`. Same kwargs as
 | Input | Type | Notes |
 |-------|------|-------|
 | `grid` | dict[str, list] | e.g. `{"seed": [1,2,3], "K": [100, 200, 500]}` → 9 jobs |
+| `seeds` | str \| list[int] | **Sharded sweep (P1-2).** A seed set as a range `"0-31"`, a comma list `"0,1,2"`, or `[0,1,2]`. Declares seeds as a first-class axis evaluated for **every** grid cell. |
+| `shard_size` | int | Max seeds per sub-job. Each cell's `seeds` are split into shards of at most this size (`shard_size ≥ len(seeds)` ⇒ one shard per cell = today's behavior). `timeout`/`backend`/`accelerators` apply **per shard**. |
+| `results_file` | str | Per-run row-structured result file to row-concatenate per cell (default `"results.csv"`). |
+| `seed_column` | str | Column in `results_file` identifying each row's seed (default `"seed"`). |
 
 Grid values become `key=value` overrides on the experiment's argv (string-valued
 — Hydra/typer coerce). If `seed` is a grid key, it sets each job's recorded seed.
+It is an error to declare seeds in both `seeds` and a grid key (`seed`/the
+seed-axis key).
 
-Returns: `{"sweep_id": "...", "job_ids": [...]}`.
+Returns (plain grid): `{"sweep_id": "...", "job_ids": [...]}`.
+Returns (sharded, i.e. `seeds` given): `{"sweep_id": "...", "cells": [{coords,
+cell_id, shard_job_ids, aggregate_ref, seeds_expected, seeds_present, status}, ...]}`.
+
+### `mcp__lab__sweep_aggregate`
+**Sharded sweeps only.** `{sweep_id}` → row-concatenate each cell's **succeeded**
+shards' `results_file` into one per-cell aggregate at `aggregate_ref`, and return
+the cell view. **Idempotent** — safe to re-run as shards finish; it is also the
+way to view current per-cell status (`status` is `complete` iff every expected
+seed is present, else `incomplete` with `missing_seeds` named — never reports a
+short aggregate as complete, never discards recovered seeds).
+
+### `mcp__lab__sweep_retry`
+**Sharded sweeps only.** `{sweep_id}` → resubmit **only** the missing shards of
+incomplete cells (skipping any shard already covered or with an in-flight prior
+retry), then re-aggregate and return the updated cell view.
+
+> Note: `mcp__lab__sweep_status` remains the *outcome/cost* summary
+> (states, preemptions, per-point spend) — it does **not** carry the per-cell
+> seed view; use `sweep_aggregate` for that.
 
 ### `mcp__lab__status`
 `{job_id}` → `{state, started_at, ended_at, exit_code, end_reason, cost}`.
@@ -143,10 +179,14 @@ the local output is empty (e.g. after a fresh clone).
 
 ## 5. The CLI surface (and the CLI-only commands)
 
-Every MCP tool has a matching CLI command (`uv run lab submit / sweep / status
-/ logs / metrics / fetch / cancel / list`). The `lab` CLI prints JSON
-mirroring the MCP returns. (`lab submit --no-dirty` is the CLI form of
-`allow_dirty=false` — refuse a dirty tree instead of snapshotting it.)
+Every MCP tool has a matching CLI command (`uv run lab submit / sweep /
+sweep-aggregate / sweep-retry / status / logs / metrics / fetch / cancel /
+list`). The `lab` CLI prints JSON mirroring the MCP returns. (`lab submit
+--no-dirty` is the CLI form of `allow_dirty=false` — refuse a dirty tree instead
+of snapshotting it.) Sharded-sweep CLI form:
+`lab sweep -c "<cmd>" --grid N=1000,1500 --seeds 0-31 --shard-size 8`, then
+`lab sweep-aggregate <sweep_id>` (idempotent; also the per-cell status view) and
+`lab sweep-retry <sweep_id>` (resubmit only missing shards).
 
 Two commands are CLI-only by design:
 
@@ -280,6 +320,17 @@ See **`examples/02-sweep-and-wait.md`**. Pattern: `mcp__lab__sweep` over the
 grid → background `lab wait --sweep <sweep_id>` → on wake, `mcp__lab__list`,
 filter to `sweep_id`, fetch each, summarize succeeded vs failed.
 
+### B′. Shard a large-seed sweep and aggregate per cell (P1-2)
+When a cell has many seeds / long per-cell wall time (so one all-seeds job is too
+long for a single timeout), declare the seed axis and a shard size instead of
+chunking by hand. Pattern: `mcp__lab__sweep(grid=…, seeds="0-31", shard_size=8)`
+→ background `lab wait --sweep <sweep_id>` → on wake, `mcp__lab__sweep_aggregate
+(<sweep_id>)` to get one per-cell `results.csv` plus `seeds_present`/`status`
+per cell → if a cell is `incomplete`, `mcp__lab__sweep_retry(<sweep_id>)` reruns
+only the missing shards, then aggregate again. Each shard is a normal job (own
+timeout + teardown + manifest); the experiment must honor the sharded results
+contract in §3. Guide: `docs/guides/sharded-sweeps.md`.
+
 ### C. Live early-kill (watch and stop if off-track)
 See **`examples/03-live-early-kill.md`**. Pattern: submit → poll
 `mcp__lab__metrics(job_id, since_step=last)` every ~10s → if the divergence
@@ -379,6 +430,7 @@ record artifact **URIs**, never credentials (spec FR-J1).
 - **Full reference (human-facing):** `DELIVERY.md` at the repo root.
 - **Provenance & timeouts guide (human-facing):** `docs/guides/provenance-and-timeouts.md`.
 - **CPU backend guide:** `docs/guides/cpu-backend.md`.
+- **Sharded sweeps guide:** `docs/guides/sharded-sweeps.md`.
 - **Spec:** `LAB-REQUIREMENTS.md` (RFC-2119, FR/AC/NFR).
 - **Design decisions:** `research/16-decisions.md`.
 - **MCP tool source:** `src/lab/mcp_server.py`.
