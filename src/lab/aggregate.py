@@ -42,6 +42,11 @@ def merge_seed_rows(csv_texts: list[str], seed_column: str) -> tuple[str, list[i
             rows.append((seed_val, dict(zip(header, raw))))
     if header is None:
         return "", []
+    seen: set[int] = set()
+    for seed_val, _ in rows:
+        if seed_val in seen:
+            raise ValueError(f"duplicate seed {seed_val} across shard results")
+        seen.add(seed_val)
     rows.sort(key=lambda r: r[0])
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\n")

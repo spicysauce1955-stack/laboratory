@@ -112,17 +112,27 @@ missing the cell reports `status: incomplete` and names them:
 {
   "cell_id": "N=1000",
   "status": "incomplete",
-  "seeds_present": 28,
+  "seeds_present": 24,
   "seeds_expected": 32,
-  "missing_seeds": [12, 13, 14, 15]
+  "missing_seeds": [8, 9, 10, 11, 12, 13, 14, 15]
 }
 ```
 
-The full sweep status is visible via:
+(Example: a 4-shard cell of 32 seeds 0–31 where shard 1 = seeds 8–15 failed — 8 seeds missing.)
+
+The per-cell status view is returned by `lab sweep-aggregate`, which is **idempotent** — safe to
+re-run at any time as shards finish:
 
 ```bash
-uv run lab sweep-status <sweep_id>
+uv run lab sweep-aggregate <sweep_id>
 ```
+
+This re-aggregates from current shard states and returns the full cell view (including
+`seeds_present`, `seeds_expected`, `missing_seeds`, and `status` per cell). Run it whenever you
+want to check which seeds have landed so far.
+
+`lab sweep-status <sweep_id>` is a separate command that returns the outcome/cost summary
+(job states, preemption count, per-point spend) — it does not show per-cell seed coverage.
 
 Via MCP the equivalent tools are `sweep_aggregate` and `sweep_retry`.
 
@@ -153,6 +163,6 @@ produced it (AC-5).
 | Command | What it does |
 |---|---|
 | `lab sweep … --seeds … --shard-size …` | Submit all shard jobs |
-| `lab sweep-aggregate <sweep_id>` | Merge succeeded shards into one per-cell CSV |
+| `lab sweep-aggregate <sweep_id>` | Re-aggregate shards and show per-cell `seeds_present`/`seeds_expected`/`missing_seeds` (idempotent) |
 | `lab sweep-retry <sweep_id>` | Resubmit missing-seed shards, then re-aggregate |
-| `lab sweep-status <sweep_id>` | Show per-cell `seeds_present`/`seeds_expected` |
+| `lab sweep-status <sweep_id>` | Show outcome/cost summary (states, preemptions, per-point spend) |

@@ -172,3 +172,22 @@ class SweepPlan(BaseModel):
     command: str  # base entrypoint, so retry_sweep can rebuild a shard spec without a manifest re-parse
     seed_axis_key: str  # config-override key carrying each shard's seed subset (default "seeds")
     cells: list[SweepCell]
+
+    def view(self) -> dict[str, Any]:
+        """Structured cell view for sharded sweeps (used by CLI + MCP shells — single source of truth)."""
+        return {
+            "sweep_id": self.sweep_id,
+            "cells": [
+                {
+                    "coords": c.coords,
+                    "cell_id": c.cell_id,
+                    "shard_job_ids": c.shard_job_ids,
+                    "aggregate_ref": c.aggregate_ref,
+                    "seeds_expected": len(c.seeds_expected),
+                    "seeds_present": len(c.seeds_present),
+                    "missing_seeds": c.missing_seeds,
+                    "status": c.status,
+                }
+                for c in self.cells
+            ],
+        }

@@ -76,25 +76,6 @@ def parse_seeds_arg(raw: str | None) -> str | list[int] | None:
     return [int(x) for x in raw.split(",")] if "," in raw else raw
 
 
-def _plan_view(plan: Any) -> dict[str, Any]:
-    return {
-        "sweep_id": plan.sweep_id,
-        "cells": [
-            {
-                "coords": c.coords,
-                "cell_id": c.cell_id,
-                "shard_job_ids": c.shard_job_ids,
-                "aggregate_ref": c.aggregate_ref,
-                "seeds_expected": len(c.seeds_expected),
-                "seeds_present": len(c.seeds_present),
-                "missing_seeds": c.missing_seeds,
-                "status": c.status,
-            }
-            for c in plan.cells
-        ],
-    }
-
-
 def _parse_grid(items: list[str]) -> dict[str, list[str]]:
     """Parse repeated `--grid key=v1,v2,...` options into {key: [values]}.
 
@@ -270,7 +251,7 @@ def sweep(
         raise typer.Exit(code=1) from e
     if lab.store.has_sweep_plan(sweep_id):
         plan = lab.sweep_plan(sweep_id)
-        _emit(_plan_view(plan))
+        _emit(plan.view())
     else:
         _emit({"sweep_id": sweep_id, "count": len(job_ids), "job_ids": job_ids})
 
@@ -355,7 +336,7 @@ def sweep_aggregate(sweep_id: str) -> None:
     except LabError as e:
         _emit({"error": str(e)})
         raise typer.Exit(code=1) from e
-    _emit(_plan_view(plan))
+    _emit(plan.view())
 
 
 @app.command(name="sweep-retry")
@@ -366,7 +347,7 @@ def sweep_retry(sweep_id: str) -> None:
     except LabError as e:
         _emit({"error": str(e)})
         raise typer.Exit(code=1) from e
-    _emit(_plan_view(plan))
+    _emit(plan.view())
 
 
 @app.command(name="list")

@@ -538,6 +538,7 @@ class Lab:
                     if sub is not None:
                         in_flight_subsets.add(str(sub))
             # inherit the original shard resources (timeout/backend/etc.) from an existing shard
+            # [0] is safe: an incomplete cell always has >=1 shard (seeds_expected is non-empty)
             base_resources = self.manifest(cell.shard_job_ids[0]).resources
             for shard in cell.shard_seeds:
                 if all(s in present for s in shard):

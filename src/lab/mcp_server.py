@@ -19,28 +19,8 @@ from fastmcp.exceptions import ToolError
 
 from lab._util import wrap_with_extras
 from lab.core import Lab, LabError, default_lab, resolve_backend_profile
-from lab.models import JobManifest, JobSpec, ResourceRequest, SweepPlan
+from lab.models import JobManifest, JobSpec, ResourceRequest
 from lab.store import JobStore
-
-
-def _plan_view(plan: SweepPlan) -> dict[str, Any]:
-    """Structured cell view for sharded sweeps — mirrors the CLI's _plan_view."""
-    return {
-        "sweep_id": plan.sweep_id,
-        "cells": [
-            {
-                "coords": c.coords,
-                "cell_id": c.cell_id,
-                "shard_job_ids": c.shard_job_ids,
-                "aggregate_ref": c.aggregate_ref,
-                "seeds_expected": len(c.seeds_expected),
-                "seeds_present": len(c.seeds_present),
-                "missing_seeds": c.missing_seeds,
-                "status": c.status,
-            }
-            for c in plan.cells
-        ],
-    }
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -178,7 +158,7 @@ def build_server(lab: Lab) -> FastMCP:
         except LabError as e:
             raise ToolError(str(e)) from e
         if the_lab.store.has_sweep_plan(sweep_id):
-            return _plan_view(the_lab.sweep_plan(sweep_id))
+            return the_lab.sweep_plan(sweep_id).view()
         return {"sweep_id": sweep_id, "job_ids": job_ids}
 
     @mcp.tool
@@ -235,7 +215,7 @@ def build_server(lab: Lab) -> FastMCP:
     def sweep_aggregate(sweep_id: str) -> dict[str, Any]:
         """Row-concatenate each cell's succeeded shards into one per-cell result; returns the cell view (P1-2)."""
         try:
-            return _plan_view(_lab().aggregate_sweep(sweep_id))
+            return _lab().aggregate_sweep(sweep_id).view()
         except LabError as e:
             raise ToolError(str(e)) from e
 
@@ -243,7 +223,7 @@ def build_server(lab: Lab) -> FastMCP:
     def sweep_retry(sweep_id: str) -> dict[str, Any]:
         """Resubmit only the missing shards of incomplete cells, then re-aggregate (P1-2)."""
         try:
-            return _plan_view(_lab().retry_sweep(sweep_id))
+            return _lab().retry_sweep(sweep_id).view()
         except LabError as e:
             raise ToolError(str(e)) from e
 

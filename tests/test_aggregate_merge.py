@@ -34,6 +34,13 @@ def test_merge_empty():
     assert merge_seed_rows([], "seed") == ("", [])
 
 
+def test_merge_rejects_duplicate_seed_across_shards():
+    a = "seed,acc\n0,0.9\n1,0.8\n"
+    b = "seed,acc\n1,0.7\n2,0.6\n"  # seed 1 appears in both shards
+    with pytest.raises(ValueError, match="duplicate"):
+        merge_seed_rows([a, b], "seed")
+
+
 def test_merge_preserves_embedded_comma_value():
     """Verify that CSV values containing commas round-trip verbatim (quoted by csv module)."""
     import csv
