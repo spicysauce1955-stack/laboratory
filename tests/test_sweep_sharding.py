@@ -57,3 +57,21 @@ def test_shard_size_ge_len_is_one_shard_per_cell(tmp_path: Path):
     assert len(job_ids) == 2  # one shard per cell
     plan = lab.sweep_plan(sweep_id)
     assert all(len(c.shard_seeds) == 1 for c in plan.cells)
+
+
+def test_bad_seed_range_raises_lab_error(tmp_path: Path):
+    lab = _lab(tmp_path)
+    with pytest.raises(LabError):
+        lab.sweep("true", {"N": [1000]}, seeds="5-2", shard_size=2)
+
+
+def test_zero_shard_size_raises_lab_error(tmp_path: Path):
+    lab = _lab(tmp_path)
+    with pytest.raises(LabError):
+        lab.sweep("true", {"N": [1000]}, seeds="0-3", shard_size=0)
+
+
+def test_singular_seed_grid_key_rejected(tmp_path: Path):
+    lab = _lab(tmp_path)
+    with pytest.raises(LabError, match="both"):
+        lab.sweep("true", {"seed": [0, 1]}, seeds="0-3", shard_size=2)

@@ -84,6 +84,30 @@ def test_sweep_aggregate_emits_cells(tmp_path: Path) -> None:
     assert c["seeds_present"] == 4
 
 
+def test_sweep_bad_seeds_comma_exits_nonzero(tmp_path: Path) -> None:
+    """Malformed comma-list seeds (e.g. '0,foo') must exit non-zero with JSON error, not a traceback."""
+    with patch.object(cli_mod, "_lab", return_value=_real_lab(tmp_path)):
+        res = runner.invoke(
+            app,
+            ["sweep", "-c", "true", "-g", "N=1000", "--seeds", "0,foo", "--shard-size", "2"],
+        )
+    assert res.exit_code != 0
+    out = json.loads(res.output)
+    assert "error" in out
+
+
+def test_sweep_bad_seeds_range_exits_nonzero(tmp_path: Path) -> None:
+    """Inverted range seeds (e.g. '5-2') must exit non-zero with JSON error, not a traceback."""
+    with patch.object(cli_mod, "_lab", return_value=_real_lab(tmp_path)):
+        res = runner.invoke(
+            app,
+            ["sweep", "-c", "true", "-g", "N=1000", "--seeds", "5-2", "--shard-size", "2"],
+        )
+    assert res.exit_code != 0
+    out = json.loads(res.output)
+    assert "error" in out
+
+
 def test_sweep_retry_emits_cells(tmp_path: Path) -> None:
     lab = _real_lab(tmp_path)
     # Create the sharded sweep via the CLI, reusing the same lab instance.

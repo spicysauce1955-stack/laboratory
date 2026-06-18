@@ -373,13 +373,16 @@ class Lab:
                 submitted_by=submitted_by, allow_dirty=allow_dirty, max_jobs=max_jobs,
                 sweep_max_cost=sweep_max_cost, daily_budget=daily_budget, committed=committed,
             )
-        if seed_axis_key in grid:
+        if seed_axis_key in grid or "seed" in grid:
             raise LabError(
-                f"seeds declared in both 'seeds' and grid key {seed_axis_key!r}; "
+                "seeds declared in both 'seeds' and a grid key ('seed'/'" + seed_axis_key + "'); "
                 "remove one — seeds are an aggregation axis, not a Cartesian grid key"
             )
-        seed_set = parse_seeds(seeds)
-        shards = partition_seeds(seed_set, shard_size if shard_size is not None else len(seed_set))
+        try:
+            seed_set = parse_seeds(seeds)
+            shards = partition_seeds(seed_set, shard_size if shard_size is not None else len(seed_set))
+        except ValueError as e:
+            raise LabError(str(e)) from e
         n_jobs = len(cells) * len(shards)
         if n_jobs > max_jobs:
             raise LabError(

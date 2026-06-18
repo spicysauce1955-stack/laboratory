@@ -11,20 +11,30 @@ def parse_seeds(spec: str | list[int]) -> list[int]:
     Seeds must be non-negative.
     """
     if isinstance(spec, str):
-        if "-" not in spec:
-            raise ValueError(f"seed range must be 'lo-hi', got {spec!r}")
-        lo_s, _, hi_s = spec.partition("-")
-        try:
-            lo, hi = int(lo_s), int(hi_s)
-        except ValueError as e:
-            raise ValueError(
-                f"seed range bounds must be integers, got {spec!r}"
-            ) from e
-        if lo < 0 or hi < 0:
-            raise ValueError(f"seeds must be non-negative, got {spec!r}")
-        if hi < lo:
-            raise ValueError(f"seed range hi < lo: {spec!r}")
-        result = list(range(lo, hi + 1))
+        if "-" in spec:
+            lo_s, _, hi_s = spec.partition("-")
+            try:
+                lo, hi = int(lo_s), int(hi_s)
+            except ValueError as e:
+                raise ValueError(
+                    f"seed range bounds must be integers, got {spec!r}"
+                ) from e
+            if lo < 0 or hi < 0:
+                raise ValueError(f"seeds must be non-negative, got {spec!r}")
+            if hi < lo:
+                raise ValueError(f"seed range hi < lo: {spec!r}")
+            result = list(range(lo, hi + 1))
+        else:
+            # Comma-separated list or bare single integer: "0,1,2" or "5"
+            parts = [p.strip() for p in spec.split(",")]
+            if any(p == "" for p in parts):
+                raise ValueError(f"seed list must not contain empty members, got {spec!r}")
+            try:
+                result = sorted({int(p) for p in parts})
+            except ValueError as e:
+                raise ValueError(
+                    f"seed list members must be integers, got {spec!r}"
+                ) from e
     else:
         try:
             result = sorted({int(s) for s in spec})

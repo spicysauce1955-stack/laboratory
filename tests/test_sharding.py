@@ -20,6 +20,23 @@ def test_parse_seeds_rejects_bad_range():
         parse_seeds("a-b")
 
 
+def test_parse_seeds_comma_list():
+    assert parse_seeds("0,1,2") == [0, 1, 2]
+
+
+def test_parse_seeds_single_int():
+    assert parse_seeds("5") == [5]
+
+
+def test_parse_seeds_comma_list_sorted_deduped():
+    assert parse_seeds("3,1,1") == [1, 3]
+
+
+def test_parse_seeds_comma_list_rejects_non_int():
+    with pytest.raises(ValueError):
+        parse_seeds("0,foo")
+
+
 def test_partition_contiguous_cover():
     assert partition_seeds([0, 1, 2, 3, 4, 5, 6, 7], 3) == [[0, 1, 2], [3, 4, 5], [6, 7]]
 

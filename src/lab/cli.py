@@ -69,12 +69,6 @@ def _emit(obj: Any) -> None:
     typer.echo(json.dumps(obj, indent=2, default=str))
 
 
-def parse_seeds_arg(raw: str | None) -> str | list[int] | None:
-    """CLI seeds flag passthrough: a comma list becomes a list[int]; a range string stays a string."""
-    if raw is None:
-        return None
-    return [int(x) for x in raw.split(",")] if "," in raw else raw
-
 
 def _parse_grid(items: list[str]) -> dict[str, list[str]]:
     """Parse repeated `--grid key=v1,v2,...` options into {key: [values]}.
@@ -241,7 +235,7 @@ def sweep(
                 if sweep_max_cost is not None
                 else None
             ),
-            seeds=parse_seeds_arg(seeds),
+            seeds=seeds,
             shard_size=shard_size,
             results_file=results_file,
             seed_column=seed_column,
