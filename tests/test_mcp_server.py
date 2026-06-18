@@ -42,6 +42,8 @@ def test_tools_registered(tmp_path: Path):
         "status",
         "submit",
         "sweep",
+        "sweep_aggregate",
+        "sweep_retry",
         "sweep_status",
     ]
 
@@ -185,3 +187,75 @@ def test_register_unknown_queue_ops_fail_loud(tmp_path: Path, monkeypatch):
                 await c.call_tool("queue_show", {"reg_id": "reg-nope"})
 
     asyncio.run(go())
+
+
+def test_sweep_sharded_returns_cells(tmp_path: Path):
+    """sweep tool with seeds + shard_size returns structured cells view (not flat job_ids)."""
+    _, server = _make(tmp_path)
+
+    async def go():
+        async with Client(server) as c:
+            r = await c.call_tool(
+                "sweep",
+                {
+                    "command": "true",
+                    "grid": {"N": [1000]},
+                    "seeds": "0-3",
+                    "shard_size": 2,
+                },
+            )
+            return r.data
+
+    data = asyncio.run(go())
+    assert "cells" in data, f"expected 'cells' key, got: {list(data.keys())}"
+    assert len(data["cells"]) == 1
+    cell = data["cells"][0]
+    assert cell["seeds_expected"] == 4
+    assert len(cell["shard_job_ids"]) == 2
+    assert cell["status"] == "pending"
+
+
+def test_sweep_aggregate_tool(tmp_path: Path):
+    """sweep_aggregate tool row-concatenates succeeded shards and returns updated cell view."""
+    lab, server = _make(tmp_path)
+
+    # arrange: sweep with shards
+    async def do_sweep():
+        async with Client(server) as c:
+            r = await c.call_tool(
+                "sweep",
+                {
+                    "command": "true",
+                    "grid": {"N": [1000]},
+                    "seeds": "0-3",
+                    "shard_size": 2,
+                },
+            )
+            return r.data
+
+    sweep_data = asyncio.run(do_sweep())
+    sweep_id = sweep_data["sweep_id"]
+    cell = sweep_data["cells"][0]
+
+    # write shard results so aggregate can find them
+    def _write_shard(job_id: str, seeds: list[int]) -> None:
+        out = lab.store.output_dir(job_id)
+        out.mkdir(parents=True, exist_ok=True)
+        lines = ["seed,acc"] + [f"{s},0.{s}" for s in seeds]
+        (out / "results.csv").write_text("\n".join(lines) + "\n")
+        lab.store.update_manifest(job_id, status=JobState.succeeded)
+
+    _write_shard(cell["shard_job_ids"][0], [0, 1])
+    _write_shard(cell["shard_job_ids"][1], [2, 3])
+
+    async def do_aggregate():
+        async with Client(server) as c:
+            r = await c.call_tool("sweep_aggregate", {"sweep_id": sweep_id})
+            return r.data
+
+    agg_data = asyncio.run(do_aggregate())
+    assert "cells" in agg_data
+    assert len(agg_data["cells"]) == 1
+    result_cell = agg_data["cells"][0]
+    assert result_cell["status"] == "complete"
+    assert result_cell["seeds_present"] == 4

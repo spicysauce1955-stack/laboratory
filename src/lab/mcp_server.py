@@ -19,8 +19,28 @@ from fastmcp.exceptions import ToolError
 
 from lab._util import wrap_with_extras
 from lab.core import Lab, LabError, default_lab, resolve_backend_profile
-from lab.models import JobManifest, JobSpec, ResourceRequest
+from lab.models import JobManifest, JobSpec, ResourceRequest, SweepPlan
 from lab.store import JobStore
+
+
+def _plan_view(plan: SweepPlan) -> dict[str, Any]:
+    """Structured cell view for sharded sweeps — mirrors the CLI's _plan_view."""
+    return {
+        "sweep_id": plan.sweep_id,
+        "cells": [
+            {
+                "coords": c.coords,
+                "cell_id": c.cell_id,
+                "shard_job_ids": c.shard_job_ids,
+                "aggregate_ref": c.aggregate_ref,
+                "seeds_expected": len(c.seeds_expected),
+                "seeds_present": len(c.seeds_present),
+                "missing_seeds": c.missing_seeds,
+                "status": c.status,
+            }
+            for c in plan.cells
+        ],
+    }
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -121,8 +141,12 @@ def build_server(lab: Lab) -> FastMCP:
         use_spot: bool = False,
         spot_fallback: bool = True,
         sweep_max_cost: float | None = None,
+        seeds: str | list[int] | None = None,
+        shard_size: int | None = None,
+        results_file: str = "results.csv",
+        seed_column: str = "seed",
     ) -> dict[str, Any]:
-        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5). with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. sweep_max_cost is an up-front admission cap: the sweep is refused if its total would exceed the daily budget (during-run enforcement is on register_sweep). backend="cpu" provisions a cheap DigitalOcean CPU droplet (default 8 vCPU, up to 48; --accelerators rejected)."""
+        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5). with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. sweep_max_cost is an up-front admission cap: the sweep is refused if its total would exceed the daily budget (during-run enforcement is on register_sweep). backend="cpu" provisions a cheap DigitalOcean CPU droplet (default 8 vCPU, up to 48; --accelerators rejected). With seeds + shard_size each cell's seeds are split into shards of at most shard_size, run as independent jobs (own timeout + teardown) and aggregated per cell; returns {sweep_id, cells:[{coords, shard_job_ids, aggregate_ref, seeds_expected, seeds_present, status}]}. results_file/seed_column name the per-run result table and its seed column."""
         from lab.scheduler.queue import default_queue
 
         resources = ResourceRequest(
@@ -146,9 +170,15 @@ def build_server(lab: Lab) -> FastMCP:
                     if sweep_max_cost is not None
                     else None
                 ),
+                seeds=seeds,
+                shard_size=shard_size,
+                results_file=results_file,
+                seed_column=seed_column,
             )
         except LabError as e:
             raise ToolError(str(e)) from e
+        if the_lab.store.has_sweep_plan(sweep_id):
+            return _plan_view(the_lab.sweep_plan(sweep_id))
         return {"sweep_id": sweep_id, "job_ids": job_ids}
 
     @mcp.tool
@@ -200,6 +230,22 @@ def build_server(lab: Lab) -> FastMCP:
     def sweep_status(sweep_id: str) -> dict[str, Any]:
         """Summarize a sweep's outcomes: preemptions, on-demand fallback, per-point spend."""
         return _lab().sweep_summary(sweep_id)
+
+    @mcp.tool
+    def sweep_aggregate(sweep_id: str) -> dict[str, Any]:
+        """Row-concatenate each cell's succeeded shards into one per-cell result; returns the cell view (P1-2)."""
+        try:
+            return _plan_view(_lab().aggregate_sweep(sweep_id))
+        except LabError as e:
+            raise ToolError(str(e)) from e
+
+    @mcp.tool
+    def sweep_retry(sweep_id: str) -> dict[str, Any]:
+        """Resubmit only the missing shards of incomplete cells, then re-aggregate (P1-2)."""
+        try:
+            return _plan_view(_lab().retry_sweep(sweep_id))
+        except LabError as e:
+            raise ToolError(str(e)) from e
 
     @mcp.tool(name="list")
     def list_jobs() -> dict[str, Any]:
