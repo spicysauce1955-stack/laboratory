@@ -32,3 +32,18 @@ def test_merge_rejects_missing_seed_column():
 
 def test_merge_empty():
     assert merge_seed_rows([], "seed") == ("", [])
+
+
+def test_merge_preserves_embedded_comma_value():
+    """Verify that CSV values containing commas round-trip verbatim (quoted by csv module)."""
+    import csv
+    import io
+
+    a = 'seed,note\n0,"foo,bar"\n1,plain\n'
+    merged, present = merge_seed_rows([a], "seed")
+    assert present == [0, 1]
+    # the comma-containing field must survive as a single quoted field, not split into two columns
+    rows = list(csv.reader(io.StringIO(merged)))
+    assert rows[0] == ["seed", "note"]
+    assert rows[1] == ["0", "foo,bar"]
+    assert rows[2] == ["1", "plain"]
