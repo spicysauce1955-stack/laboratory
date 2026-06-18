@@ -396,7 +396,8 @@ class Lab:
         all_job_ids: list[str] = []
         plan_cells: list[SweepCell] = []
         for cell in cells:
-            cid = cell_id_for(cell)
+            coords = {k: str(v) for k, v in cell.items()}
+            cid = cell_id_for(coords)
             shard_job_ids: list[str] = []
             for shard in shards:
                 point = {**cell, seed_axis_key: seeds_to_arg(shard)}
@@ -411,7 +412,7 @@ class Lab:
                 all_job_ids.append(jid)
             plan_cells.append(
                 SweepCell(
-                    coords={k: str(v) for k, v in cell.items()},
+                    coords=coords,
                     cell_id=cid,
                     seeds_expected=seed_set,
                     shard_seeds=shards,

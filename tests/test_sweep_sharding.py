@@ -7,6 +7,7 @@ import pytest
 from lab.backends.local import LocalBackend
 from lab.core import Lab, LabError
 from lab.manifest import repo_root
+from lab.store import cell_id_for
 
 
 def _lab(tmp_path: Path) -> Lab:
@@ -40,6 +41,8 @@ def test_sharded_sweep_partitions_and_plans(tmp_path: Path):
     assert any("seeds=6,7" in c for c in cmds)
     # each shard records its cell_id; the per-job singular seed anchors to the shard's first seed
     assert all(lab.manifest(j).cell_id == cell.cell_id for j in cell.shard_job_ids)
+    # invariant: cell_id_for(coords) must equal the stored cell_id (fix: coords coerced before hashing)
+    assert cell_id_for(cell.coords) == cell.cell_id
 
 
 def test_seeds_in_both_axis_and_grid_is_rejected(tmp_path: Path):
