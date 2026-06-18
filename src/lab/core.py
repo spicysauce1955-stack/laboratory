@@ -514,6 +514,33 @@ class Lab:
         self.store.write_sweep_plan(plan)
         return plan
 
+    def retry_sweep(self, sweep_id: str, *, allow_dirty: bool = True) -> SweepPlan:
+        """Resubmit only the missing shards of incomplete cells, then re-aggregate (P1-2, FR-SS-7).
+
+        A shard is missing if any of its assigned seeds is absent from the current aggregate. Fresh
+        shard jobs join the same ``sweep_id``/``cell_id``; succeeded shards are never touched.
+        """
+        plan = self.aggregate_sweep(sweep_id)  # refresh present/missing from current shard states
+        for cell in plan.cells:
+            if cell.status != "incomplete":
+                continue
+            present = set(cell.seeds_present)
+            # inherit the original shard resources (timeout/backend/etc.) from an existing shard
+            base_resources = self.manifest(cell.shard_job_ids[0]).resources
+            for shard in cell.shard_seeds:
+                if all(s in present for s in shard):
+                    continue  # this shard's seeds are already covered
+                point = {**cell.coords, plan.seed_axis_key: seeds_to_arg(shard)}
+                spec = build_sweep_point_spec(
+                    plan.command, point, seed=shard[0], resources=base_resources
+                )
+                jid = self.submit(
+                    spec, allow_dirty=allow_dirty, sweep_id=sweep_id, cell_id=cell.cell_id
+                )
+                cell.shard_job_ids.append(jid)
+        self.store.write_sweep_plan(plan)
+        return self.aggregate_sweep(sweep_id)
+
     def _sibling_lab(self, repo: Path) -> Lab:
         """A Lab rooted at ``repo`` (e.g. an extracted bundle) over the same backend kind, sharing
         this lab's home/store — mirrors the scheduler's ``make_lab`` for confirm relaunches."""
