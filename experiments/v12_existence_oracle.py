@@ -29,7 +29,8 @@ import os
 import pathlib
 
 import numpy as np
-from scipy.optimize import linprog
+import scipy.sparse as sp
+from scipy.optimize import Bounds, LinearConstraint, linprog, milp
 
 HERE = pathlib.Path(__file__).resolve().parent
 OUT = HERE / "data"
@@ -135,6 +136,81 @@ def lp_feasible(Phi, y, theta, jstar, delta=1e-2, wbound=1e3) -> bool:
     return bool(res.success)
 
 
+# --------------------------------------------------------------------------- #
+# EXACT existence via big-M MILP: the solver CHOOSES each +1 pattern's read-out
+# time (binary z[mu,j], sum_j z[mu,j] >= 1), instead of fixing it heuristically.
+#   +1 mu:  for all j   w.Phi[mu,j] >= theta+delta - BigM*(1 - z[mu,j])   (active iff z=1)
+#                       sum_j z[mu,j] >= 1                                 (>=1 chosen time)
+#   -1 nu:  for all j   w.Phi[nu,j] <= theta-delta                        (convex, all times)
+# Feasible  => an existence CERTIFICATE (exact, not a lower bound).
+# Infeasible (status 2) => no separating w with |w|<=wbound at margin delta exists
+#   *for that bound* -- reported as "infeasible" but, per the honest-NO policy, never
+#   promoted to a claim of true infeasibility (it is bound/margin-conditioned).
+# Time-limited with no incumbent => "unknown" (NOT counted as existence).
+# In the perceptron limit (M=1) sum_j z=1 forces z=1, the binaries vanish, and the MILP
+# reduces exactly to the LP -> Cover's alpha_c=2. Searching assignments can only RAISE the
+# feasible fraction vs the fixed-assignment LP, so MILP_crossing >= LP_crossing (the gate).
+# --------------------------------------------------------------------------- #
+def milp_feasible(Phi, y, theta, delta=1e-2, wbound=1e3, time_limit=30.0) -> str:
+    """Return 'feasible' | 'infeasible' | 'unknown' for the big-M existence MILP."""
+    P, M, N = Phi.shape
+    pos = np.where(y > 0)[0]
+    neg = np.where(y < 0)[0]
+    npos = len(pos)
+    nvar = N + npos * M                      # [w_0..w_{N-1}, z_{pos0,0..M-1}, z_{pos1,..}, ...]
+
+    def zcol(p_idx, j):                      # global column index of binary z for +1 #p_idx, time j
+        return N + p_idx * M + j
+
+    # safe big-M: w.Phi >= theta+delta - BigM must be slack when z=0, i.e.
+    # BigM >= (theta+delta) - min_w(w.Phi) = (theta+delta) + wbound * max_row ||Phi||_1
+    row_l1 = np.abs(Phi).sum(axis=2)         # [P, M]
+    big_m = float(theta + delta + wbound * row_l1.max() + 1.0)
+
+    rows, cols, data = [], [], []
+    lb, ub = [], []
+    r = 0
+    # +1 target-time constraints (one row per (mu, j)):  w.Phi + BigM*z >= theta+delta
+    for pi, mu in enumerate(pos):
+        for j in range(M):
+            phi = Phi[mu, j]
+            nz = np.nonzero(phi)[0]
+            rows.extend([r] * len(nz)); cols.extend(nz.tolist()); data.extend(phi[nz].tolist())
+            rows.append(r); cols.append(zcol(pi, j)); data.append(big_m)
+            lb.append(theta + delta); ub.append(np.inf)
+            r += 1
+    # +1 at-least-one-time:  sum_j z[mu,j] >= 1
+    for pi, _ in enumerate(pos):
+        for j in range(M):
+            rows.append(r); cols.append(zcol(pi, j)); data.append(1.0)
+        lb.append(1.0); ub.append(np.inf)
+        r += 1
+    # -1 null constraints (one row per (nu, j)):  w.Phi <= theta-delta
+    for nu in neg:
+        for j in range(M):
+            phi = Phi[nu, j]
+            nz = np.nonzero(phi)[0]
+            if len(nz) == 0:
+                continue
+            rows.extend([r] * len(nz)); cols.extend(nz.tolist()); data.extend(phi[nz].tolist())
+            lb.append(-np.inf); ub.append(theta - delta)
+            r += 1
+
+    A = sp.coo_matrix((data, (rows, cols)), shape=(r, nvar)).tocsr()
+    constraints = LinearConstraint(A, np.asarray(lb), np.asarray(ub))
+    integrality = np.zeros(nvar); integrality[N:] = 1          # z binary, w continuous
+    var_lb = np.concatenate([np.full(N, -wbound), np.zeros(npos * M)])
+    var_ub = np.concatenate([np.full(N, wbound), np.ones(npos * M)])
+    res = milp(c=np.zeros(nvar), constraints=constraints, integrality=integrality,
+               bounds=Bounds(var_lb, var_ub), options={"time_limit": time_limit})
+    # scipy/HiGHS status: 0=optimal(=any feasible since c=0), 2=infeasible, else time/other.
+    if res.status == 0 or res.x is not None:
+        return "feasible"
+    if res.status == 2:
+        return "infeasible"
+    return "unknown"
+
+
 def exists(Phi, y, theta, n_restart=4, seed=0) -> bool:
     """Existence lower bound: feasible for SOME assignment from R trained seeds + repair."""
     P, M, N = Phi.shape
@@ -161,19 +237,32 @@ def exists(Phi, y, theta, n_restart=4, seed=0) -> bool:
 # --------------------------------------------------------------------------- #
 # alpha-sweep -> existence half-crossing
 # --------------------------------------------------------------------------- #
-def crossing(gen, N, theta, alphas, n_seeds, K=None, n_restart=4):
+def crossing(gen, N, theta, alphas, n_seeds, K=None, n_restart=4,
+             method="lp", time_limit=30.0, wbound=1e3, delta=1e-2, M=0, status=None):
+    """Existence fraction vs alpha. method='lp' (heuristic lower bound) or 'milp' (exact,
+    solver chooses the read-out-time assignment). When method='milp' and `status` is a dict,
+    record the per-alpha {feasible,infeasible,unknown} counts so a time-limited NO is never
+    silently conflated with a proven infeasibility."""
     out = {}
     for a in alphas:
         P = int(round(a * N))
         hits = 0
+        tally = {"feasible": 0, "infeasible": 0, "unknown": 0}
         for s in range(n_seeds):
             rng = np.random.default_rng(1000 * s + P)
             if K is None:
                 Phi, y = gen(N, P, rng)
             else:
-                Phi, y = gen(N, P, K, rng)
-            hits += exists(Phi, y, theta, n_restart=n_restart, seed=s)
+                Phi, y = gen(N, P, K, rng) if M == 0 else gen(N, P, K, rng, M=M)
+            if method == "milp":
+                st = milp_feasible(Phi, y, theta, delta=delta, wbound=wbound, time_limit=time_limit)
+                tally[st] += 1
+                hits += (st == "feasible")
+            else:
+                hits += exists(Phi, y, theta, n_restart=n_restart, seed=s)
         out[a] = hits / n_seeds
+        if status is not None:
+            status[a] = tally
     return out
 
 
@@ -186,6 +275,10 @@ def half_cross(frac: dict[float, float]) -> float:
     return float("nan")
 
 
+def _parse_alphas(s, default):
+    return [float(x) for x in s.split(",")] if s else default
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gate", action="store_true", help="run only the perceptron self-gate")
@@ -196,27 +289,83 @@ def main():
                     help="also run the GS-2006 synchrony/perceptron control (existence -> 2)")
     ap.add_argument("--no-singlespike", action="store_true",
                     help="skip the single-spike block (e.g. when only the synchrony control is wanted)")
+    # --- A4: exact big-M MILP existence oracle ---
+    ap.add_argument("--milp", action="store_true",
+                    help="use the EXACT big-M MILP (solver chooses read-out times) instead of the "
+                         "heuristic LP lower bound; MILP existence >= LP everywhere (Stage-2 A4)")
+    ap.add_argument("--time-limit", type=float, default=30.0, help="MILP per-instance time cap (s)")
+    ap.add_argument("--wbound", type=float, default=1e3, help="MILP |w| box bound")
+    ap.add_argument("--delta", type=float, default=1e-2, help="MILP margin")
+    ap.add_argument("--scale", type=str, default="",
+                    help="comma N-list for the single-spike existence-vs-N sweep (e.g. 80,160,320)")
+    ap.add_argument("--milp-M", type=int, default=0, help="cap candidate read-out times (0=default ~3K)")
+    ap.add_argument("--alphas", type=str, default="", help="override single-spike/scale alpha grid")
     args = ap.parse_args()
+    method = "milp" if args.milp else "lp"
+    mkw = dict(method=method, time_limit=args.time_limit, wbound=args.wbound,
+               delta=args.delta, M=args.milp_M)
     # When launched by the lab, write the result JSON into the fetchable run dir.
     out_dir = pathlib.Path(os.environ["LAB_RUN_DIR"]) if os.environ.get("LAB_RUN_DIR") else OUT
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"PSP: t_peak={T_PEAK:.4f} ms, V0={V0:.4f}")
-    print("=== GATE: perceptron limit (must give alpha_c ~ 2) ===")
+    print(f"PSP: t_peak={T_PEAK:.4f} ms, V0={V0:.4f}  | method={method}")
+    print(f"=== GATE: perceptron limit (must give alpha_c ~ 2) [{method}] ===")
     frac = crossing(gen_perceptron, args.N, theta=0.0,
-                    alphas=[1.4, 1.7, 1.9, 2.0, 2.1, 2.3, 2.6], n_seeds=args.seeds)
+                    alphas=[1.4, 1.7, 1.9, 2.0, 2.1, 2.3, 2.6], n_seeds=args.seeds, **mkw)
     ac = half_cross(frac)
     for a in sorted(frac):
         print(f"  alpha={a:.2f}  exists_frac={frac[a]:.2f}")
     print(f"  -> existence half-crossing = {ac:.3f}   (target 2.0)")
     gate_ok = abs(ac - 2.0) < 0.15
     print(f"  GATE {'PASS' if gate_ok else 'FAIL'}")
-    result = {"gate": {"frac": frac, "crossing": ac, "pass": gate_ok}}
+    result = {"method": method, "gate": {"frac": frac, "crossing": ac, "pass": gate_ok}}
 
-    if not args.gate and gate_ok and not args.no_singlespike:
+    ss_alphas = _parse_alphas(args.alphas, [2.0, 2.4, 2.8, 3.0, 3.2, 3.6])
+
+    # A4 MILP-vs-LP monotonicity gate at N=40: MILP can only RAISE the feasible fraction, so
+    # MILP_crossing >= LP_crossing (~2.47). Run BOTH here when in --milp mode.
+    if args.milp and gate_ok and not args.no_singlespike:
+        print(f"\n=== A4 GATE: N={args.N} single-spike, MILP vs LP lower bound ===")
+        st_lp = {}
+        fr_lp = crossing(gen_singlespike, args.N, theta=1.0, alphas=ss_alphas,
+                         n_seeds=args.seeds, K=args.K, method="lp")
+        c_lp = half_cross(fr_lp)
+        st_milp = {}
+        fr_milp = crossing(gen_singlespike, args.N, theta=1.0, alphas=ss_alphas,
+                           n_seeds=args.seeds, K=args.K, status=st_milp, **mkw)
+        c_milp = half_cross(fr_milp)
+        for a in sorted(fr_milp):
+            t = st_milp.get(a, {})
+            print(f"  alpha={a:.2f}  LP={fr_lp[a]:.2f}  MILP={fr_milp[a]:.2f}  "
+                  f"(feas={t.get('feasible',0)} infeas={t.get('infeasible',0)} unk={t.get('unknown',0)})")
+        mono_ok = all(fr_milp[a] >= fr_lp[a] - 1e-9 for a in ss_alphas)
+        print(f"  LP crossing={c_lp:.3f}  MILP crossing={c_milp:.3f}  "
+              f"monotone(MILP>=LP)={'PASS' if mono_ok else 'FAIL'}")
+        result["a4_gate_N40"] = {"N": args.N, "K": args.K, "alphas": ss_alphas,
+                                 "lp_frac": fr_lp, "milp_frac": fr_milp, "milp_status": st_milp,
+                                 "lp_crossing": c_lp, "milp_crossing": c_milp, "monotone": mono_ok}
+
+    # A4 existence-vs-N scale sweep (MILP). Records per-cell {feasible,infeasible,unknown}.
+    if gate_ok and args.scale:
+        result["scale"] = {}
+        for Nsc in [int(x) for x in args.scale.split(",")]:
+            print(f"\n=== existence-vs-N: N={Nsc}, K={args.K} [{method}] ===")
+            st = {}
+            fr = crossing(gen_singlespike, Nsc, theta=1.0, alphas=ss_alphas,
+                          n_seeds=args.seeds, K=args.K, status=st, **mkw)
+            for a in sorted(fr):
+                t = st.get(a, {})
+                tag = f"  (feas={t.get('feasible',0)} infeas={t.get('infeasible',0)} unk={t.get('unknown',0)})" if args.milp else ""
+                print(f"  alpha={a:.2f}  exists_frac={fr[a]:.2f}{tag}")
+            cc = half_cross(fr)
+            print(f"  -> N={Nsc} existence half-crossing = {cc:.3f}")
+            result["scale"][Nsc] = {"N": Nsc, "K": args.K, "frac": fr, "crossing": cc,
+                                    "milp_status": st if args.milp else None}
+
+    if not args.gate and not args.milp and gate_ok and not args.no_singlespike:
         print(f"\n=== single-spike existence (N={args.N}, K={args.K}) ===")
         fr = crossing(gen_singlespike, args.N, theta=1.0,
-                      alphas=[2.0, 2.4, 2.8, 3.0, 3.2, 3.6], n_seeds=args.seeds, K=args.K)
+                      alphas=ss_alphas, n_seeds=args.seeds, K=args.K)
         for a in sorted(fr):
             print(f"  alpha={a:.2f}  exists_frac={fr[a]:.2f}")
         print(f"  -> single-spike existence half-crossing = {half_cross(fr):.3f}")
