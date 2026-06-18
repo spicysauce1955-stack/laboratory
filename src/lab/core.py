@@ -519,17 +519,31 @@ class Lab:
 
         A shard is missing if any of its assigned seeds is absent from the current aggregate. Fresh
         shard jobs join the same ``sweep_id``/``cell_id``; succeeded shards are never touched.
+
+        Safe to call repeatedly: if a prior retry's job for a given seed subset is still in a
+        non-terminal state (queued/running), that shard is skipped — no duplicate in-flight jobs.
         """
         plan = self.aggregate_sweep(sweep_id)  # refresh present/missing from current shard states
         for cell in plan.cells:
             if cell.status != "incomplete":
                 continue
             present = set(cell.seeds_present)
+            # Collect seed-subset strings of all currently in-flight (non-terminal) shard jobs so
+            # we can skip resubmitting a shard that already has a live retry running.
+            in_flight_subsets: set[str] = set()
+            for jid in cell.shard_job_ids:
+                m = self.manifest(jid)
+                if m.status not in _TERMINAL_STATES:
+                    sub = m.run.resolved_config.get(plan.seed_axis_key)
+                    if sub is not None:
+                        in_flight_subsets.add(str(sub))
             # inherit the original shard resources (timeout/backend/etc.) from an existing shard
             base_resources = self.manifest(cell.shard_job_ids[0]).resources
             for shard in cell.shard_seeds:
                 if all(s in present for s in shard):
                     continue  # this shard's seeds are already covered
+                if seeds_to_arg(shard) in in_flight_subsets:
+                    continue  # a prior retry for this exact subset is still running — don't duplicate
                 point = {**cell.coords, plan.seed_axis_key: seeds_to_arg(shard)}
                 spec = build_sweep_point_spec(
                     plan.command, point, seed=shard[0], resources=base_resources
