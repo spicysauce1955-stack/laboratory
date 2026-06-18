@@ -140,3 +140,34 @@ class JobManifest(BaseModel):
     artifacts_uri: str | None = None  # durable object-store prefix, e.g. r2://lab-artifacts/<id>
     artifacts: list[ArtifactRecord] = Field(default_factory=list)
     final_metrics: dict[str, float] = Field(default_factory=dict)  # last value per series (FR-B4)
+
+
+class SweepCell(BaseModel):
+    """One non-seed grid point of a sharded sweep, plus its seed-shard bookkeeping (P1-2).
+
+    The authoritative cell->shards map. ``seeds_present``/``missing_seeds``/``status`` are filled by
+    aggregation (pending until then); the shard job manifests stay the fail-closed source of truth
+    for code/seed state — this record is grouping + accounting, never a provenance substitute.
+    """
+
+    coords: dict[str, Any]
+    cell_id: str
+    seeds_expected: list[int]
+    shard_seeds: list[list[int]]
+    shard_job_ids: list[str]
+    results_file: str
+    seed_column: str
+    aggregate_ref: str
+    seeds_present: list[int] = Field(default_factory=list)
+    missing_seeds: list[int] = Field(default_factory=list)
+    status: Literal["pending", "complete", "incomplete"] = "pending"
+
+
+class SweepPlan(BaseModel):
+    """Persisted plan for a sharded sweep (P1-2), keyed by ``sweep_id`` under the lab home."""
+
+    sweep_id: str
+    created_at: datetime
+    command: str  # base entrypoint, so retry_sweep can rebuild a shard spec without a manifest re-parse
+    seed_axis_key: str  # config-override key carrying each shard's seed subset (default "seeds")
+    cells: list[SweepCell]
