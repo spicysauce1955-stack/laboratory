@@ -165,7 +165,9 @@ def _seed_running_job(lab: Lab, job_id: str) -> None:
 
 
 def _patch_empty_sky(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Inject a fake ``sky`` module so reconcile's cloud-agnostic status pass is hermetic."""
+    """Make reconcile's external passes hermetic: a fake ``sky`` module (cloud-agnostic status pass)
+    and an empty DO block-volume listing (this dev box has doctl configured, so without the stub the
+    volume pass would hit the real DO API)."""
     fake = types.ModuleType("sky")
     fake.get = lambda x: x  # type: ignore[attr-defined]
     fake.status = lambda refresh=False: []  # type: ignore[attr-defined]
@@ -174,6 +176,7 @@ def _patch_empty_sky(monkeypatch: pytest.MonkeyPatch) -> None:
         AUTO="AUTO", FORCE="FORCE", NONE="NONE"
     )
     monkeypatch.setitem(sys.modules, "sky", fake)
+    monkeypatch.setattr(skypilot_mod, "list_do_volumes", lambda client=None: [])
 
 
 def test_reconcile_finds_orphans_dry_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -228,6 +231,55 @@ def test_reconcile_finds_ghosts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     report = lab.reconcile(apply=False)
     assert report["orphans"] == []
     assert report["ghosts"] == ["lab-job-ghost"]
+
+
+def test_reconcile_finds_and_destroys_do_volume_orphans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A `lab-*` DO volume with no matching running job is reported and (with apply) deleted — the
+    leak `sky.status` can't see once its droplet is gone but the volume lingers."""
+    repo = repo_root(Path.cwd())
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
+    _seed_running_job(lab, "job-alive")  # cluster: lab-job-alive
+    monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda: [])
+    _patch_empty_sky(monkeypatch)
+    volumes = [
+        {"id": "vol-orphan", "name": "lab-job-dead-3dd1-head"},   # no running job -> orphan
+        {"id": "vol-alive", "name": "lab-job-alive-3dd1-head"},   # tied to running job -> kept
+    ]
+    monkeypatch.setattr(skypilot_mod, "list_do_volumes", lambda client=None: volumes)
+    deleted: list[str] = []
+
+    class _DOVolumes:
+        def delete(self, volume_id: str, **kw: object) -> None:
+            deleted.append(volume_id)
+
+    class _DOClient:
+        volumes = _DOVolumes()
+
+    monkeypatch.setattr(skypilot_mod, "_get_do_client", lambda: _DOClient())
+
+    report = lab.reconcile(apply=True)
+    assert [o["id"] for o in report["do_volume_orphans"]] == ["vol-orphan"]
+    assert report["do_volumes_destroyed"] == ["vol-orphan"]
+    assert deleted == ["vol-orphan"]
+
+
+def test_reconcile_tolerates_do_unconfigured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """If DO isn't configured (volume listing raises), reconcile still succeeds with an empty
+    volume-orphan list — the DO volume pass is best-effort, not fatal like the Vast pass."""
+    repo = repo_root(Path.cwd())
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
+    monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda: [])
+    _patch_empty_sky(monkeypatch)
+
+    def _boom(client: object | None = None) -> list[dict]:
+        raise RuntimeError("no doctl config")
+
+    monkeypatch.setattr(skypilot_mod, "list_do_volumes", _boom)
+    report = lab.reconcile(apply=False)
+    assert report["do_volume_orphans"] == []
+    assert report["do_volumes_destroyed"] == []
 
 
 def test_reconcile_propagates_import_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

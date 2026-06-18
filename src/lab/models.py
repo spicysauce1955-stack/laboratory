@@ -29,6 +29,7 @@ class ResourceRequest(BaseModel):
     cpus: int | None = None
     gpus: int | None = None
     memory: str | None = None  # e.g. "32GB"
+    disk_size: int | None = None  # boot/attached volume size in GB (skypilot; DO volume size)
     accelerators: str | None = None  # SkyPilot accelerator spec, e.g. "RTX_3070:1" (remote)
     cloud: str | None = None  # SkyPilot cloud: "vast" (default) | "do" | "gcp"; None -> "vast"
     timeout: str | None = None  # wall-clock limit, e.g. "2h" (FR-I1)

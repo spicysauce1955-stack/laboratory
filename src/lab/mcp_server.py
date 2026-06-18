@@ -54,6 +54,7 @@ def build_server(lab: Lab) -> FastMCP:
         cpus: int | None = None,
         memory: str | None = None,
         gpus: int | None = None,
+        disk_size: int | None = None,
         accelerators: str | None = None,
         timeout: str | None = None,
         provision_timeout: str | None = None,
@@ -62,10 +63,11 @@ def build_server(lab: Lab) -> FastMCP:
         spot_fallback: bool = True,
         allow_dirty: bool = True,
     ) -> dict[str, Any]:
-        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. allow_dirty=False refuses a dirty working tree (default snapshots the diff, FR-B1). backend="cpu" provisions a cheap DigitalOcean CPU droplet (default 8 vCPU, up to 48; --accelerators rejected)."""
+        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. allow_dirty=False refuses a dirty working tree (default snapshots the diff, FR-B1). disk_size sizes the boot/attached volume in GB (skypilot; DO volume size). backend="cpu" provisions a cheap DigitalOcean CPU droplet (default 4 vCPU + 50GB volume, up to 48; --accelerators rejected)."""
         resources = ResourceRequest(
-            cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
-            provision_timeout=provision_timeout, use_spot=use_spot, spot_fallback=spot_fallback,
+            cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
+            timeout=timeout, provision_timeout=provision_timeout, use_spot=use_spot,
+            spot_fallback=spot_fallback,
         )
         try:
             provisioner, resources = resolve_backend_profile(backend, resources)
@@ -114,6 +116,7 @@ def build_server(lab: Lab) -> FastMCP:
         cpus: int | None = None,
         memory: str | None = None,
         gpus: int | None = None,
+        disk_size: int | None = None,
         accelerators: str | None = None,
         timeout: str | None = None,
         provision_timeout: str | None = None,
@@ -126,12 +129,13 @@ def build_server(lab: Lab) -> FastMCP:
         results_file: str = "results.csv",
         seed_column: str = "seed",
     ) -> dict[str, Any]:
-        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5). with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. sweep_max_cost is an up-front admission cap: the sweep is refused if its total would exceed the daily budget (during-run enforcement is on register_sweep). backend="cpu" provisions a cheap DigitalOcean CPU droplet (default 8 vCPU, up to 48; --accelerators rejected). With seeds + shard_size each cell's seeds are split into shards of at most shard_size, run as independent jobs (own timeout + teardown) and aggregated per cell; returns {sweep_id, cells:[{coords, shard_job_ids, aggregate_ref, seeds_expected, seeds_present, status}]}. results_file/seed_column name the per-run result table and its seed column."""
+        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5). with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. sweep_max_cost is an up-front admission cap: the sweep is refused if its total would exceed the daily budget (during-run enforcement is on register_sweep). disk_size sizes the boot/attached volume in GB (skypilot; DO volume size). backend="cpu" provisions a cheap DigitalOcean CPU droplet (default 4 vCPU + 50GB volume, up to 48; --accelerators rejected). With seeds + shard_size each cell's seeds are split into shards of at most shard_size, run as independent jobs (own timeout + teardown) and aggregated per cell; returns {sweep_id, cells:[{coords, shard_job_ids, aggregate_ref, seeds_expected, seeds_present, status}]}. results_file/seed_column name the per-run result table and its seed column."""
         from lab.scheduler.queue import default_queue
 
         resources = ResourceRequest(
-            cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
-            provision_timeout=provision_timeout, use_spot=use_spot, spot_fallback=spot_fallback,
+            cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
+            timeout=timeout, provision_timeout=provision_timeout, use_spot=use_spot,
+            spot_fallback=spot_fallback,
         )
         try:
             provisioner, resources = resolve_backend_profile(backend, resources)

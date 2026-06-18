@@ -198,7 +198,10 @@ def build_sweep_point_spec(
 
 
 CPU_DEFAULT_CLOUD = "do"
-CPU_DEFAULT_VCPUS = 8
+# Keep defaults within a fresh DigitalOcean account's tier: 8-vCPU sizes and a 256GB block volume
+# (SkyPilot's default disk_size) are both tier-restricted and fail provisioning until a tier bump.
+CPU_DEFAULT_VCPUS = 4
+CPU_DEFAULT_DISK_GB = 50
 
 
 def resolve_backend_profile(
@@ -218,6 +221,7 @@ def resolve_backend_profile(
         update={
             "cloud": CPU_DEFAULT_CLOUD,
             "cpus": resources.cpus or CPU_DEFAULT_VCPUS,
+            "disk_size": resources.disk_size or CPU_DEFAULT_DISK_GB,
             "use_spot": False,
             "spot_fallback": False,
         }
@@ -816,6 +820,35 @@ class Lab:
                 except Exception as e:  # noqa: BLE001
                     print(f"[lab] reconcile sky.down {cl} failed: {e}")
 
+        # DO block-volume pass (best-effort): sky.down deletes the volume with its droplet, but a
+        # partial teardown can leave a detached `lab-*` volume that the instance passes above can't
+        # see (its droplet is gone) — yet it keeps billing. Skipped silently when DO isn't
+        # configured (no doctl), since not every account uses DigitalOcean.
+        from lab.backends.skypilot import do_volume_orphans as _find_do_volume_orphans
+        from lab.backends.skypilot import list_do_volumes
+
+        do_volume_orphans: list[dict[str, Any]] = []
+        do_volumes_destroyed: list[Any] = []
+        try:
+            volumes = list_do_volumes()
+        except Exception:  # noqa: BLE001 — DO not configured/unavailable: skip the volume pass
+            volumes = None
+        if volumes is not None:
+            do_volume_orphans = _find_do_volume_orphans(volumes, set(running_clusters))
+            if apply and do_volume_orphans:
+                from lab.backends.skypilot import _get_do_client
+
+                client = _get_do_client()
+                for vol in do_volume_orphans:
+                    vol_id = vol.get("id")
+                    if vol_id is None:
+                        continue
+                    try:
+                        client.volumes.delete(volume_id=vol_id)
+                        do_volumes_destroyed.append(vol_id)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[lab] reconcile delete volume {vol_id} failed: {e}")
+
         return {
             "instances_total": len(instances),
             "orphans": orphans,
@@ -823,6 +856,8 @@ class Lab:
             "ghosts": ghosts,
             "sky_orphans": sky_orphans,
             "sky_destroyed": sky_destroyed,
+            "do_volume_orphans": do_volume_orphans,
+            "do_volumes_destroyed": do_volumes_destroyed,
             "applied": apply,
         }
 
