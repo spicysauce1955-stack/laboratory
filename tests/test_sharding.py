@@ -35,3 +35,30 @@ def test_partition_rejects_nonpositive_size():
 
 def test_seeds_to_arg():
     assert seeds_to_arg([0, 1, 2, 3]) == "0,1,2,3"
+
+
+def test_parse_seeds_rejects_negative_range():
+    with pytest.raises(ValueError, match="seeds must be non-negative"):
+        parse_seeds("0--1")
+
+
+def test_parse_seeds_rejects_negative_list():
+    with pytest.raises(ValueError, match="seeds must be non-negative"):
+        parse_seeds([-1, 0])
+
+
+def test_seeds_to_arg_rejects_negative():
+    with pytest.raises(ValueError, match="seeds must be non-negative"):
+        seeds_to_arg([-1])
+
+
+def test_seeds_to_arg_single():
+    assert seeds_to_arg([5]) == "5"
+
+
+def test_seeds_to_arg_empty():
+    assert seeds_to_arg([]) == ""
+
+
+def test_partition_seeds_empty():
+    assert partition_seeds([], 3) == []

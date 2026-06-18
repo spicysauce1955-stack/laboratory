@@ -8,6 +8,7 @@ def parse_seeds(spec: str | list[int]) -> list[int]:
     """Parse a seed declaration into a sorted, de-duplicated seed set.
 
     Accepts an inclusive range string ``"0-31"`` or an explicit list ``[0, 1, 2]``.
+    Seeds must be non-negative.
     """
     if isinstance(spec, str):
         if "-" not in spec:
@@ -19,13 +20,22 @@ def parse_seeds(spec: str | list[int]) -> list[int]:
             raise ValueError(
                 f"seed range bounds must be integers, got {spec!r}"
             ) from e
+        if lo < 0 or hi < 0:
+            raise ValueError(f"seeds must be non-negative, got {spec!r}")
         if hi < lo:
             raise ValueError(f"seed range hi < lo: {spec!r}")
-        return list(range(lo, hi + 1))
-    try:
-        return sorted({int(s) for s in spec})
-    except (TypeError, ValueError) as e:
-        raise ValueError(f"seed list members must be integers, got {spec!r}") from e
+        result = list(range(lo, hi + 1))
+    else:
+        try:
+            result = sorted({int(s) for s in spec})
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"seed list members must be integers, got {spec!r}"
+                             ) from e
+    # Check for negative seeds after computing result
+    if any(s < 0 for s in result):
+        bad = next(s for s in result if s < 0)
+        raise ValueError(f"seeds must be non-negative, got {bad}")
+    return result
 
 
 def partition_seeds(seeds: list[int], shard_size: int) -> list[list[int]]:
@@ -36,5 +46,11 @@ def partition_seeds(seeds: list[int], shard_size: int) -> list[list[int]]:
 
 
 def seeds_to_arg(seeds: list[int]) -> str:
-    """Render a shard's seed subset as a comma-joined config-override value (digits + commas only)."""
+    """Render a shard's seed subset as a comma-joined config-override value (digits + commas only).
+
+    Injection-safety invariant: output contains only digits and commas (no minus signs).
+    """
+    if any(s < 0 for s in seeds):
+        bad = next(s for s in seeds if s < 0)
+        raise ValueError(f"seeds must be non-negative, got {bad}")
     return ",".join(str(s) for s in seeds)
