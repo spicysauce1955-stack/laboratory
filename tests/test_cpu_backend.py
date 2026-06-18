@@ -31,13 +31,19 @@ def test_profile_cpu_sets_do_and_defaults():
     provisioner, res = resolve_backend_profile("cpu", ResourceRequest())
     assert provisioner == "skypilot"
     assert res.cloud == "do"
-    assert res.cpus == 8  # default
+    assert res.cpus == 4  # default kept within the default DO account tier
+    assert res.disk_size == 50  # default volume within the default DO block-storage tier
     assert res.use_spot is False and res.spot_fallback is False
 
 
 def test_profile_cpu_preserves_explicit_cpus():
     _, res = resolve_backend_profile("cpu", ResourceRequest(cpus=32))
     assert res.cpus == 32 and res.cloud == "do"
+
+
+def test_profile_cpu_preserves_explicit_disk_size():
+    _, res = resolve_backend_profile("cpu", ResourceRequest(disk_size=200))
+    assert res.disk_size == 200 and res.cloud == "do"
 
 
 def test_profile_cpu_rejects_accelerators():
@@ -71,6 +77,50 @@ def test_build_task_uses_do_cloud_no_accelerators(tmp_path: Path):
     res = list(task.resources)[0]
     assert isinstance(res.cloud, sky.clouds.DO)
     assert res.accelerators is None
+
+
+def test_build_task_passes_disk_size_to_resources(tmp_path: Path):
+    """disk_size on the request must reach sky.Resources, so SkyPilot's DO provisioner sizes the
+    attached block volume within the account tier (default 256GB volume is rejected on a fresh DO
+    account: '422 failed to create volume: invalid size specified')."""
+    m = make_manifest("c3", "python x.py", timeout="10m")
+    m.resources.cloud = "do"
+    m.resources.cpus = 4
+    m.resources.disk_size = 50
+    task = build_task(m, workdir=tmp_path)
+    res = list(task.resources)[0]
+    assert res.disk_size == 50
+
+
+def test_do_volume_orphans_flags_untracked_lab_volumes():
+    """The volume-leak analogue of the instance orphan pass: a `lab-*` DO block volume not tied to
+    any running cluster is an orphan (SkyPilot names the volume after the cluster)."""
+    from lab.backends.skypilot import do_volume_orphans
+
+    volumes = [
+        {"id": "v1", "name": "lab-job-dead-3dd1-head"},   # no running cluster -> orphan
+        {"id": "v2", "name": "lab-job-alive-3dd1-head"},  # tied to a running cluster -> kept
+        {"id": "v3", "name": "someone-else-vol"},         # not ours -> ignored
+    ]
+    orphans = do_volume_orphans(volumes, running_clusters={"lab-job-alive"})
+    assert orphans == [{"id": "v1", "name": "lab-job-dead-3dd1-head"}]
+
+
+def test_list_do_volumes_parses_pydo_response():
+    """list_do_volumes unwraps pydo's {'volumes': [...]} response into plain dicts."""
+    from lab.backends.skypilot import list_do_volumes
+
+    class _Vols:
+        def list(self, **kw):  # noqa: A003 — mirrors pydo's volumes.list(**kwargs)
+            return {"volumes": [{"id": "v1", "name": "lab-x"}, {"id": "v2", "name": "lab-y"}]}
+
+    class _Client:
+        volumes = _Vols()
+
+    assert list_do_volumes(_Client()) == [
+        {"id": "v1", "name": "lab-x"},
+        {"id": "v2", "name": "lab-y"},
+    ]
 
 
 def test_build_task_rejects_do_spot(tmp_path: Path):
@@ -189,9 +239,21 @@ def test_cli_submit_cpu_stamps_do_profile():
     assert result.exit_code == 0, f"Exit {result.exit_code}: {result.output}"
     assert len(captured) == 1
     res = captured[0].resources
-    assert res.cloud == "do" and res.cpus == 8
+    assert res.cloud == "do" and res.cpus == 4 and res.disk_size == 50
     assert res.use_spot is False and res.spot_fallback is False
     assert seen_backends == ["skypilot"]  # cpu resolved to the skypilot provisioner
+
+
+def test_cli_submit_disk_size_flows_to_resources():
+    """`--disk-size` reaches the submitted spec's resources (the override the cpu profile honors)."""
+    captured: list[JobSpec] = []
+    fake_lab = _make_fake_lab(captured)
+    with patch.object(cli_mod, "_lab", return_value=fake_lab):
+        result = CliRunner().invoke(
+            app, ["submit", "-c", "python x.py", "--backend", "cpu", "--disk-size", "120"]
+        )
+    assert result.exit_code == 0, f"Exit {result.exit_code}: {result.output}"
+    assert captured[0].resources.disk_size == 120  # overrides the cpu profile default of 50
 
 
 def test_cli_submit_cpu_rejects_accelerators():
@@ -231,5 +293,5 @@ def test_cli_sweep_cpu_stamps_do_profile():
     assert result.exit_code == 0, f"Exit {result.exit_code}: {result.output}"
     assert len(resources_seen) == 1
     res = resources_seen[0]
-    assert res.cloud == "do" and res.cpus == 8
+    assert res.cloud == "do" and res.cpus == 4 and res.disk_size == 50
     assert seen_backends == ["skypilot"]

@@ -6,6 +6,7 @@ Wired to the local backend by default; structured JSON output mirrors the MCP §
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -69,6 +70,24 @@ def _emit(obj: Any) -> None:
     typer.echo(json.dumps(obj, indent=2, default=str))
 
 
+def _settle_teardown(lab: Lab, manifests: list[Any], *, interval: float, attempts: int = 3) -> list[Any]:
+    """Re-read manifests briefly so a teardown_status that's merely lagging (a job reports terminal
+    a tick before its teardown is recorded) settles to its real value before we classify clean vs.
+    leaked vs. unconfirmed. Only re-reads while some remote job still shows a null teardown."""
+
+    def _unsettled(ms: list[Any]) -> bool:
+        return any(
+            m.backend.provisioner != "local" and m.teardown_status is None for m in ms
+        )
+
+    for _ in range(attempts):
+        if not _unsettled(manifests):
+            break
+        time.sleep(min(interval, 5.0))
+        manifests = [lab.manifest(m.job_id) for m in manifests]
+    return manifests
+
+
 
 def _parse_grid(items: list[str]) -> dict[str, list[str]]:
     """Parse repeated `--grid key=v1,v2,...` options into {key: [values]}.
@@ -100,6 +119,7 @@ def submit(
     cpus: int | None = typer.Option(None),
     memory: str | None = typer.Option(None, help="e.g. 8 or 8+ (GB)"),
     gpus: int | None = typer.Option(None),
+    disk_size: int | None = typer.Option(None, "--disk-size", help="boot/attached volume size in GB (skypilot; DO volume size). cpu backend defaults to 50"),
     accelerators: str | None = typer.Option(None, "--accelerators", help="e.g. RTX_3070:1 (required for Vast)"),
     timeout: str | None = typer.Option(
         None, help="hard wall-clock cap, e.g. 2h / 30m / 45s — on overrun the job is killed, the "
@@ -125,8 +145,9 @@ def submit(
     end_reason.
     """
     resources = ResourceRequest(
-        cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
-        provision_timeout=provision_timeout, use_spot=spot, spot_fallback=not no_fallback,
+        cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
+        timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
+        spot_fallback=not no_fallback,
     )
     try:
         provisioner, resources = resolve_backend_profile(backend, resources)
@@ -195,6 +216,7 @@ def sweep(
     cpus: int | None = typer.Option(None),
     memory: str | None = typer.Option(None),
     gpus: int | None = typer.Option(None),
+    disk_size: int | None = typer.Option(None, "--disk-size", help="boot/attached volume size in GB per job (skypilot; DO volume size). cpu backend defaults to 50"),
     accelerators: str | None = typer.Option(None, "--accelerators"),
     timeout: str | None = typer.Option(None, help="wall-clock per job, e.g. 2h"),
     provision_timeout: str | None = typer.Option(None, "--provision-timeout", help="abort a host that doesn't reach UP in time, e.g. 10m (skypilot; default 8m)"),
@@ -212,8 +234,9 @@ def sweep(
 ) -> None:
     """Submit a parameter-grid sweep: one job per point under a sweep_id (FR-A5)."""
     resources = ResourceRequest(
-        cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
-        provision_timeout=provision_timeout, use_spot=spot, spot_fallback=not no_fallback,
+        cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
+        timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
+        spot_fallback=not no_fallback,
     )
     try:
         provisioner, resources = resolve_backend_profile(backend, resources)
@@ -388,12 +411,26 @@ def wait(
     if missing:  # fail-loud (FR-F3), not a raw traceback
         _emit({"error": f"unknown job id(s): {missing}"})
         raise typer.Exit(code=2)
-    manifests = _lab_for(ids[0]).wait(ids, interval=interval, timeout=timeout)
+    the_lab = _lab_for(ids[0])
+    manifests = the_lab.wait(ids, interval=interval, timeout=timeout)
     all_terminal = all(m.status in _TERMINAL for m in manifests)
+    if all_terminal:
+        manifests = _settle_teardown(the_lab, manifests, interval=interval)
     teardown_leaks = [m.job_id for m in manifests if m.teardown_status == "failed"]
+    # A remote job that's terminal but whose teardown_status never settled is neither clean
+    # ("succeeded") nor a confirmed leak ("failed") — don't let that null masquerade as a clean
+    # exit 0. (Local jobs provision nothing, so their null teardown_status is expected.)
+    teardown_unconfirmed = [
+        m.job_id
+        for m in manifests
+        if m.status in _TERMINAL
+        and m.backend.provisioner != "local"
+        and m.teardown_status is None
+    ]
     summary = {
         "all_terminal": all_terminal,
         "teardown_leaks": teardown_leaks,  # FR-C2 — non-empty == a paid rental may still be running
+        "teardown_unconfirmed": teardown_unconfirmed,  # null teardown — run `lab reconcile` to be sure
         "jobs": [
             {
                 "job_id": m.job_id,
@@ -407,6 +444,13 @@ def wait(
     _emit(summary)
     if done_file is not None:
         done_file.write_text(json.dumps(summary, indent=2, default=str))
+    if teardown_unconfirmed and not teardown_leaks:
+        typer.echo(
+            f"[lab] warning: teardown not confirmed for {teardown_unconfirmed} "
+            "(status is null, not 'failed') — run `lab reconcile` to be sure no machine or "
+            "block volume is still billing.",
+            err=True,
+        )
     if not all_terminal:
         raise typer.Exit(code=1)
     if teardown_leaks:

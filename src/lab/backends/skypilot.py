@@ -202,6 +202,42 @@ def list_vast_instances(client: Any | None = None) -> list[dict[str, Any]]:
     return list(client.show_instances())
 
 
+def _get_do_client() -> Any:
+    """Construct a DigitalOcean (pydo) client via SkyPilot's DO provisioner config. Test seam:
+    monkeypatch this to inject a fake."""
+    from sky.provision.do import utils as do_utils
+
+    return do_utils.client()  # type: ignore[no-untyped-call]
+
+
+def list_do_volumes(client: Any | None = None) -> list[dict[str, Any]]:
+    """Return every DO block volume on the account as plain dicts (raises if the DO client/listing
+    fails — callers in best-effort paths swallow that). pydo paginates; pull a large page since a
+    lab account holds only a handful of `lab-*` volumes."""
+    if client is None:
+        client = _get_do_client()
+    resp = client.volumes.list(per_page=200)
+    vols = resp.get("volumes", []) if isinstance(resp, dict) else resp
+    return [dict(v) for v in (vols or [])]
+
+
+def do_volume_orphans(
+    volumes: list[dict[str, Any]], running_clusters: set[str]
+) -> list[dict[str, Any]]:
+    """`lab-*` DO block volumes not tied to any running cluster — the volume-leak analogue of the
+    instance orphan pass (`reconcile`). SkyPilot's DO provisioner names the attached volume after
+    its cluster, so a running cluster name is a substring of its volume's name. Pure."""
+    orphans: list[dict[str, Any]] = []
+    for v in volumes:
+        name = str(v.get("name", ""))
+        if not name.startswith("lab-"):
+            continue  # not a lab volume — leave it alone
+        if any(c.lower() in name.lower() for c in running_clusters):
+            continue  # backs a live job
+        orphans.append({"id": v.get("id"), "name": name})
+    return orphans
+
+
 def confirm_no_rental(cluster: str) -> bool:
     """True iff no Vast rental labelled for this cluster remains. Best-effort: returns False on any
     match OR if the listing fails — we never claim 'gone' under uncertainty (FR-C2)."""
@@ -475,6 +511,7 @@ def build_task(manifest: JobManifest, workdir: Path) -> sky.Task:
     _cpus = manifest.resources.cpus
     _memory = manifest.resources.memory
     _accels = manifest.resources.accelerators or None
+    _disk = manifest.resources.disk_size
 
     def _res(*, use_spot: bool | None = None) -> sky.Resources:
         return sky.Resources(
@@ -482,6 +519,7 @@ def build_task(manifest: JobManifest, workdir: Path) -> sky.Task:
             cpus=_cpus,
             memory=_memory,
             accelerators=_accels,
+            disk_size=_disk,
             use_spot=use_spot,
         )
 

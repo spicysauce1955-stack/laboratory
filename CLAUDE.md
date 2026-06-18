@@ -31,9 +31,13 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   refuses instead. Deferred paths set `diff_ref` to the bundle key. Timeout `end_reason` carries the
   wall ("timed out after Ns wall-clock cap"). Guide: `docs/guides/provenance-and-timeouts.md`.
 - **CPU backend (FR P1-1):** `lab submit --backend cpu` provisions a cheap multi-core **DigitalOcean**
-  droplet (default 8 vCPU, up to 48; on-demand) via SkyPilot — sugar over skypilot + `cloud="do"`,
-  resolved in `resolve_backend_profile`. The cloud is configurable (`vast`/`do`/`gcp`). `lab reconcile`
-  is cloud-agnostic (a `sky.status` orphan pass). Guide: `docs/guides/cpu-backend.md`.
+  droplet (default **4 vCPU + 50 GB volume**, up to 48; on-demand) via SkyPilot — sugar over skypilot +
+  `cloud="do"`, resolved in `resolve_backend_profile`. Defaults stay inside a **fresh DO account tier**:
+  8-vCPU sizes AND SkyPilot's default 256 GB volume both `422` on an untouched account (size
+  restricted / "invalid size specified") — bigger needs a DO tier-increase ticket. `disk_size` lives on
+  `ResourceRequest` → `sky.Resources`. The cloud is configurable (`vast`/`do`/`gcp`). `lab reconcile`
+  is cloud-agnostic (a `sky.status` orphan pass) but checks **instances, not volumes**. Guide:
+  `docs/guides/cpu-backend.md`.
 - **Sharded sweeps (FR P1-2):** `lab sweep --seeds 0-31 --shard-size 8` splits each grid cell's
   seeds into independently-bounded shard jobs (own timeout + teardown), then `lab sweep-aggregate`
   row-concatenates the succeeded shards into one per-cell `results.csv` (seed column overridable),
