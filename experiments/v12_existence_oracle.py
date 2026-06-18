@@ -333,8 +333,11 @@ def main():
     if args.milp and gate_ok and not args.no_singlespike:
         print(f"\n=== A4 GATE: N={args.N} single-spike, MILP vs LP lower bound ===")
         st_lp = {}
+        # Use the SAME candidate-time grid (args.milp_M) for the LP baseline so MILP>=LP is a fair
+        # monotonicity check (both search/fix read-out times over the identical grid); otherwise a
+        # capped-M MILP vs a fine-M LP could violate monotonicity for a grid-resolution reason.
         fr_lp = crossing(gen_singlespike, args.N, theta=1.0, alphas=ss_alphas,
-                         n_seeds=args.seeds, K=args.K, method="lp")
+                         n_seeds=args.seeds, K=args.K, method="lp", M=args.milp_M)
         c_lp = half_cross(fr_lp)
         st_milp = {}
         fr_milp = crossing(gen_singlespike, args.N, theta=1.0, alphas=ss_alphas,
