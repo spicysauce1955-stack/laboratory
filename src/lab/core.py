@@ -43,8 +43,11 @@ from lab.models import (
     JobState,
     ResourceRequest,
     RunSpec,
+    SweepCell,
+    SweepPlan,
 )
-from lab.store import JobStore
+from lab.sharding import parse_seeds, partition_seeds, seeds_to_arg
+from lab.store import JobStore, cell_id_for
 
 _TERMINAL_STATES = frozenset(
     {
@@ -233,6 +236,7 @@ class Lab:
         *,
         allow_dirty: bool = True,
         sweep_id: str | None = None,
+        cell_id: str | None = None,
         code: CodeRef | None = None,
         registration_id: str | None = None,
         confirms: str | None = None,
@@ -280,6 +284,7 @@ class Lab:
         manifest = JobManifest(
             job_id=job_id,
             sweep_id=sweep_id,
+            cell_id=cell_id,
             registration_id=registration_id,
             confirms=confirms,
             created_at=now(),
@@ -339,6 +344,11 @@ class Lab:
         sweep_max_cost: float | None = None,
         daily_budget: float | None = None,
         committed: float = 0.0,
+        seeds: str | list[int] | None = None,
+        shard_size: int | None = None,
+        results_file: str = "results.csv",
+        seed_column: str = "seed",
+        seed_axis_key: str = "seeds",
     ) -> tuple[str, list[str]]:
         """Submit one job per grid point under a shared sweep_id (FR-A5).
 
@@ -349,37 +359,119 @@ class Lab:
 
         ``sweep_max_cost`` caps total sweep spend; ``daily_budget`` + ``committed`` enforce an
         up-front admission check (cost-safety, derived not metered). All default to no-op.
+
+        With ``seeds`` + ``shard_size`` (P1-2) each cell's seed set is partitioned into shards of at
+        most ``shard_size`` seeds; each shard runs as its own job (own timeout + teardown) with its
+        seed subset appended under ``seed_axis_key`` (e.g. ``seeds=0,1``). A ``SweepPlan`` is
+        persisted for aggregation/retry. ``seeds`` absent ⇒ today's behavior, no plan written.
         """
-        points = expand_grid(grid)
+        cells = expand_grid(grid)
+        if seeds is None:
+            return self._sweep_unsharded(
+                command, cells, resources=resources, seed=seed, code_ref=code_ref,
+                submitted_by=submitted_by, allow_dirty=allow_dirty, max_jobs=max_jobs,
+                sweep_max_cost=sweep_max_cost, daily_budget=daily_budget, committed=committed,
+            )
+        if seed_axis_key in grid:
+            raise LabError(
+                f"seeds declared in both 'seeds' and grid key {seed_axis_key!r}; "
+                "remove one — seeds are an aggregation axis, not a Cartesian grid key"
+            )
+        seed_set = parse_seeds(seeds)
+        shards = partition_seeds(seed_set, shard_size if shard_size is not None else len(seed_set))
+        n_jobs = len(cells) * len(shards)
+        if n_jobs > max_jobs:
+            raise LabError(
+                f"sharded sweep would submit {n_jobs} jobs (> max_jobs={max_jobs}); "
+                "narrow the grid/seeds, raise shard_size, or raise max_jobs"
+            )
+        per_point_cap: float | None = (
+            sweep_max_cost / n_jobs if sweep_max_cost is not None and n_jobs > 0 else None
+        )
+        check_sweep_admission(
+            n_points=n_jobs, per_point_cap=per_point_cap,
+            daily_budget=daily_budget, committed=committed,
+        )
+        sweep_id = f"sweep-{_new_job_id()}"
+        all_job_ids: list[str] = []
+        plan_cells: list[SweepCell] = []
+        for cell in cells:
+            cid = cell_id_for(cell)
+            shard_job_ids: list[str] = []
+            for shard in shards:
+                point = {**cell, seed_axis_key: seeds_to_arg(shard)}
+                spec = build_sweep_point_spec(
+                    command, point, seed=shard[0], resources=resources,
+                    code_ref=code_ref, submitted_by=submitted_by,
+                )
+                jid = self.submit(
+                    spec, allow_dirty=allow_dirty, sweep_id=sweep_id, cell_id=cid
+                )
+                shard_job_ids.append(jid)
+                all_job_ids.append(jid)
+            plan_cells.append(
+                SweepCell(
+                    coords={k: str(v) for k, v in cell.items()},
+                    cell_id=cid,
+                    seeds_expected=seed_set,
+                    shard_seeds=shards,
+                    shard_job_ids=shard_job_ids,
+                    results_file=results_file,
+                    seed_column=seed_column,
+                    aggregate_ref=str(self.home / sweep_id / "cells" / cid / results_file),
+                )
+            )
+        self.store.write_sweep_plan(
+            SweepPlan(
+                sweep_id=sweep_id, created_at=now(), command=command,
+                seed_axis_key=seed_axis_key, cells=plan_cells,
+            )
+        )
+        return sweep_id, all_job_ids
+
+    def _sweep_unsharded(
+        self,
+        command: str,
+        points: list[dict[str, Any]],
+        *,
+        resources: ResourceRequest | None,
+        seed: int | None,
+        code_ref: str,
+        submitted_by: str,
+        allow_dirty: bool,
+        max_jobs: int,
+        sweep_max_cost: float | None,
+        daily_budget: float | None,
+        committed: float,
+    ) -> tuple[str, list[str]]:
+        """The pre-P1-2 one-job-per-cell path (FR-A5), extracted unchanged."""
         if len(points) > max_jobs:
             raise LabError(
                 f"sweep would submit {len(points)} jobs (> max_jobs={max_jobs}); "
                 "narrow the grid or raise max_jobs"
             )
-        # Derive per-point cap from a whole-sweep ceiling, if provided. No live price at
-        # immediate-submit time, so an explicit cap is the only cost signal; uncosted -> no-op.
         per_point_cap: float | None = (
             sweep_max_cost / len(points) if sweep_max_cost is not None and len(points) > 0 else None
         )
         check_sweep_admission(
-            n_points=len(points),
-            per_point_cap=per_point_cap,
-            daily_budget=daily_budget,
-            committed=committed,
+            n_points=len(points), per_point_cap=per_point_cap,
+            daily_budget=daily_budget, committed=committed,
         )
         sweep_id = f"sweep-{_new_job_id()}"
         job_ids: list[str] = []
         for point in points:
             spec = build_sweep_point_spec(
-                command,
-                point,
-                seed=seed,
-                resources=resources,
-                code_ref=code_ref,
-                submitted_by=submitted_by,
+                command, point, seed=seed, resources=resources,
+                code_ref=code_ref, submitted_by=submitted_by,
             )
             job_ids.append(self.submit(spec, allow_dirty=allow_dirty, sweep_id=sweep_id))
         return sweep_id, job_ids
+
+    def sweep_plan(self, sweep_id: str) -> SweepPlan:
+        """Read the persisted shard plan for a sharded sweep (P1-2)."""
+        if not self.store.has_sweep_plan(sweep_id):
+            raise LabError(f"no shard plan for {sweep_id!r} (not a sharded sweep?)")
+        return self.store.read_sweep_plan(sweep_id)
 
     def _sibling_lab(self, repo: Path) -> Lab:
         """A Lab rooted at ``repo`` (e.g. an extracted bundle) over the same backend kind, sharing

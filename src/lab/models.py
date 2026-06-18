@@ -119,6 +119,7 @@ class JobManifest(BaseModel):
 
     job_id: str
     sweep_id: str | None = None
+    cell_id: str | None = None  # sharded-sweep cell grouping (P1-2); None for non-sharded jobs
     registration_id: str | None = None  # set when launched by the scheduler (spec §4.5 repair)
     confirms: str | None = None  # the run-id this job was launched to re-derive (lab confirm)
     created_at: datetime
