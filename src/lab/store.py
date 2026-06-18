@@ -9,13 +9,20 @@ Layout (per job, under the lab ``home`` dir, default ``runs/``):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 from typing import Any
 
 from lab.metrics import snapshot_final_metrics
-from lab.models import JobManifest, JobState
+from lab.models import JobManifest, JobState, SweepPlan
+
+
+def cell_id_for(coords: dict[str, Any]) -> str:
+    """Deterministic, order-independent 8-hex id for a cell's non-seed coordinates."""
+    canon = json.dumps(coords, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canon.encode()).hexdigest()[:8]
 
 
 class JobStore:
@@ -81,6 +88,18 @@ class JobStore:
     def read_runtime(self, job_id: str) -> dict[str, Any]:
         p = self.runtime_path(job_id)
         return json.loads(p.read_text()) if p.exists() else {}
+
+    def sweep_plan_path(self, sweep_id: str) -> Path:
+        return self.home / sweep_id / "plan.json"
+
+    def has_sweep_plan(self, sweep_id: str) -> bool:
+        return self.sweep_plan_path(sweep_id).exists()
+
+    def write_sweep_plan(self, plan: SweepPlan) -> None:
+        self._atomic_write(self.sweep_plan_path(plan.sweep_id), plan.model_dump_json(indent=2))
+
+    def read_sweep_plan(self, sweep_id: str) -> SweepPlan:
+        return SweepPlan.model_validate_json(self.sweep_plan_path(sweep_id).read_text())
 
     def list_job_ids(self) -> list[str]:
         if not self.home.exists():

@@ -119,6 +119,7 @@ class JobManifest(BaseModel):
 
     job_id: str
     sweep_id: str | None = None
+    cell_id: str | None = None  # sharded-sweep cell grouping (P1-2); None for non-sharded jobs
     registration_id: str | None = None  # set when launched by the scheduler (spec §4.5 repair)
     confirms: str | None = None  # the run-id this job was launched to re-derive (lab confirm)
     created_at: datetime
@@ -140,3 +141,53 @@ class JobManifest(BaseModel):
     artifacts_uri: str | None = None  # durable object-store prefix, e.g. r2://lab-artifacts/<id>
     artifacts: list[ArtifactRecord] = Field(default_factory=list)
     final_metrics: dict[str, float] = Field(default_factory=dict)  # last value per series (FR-B4)
+
+
+class SweepCell(BaseModel):
+    """One non-seed grid point of a sharded sweep, plus its seed-shard bookkeeping (P1-2).
+
+    The authoritative cell->shards map. ``seeds_present``/``missing_seeds``/``status`` are filled by
+    aggregation (pending until then); the shard job manifests stay the fail-closed source of truth
+    for code/seed state — this record is grouping + accounting, never a provenance substitute.
+    """
+
+    coords: dict[str, Any]
+    cell_id: str
+    seeds_expected: list[int]
+    shard_seeds: list[list[int]]
+    shard_job_ids: list[str]
+    results_file: str
+    seed_column: str
+    aggregate_ref: str
+    seeds_present: list[int] = Field(default_factory=list)
+    missing_seeds: list[int] = Field(default_factory=list)
+    status: Literal["pending", "complete", "incomplete"] = "pending"
+
+
+class SweepPlan(BaseModel):
+    """Persisted plan for a sharded sweep (P1-2), keyed by ``sweep_id`` under the lab home."""
+
+    sweep_id: str
+    created_at: datetime
+    command: str  # base entrypoint, so retry_sweep can rebuild a shard spec without a manifest re-parse
+    seed_axis_key: str  # config-override key carrying each shard's seed subset (default "seeds")
+    cells: list[SweepCell]
+
+    def view(self) -> dict[str, Any]:
+        """Structured cell view for sharded sweeps (used by CLI + MCP shells — single source of truth)."""
+        return {
+            "sweep_id": self.sweep_id,
+            "cells": [
+                {
+                    "coords": c.coords,
+                    "cell_id": c.cell_id,
+                    "shard_job_ids": c.shard_job_ids,
+                    "aggregate_ref": c.aggregate_ref,
+                    "seeds_expected": len(c.seeds_expected),
+                    "seeds_present": len(c.seeds_present),
+                    "missing_seeds": c.missing_seeds,
+                    "status": c.status,
+                }
+                for c in self.cells
+            ],
+        }

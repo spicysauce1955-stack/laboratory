@@ -69,6 +69,7 @@ def _emit(obj: Any) -> None:
     typer.echo(json.dumps(obj, indent=2, default=str))
 
 
+
 def _parse_grid(items: list[str]) -> dict[str, list[str]]:
     """Parse repeated `--grid key=v1,v2,...` options into {key: [values]}.
 
@@ -204,6 +205,10 @@ def sweep(
         help="with --spot, do NOT fall back to on-demand if spot is scarce (wait/skip instead)",
     ),
     sweep_max_cost: float | None = typer.Option(None, "--sweep-max-cost", help="up-front admission cap in USD: refuse the sweep if its total would exceed your daily budget (cost-safety); during-run enforcement is on register-sweep"),
+    seeds: str | None = typer.Option(None, "--seeds", help="seed set as a range '0-31' or comma list '0,1,2'; declares seeds as a sharded axis (P1-2)"),
+    shard_size: int | None = typer.Option(None, "--shard-size", help="max seeds per sub-job; each cell's seeds are split into shards of this size"),
+    results_file: str = typer.Option("results.csv", "--results-file", help="per-run row-structured result file to aggregate per cell"),
+    seed_column: str = typer.Option("seed", "--seed-column", help="column in --results-file identifying each row's seed"),
 ) -> None:
     """Submit a parameter-grid sweep: one job per point under a sweep_id (FR-A5)."""
     resources = ResourceRequest(
@@ -230,11 +235,19 @@ def sweep(
                 if sweep_max_cost is not None
                 else None
             ),
+            seeds=seeds,
+            shard_size=shard_size,
+            results_file=results_file,
+            seed_column=seed_column,
         )
     except LabError as e:
         _emit({"error": str(e)})
         raise typer.Exit(code=1) from e
-    _emit({"sweep_id": sweep_id, "count": len(job_ids), "job_ids": job_ids})
+    if lab.store.has_sweep_plan(sweep_id):
+        plan = lab.sweep_plan(sweep_id)
+        _emit(plan.view())
+    else:
+        _emit({"sweep_id": sweep_id, "count": len(job_ids), "job_ids": job_ids})
 
 
 @app.command()
@@ -307,6 +320,28 @@ def cancel(job_id: str) -> None:
 def sweep_status(sweep_id: str) -> None:
     """Summarize a sweep's outcomes: preemptions, on-demand fallback, per-point spend."""
     _emit(_lab().sweep_summary(sweep_id))
+
+
+@app.command(name="sweep-aggregate")
+def sweep_aggregate(sweep_id: str) -> None:
+    """Row-concatenate each cell's succeeded shards into one per-cell result (P1-2)."""
+    try:
+        plan = _lab().aggregate_sweep(sweep_id)
+    except LabError as e:
+        _emit({"error": str(e)})
+        raise typer.Exit(code=1) from e
+    _emit(plan.view())
+
+
+@app.command(name="sweep-retry")
+def sweep_retry(sweep_id: str) -> None:
+    """Resubmit only the missing shards of incomplete cells, then re-aggregate (P1-2)."""
+    try:
+        plan = _lab().retry_sweep(sweep_id)
+    except LabError as e:
+        _emit({"error": str(e)})
+        raise typer.Exit(code=1) from e
+    _emit(plan.view())
 
 
 @app.command(name="list")

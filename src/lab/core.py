@@ -43,8 +43,12 @@ from lab.models import (
     JobState,
     ResourceRequest,
     RunSpec,
+    SweepCell,
+    SweepPlan,
 )
-from lab.store import JobStore
+from lab.aggregate import merge_seed_rows
+from lab.sharding import parse_seeds, partition_seeds, seeds_to_arg
+from lab.store import JobStore, cell_id_for
 
 _TERMINAL_STATES = frozenset(
     {
@@ -233,6 +237,7 @@ class Lab:
         *,
         allow_dirty: bool = True,
         sweep_id: str | None = None,
+        cell_id: str | None = None,
         code: CodeRef | None = None,
         registration_id: str | None = None,
         confirms: str | None = None,
@@ -280,6 +285,7 @@ class Lab:
         manifest = JobManifest(
             job_id=job_id,
             sweep_id=sweep_id,
+            cell_id=cell_id,
             registration_id=registration_id,
             confirms=confirms,
             created_at=now(),
@@ -339,6 +345,11 @@ class Lab:
         sweep_max_cost: float | None = None,
         daily_budget: float | None = None,
         committed: float = 0.0,
+        seeds: str | list[int] | None = None,
+        shard_size: int | None = None,
+        results_file: str = "results.csv",
+        seed_column: str = "seed",
+        seed_axis_key: str = "seeds",
     ) -> tuple[str, list[str]]:
         """Submit one job per grid point under a shared sweep_id (FR-A5).
 
@@ -349,37 +360,204 @@ class Lab:
 
         ``sweep_max_cost`` caps total sweep spend; ``daily_budget`` + ``committed`` enforce an
         up-front admission check (cost-safety, derived not metered). All default to no-op.
+
+        With ``seeds`` + ``shard_size`` (P1-2) each cell's seed set is partitioned into shards of at
+        most ``shard_size`` seeds; each shard runs as its own job (own timeout + teardown) with its
+        seed subset appended under ``seed_axis_key`` (e.g. ``seeds=0,1``). A ``SweepPlan`` is
+        persisted for aggregation/retry. ``seeds`` absent ⇒ today's behavior, no plan written.
         """
-        points = expand_grid(grid)
+        cells = expand_grid(grid)
+        if seeds is None:
+            return self._sweep_unsharded(
+                command, cells, resources=resources, seed=seed, code_ref=code_ref,
+                submitted_by=submitted_by, allow_dirty=allow_dirty, max_jobs=max_jobs,
+                sweep_max_cost=sweep_max_cost, daily_budget=daily_budget, committed=committed,
+            )
+        if seed_axis_key in grid or "seed" in grid:
+            raise LabError(
+                "seeds declared in both 'seeds' and a grid key ('seed'/'" + seed_axis_key + "'); "
+                "remove one — seeds are an aggregation axis, not a Cartesian grid key"
+            )
+        try:
+            seed_set = parse_seeds(seeds)
+            shards = partition_seeds(seed_set, shard_size if shard_size is not None else len(seed_set))
+        except ValueError as e:
+            raise LabError(str(e)) from e
+        n_jobs = len(cells) * len(shards)
+        if n_jobs > max_jobs:
+            raise LabError(
+                f"sharded sweep would submit {n_jobs} jobs (> max_jobs={max_jobs}); "
+                "narrow the grid/seeds, raise shard_size, or raise max_jobs"
+            )
+        per_point_cap: float | None = (
+            sweep_max_cost / n_jobs if sweep_max_cost is not None and n_jobs > 0 else None
+        )
+        check_sweep_admission(
+            n_points=n_jobs, per_point_cap=per_point_cap,
+            daily_budget=daily_budget, committed=committed,
+        )
+        sweep_id = f"sweep-{_new_job_id()}"
+        all_job_ids: list[str] = []
+        plan_cells: list[SweepCell] = []
+        for cell in cells:
+            coords = {k: str(v) for k, v in cell.items()}
+            cid = cell_id_for(coords)
+            shard_job_ids: list[str] = []
+            for shard in shards:
+                point = {**cell, seed_axis_key: seeds_to_arg(shard)}
+                spec = build_sweep_point_spec(
+                    command, point, seed=shard[0], resources=resources,
+                    code_ref=code_ref, submitted_by=submitted_by,
+                )
+                jid = self.submit(
+                    spec, allow_dirty=allow_dirty, sweep_id=sweep_id, cell_id=cid
+                )
+                shard_job_ids.append(jid)
+                all_job_ids.append(jid)
+            plan_cells.append(
+                SweepCell(
+                    coords=coords,
+                    cell_id=cid,
+                    seeds_expected=seed_set,
+                    shard_seeds=shards,
+                    shard_job_ids=shard_job_ids,
+                    results_file=results_file,
+                    seed_column=seed_column,
+                    aggregate_ref=str(self.home / sweep_id / "cells" / cid / results_file),
+                )
+            )
+        self.store.write_sweep_plan(
+            SweepPlan(
+                sweep_id=sweep_id, created_at=now(), command=command,
+                seed_axis_key=seed_axis_key, cells=plan_cells,
+            )
+        )
+        return sweep_id, all_job_ids
+
+    def _sweep_unsharded(
+        self,
+        command: str,
+        points: list[dict[str, Any]],
+        *,
+        resources: ResourceRequest | None,
+        seed: int | None,
+        code_ref: str,
+        submitted_by: str,
+        allow_dirty: bool,
+        max_jobs: int,
+        sweep_max_cost: float | None,
+        daily_budget: float | None,
+        committed: float,
+    ) -> tuple[str, list[str]]:
+        """The pre-P1-2 one-job-per-cell path (FR-A5), extracted unchanged."""
         if len(points) > max_jobs:
             raise LabError(
                 f"sweep would submit {len(points)} jobs (> max_jobs={max_jobs}); "
                 "narrow the grid or raise max_jobs"
             )
-        # Derive per-point cap from a whole-sweep ceiling, if provided. No live price at
-        # immediate-submit time, so an explicit cap is the only cost signal; uncosted -> no-op.
         per_point_cap: float | None = (
             sweep_max_cost / len(points) if sweep_max_cost is not None and len(points) > 0 else None
         )
         check_sweep_admission(
-            n_points=len(points),
-            per_point_cap=per_point_cap,
-            daily_budget=daily_budget,
-            committed=committed,
+            n_points=len(points), per_point_cap=per_point_cap,
+            daily_budget=daily_budget, committed=committed,
         )
         sweep_id = f"sweep-{_new_job_id()}"
         job_ids: list[str] = []
         for point in points:
             spec = build_sweep_point_spec(
-                command,
-                point,
-                seed=seed,
-                resources=resources,
-                code_ref=code_ref,
-                submitted_by=submitted_by,
+                command, point, seed=seed, resources=resources,
+                code_ref=code_ref, submitted_by=submitted_by,
             )
             job_ids.append(self.submit(spec, allow_dirty=allow_dirty, sweep_id=sweep_id))
         return sweep_id, job_ids
+
+    def sweep_plan(self, sweep_id: str) -> SweepPlan:
+        """Read the persisted shard plan for a sharded sweep (P1-2)."""
+        if not self.store.has_sweep_plan(sweep_id):
+            raise LabError(f"no shard plan for {sweep_id!r} (not a sharded sweep?)")
+        return self.store.read_sweep_plan(sweep_id)
+
+    def aggregate_sweep(self, sweep_id: str) -> SweepPlan:
+        """Row-concatenate each cell's succeeded shards into one per-cell result (P1-2, FR-SS-4..7).
+
+        Idempotent pull reducer: recomputes from current shard states each call, so it is safe to run
+        repeatedly as shards finish. A cell is ``complete`` iff every expected seed is present, else
+        ``incomplete`` with the missing seeds named — never presents a short aggregate as complete and
+        never discards recovered seeds (FR-SS-7).
+        """
+        plan = self.sweep_plan(sweep_id)
+        for cell in plan.cells:
+            texts: list[str] = []
+            for jid in cell.shard_job_ids:
+                if self.manifest(jid).status is not JobState.succeeded:
+                    continue
+                self.fetch_artifacts(jid)  # ensure the local copy exists (R2 fallback inside)
+                rf = self.store.output_dir(jid) / cell.results_file
+                if rf.exists():
+                    texts.append(rf.read_text())
+            merged, present = merge_seed_rows(texts, cell.seed_column)
+            cell.seeds_present = present
+            present_set = set(present)
+            cell.missing_seeds = [s for s in cell.seeds_expected if s not in present_set]
+            cell.status = "complete" if not cell.missing_seeds else "incomplete"
+            if merged:
+                dest = Path(cell.aggregate_ref)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(merged)
+                if r2_enabled():
+                    r2 = R2Store.from_env()
+                    if r2 is not None:
+                        try:
+                            r2.upload_file(
+                                dest, f"{sweep_id}/cells/{cell.cell_id}/{cell.results_file}"
+                            )
+                        except Exception as e:  # noqa: BLE001 — local aggregate stays authoritative
+                            print(f"[lab] aggregate R2 mirror failed, keeping local copy: {e}")
+        self.store.write_sweep_plan(plan)
+        return plan
+
+    def retry_sweep(self, sweep_id: str, *, allow_dirty: bool = True) -> SweepPlan:
+        """Resubmit only the missing shards of incomplete cells, then re-aggregate (P1-2, FR-SS-7).
+
+        A shard is missing if any of its assigned seeds is absent from the current aggregate. Fresh
+        shard jobs join the same ``sweep_id``/``cell_id``; succeeded shards are never touched.
+
+        Safe to call repeatedly: if a prior retry's job for a given seed subset is still in a
+        non-terminal state (queued/running), that shard is skipped — no duplicate in-flight jobs.
+        """
+        plan = self.aggregate_sweep(sweep_id)  # refresh present/missing from current shard states
+        for cell in plan.cells:
+            if cell.status != "incomplete":
+                continue
+            present = set(cell.seeds_present)
+            # Collect seed-subset strings of all currently in-flight (non-terminal) shard jobs so
+            # we can skip resubmitting a shard that already has a live retry running.
+            in_flight_subsets: set[str] = set()
+            for jid in cell.shard_job_ids:
+                m = self.manifest(jid)
+                if m.status not in _TERMINAL_STATES:
+                    sub = m.run.resolved_config.get(plan.seed_axis_key)
+                    if sub is not None:
+                        in_flight_subsets.add(str(sub))
+            # inherit the original shard resources (timeout/backend/etc.) from an existing shard
+            # [0] is safe: an incomplete cell always has >=1 shard (seeds_expected is non-empty)
+            base_resources = self.manifest(cell.shard_job_ids[0]).resources
+            for shard in cell.shard_seeds:
+                if all(s in present for s in shard):
+                    continue  # this shard's seeds are already covered
+                if seeds_to_arg(shard) in in_flight_subsets:
+                    continue  # a prior retry for this exact subset is still running — don't duplicate
+                point = {**cell.coords, plan.seed_axis_key: seeds_to_arg(shard)}
+                spec = build_sweep_point_spec(
+                    plan.command, point, seed=shard[0], resources=base_resources
+                )
+                jid = self.submit(
+                    spec, allow_dirty=allow_dirty, sweep_id=sweep_id, cell_id=cell.cell_id
+                )
+                cell.shard_job_ids.append(jid)
+        self.store.write_sweep_plan(plan)
+        return self.aggregate_sweep(sweep_id)
 
     def _sibling_lab(self, repo: Path) -> Lab:
         """A Lab rooted at ``repo`` (e.g. an extracted bundle) over the same backend kind, sharing
