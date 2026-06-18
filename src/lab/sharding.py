@@ -1,0 +1,40 @@
+"""Pure seed-axis helpers for sharded sweeps (P1-2): parse a declared seed set, partition it into
+per-shard subsets, and render a shard's subset as an injection-safe config-override value. No I/O."""
+
+from __future__ import annotations
+
+
+def parse_seeds(spec: str | list[int]) -> list[int]:
+    """Parse a seed declaration into a sorted, de-duplicated seed set.
+
+    Accepts an inclusive range string ``"0-31"`` or an explicit list ``[0, 1, 2]``.
+    """
+    if isinstance(spec, str):
+        if "-" not in spec:
+            raise ValueError(f"seed range must be 'lo-hi', got {spec!r}")
+        lo_s, _, hi_s = spec.partition("-")
+        try:
+            lo, hi = int(lo_s), int(hi_s)
+        except ValueError as e:
+            raise ValueError(
+                f"seed range bounds must be integers, got {spec!r}"
+            ) from e
+        if hi < lo:
+            raise ValueError(f"seed range hi < lo: {spec!r}")
+        return list(range(lo, hi + 1))
+    try:
+        return sorted({int(s) for s in spec})
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"seed list members must be integers, got {spec!r}") from e
+
+
+def partition_seeds(seeds: list[int], shard_size: int) -> list[list[int]]:
+    """Split ``seeds`` into contiguous chunks of at most ``shard_size`` (complete, non-overlapping)."""
+    if shard_size < 1:
+        raise ValueError(f"shard_size must be >= 1, got {shard_size}")
+    return [seeds[i : i + shard_size] for i in range(0, len(seeds), shard_size)]
+
+
+def seeds_to_arg(seeds: list[int]) -> str:
+    """Render a shard's seed subset as a comma-joined config-override value (digits + commas only)."""
+    return ",".join(str(s) for s in seeds)
