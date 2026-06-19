@@ -92,6 +92,25 @@ def _serial(spikes, valid, w, duration, n_grid):
     return vmax, tmax
 
 
+def _compare(spikes, valid, w, t_grid, duration, n_grid, tag: str):
+    """Return (v_ok, t_ok, n_dead, msg) comparing batched vs serial for one weight vector."""
+    vb, tb = _batched(spikes, valid, w, t_grid)
+    vs, ts = _serial(spikes, valid, w, duration, n_grid)
+    dt = float(t_grid[1] - t_grid[0])
+    # The batched engine's credit-assignment time is necessarily a grid index, so the serial fallback
+    # time t_last+t_peak (which can exceed the window) is clamped to the grid before comparison.
+    ts_cl = np.clip(ts, float(t_grid[0]), float(t_grid[-1]))
+    dv, dtm = np.abs(vb - vs), np.abs(tb - ts_cl)
+    v_scale = max(1e-9, float(np.abs(vs).max()))
+    v_ok = bool(dv.max() <= 1e-3 * v_scale + 1e-5)
+    t_ok = bool(dtm.max() <= 2.0 * dt + 1e-6)  # argmax may differ a cell at near-ties (float32 vs float64)
+    n_dead = int((vs <= 0.0).sum())
+    msg = (f"  [{tag}] V_max max|Δ|={dv.max():.3e} ({'OK' if v_ok else 'FAIL'})  "
+           f"t_max max|Δ|={dtm.max():.4f}ms/tol{2*dt:.3f} ({'OK' if t_ok else 'FAIL'})  "
+           f"dead={n_dead}/{len(vs)}")
+    return v_ok, t_ok, n_dead, msg
+
+
 def _validate_reference_against_canonical(spikes, valid, w, duration, n_grid) -> str:
     """If the tempotron package is importable, assert the inline ref == canonical decision.v_max_gs."""
     try:
@@ -114,22 +133,27 @@ def _validate_reference_against_canonical(spikes, valid, w, duration, n_grid) ->
 
 def check() -> bool:
     spikes, valid, w, t_grid, duration, n_grid = _build()
-    vb, tb = _batched(spikes, valid, w, t_grid)
-    vs, ts = _serial(spikes, valid, w, duration, n_grid)
     dt = float(t_grid[1] - t_grid[0])
-    dv, dtm = np.abs(vb - vs), np.abs(tb - ts)
-    v_scale = max(1e-9, float(np.abs(vs).max()))
-    v_ok = dv.max() <= 1e-3 * v_scale + 1e-5
-    t_ok = dtm.max() <= 2.0 * dt + 1e-6  # argmax may differ a cell at near-ties (float32 vs float64)
-    dead = vs <= 0.0
+    print(f"N=200 single-spike, P={spikes.shape[1]} patterns, grid dt={dt:.4f} ms ({n_grid} pts)")
+
+    # Case A: generic N(0,1) weights (V_max>0 -> argmax path, GS rule 1 only).
+    vA, tA, deadA, mA = _compare(spikes, valid, w, t_grid, duration, n_grid, "rand-w  ")
+    print(mA)
+    # Case B: all-negative weights force V<=0 everywhere -> exercises the dead-trajectory
+    # fallback (GS rule 2: t_max = t_last + t_peak, clamped to the grid).
+    w_neg = -torch.abs(w)
+    vB, tB, deadB, mB = _compare(spikes, valid, w_neg, t_grid, duration, n_grid, "neg-w   ")
+    print(mB)
+
     ref_note = _validate_reference_against_canonical(spikes, valid, w, duration, n_grid)
-    print(f"N=200 single-spike, P={len(vs)} patterns, grid dt={dt:.4f} ms ({n_grid} pts)")
-    print(f"  V_max:  max|Δ|={dv.max():.3e}  (tol 1e-3·{v_scale:.3f})   -> {'OK' if v_ok else 'FAIL'}")
-    print(f"  t_max:  max|Δ|={dtm.max():.4f} ms  (tol {2*dt:.4f})       -> {'OK' if t_ok else 'FAIL'}")
-    print(f"  dead-trajectory (V_max<=0): {int(dead.sum())}/{len(vs)} patterns exercise the fallback")
     print(ref_note)
-    ok = bool(v_ok and t_ok)
-    print(f"GATE {'PASS' if ok else 'FAIL'}")
+
+    coverage_ok = deadB > 0  # the fallback path must actually be hit by case B
+    if not coverage_ok:
+        print("  FAIL: case B produced no dead trajectories -> rule-2 fallback never exercised")
+    ok = bool(vA and tA and vB and tB and coverage_ok)
+    print(f"GATE {'PASS' if ok else 'FAIL'}  "
+          f"(rule-1 argmax: case A; rule-2 fallback: {deadB}/{spikes.shape[1]} dead in case B)")
     return ok
 
 
