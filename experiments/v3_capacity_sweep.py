@@ -175,17 +175,66 @@ def precompute_traces(
     return s
 
 
+def gs_readout_terms(
+    spike_times: torch.Tensor,  # (Sb, P, N, max_spikes)
+    valid: torch.Tensor,        # (Sb, P, N, max_spikes)
+    t_grid: torch.Tensor,       # (G,) uniform on [0, T]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Precompute the two weight-INDEPENDENT corrections of the GS-2006 Suppl.-Methods readout.
+
+    Vectorised mirror of :func:`tempotron.decision.v_max_gs` (the serial reference). Both terms
+    depend only on the pattern's spike times, so they are computed once and added/applied inside
+    the hot epoch loop at no per-epoch cost:
+
+    1. ``vbias[b,p,g] = -0.01 * K(t_g - (t_first[b,p] - t_peak))`` -- a small hyperpolarizing PSP
+       peaking at the first input spike, initialising ``V`` to ``-0.01`` (GS rule 1). Added to ``V``
+       before the argmax.
+    2. ``tfallback_idx[b,p]`` -- the grid index nearest ``t_last[b,p] + t_peak``; used as the
+       credit-assignment time when the trajectory never crosses rest (``max_t V <= 0``), so the
+       gradient ``s(t*)`` is well-defined for all-negative / synchrony-dead drive (GS rule 2).
+
+    ``t_first``/``t_last`` are the min/max over VALID spikes in pattern ``(b,p)``. The kernel and
+    ``t_peak`` use the module ``TAU_M``/``TAU_S`` (peak-normalised), matching the reference exactly.
+    """
+    tp = TAU_M * TAU_S / (TAU_M - TAU_S) * math.log(TAU_M / TAU_S)
+    has = (valid > 0).any(dim=(2, 3))                                # (Sb,P): pattern has >=1 spike
+    big = torch.finfo(spike_times.dtype).max
+    t_first = torch.where(valid > 0, spike_times, torch.full_like(spike_times, big)).amin(dim=(2, 3))
+    t_last = torch.where(valid > 0, spike_times, torch.full_like(spike_times, -big)).amax(dim=(2, 3))
+    tg = t_grid.view(1, 1, -1)                                       # (1,1,G)
+    vbias = -0.01 * psp_kernel(tg - (t_first - tp).unsqueeze(-1))    # (Sb,P,G)
+    vbias = vbias * has.unsqueeze(-1)                                # empty patterns -> no bias
+    t0 = float(t_grid[0])
+    dt = float(t_grid[1] - t_grid[0])
+    tfall = (t_last + tp).clamp(min=t0, max=float(t_grid[-1]))
+    tfallback_idx = torch.round((tfall - t0) / dt).long().clamp(0, t_grid.numel() - 1)  # (Sb,P)
+    return vbias, tfallback_idx
+
+
 # --------------------------------------------------------------------------------------------
 # Forward pass + Gutig-Sompolinsky training (online by default; batch-mode optional)
 # --------------------------------------------------------------------------------------------
 def _forward(s: torch.Tensor, w: torch.Tensor,
-             tfixed: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+             tfixed: torch.Tensor | None = None,
+             gs_vbias: torch.Tensor | None = None,
+             gs_tfallback: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """``V[b,p,g] = sum_i s[b,p,g,i] w[b,i]``; return ``(vmax, argmax_t)`` each ``(Sb, P)``.
 
     ``tfixed`` (Sb,P): if given, read out at this fixed time per pattern instead of argmax_t V
     (the drive-peak readout for the GS-2006 synchrony control; see ``readout`` in ``train_batch``).
+
+    ``gs_vbias`` (Sb,P,G) / ``gs_tfallback`` (Sb,P): the GS-2006 Suppl.-Methods readout
+    (``readout='gs'``). The hyperpolarizing PSP ``gs_vbias`` is added to ``V`` before the argmax;
+    where the trajectory never crosses rest (``vmax <= 0``) the credit-assignment time is overridden
+    to ``gs_tfallback`` (vectorised mirror of :func:`tempotron.decision.v_max_gs`).
     """
     v = torch.einsum("bpgn,bn->bpg", s, w)
+    if gs_vbias is not None:
+        v = v + gs_vbias
+        vmax, targ = v.max(dim=2)
+        if gs_tfallback is not None:
+            targ = torch.where(vmax <= 0.0, gs_tfallback, targ)
+        return vmax, targ
     if tfixed is None:
         vmax, targ = v.max(dim=2)
         return vmax, targ
@@ -269,7 +318,9 @@ def train_batch(
     vthr_fixed: float | None = None,  # V8 faithful-GS: fix V_thr (=1) and rescale init weights to it
     rescale_init: bool = True,    # T2-A: if False, keep w_init as-is (no median rescale) -- the GS
                                   # Suppl-Methods sigma_w=1e-3 faithful init that starts silent
-    readout: str = "vmax",  # 'vmax' (tempotron argmax_t V) | 'drive_peak' (GS synchrony control)
+    readout: str = "vmax",  # 'vmax' (tempotron argmax_t V) | 'drive_peak' (GS control) | 'gs' (GS-2006 Suppl-Methods)
+    gs_vbias: torch.Tensor | None = None,    # (Sb,P,G) hyperpolarizing init PSP; required when readout='gs'
+    gs_tfallback: torch.Tensor | None = None,  # (Sb,P) dead-trajectory readout-time index (readout='gs')
     log_every: int = 0,    # V8: if >0, print converged-fraction every log_every epochs (live monitor)
     patience: int = 0,     # V8: if >0, stop a cell after this many epochs with no new convergence
     log_tag: str = "",
@@ -325,7 +376,14 @@ def train_batch(
     # makes the timing-removed ensemble a faithful perceptron; for the generic ensembles the
     # tempotron's argmax_t V readout is the intended one, so this is opt-in (online mode only).
     tdrive = s.sum(dim=3).argmax(dim=2) if readout == "drive_peak" else None  # (Sb,P) or None
-    vmax, _ = _forward(s, w, tdrive)
+    gs_on = readout == "gs"  # GS-2006 Suppl-Methods readout (faithful online rule)
+    if gs_on:
+        if mode != "online":
+            raise ValueError("readout='gs' (faithful GS readout) is implemented for mode='online' only")
+        if gs_vbias is None or gs_tfallback is None:
+            raise ValueError("readout='gs' requires gs_vbias and gs_tfallback (see gs_readout_terms)")
+    vmax, _ = _forward(s, w, tdrive,
+                       gs_vbias if gs_on else None, gs_tfallback if gs_on else None)
 
     def _vmax_median(v: torch.Tensor) -> torch.Tensor:
         """Per-seed median V_max over *valid* patterns (mask=None => over all P)."""
@@ -428,7 +486,11 @@ def train_batch(
             for pi in order:
                 sp = s[:, pi]                               # (Sb, G, N) contiguous
                 vp = torch.einsum("bgn,bn->bg", sp, w)
-                if tdrive is None:
+                if gs_on:
+                    vp = vp + gs_vbias[:, pi]               # GS hyperpolarizing init PSP (Sb,G)
+                    vmx, tg = vp.max(dim=1)                 # argmax_t (V + bias)
+                    tg = torch.where(vmx <= 0.0, gs_tfallback[:, pi], tg)  # dead-trajectory fallback time
+                elif tdrive is None:
                     vmx, tg = vp.max(dim=1)                 # (Sb,) tempotron argmax_t V
                 else:
                     tg = tdrive[:, pi]                      # fixed drive-peak readout
@@ -940,6 +1002,9 @@ def main() -> int:
                     b1 = min(b0 + sb_size, n_seeds)
                     s = precompute_traces(spikes[b0:b1], valid[b0:b1], t_grid, elem_budget)
                     lab_b = labels[b0:b1]
+                    gs_vbias = gs_tfallback = None
+                    if readout == "gs":  # GS-2006 Suppl-Methods readout terms for this seed-batch
+                        gs_vbias, gs_tfallback = gs_readout_terms(spikes[b0:b1], valid[b0:b1], t_grid)
                     wrng = np.random.default_rng(cell_seed(master_seed, n_aff, alpha, k, tag=1) + b0)
                     w0 = torch.from_numpy(
                         (sigma_w * wrng.standard_normal((b1 - b0, n_aff))).astype(np.float32)).to(device)
@@ -952,6 +1017,7 @@ def main() -> int:
                                       mode=mode, uth_scale=uth_scale, kappa_target=kappa_target,
                                       noise_sigmas=noise_sigmas, vthr_fixed=vthr_fixed,
                                       rescale_init=rescale_init, readout=readout,
+                                      gs_vbias=gs_vbias, gs_tfallback=gs_tfallback,
                                       log_every=log_every, patience=patience,
                                       log_tag=f"K{round(k)}N{n_aff}a{alpha:.2f}b{b0}",
                                       record_history=bool(history_flag) and b0 == 0,
