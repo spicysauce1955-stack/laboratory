@@ -168,42 +168,54 @@ def run_kacrice(p: dict, run_dir: Path, seed: int) -> int:
 # --------------------------------------------------------------------------- #
 # MODE: capacity  (EXP-B)                                                       #
 # --------------------------------------------------------------------------- #
-def train_tempotron(spikes, labels, m, G, epochs, lr0, rng, kappa=0.2):
-    """Faithful GS voltage credit-assignment, ONLINE (per-pattern) with a margin.
+def train_tempotron(spikes, labels, m, G, epochs, lr0, rng, kappa=1.0, diag=False):
+    """Faithful GS voltage credit-assignment, ONLINE per-pattern, with a LEARNABLE
+    threshold theta (bias) updated online, and a fixed margin kappa.
 
-    Decision: yhat = +1 iff  max_t V(t; w) > theta. We work in the GS gauge with a
-    FIXED threshold theta=1 and let the weight scale adapt (an explicit learnable
-    theta is gauge-equivalent to rescaling w). A pattern is 'correct with margin'
-    iff  y_mu (V_mu(t*) - theta) >= kappa.  On a margin violation, the online GS
-    update pushes V(t*) toward the correct side:
-        w += lr * y_mu * dV/dw|_{t*}.
-    Online (one pattern at a time, reshuffled each epoch) avoids the cancellation of
-    a batch sum over random +-1 labels. Returns (solved, final_errors)."""
+    Decision: yhat = +1 iff  max_t V(t; w) - theta > 0.  GS rule on a margin
+    violation  y_mu (V_mu(t*) - theta) < kappa:
+        w     += lr * y_mu * dV/dw|_{t*}
+        theta -= lr * y_mu                      (online bias adaptation)
+    Weights are kept on a fixed-scale sphere ||w||=sqrt(N) (spherical perceptron
+    gauge) so the margin kappa is meaningful and the operating point can't drift to
+    a constant classifier. Returns (solved, final_errors[, diag_dict])."""
     P, N = spikes.shape
     ks = np.arange(1, m + 1)
-    w = rng.standard_normal(N) / np.sqrt(N * m)    # V scale ~ O(1)
-    theta = 1.0
+    w = rng.standard_normal(N)
+    w *= np.sqrt(N) / np.linalg.norm(w)            # ||w|| = sqrt(N)
+    theta = 0.0
     best = P
+    nerr0 = None
     for ep in range(epochs):
-        lr = lr0 / (1.0 + ep / 100.0)              # gentle decay
+        lr = lr0 / (1.0 + ep / 200.0)
         order = rng.permutation(P)
-        # ---- online sweep ----
         for mu in order:
-            sp = spikes[mu:mu + 1]                  # (1, N)
+            sp = spikes[mu:mu + 1]
             A, B, _ = project_coeffs(w, sp, m)
             vmax, tstar = vmax_and_argmax(A, B, ks, G)
-            margin = labels[mu] * (vmax[0] - theta)
-            if margin < kappa:
-                g = grad_at_tstar(sp, tstar, ks)[0]   # (N,)
+            if labels[mu] * (vmax[0] - theta) < kappa:
+                g = grad_at_tstar(sp, tstar, ks)[0]
                 w = w + lr * labels[mu] * g
-        # ---- epoch error count (0/1, no margin) ----
+                w *= np.sqrt(N) / np.linalg.norm(w)   # reproject to sphere
+                theta = theta - lr * labels[mu]
+        # epoch 0/1 error
         A, B, _ = project_coeffs(w, spikes, m)
         vmax, _ = vmax_and_argmax(A, B, ks, G)
-        yhat = np.where(vmax - theta > 0.0, 1, -1)
-        nerr = int((yhat != labels).sum())
+        nerr = int((np.where(vmax - theta > 0.0, 1, -1) != labels).sum())
+        if nerr0 is None:
+            nerr0 = nerr
         best = min(best, nerr)
         if nerr == 0:
+            if diag:
+                return True, 0, {"nerr0": nerr0, "theta": float(theta),
+                                 "vmax_mean": float(vmax.mean()), "epochs_used": ep}
             return True, 0
+    if diag:
+        A, B, _ = project_coeffs(w, spikes, m)
+        vmax, _ = vmax_and_argmax(A, B, ks, G)
+        return False, best, {"nerr0": nerr0, "theta": float(theta),
+                             "vmax_mean": float(vmax.mean()),
+                             "vmax_std": float(vmax.std()), "epochs_used": epochs}
     return False, best
 
 
@@ -241,13 +253,23 @@ def run_capacity(p: dict, run_dir: Path, default_seed: int) -> int:
     lr0 = float(p.get("lr0", "0.01"))
     seeds = parse_seed_set(p, default_seed)
 
+    kappa = float(p.get("kappa", "1.0"))
+    diag = p.get("diag", "0") == "1"
+
     rows = []
     metrics = (run_dir / "metrics.jsonl").open("w")
     for step, seed in enumerate(seeds):
         rng = np.random.default_rng(seed)
         P = int(round(alpha * N))
         spikes, labels = make_patterns(P, N, rng)
-        solved, nerr = train_tempotron(spikes, labels, m, G, epochs, lr0, rng)
+        out = train_tempotron(spikes, labels, m, G, epochs, lr0, rng, kappa, diag)
+        if diag:
+            solved, nerr, d = out
+            print(f"[diag] m={m} a={alpha} seed={seed} solved={solved} "
+                  f"nerr0={d['nerr0']} nerr={nerr} theta={d['theta']:.3f} "
+                  f"vmax_mean={d['vmax_mean']:.3f} ep={d.get('epochs_used')}")
+        else:
+            solved, nerr = out
         rows.append({
             "seed": seed, "m": m, "alpha": alpha, "N": N, "P": P,
             "solved": int(solved), "final_errors": nerr,
