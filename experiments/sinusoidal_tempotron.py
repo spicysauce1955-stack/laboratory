@@ -169,73 +169,97 @@ def run_kacrice(p: dict, run_dir: Path, seed: int) -> int:
 # MODE: capacity  (EXP-B)                                                       #
 # --------------------------------------------------------------------------- #
 def train_tempotron(spikes, labels, m, G, epochs, lr0, rng):
-    """Faithful GS voltage credit-assignment. spikes (P, N) include a bias column.
+    """Faithful GS voltage credit-assignment with an EXPLICIT learnable threshold theta.
+
+    Decision: yhat = +1 iff  max_t V(t; w) > theta.   (theta>0 makes the '-' class
+    -- which needs max_t V <= theta -- achievable; theta=0 is the degenerate norm
+    limit of sec 3.2.)  GS rule on a misclassified pattern mu:
+        w     += lr * y_mu * dV/dw|_{t*}      (push V(t*) toward the correct side)
+        theta -= lr * y_mu                     (move the bias the opposite way)
     Returns (solved: bool, final_errors: int)."""
     P, N = spikes.shape
     ks = np.arange(1, m + 1)
-    w = rng.standard_normal(N) * 0.01
+    w = rng.standard_normal(N) / np.sqrt(N)        # O(1) initial V scale
+    theta = 1.0                                    # learnable threshold (GS gauge)
+    best = P
     for ep in range(epochs):
         A, B, _ = project_coeffs(w, spikes, m)
         vmax, tstar = vmax_and_argmax(A, B, ks, G)
-        yhat = np.where(vmax > 0.0, 1, -1)
+        s = vmax - theta
+        yhat = np.where(s > 0.0, 1, -1)
         wrong = yhat != labels
         nerr = int(wrong.sum())
+        best = min(best, nerr)
         if nerr == 0:
             return True, 0
         lr = lr0 / np.sqrt(1.0 + ep)
         g = grad_at_tstar(spikes, tstar, ks)          # (P, N) dV/dw at t*
-        # update only on misclassified: push V(t*) toward correct side
         upd = (labels[wrong, None] * g[wrong]).sum(axis=0)
         w = w + lr * upd
+        theta = theta - lr * labels[wrong].sum()
     # final check
     A, B, _ = project_coeffs(w, spikes, m)
     vmax, _ = vmax_and_argmax(A, B, ks, G)
-    yhat = np.where(vmax > 0.0, 1, -1)
+    yhat = np.where(vmax - theta > 0.0, 1, -1)
     nerr = int((yhat != labels).sum())
-    return nerr == 0, nerr
+    return nerr == 0, min(best, nerr)
 
 
 def make_patterns(P, N, rng):
-    """N spike times U[0,2pi] per pattern + one bias afferent at a fixed phase.
-    Bias afferent: a column whose projected coeff is constant (acts as threshold).
-    We implement the bias as an extra afferent with spike time 0 (so cos(k*0)=1,
-    sin=0) -> contributes A_k += w_bias for all k -> a learnable DC offset that
-    shifts max_t V, i.e. the threshold theta."""
+    """N spike times U[0,2pi] per pattern; balanced random +-1 labels.
+    Threshold theta is an explicit learnable scalar (see train_tempotron), so no
+    bias afferent is needed -- the learnable dimension is exactly N."""
     spikes = rng.uniform(0.0, T, size=(P, N))
-    bias_col = np.zeros((P, 1))           # t=0 for the bias afferent
-    spikes = np.concatenate([spikes, bias_col], axis=1)   # (P, N+1)
-    labels = rng.choice([-1, 1], size=P)
-    # balance labels
+    labels = np.empty(P, dtype=int)
     labels[: P // 2] = 1
     labels[P // 2:] = -1
     rng.shuffle(labels)
     return spikes, labels
 
 
-def run_capacity(p: dict, run_dir: Path, seed: int) -> int:
-    rng = np.random.default_rng(seed)
+def parse_seed_set(p: dict, default_seed: int) -> list[int]:
+    """Read the sharded-sweep seed subset from `seeds=` (range '0-7' or list '0,1,2').
+    Falls back to the single $LAB_SEED if `seeds=` absent."""
+    s = p.get("seeds")
+    if not s:
+        return [default_seed]
+    s = s.strip()
+    if "-" in s and "," not in s:
+        a, b = s.split("-")
+        return list(range(int(a), int(b) + 1))
+    return [int(x) for x in s.split(",") if x != ""]
+
+
+def run_capacity(p: dict, run_dir: Path, default_seed: int) -> int:
     m = int(p["m"])
     alpha = float(p["alpha"])
     N = int(p.get("N", "100"))
     G = int(p.get("G", str(64 * m)))
     epochs = int(p.get("epochs", "400"))
     lr0 = float(p.get("lr0", "0.01"))
+    seeds = parse_seed_set(p, default_seed)
 
-    P = int(round(alpha * N))
-    spikes, labels = make_patterns(P, N, rng)
-    solved, nerr = train_tempotron(spikes, labels, m, G, epochs, lr0, rng)
-
-    row = {
-        "seed": seed, "m": m, "alpha": alpha, "N": N, "P": P,
-        "solved": int(solved), "final_errors": nerr,
-        "kacrice_Keff": round(kacrice_closed_form(m), 5),
-    }
-    with (run_dir / "metrics.jsonl").open("w") as f:
-        f.write(json.dumps({"name": "solved", "value": float(solved),
-                            "step": 0, "wall_time": time.time()}) + "\n")
-    write_results(run_dir, [row])
-    (run_dir / "summary.json").write_text(json.dumps({"mode": "capacity", **row}, indent=2))
-    print(f"[capacity] m={m} alpha={alpha} N={N} P={P} solved={solved} nerr={nerr}")
+    rows = []
+    metrics = (run_dir / "metrics.jsonl").open("w")
+    for step, seed in enumerate(seeds):
+        rng = np.random.default_rng(seed)
+        P = int(round(alpha * N))
+        spikes, labels = make_patterns(P, N, rng)
+        solved, nerr = train_tempotron(spikes, labels, m, G, epochs, lr0, rng)
+        rows.append({
+            "seed": seed, "m": m, "alpha": alpha, "N": N, "P": P,
+            "solved": int(solved), "final_errors": nerr,
+            "kacrice_Keff": round(kacrice_closed_form(m), 5),
+        })
+        metrics.write(json.dumps({"name": "solved", "value": float(solved),
+                                  "step": step, "wall_time": time.time()}) + "\n")
+        print(f"[capacity] m={m} alpha={alpha} seed={seed} P={P} solved={solved} nerr={nerr}")
+    metrics.close()
+    write_results(run_dir, rows)
+    nsolved = sum(r["solved"] for r in rows)
+    (run_dir / "summary.json").write_text(json.dumps(
+        {"mode": "capacity", "m": m, "alpha": alpha, "N": N,
+         "n_seeds": len(rows), "n_solved": nsolved}, indent=2))
     return 0
 
 
