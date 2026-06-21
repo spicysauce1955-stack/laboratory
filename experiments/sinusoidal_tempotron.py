@@ -168,41 +168,43 @@ def run_kacrice(p: dict, run_dir: Path, seed: int) -> int:
 # --------------------------------------------------------------------------- #
 # MODE: capacity  (EXP-B)                                                       #
 # --------------------------------------------------------------------------- #
-def train_tempotron(spikes, labels, m, G, epochs, lr0, rng):
-    """Faithful GS voltage credit-assignment with an EXPLICIT learnable threshold theta.
+def train_tempotron(spikes, labels, m, G, epochs, lr0, rng, kappa=0.2):
+    """Faithful GS voltage credit-assignment, ONLINE (per-pattern) with a margin.
 
-    Decision: yhat = +1 iff  max_t V(t; w) > theta.   (theta>0 makes the '-' class
-    -- which needs max_t V <= theta -- achievable; theta=0 is the degenerate norm
-    limit of sec 3.2.)  GS rule on a misclassified pattern mu:
-        w     += lr * y_mu * dV/dw|_{t*}      (push V(t*) toward the correct side)
-        theta -= lr * y_mu                     (move the bias the opposite way)
-    Returns (solved: bool, final_errors: int)."""
+    Decision: yhat = +1 iff  max_t V(t; w) > theta. We work in the GS gauge with a
+    FIXED threshold theta=1 and let the weight scale adapt (an explicit learnable
+    theta is gauge-equivalent to rescaling w). A pattern is 'correct with margin'
+    iff  y_mu (V_mu(t*) - theta) >= kappa.  On a margin violation, the online GS
+    update pushes V(t*) toward the correct side:
+        w += lr * y_mu * dV/dw|_{t*}.
+    Online (one pattern at a time, reshuffled each epoch) avoids the cancellation of
+    a batch sum over random +-1 labels. Returns (solved, final_errors)."""
     P, N = spikes.shape
     ks = np.arange(1, m + 1)
-    w = rng.standard_normal(N) / np.sqrt(N)        # O(1) initial V scale
-    theta = 1.0                                    # learnable threshold (GS gauge)
+    w = rng.standard_normal(N) / np.sqrt(N * m)    # V scale ~ O(1)
+    theta = 1.0
     best = P
     for ep in range(epochs):
+        lr = lr0 / (1.0 + ep / 100.0)              # gentle decay
+        order = rng.permutation(P)
+        # ---- online sweep ----
+        for mu in order:
+            sp = spikes[mu:mu + 1]                  # (1, N)
+            A, B, _ = project_coeffs(w, sp, m)
+            vmax, tstar = vmax_and_argmax(A, B, ks, G)
+            margin = labels[mu] * (vmax[0] - theta)
+            if margin < kappa:
+                g = grad_at_tstar(sp, tstar, ks)[0]   # (N,)
+                w = w + lr * labels[mu] * g
+        # ---- epoch error count (0/1, no margin) ----
         A, B, _ = project_coeffs(w, spikes, m)
-        vmax, tstar = vmax_and_argmax(A, B, ks, G)
-        s = vmax - theta
-        yhat = np.where(s > 0.0, 1, -1)
-        wrong = yhat != labels
-        nerr = int(wrong.sum())
+        vmax, _ = vmax_and_argmax(A, B, ks, G)
+        yhat = np.where(vmax - theta > 0.0, 1, -1)
+        nerr = int((yhat != labels).sum())
         best = min(best, nerr)
         if nerr == 0:
             return True, 0
-        lr = lr0 / np.sqrt(1.0 + ep)
-        g = grad_at_tstar(spikes, tstar, ks)          # (P, N) dV/dw at t*
-        upd = (labels[wrong, None] * g[wrong]).sum(axis=0)
-        w = w + lr * upd
-        theta = theta - lr * labels[wrong].sum()
-    # final check
-    A, B, _ = project_coeffs(w, spikes, m)
-    vmax, _ = vmax_and_argmax(A, B, ks, G)
-    yhat = np.where(vmax - theta > 0.0, 1, -1)
-    nerr = int((yhat != labels).sum())
-    return nerr == 0, min(best, nerr)
+    return False, best
 
 
 def make_patterns(P, N, rng):
