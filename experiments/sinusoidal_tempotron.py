@@ -344,8 +344,11 @@ def run_capacity(p: dict, run_dir: Path, default_seed: int) -> int:
                 })
                 metrics.write(json.dumps({"name": "solved", "value": float(solved),
                                           "step": step, "wall_time": time.time()}) + "\n")
+                metrics.flush()
                 step += 1
-            print(f"[capacity] m={m} alpha={alpha} done ({len(seeds)} seeds)")
+            # incremental write after EACH cell -> timeout-safe partial results
+            write_results(run_dir, rows)
+            print(f"[capacity] m={m} alpha={alpha} done ({len(seeds)} seeds)", flush=True)
     metrics.close()
     write_results(run_dir, rows)
     nsolved = sum(r["solved"] for r in rows)
