@@ -219,6 +219,69 @@ def train_tempotron(spikes, labels, m, G, epochs, lr0, rng, kappa=1.0, diag=Fals
     return False, best
 
 
+def train_softmax(spikes, labels, m, G, epochs, lr0, rng, beta=8.0, kappa=1.0):
+    """Capacity estimator via a DIFFERENTIABLE soft-max surrogate of max_t V.
+
+    The hard rule max_t V is non-smooth; the GS argmax credit-assignment hits the
+    algorithm-existence gap (plateaus above 0 error even when separable). We train on
+    the smooth softmax potential  Vsoft = (1/beta) log sum_t exp(beta V(t))  -> max as
+    beta->inf, with a full-batch hinge loss  sum_mu [kappa - y_mu (Vsoft_mu - theta)]_+
+    minimised by gradient descent (Adam-like with momentum). EVALUATION still uses the
+    TRUE hard max_t V > theta. A pattern set is 'solved' iff 0 hard-decision errors.
+    This is a standard smooth-max capacity probe (cf. the soft-max reduction); it tests
+    SEPARABILITY, decoupling existence from the GS algorithm's convergence.
+    Returns (solved, final_errors)."""
+    P, N = spikes.shape
+    ks = np.arange(1, m + 1)
+    tgrid = np.linspace(0.0, T, G, endpoint=False)
+    cosG = np.cos(tgrid[:, None] * ks[None, :])    # (G, m)
+    sinG = np.sin(tgrid[:, None] * ks[None, :])
+    # per-pattern feature tensors: Phi_cos[mu,g,i] = cos(k t_i) . cos(k t_g) summed over k
+    phc = np.cos(spikes[:, :, None] * ks[None, None, :])   # (P,N,m)
+    phs = np.sin(spikes[:, :, None] * ks[None, None, :])   # (P,N,m)
+    # V(t_g) for pattern mu = sum_i w_i sum_k [phc cosG + phs(-?)]; build per-g basis:
+    # A_k=sum_i w_i phc ; B_k=-sum_i w_i phs ; V_g = sum_k A_k cosG_gk + B_k sinG_gk
+    #      = sum_i w_i sum_k (phc_ik cosG_gk - phs_ik sinG_gk)
+    # Psi[mu,g,i] = sum_k (phc_ik cosG_gk - phs_ik sinG_gk)   (P,G,N)
+    Psi = np.einsum("pik,gk->pgi", phc, cosG) - np.einsum("pik,gk->pgi", phs, sinG)
+    w = rng.standard_normal(N); w *= np.sqrt(N) / np.linalg.norm(w)
+    theta = 0.0
+    mw = np.zeros(N); vw = np.zeros(N); mt = 0.0; vt = 0.0
+    b1, b2, eps = 0.9, 0.999, 1e-8
+    best = P
+    for ep in range(1, epochs + 1):
+        Vg = Psi @ w                                   # (P, G)
+        Vmax = Vg.max(axis=1, keepdims=True)
+        ex = np.exp(beta * (Vg - Vmax))                # (P,G) stable
+        sw = ex / ex.sum(axis=1, keepdims=True)        # softmax weights
+        Vsoft = Vmax[:, 0] + np.log(ex.sum(axis=1)) / beta   # (P,)
+        margin = labels * (Vsoft - theta)
+        viol = margin < kappa
+        # gradient of hinge: d/dw [-(y(Vsoft-theta))] on violators
+        # dVsoft/dw = sum_g sw_g Psi[mu,g,:]
+        dVsoft = np.einsum("pg,pgi->pi", sw, Psi)      # (P,N)
+        gw = -(labels[viol, None] * dVsoft[viol]).sum(axis=0)
+        gt = (labels[viol]).sum()                      # d/dtheta
+        # Adam
+        lr = lr0
+        mw = b1 * mw + (1 - b1) * gw; vw = b2 * vw + (1 - b2) * gw**2
+        mt = b1 * mt + (1 - b1) * gt; vt = b2 * vt + (1 - b2) * gt**2
+        mwh = mw / (1 - b1**ep); vwh = vw / (1 - b2**ep)
+        mth = mt / (1 - b1**ep); vth = vt / (1 - b2**ep)
+        w = w - lr * mwh / (np.sqrt(vwh) + eps)
+        w *= np.sqrt(N) / np.linalg.norm(w)
+        theta = theta - lr * mth / (np.sqrt(vth) + eps)
+        # hard-decision error (TRUE max)
+        if ep % 25 == 0 or ep == epochs:
+            A, B, _ = project_coeffs(w, spikes, m)
+            vmaxh, _ = vmax_and_argmax(A, B, ks, max(G, 256))
+            nerr = int((np.where(vmaxh - theta > 0.0, 1, -1) != labels).sum())
+            best = min(best, nerr)
+            if nerr == 0:
+                return True, 0
+    return False, best
+
+
 def make_patterns(P, N, rng):
     """N spike times U[0,2pi] per pattern; balanced random +-1 labels.
     Threshold theta is an explicit learnable scalar (see train_tempotron), so no
@@ -255,6 +318,8 @@ def run_capacity(p: dict, run_dir: Path, default_seed: int) -> int:
 
     kappa = float(p.get("kappa", "1.0"))
     diag = p.get("diag", "0") == "1"
+    trainer = p.get("trainer", "softmax")
+    beta = float(p.get("beta", "8.0"))
 
     rows = []
     metrics = (run_dir / "metrics.jsonl").open("w")
@@ -262,14 +327,19 @@ def run_capacity(p: dict, run_dir: Path, default_seed: int) -> int:
         rng = np.random.default_rng(seed)
         P = int(round(alpha * N))
         spikes, labels = make_patterns(P, N, rng)
-        out = train_tempotron(spikes, labels, m, G, epochs, lr0, rng, kappa, diag)
-        if diag:
-            solved, nerr, d = out
-            print(f"[diag] m={m} a={alpha} seed={seed} solved={solved} "
-                  f"nerr0={d['nerr0']} nerr={nerr} theta={d['theta']:.3f} "
-                  f"vmax_mean={d['vmax_mean']:.3f} ep={d.get('epochs_used')}")
+        if trainer == "softmax":
+            solved, nerr = train_softmax(spikes, labels, m, G, epochs, lr0, rng, beta, kappa)
+            if diag:
+                print(f"[diag-sm] m={m} a={alpha} seed={seed} solved={solved} nerr={nerr}")
         else:
-            solved, nerr = out
+            out = train_tempotron(spikes, labels, m, G, epochs, lr0, rng, kappa, diag)
+            if diag:
+                solved, nerr, d = out
+                print(f"[diag] m={m} a={alpha} seed={seed} solved={solved} "
+                      f"nerr0={d['nerr0']} nerr={nerr} theta={d['theta']:.3f} "
+                      f"vmax_mean={d['vmax_mean']:.3f} ep={d.get('epochs_used')}")
+            else:
+                solved, nerr = out
         rows.append({
             "seed": seed, "m": m, "alpha": alpha, "N": N, "P": P,
             "solved": int(solved), "final_errors": nerr,
