@@ -308,14 +308,13 @@ def parse_seed_set(p: dict, default_seed: int) -> list[int]:
 
 
 def run_capacity(p: dict, run_dir: Path, default_seed: int) -> int:
-    m = int(p["m"])
-    alpha = float(p["alpha"])
+    # m and alpha may be single values or comma-lists -> one job covers a whole grid
+    m_list = [int(x) for x in str(p.get("m", "4")).split(",") if x != ""]
+    alpha_list = [float(x) for x in str(p.get("alpha", "1.0")).split(",") if x != ""]
     N = int(p.get("N", "100"))
-    G = int(p.get("G", str(64 * m)))
     epochs = int(p.get("epochs", "400"))
     lr0 = float(p.get("lr0", "0.01"))
     seeds = parse_seed_set(p, default_seed)
-
     kappa = float(p.get("kappa", "1.0"))
     diag = p.get("diag", "0") == "1"
     trainer = p.get("trainer", "softmax")
@@ -323,37 +322,36 @@ def run_capacity(p: dict, run_dir: Path, default_seed: int) -> int:
 
     rows = []
     metrics = (run_dir / "metrics.jsonl").open("w")
-    for step, seed in enumerate(seeds):
-        rng = np.random.default_rng(seed)
-        P = int(round(alpha * N))
-        spikes, labels = make_patterns(P, N, rng)
-        if trainer == "softmax":
-            solved, nerr = train_softmax(spikes, labels, m, G, epochs, lr0, rng, beta, kappa)
-            if diag:
-                print(f"[diag-sm] m={m} a={alpha} seed={seed} solved={solved} nerr={nerr}")
-        else:
-            out = train_tempotron(spikes, labels, m, G, epochs, lr0, rng, kappa, diag)
-            if diag:
-                solved, nerr, d = out
-                print(f"[diag] m={m} a={alpha} seed={seed} solved={solved} "
-                      f"nerr0={d['nerr0']} nerr={nerr} theta={d['theta']:.3f} "
-                      f"vmax_mean={d['vmax_mean']:.3f} ep={d.get('epochs_used')}")
-            else:
-                solved, nerr = out
-        rows.append({
-            "seed": seed, "m": m, "alpha": alpha, "N": N, "P": P,
-            "solved": int(solved), "final_errors": nerr,
-            "kacrice_Keff": round(kacrice_closed_form(m), 5),
-        })
-        metrics.write(json.dumps({"name": "solved", "value": float(solved),
-                                  "step": step, "wall_time": time.time()}) + "\n")
-        print(f"[capacity] m={m} alpha={alpha} seed={seed} P={P} solved={solved} nerr={nerr}")
+    step = 0
+    for m in m_list:
+        G = int(p.get("G", str(64 * m)))
+        for alpha in alpha_list:
+            for seed in seeds:
+                rng = np.random.default_rng(seed * 100003 + m * 101 + int(alpha * 10))
+                P = int(round(alpha * N))
+                spikes, labels = make_patterns(P, N, rng)
+                if trainer == "softmax":
+                    solved, nerr = train_softmax(spikes, labels, m, G, epochs, lr0, rng, beta, kappa)
+                    if diag:
+                        print(f"[diag-sm] m={m} a={alpha} seed={seed} solved={solved} nerr={nerr}")
+                else:
+                    out = train_tempotron(spikes, labels, m, G, epochs, lr0, rng, kappa, diag)
+                    solved, nerr = out[0], out[1]
+                rows.append({
+                    "seed": seed, "m": m, "alpha": alpha, "N": N, "P": P,
+                    "solved": int(solved), "final_errors": nerr,
+                    "kacrice_Keff": round(kacrice_closed_form(m), 5),
+                })
+                metrics.write(json.dumps({"name": "solved", "value": float(solved),
+                                          "step": step, "wall_time": time.time()}) + "\n")
+                step += 1
+            print(f"[capacity] m={m} alpha={alpha} done ({len(seeds)} seeds)")
     metrics.close()
     write_results(run_dir, rows)
     nsolved = sum(r["solved"] for r in rows)
     (run_dir / "summary.json").write_text(json.dumps(
-        {"mode": "capacity", "m": m, "alpha": alpha, "N": N,
-         "n_seeds": len(rows), "n_solved": nsolved}, indent=2))
+        {"mode": "capacity", "m_list": m_list, "alpha_list": alpha_list, "N": N,
+         "n_rows": len(rows), "n_solved": nsolved}, indent=2))
     return 0
 
 
