@@ -833,7 +833,13 @@ def main() -> int:
     # gabor: omega0 is the carrier; the bisection sets sigma so Q = omega0*sigma varies along K_eff.
     # To probe the TWO regimes set Q explicitly: if gabor_Q>0, omega0 is derived per cell from the
     # bisected sigma as omega0 = Q/sigma (band-pass at fixed Q); else omega0 is the fixed carrier.
-    gabor_omega0 = float(ov.get("gabor_omega0", "1.0"))
+    # Carrier frequency for gabor/sinusoid. The campaign drives this with a bare ``omega0=`` argv
+    # (NOT ``gabor_omega0=``); accept that as the primary alias so the carrier is actually threaded
+    # into the K_eff bisection / certified-axis recomputation. Before this, ``omega0=`` was dropped on
+    # the floor and gabor silently used the default 1.0 rad/ms -- a high-Q band centred at 1, which
+    # rails Keff_rice = T*bandwidth ~= T for every cell (bisection cannot reach the target). The
+    # legacy ``gabor_omega0=`` key still works. (``omega0_list=`` remains a separate width override.)
+    gabor_omega0 = float(ov.get("omega0", ov.get("gabor_omega0", "1.0")))
     gabor_Q = float(ov.get("gabor_Q", "0"))      # if >0, hold Q=omega0*sigma fixed (regime knob)
     # sinusoid: omega0 IS the bisected knob (single frequency); n_lobes_win sets its window span.
     # rect: bisect to a target D_PR (K_eff_rice diverges with dt) and ALSO log K_eff_rice.
