@@ -249,6 +249,15 @@ def confirm_no_rental(cluster: str) -> bool:
     return not any(needle in _instance_label(inst) for inst in instances)  # _instance_label is lower
 
 
+def preempted_teardown_confirmed(cloud: str, cluster: str) -> bool:
+    """Whether a preempted job's instance is confirmably gone. Vast has a provider-direct listing
+    to double-check against (:func:`confirm_no_rental`); other clouds have none, so the
+    :func:`tear_down_and_record` outcome is already the authoritative answer."""
+    if cloud != "vast":
+        return True
+    return confirm_no_rental(cluster)
+
+
 def vast_hourly_for_cluster(cluster: str, client: Any | None = None) -> float | None:
     """Actual billed USD/hour (``dph_total``) for the Vast rental backing ``cluster``, or None.
 
@@ -409,10 +418,19 @@ def tear_down_and_record(
     fields: dict[str, Any] = {"teardown_status": "succeeded" if succeeded else "failed"}
     annotation: str | None = None
     if not succeeded:
+        if cloud == "vast":
+            remedy = (
+                "AND vast-sdk fallback. Run `lab reconcile --apply` "
+                "(or `vastai destroy_instance <id>`) to stop the bleed."
+            )
+        else:
+            remedy = (
+                f"(no provider-direct fallback for {cloud}). Run `lab reconcile --apply` and "
+                f"check `sky status` / the {cloud} console to stop the bleed."
+            )
         annotation = (
             f"TEARDOWN FAILED for cluster {cluster!r}: {outcome['error']} after "
-            f"{outcome['attempts']} sky.down attempts AND vast-sdk fallback. "
-            "Run `lab reconcile --apply` (or `vastai destroy_instance <id>`) to stop the bleed."
+            f"{outcome['attempts']} sky.down attempts {remedy}"
         )
     elif outcome["vast_fallback_used"]:
         annotation = (
@@ -477,14 +495,22 @@ def provision_with_watchdog(sky_mod: Any, request_id: Any, *, timeout_s: float) 
 
 
 def _cloud_for(name: str | None) -> "sky.clouds.Cloud":
-    """Map a lab cloud name to a SkyPilot cloud object. Unknown/None -> Vast (the default)."""
+    """Map a lab cloud name to a SkyPilot cloud object. None -> Vast (the default); an unknown
+    name raises rather than silently landing on Vast (defense in depth for hand-edited
+    manifests — the CLI/MCP already validate via ``validate_cloud``)."""
     import sky
 
-    return {
+    from lab.core import LabError
+
+    clouds = {
         "vast": sky.clouds.Vast,
         "do": sky.clouds.DO,
         "gcp": sky.clouds.GCP,
-    }.get(name or "vast", sky.clouds.Vast)()
+    }
+    key = name or "vast"
+    if key not in clouds:
+        raise LabError(f"unknown cloud {key!r} on manifest; supported: {', '.join(clouds)}")
+    return clouds[key]()
 
 
 def build_task(manifest: JobManifest, workdir: Path) -> sky.Task:

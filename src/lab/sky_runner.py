@@ -24,9 +24,9 @@ from lab.backends.skypilot import (
     ProvisionTimeout,
     build_task,
     cluster_name_for,
-    confirm_no_rental,
     confirm_success,
     map_job_status,
+    preempted_teardown_confirmed,
     promote_timeout,
     provision_with_watchdog,
     tear_down_and_record,
@@ -164,11 +164,18 @@ def provision_failure_reason(generic: str, cloud: str) -> str:
     """Enrich a generic provision-failure message per cloud (§8).
 
     Vast returns 400 on a depleted balance, surfaced generically — consult the balance and say so.
-    For DigitalOcean, point at the most common cause: DO not enabled / no doctl token / quota."""
+    For DigitalOcean/GCP, point at the most common causes: cloud not enabled in `sky check`,
+    missing credentials, or quota."""
     if cloud == "do":
         return (
             f"{generic} — if this is a DigitalOcean setup issue, check `sky check` shows DO enabled "
             "(doctl token at ~/.config/doctl/config.yaml) and your DO vCPU quota covers the size"
+        )
+    if cloud == "gcp":
+        return (
+            f"{generic} — if this is a GCP setup issue, check `sky check gcp` passes "
+            "(`gcloud auth application-default login`), the Compute Engine API is enabled, and "
+            "your regional quota covers the accelerator family (per-family quota for L4/T4)"
         )
     if cloud == "vast":
         bal = vast_balance()
@@ -184,6 +191,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
     install_log_redaction(store.logs_path(job_id))  # scrub secrets before any SkyPilot output
     manifest = store.read_manifest(job_id)
     cluster = cluster_name_for(job_id)
+    cloud = manifest.resources.cloud or "vast"
 
     if not adopt:
         started = now()
@@ -219,7 +227,6 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             # Record cost up-front so a running job already shows it (FR-I2). The host is UP now,
             # so the Vast rental exists — bill at its real dph_total, not SkyPilot's low catalog
             # estimate.
-            cloud = manifest.resources.cloud or "vast"
             hourly_usd = _resolve_hourly(cluster, handle, cloud)
             estimated_usd = actual_cost(hourly_usd, parse_duration(manifest.resources.timeout))
             # Record which instance kind SkyPilot actually launched (spot vs on-demand) — with
@@ -240,7 +247,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                 ),
             )
         else:
-            hourly_usd = _resolve_hourly(cluster, None, manifest.resources.cloud or "vast")
+            hourly_usd = _resolve_hourly(cluster, None, cloud)
             estimated_usd = manifest.cost.estimated_usd if manifest.cost else None
             sky_job_id = None  # match any job in the cluster queue
 
@@ -280,14 +287,14 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                 "(host never reached UP — likely a dead Vast offer; resubmit for a fresh host)"
             )[:300],
         )
-        tear_down_and_record(sky, cluster, store, job_id, manifest.resources.cloud or "vast")
+        tear_down_and_record(sky, cluster, store, job_id, cloud)
         return 1
     except Exception as e:  # noqa: BLE001
-        reason = provision_failure_reason(f"launch error: {e}", manifest.resources.cloud or "vast")
+        reason = provision_failure_reason(f"launch error: {e}", cloud)
         store.update_manifest(
             job_id, status=JobState.failed, ended_at=now(), end_reason=reason[:300]
         )
-        tear_down_and_record(sky, cluster, store, job_id, manifest.resources.cloud or "vast")
+        tear_down_and_record(sky, cluster, store, job_id, cloud)
         return 1
 
     try:
@@ -363,8 +370,8 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             cost=cost,
         )
 
-    teardown_ok = tear_down_and_record(sky, cluster, store, job_id, manifest.resources.cloud or "vast")
-    if final is JobState.preempted and not confirm_no_rental(cluster):
+    teardown_ok = tear_down_and_record(sky, cluster, store, job_id, cloud)
+    if final is JobState.preempted and not preempted_teardown_confirmed(cloud, cluster):
         # The instance vanished (preemption inferred), but we can't confirm the Vast rental is
         # actually gone — flag it so `lab wait` exits 3 and the operator can run `lab reconcile`
         # before any auto-resubmitter builds on a potentially-still-billing orphan (FR-C2).

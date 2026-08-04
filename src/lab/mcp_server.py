@@ -56,6 +56,7 @@ def build_server(lab: Lab) -> FastMCP:
         gpus: int | None = None,
         disk_size: int | None = None,
         accelerators: str | None = None,
+        cloud: str | None = None,
         timeout: str | None = None,
         provision_timeout: str | None = None,
         with_pkg: list[str] | None = None,
@@ -63,10 +64,10 @@ def build_server(lab: Lab) -> FastMCP:
         spot_fallback: bool = True,
         allow_dirty: bool = True,
     ) -> dict[str, Any]:
-        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. allow_dirty=False refuses a dirty working tree (default snapshots the diff, FR-B1). disk_size sizes the boot/attached volume in GB (skypilot; DO volume size). backend="cpu" provisions a cheap DigitalOcean CPU droplet (default 4 vCPU + 50GB volume, up to 48; --accelerators rejected)."""
+        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. allow_dirty=False refuses a dirty working tree (default snapshots the diff, FR-B1). disk_size sizes the boot/attached volume in GB (skypilot; DO volume size). cloud picks the skypilot cloud: vast (default) | do | gcp — GCP runs both CPU and GPU jobs (accelerators e.g. 'T4:1'/'L4:1', spot allowed). backend="cpu" provisions a cheap CPU box (DigitalOcean by default, cloud="gcp" to override; default 4 vCPU + 50GB volume, up to 48; --accelerators rejected)."""
         resources = ResourceRequest(
             cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
-            timeout=timeout, provision_timeout=provision_timeout, use_spot=use_spot,
+            cloud=cloud, timeout=timeout, provision_timeout=provision_timeout, use_spot=use_spot,
             spot_fallback=spot_fallback,
         )
         try:
@@ -118,6 +119,7 @@ def build_server(lab: Lab) -> FastMCP:
         gpus: int | None = None,
         disk_size: int | None = None,
         accelerators: str | None = None,
+        cloud: str | None = None,
         timeout: str | None = None,
         provision_timeout: str | None = None,
         with_pkg: list[str] | None = None,
@@ -129,12 +131,12 @@ def build_server(lab: Lab) -> FastMCP:
         results_file: str = "results.csv",
         seed_column: str = "seed",
     ) -> dict[str, Any]:
-        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5). with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. sweep_max_cost is an up-front admission cap: the sweep is refused if its total would exceed the daily budget (during-run enforcement is on register_sweep). disk_size sizes the boot/attached volume in GB (skypilot; DO volume size). backend="cpu" provisions a cheap DigitalOcean CPU droplet (default 4 vCPU + 50GB volume, up to 48; --accelerators rejected). With seeds + shard_size each cell's seeds are split into shards of at most shard_size, run as independent jobs (own timeout + teardown) and aggregated per cell; returns {sweep_id, cells:[{coords, shard_job_ids, aggregate_ref, seeds_expected, seeds_present, status}]}. results_file/seed_column name the per-run result table and its seed column."""
+        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5). with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. sweep_max_cost is an up-front admission cap: the sweep is refused if its total would exceed the daily budget (during-run enforcement is on register_sweep). disk_size sizes the boot/attached volume in GB (skypilot; DO volume size). cloud picks the skypilot cloud: vast (default) | do | gcp. backend="cpu" provisions a cheap CPU box (DigitalOcean by default, cloud="gcp" to override; default 4 vCPU + 50GB volume, up to 48; --accelerators rejected). With seeds + shard_size each cell's seeds are split into shards of at most shard_size, run as independent jobs (own timeout + teardown) and aggregated per cell; returns {sweep_id, cells:[{coords, shard_job_ids, aggregate_ref, seeds_expected, seeds_present, status}]}. results_file/seed_column name the per-run result table and its seed column."""
         from lab.scheduler.queue import default_queue
 
         resources = ResourceRequest(
             cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
-            timeout=timeout, provision_timeout=provision_timeout, use_spot=use_spot,
+            cloud=cloud, timeout=timeout, provision_timeout=provision_timeout, use_spot=use_spot,
             spot_fallback=spot_fallback,
         )
         try:
@@ -261,6 +263,7 @@ def build_server(lab: Lab) -> FastMCP:
         cpus: int | None = None,
         memory: str | None = None,
         accelerators: str | None = None,
+        cloud: str | None = None,
         timeout: str | None = None,
         window: str | None = None,
         tz: str = "UTC",
@@ -270,7 +273,7 @@ def build_server(lab: Lab) -> FastMCP:
         max_cost: float | None = None,
         after: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Register a deferred job: launched by the scheduler when all triggers hold (time window HH:MM-HH:MM, Vast price <= max_hourly $/h, after=reg_ids succeeded). expires (+3d / ISO) is the required run-by guardrail; worst-case cost = max_hourly x timeout."""
+        """Register a deferred job: launched by the scheduler when all triggers hold (time window HH:MM-HH:MM, Vast price <= max_hourly $/h, after=reg_ids succeeded). expires (+3d / ISO) is the required run-by guardrail; worst-case cost = max_hourly x timeout. cloud picks the skypilot cloud: vast (default) | do | gcp — max_hourly/offer_query gate on Vast offers and are rejected for other clouds."""
         from datetime import datetime
 
         if accelerators and timeout is None:
@@ -294,7 +297,7 @@ def build_server(lab: Lab) -> FastMCP:
             command=command,
             seed=seed,
             resources=ResourceRequest(
-                cpus=cpus, memory=memory, accelerators=accelerators, timeout=timeout
+                cpus=cpus, memory=memory, accelerators=accelerators, cloud=cloud, timeout=timeout
             ),
             submitted_by="agent",
         )
@@ -321,6 +324,7 @@ def build_server(lab: Lab) -> FastMCP:
         cpus: int | None = None,
         memory: str | None = None,
         accelerators: str | None = None,
+        cloud: str | None = None,
         timeout: str | None = None,
         window: str | None = None,
         tz: str = "UTC",
@@ -334,7 +338,8 @@ def build_server(lab: Lab) -> FastMCP:
         the always-on scheduler paces them (subject to triggers and the queue-wide max_concurrent
         control) and stops launching once finished-spend hits sweep_max_cost (it never kills a
         running point). grid is {key: [values]}. expires (+3d / ISO) is the required run-by
-        guardrail. Returns {sweep_id, count, reg_ids}."""
+        guardrail. cloud: vast (default) | do | gcp — max_hourly/offer_query are Vast-only.
+        Returns {sweep_id, count, reg_ids}."""
         from datetime import datetime
 
         if accelerators and timeout is None:
@@ -358,7 +363,8 @@ def build_server(lab: Lab) -> FastMCP:
             sweep_id, regs = sched_register_sweep(
                 lab.repo, queue, command, grid,
                 resources=ResourceRequest(
-                    cpus=cpus, memory=memory, accelerators=accelerators, timeout=timeout
+                    cpus=cpus, memory=memory, accelerators=accelerators, cloud=cloud,
+                    timeout=timeout
                 ),
                 triggers=triggers,
                 guardrails=Guardrails(expires_at=expires_at, max_cost_usd=max_cost),

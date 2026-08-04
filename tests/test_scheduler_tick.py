@@ -419,7 +419,7 @@ def test_watchdog_respawns_when_cluster_alive_within_timeout(tmp_path: Path):
     sched, q = _watchdog_sched(tmp_path)
     _skypilot_launched_reg(tmp_path, q, sched, started_ago_s=60)
     events: list[str] = []
-    sched._cluster_alive = lambda cluster: True  # type: ignore[method-assign]
+    sched._cluster_alive = lambda cluster, cloud="vast": True  # type: ignore[method-assign]
     sched._respawn_supervisor = lambda job_id: events.append(f"respawn:{job_id}")  # type: ignore[method-assign]
     sched.tick()
     assert events == ["respawn:j-sky"]
@@ -430,8 +430,8 @@ def test_watchdog_times_out_overdue_job(tmp_path: Path):
     sched, q = _watchdog_sched(tmp_path)
     _skypilot_launched_reg(tmp_path, q, sched, started_ago_s=2 * 3600, timeout="1h")
     events: list[str] = []
-    sched._cluster_alive = lambda cluster: True  # type: ignore[method-assign]
-    sched._teardown = lambda cluster, job_id: events.append(f"down:{cluster}") or True  # type: ignore[method-assign]
+    sched._cluster_alive = lambda cluster, cloud="vast": True  # type: ignore[method-assign]
+    sched._teardown = lambda cluster, job_id, cloud="vast": events.append(f"down:{cluster}") or True  # type: ignore[method-assign]
     sched.tick()
     assert events == ["down:lab-j-sky"]
     assert sched.store.read_manifest("j-sky").status.value == "timed_out"
@@ -441,7 +441,7 @@ def test_watchdog_times_out_overdue_job(tmp_path: Path):
 def test_watchdog_marks_failed_when_cluster_gone(tmp_path: Path):
     sched, q = _watchdog_sched(tmp_path)
     _skypilot_launched_reg(tmp_path, q, sched, started_ago_s=60)
-    sched._cluster_alive = lambda cluster: False  # type: ignore[method-assign]
+    sched._cluster_alive = lambda cluster, cloud="vast": False  # type: ignore[method-assign]
     sched.tick()
     m = sched.store.read_manifest("j-sky")
     assert m.status.value == "failed" and "supervisor died" in (m.end_reason or "")

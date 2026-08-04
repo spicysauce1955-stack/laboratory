@@ -197,6 +197,8 @@ def build_sweep_point_spec(
     )
 
 
+SUPPORTED_CLOUDS: tuple[str, ...] = ("vast", "do", "gcp")
+
 CPU_DEFAULT_CLOUD = "do"
 # Keep defaults within a fresh DigitalOcean account's tier: 8-vCPU sizes and a 256GB block volume
 # (SkyPilot's default disk_size) are both tier-restricted and fail provisioning until a tier bump.
@@ -204,28 +206,41 @@ CPU_DEFAULT_VCPUS = 4
 CPU_DEFAULT_DISK_GB = 50
 
 
+def validate_cloud(cloud: str | None) -> str | None:
+    """Reject cloud names outside :data:`SUPPORTED_CLOUDS` (None = the Vast default). Pure."""
+    if cloud is not None and cloud not in SUPPORTED_CLOUDS:
+        raise LabError(
+            f"unknown cloud {cloud!r}; supported: {', '.join(SUPPORTED_CLOUDS)} (default: vast)"
+        )
+    return cloud
+
+
 def resolve_backend_profile(
     backend: str, resources: ResourceRequest
 ) -> tuple[str, ResourceRequest]:
     """Resolve the ``cpu`` convenience backend into (provisioner_name, resources).
 
-    ``cpu`` is sugar for the SkyPilot provisioner on a cheap CPU cloud (DigitalOcean): it clears
-    accelerators, defaults to ``CPU_DEFAULT_VCPUS`` vCPUs, and disables spot (DO has none). Other
-    backends pass through unchanged (identity), so the CLI and MCP stay thin shells. Pure; no I/O.
+    ``cpu`` is sugar for the SkyPilot provisioner on a cheap CPU cloud (DigitalOcean by default,
+    overridable via ``resources.cloud``): it clears accelerators and defaults to
+    ``CPU_DEFAULT_VCPUS`` vCPUs. Spot is forced off only on DO (which has none) — GCP CPU jobs
+    may use preemptible. Other backends pass through unchanged (identity), so the CLI and MCP
+    stay thin shells. Pure; no I/O.
     """
+    validate_cloud(resources.cloud)
     if backend != "cpu":
         return backend, resources
     if resources.accelerators:
         raise LabError("--backend cpu provisions a CPU-only box; drop --accelerators")
-    return "skypilot", resources.model_copy(
-        update={
-            "cloud": CPU_DEFAULT_CLOUD,
-            "cpus": resources.cpus or CPU_DEFAULT_VCPUS,
-            "disk_size": resources.disk_size or CPU_DEFAULT_DISK_GB,
-            "use_spot": False,
-            "spot_fallback": False,
-        }
-    )
+    cloud = resources.cloud or CPU_DEFAULT_CLOUD
+    update: dict[str, Any] = {
+        "cloud": cloud,
+        "cpus": resources.cpus or CPU_DEFAULT_VCPUS,
+        "disk_size": resources.disk_size or CPU_DEFAULT_DISK_GB,
+    }
+    if cloud == "do":
+        update["use_spot"] = False
+        update["spot_fallback"] = False
+    return "skypilot", resources.model_copy(update=update)
 
 
 class Lab:
@@ -755,8 +770,10 @@ class Lab:
         SkyPilot's local registry — which may have already lost track of the rental). Without
         ``apply``, it's a dry run; no rentals are touched.
 
-        Raises :class:`LabError` if vastai-sdk is unavailable or the listing call fails — there is
-        no safe degraded mode for a leak-detection command.
+        A missing vastai-sdk (a DO/GCP-only install) skips the Vast-direct pass — the report
+        carries ``vast_pass`` explaining why — while the cloud-agnostic ``sky.status`` pass and
+        the DO volume pass still run. Any other listing failure raises :class:`LabError`: when
+        the SDK *is* present there is no safe degraded mode for a leak-detection command.
         """
         from lab.backends.skypilot import (  # local import: skypilot is an optional extra
             _instance_label,
@@ -764,12 +781,12 @@ class Lab:
             list_vast_instances,
         )
 
+        vast_pass = "ran"
         try:
             instances = list_vast_instances()
-        except ImportError as e:
-            raise LabError(
-                "vastai-sdk not installed; run `uv sync --extra skypilot` then retry"
-            ) from e
+        except ImportError:
+            instances = []
+            vast_pass = "skipped (vastai-sdk not installed)"
         except Exception as e:  # noqa: BLE001
             raise LabError(f"could not list Vast.ai rentals: {e}") from e
 
@@ -850,6 +867,7 @@ class Lab:
                         print(f"[lab] reconcile delete volume {vol_id} failed: {e}")
 
         return {
+            "vast_pass": vast_pass,
             "instances_total": len(instances),
             "orphans": orphans,
             "destroyed": destroyed,

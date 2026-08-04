@@ -282,7 +282,9 @@ def test_reconcile_tolerates_do_unconfigured(tmp_path: Path, monkeypatch: pytest
     assert report["do_volumes_destroyed"] == []
 
 
-def test_reconcile_propagates_import_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_reconcile_skips_vast_pass_without_sdk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A missing vastai-sdk (DO/GCP-only install) skips the Vast pass instead of failing —
+    the sky.status pass still provides cloud-agnostic leak detection."""
     repo = repo_root(Path.cwd())
     lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
 
@@ -290,8 +292,11 @@ def test_reconcile_propagates_import_error(tmp_path: Path, monkeypatch: pytest.M
         raise ImportError("no vastai-sdk")
 
     monkeypatch.setattr(skypilot_mod, "list_vast_instances", _boom)
-    with pytest.raises(LabError, match="vastai-sdk not installed"):
-        lab.reconcile()
+    _patch_empty_sky(monkeypatch)
+    monkeypatch.setattr(skypilot_mod, "list_do_volumes", lambda client=None: [])
+    report = lab.reconcile()
+    assert report["vast_pass"] == "skipped (vastai-sdk not installed)"
+    assert report["orphans"] == []
 
 
 def test_find_cached(tmp_path: Path):

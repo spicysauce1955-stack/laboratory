@@ -1,9 +1,11 @@
 """Scrub secrets from captured subprocess output before it reaches disk (FR-J1).
 
-SkyPilot/Vast log the Vast API key inside request URLs (``…?api_key=<key>``); that output is
-streamed into ``logs.txt`` (and would go to R2). :func:`redact` masks the value at capture time
-so the secret never lands on disk; :func:`install_log_redaction` wires it onto fds 1/2 in the
-supervisor so even subprocess output is filtered.
+SkyPilot/Vast log the Vast API key inside request URLs (``…?api_key=<key>``); gcloud/SkyPilot
+on GCP can log OAuth material (``"access_token": "ya29.…"``, refresh tokens, service-account
+``private_key`` JSON fields). That output is streamed into ``logs.txt`` (and would go to R2).
+:func:`redact` masks the value at capture time so the secret never lands on disk;
+:func:`install_log_redaction` wires it onto fds 1/2 in the supervisor so even subprocess output
+is filtered.
 """
 
 from __future__ import annotations
@@ -23,6 +25,14 @@ _PATTERNS = (
     # Mask the WHOLE header value (scheme + token), not just the first token: a real
     # `Authorization: Bearer <jwt>` has a space, so `\S+` would leave the token exposed.
     re.compile(r"(Authorization:[ \t]*).+", re.IGNORECASE),
+    # GCP JSON credential fields (OAuth responses, ADC files, service-account keys). The value
+    # class excludes `"` so the match stops at the closing quote and re-masks idempotently.
+    re.compile(
+        r'("(?:access_token|refresh_token|client_secret|id_token|private_key)"\s*:\s*")[^"]+',
+        re.IGNORECASE,
+    ),
+    # Bare OAuth2 access tokens (gcloud logs them outside JSON too, e.g. in curl commands).
+    re.compile(r"(ya29\.)[0-9A-Za-z_\-.]+"),
 )
 
 

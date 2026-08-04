@@ -113,6 +113,7 @@ def _parse_grid(items: list[str]) -> dict[str, list[str]]:
 def submit(
     command: str = typer.Option(..., "--command", "-c", help="entrypoint, e.g. 'python experiments/x.py'"),
     backend: str = typer.Option("local", "--backend", help="local | skypilot | cpu"),
+    cloud: str | None = typer.Option(None, "--cloud", help="vast | do | gcp (default vast; --backend cpu defaults to do)"),
     cache: bool = typer.Option(False, "--cache", help="reuse a prior succeeded identical job (FR-B5)"),
     seed: int | None = typer.Option(None, help="explicit seed (recorded in the manifest)"),
     code_ref: str = typer.Option("HEAD", help="git ref to pin"),
@@ -146,12 +147,12 @@ def submit(
     """
     resources = ResourceRequest(
         cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
-        timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
+        cloud=cloud, timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
         spot_fallback=not no_fallback,
     )
     try:
         provisioner, resources = resolve_backend_profile(backend, resources)
-    except LabError as e:  # e.g. --backend cpu with --accelerators (FR-F3)
+    except LabError as e:  # e.g. --backend cpu with --accelerators, unknown --cloud (FR-F3)
         _emit({"error": str(e)})
         raise typer.Exit(code=1) from e
     lab = _lab(provisioner)
@@ -212,6 +213,7 @@ def sweep(
     command: str = typer.Option(..., "--command", "-c", help="entrypoint, e.g. 'python experiments/x.py'"),
     grid: list[str] = typer.Option(..., "--grid", "-g", help="key=v1,v2,... (repeatable)"),
     backend: str = typer.Option("local", "--backend", help="local | skypilot | cpu"),
+    cloud: str | None = typer.Option(None, "--cloud", help="vast | do | gcp (default vast; --backend cpu defaults to do)"),
     seed: int | None = typer.Option(None),
     cpus: int | None = typer.Option(None),
     memory: str | None = typer.Option(None),
@@ -235,7 +237,7 @@ def sweep(
     """Submit a parameter-grid sweep: one job per point under a sweep_id (FR-A5)."""
     resources = ResourceRequest(
         cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
-        timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
+        cloud=cloud, timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
         spot_fallback=not no_fallback,
     )
     try:
@@ -476,11 +478,12 @@ def reconcile(
         False, "--apply", help="destroy orphaned rentals (default: dry-run report only)"
     ),
 ) -> None:
-    """Cross-check Vast.ai rentals against local jobs to find leaks (FR-C2).
+    """Cross-check cloud instances against local jobs to find leaks (FR-C2).
 
-    Dry-run by default. ``--apply`` destroys every Vast.ai rental whose label matches the lab
-    cluster pattern but has no live local job — use this to clean up after a teardown failure
-    (look for ``teardown_status: "failed"`` in ``lab status``). Exits 3 if orphans are found in
+    Dry-run by default. ``--apply`` destroys every Vast.ai rental and SkyPilot-tracked ``lab-*``
+    cluster (the ``sky.status`` pass covers DO/GCP) with no live local job — use this to clean up
+    after a teardown failure (look for ``teardown_status: "failed"`` in ``lab status``). The
+    Vast-direct pass is skipped when vastai-sdk isn't installed. Exits 3 if orphans are found in
     dry-run mode — re-run with --apply, or destroy by hand via ``vastai destroy_instance <id>``.
     """
     try:
@@ -489,7 +492,7 @@ def reconcile(
         _emit({"error": str(e)})
         raise typer.Exit(code=2) from e
     _emit(report)
-    if report["orphans"] and not apply:
+    if (report["orphans"] or report["sky_orphans"]) and not apply:
         raise typer.Exit(code=3)  # action required: re-run with --apply
 
 
@@ -516,6 +519,9 @@ def register(
     gpus: int | None = typer.Option(None),
     accelerators: str | None = typer.Option(
         None, "--gpu", "--accelerators", help="e.g. RTX_4090:1"
+    ),
+    cloud: str | None = typer.Option(
+        None, "--cloud", help="vast | do | gcp (default vast; price/offer triggers are Vast-only)"
     ),
     timeout: str | None = typer.Option(
         None, help="wall-clock limit per job, e.g. 2h (cost bound, FR-I1)"
@@ -568,8 +574,8 @@ def register(
         command=command,
         seed=seed,
         resources=ResourceRequest(
-            cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
-            use_spot=spot, spot_fallback=not no_fallback,
+            cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, cloud=cloud,
+            timeout=timeout, use_spot=spot, spot_fallback=not no_fallback,
         ),
         submitted_by="human",
     )
@@ -606,6 +612,9 @@ def register_sweep(
     gpus: int | None = typer.Option(None),
     accelerators: str | None = typer.Option(
         None, "--gpu", "--accelerators", help="e.g. RTX_4090:1"
+    ),
+    cloud: str | None = typer.Option(
+        None, "--cloud", help="vast | do | gcp (default vast; price/offer triggers are Vast-only)"
     ),
     timeout: str | None = typer.Option(
         None, help="wall-clock limit per job, e.g. 2h (cost bound, FR-I1)"
@@ -657,8 +666,8 @@ def register_sweep(
     )
     guardrails = Guardrails(expires_at=expires_at, max_cost_usd=max_cost)
     resources = ResourceRequest(
-        cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
-        use_spot=spot, spot_fallback=not no_fallback,
+        cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, cloud=cloud,
+        timeout=timeout, use_spot=spot, spot_fallback=not no_fallback,
     )
     try:
         sweep_id, regs = sched_register_sweep(
