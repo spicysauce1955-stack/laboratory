@@ -37,7 +37,10 @@ def test_aggregate_complete_cell(tmp_path: Path):
     assert c.seeds_present == [0, 1, 2, 3]
     assert c.missing_seeds == []
     agg = Path(c.aggregate_ref).read_text()
-    assert agg == "seed,acc\n0,0.0\n1,0.1\n2,0.2\n3,0.3\n"
+    assert agg == (
+        "seed,acc,_shard_status\n0,0.0,succeeded\n1,0.1,succeeded\n"
+        "2,0.2,succeeded\n3,0.3,succeeded\n"
+    )
 
 
 def test_aggregate_partial_failure_is_honest(tmp_path: Path):
@@ -53,7 +56,9 @@ def test_aggregate_partial_failure_is_honest(tmp_path: Path):
     assert c.status == "incomplete"
     assert c.seeds_present == [0, 1]
     assert c.missing_seeds == [2, 3]
-    assert Path(c.aggregate_ref).read_text() == "seed,acc\n0,0.0\n1,0.1\n"
+    assert Path(c.aggregate_ref).read_text() == (
+        "seed,acc,_shard_status\n0,0.0,succeeded\n1,0.1,succeeded\n"
+    )
 
 
 def test_aggregate_is_idempotent_and_resumable(tmp_path: Path):
@@ -66,3 +71,97 @@ def test_aggregate_is_idempotent_and_resumable(tmp_path: Path):
     _write_shard_result(lab, cell.shard_job_ids[1], [2, 3])  # second shard finishes later
     second = lab.aggregate_sweep(sweep_id).cells[0]
     assert second.status == "complete" and second.seeds_present == [0, 1, 2, 3]
+
+
+def _write_partial_result(lab: Lab, job_id: str, seeds: list[int], status: JobState) -> None:
+    """A shard that reached a non-succeeded terminal state but left rows on disk
+    (heartbeat-rsynced partial output)."""
+    out = lab.store.output_dir(job_id)
+    out.mkdir(parents=True, exist_ok=True)
+    lines = ["seed,acc"] + [f"{s},0.{s}" for s in seeds]
+    (out / "results.csv").write_text("\n".join(lines) + "\n")
+    lab.store.update_manifest(job_id, status=status)
+
+
+def test_aggregate_includes_timed_out_shard_rows_by_default(tmp_path: Path):
+    """Field-report #2: rows the user already paid for must not be discarded."""
+    lab = _lab(tmp_path)
+    sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0-3", shard_size=2)
+    cell = lab.sweep_plan(sweep_id).cells[0]
+    _write_shard_result(lab, cell.shard_job_ids[0], [0, 1])
+    _write_partial_result(lab, cell.shard_job_ids[1], [2], JobState.timed_out)  # 1 of 2 seeds
+
+    c = lab.aggregate_sweep(sweep_id).cells[0]
+    assert c.seeds_present == [0, 1, 2]
+    assert c.seeds_partial == [2]
+    assert c.missing_seeds == [3]
+    assert c.status == "incomplete"
+    agg = Path(c.aggregate_ref).read_text()
+    assert "2,0.2,timed_out" in agg and "0,0.0,succeeded" in agg
+
+
+def test_aggregate_strict_excludes_partial_shards(tmp_path: Path):
+    lab = _lab(tmp_path)
+    sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0-3", shard_size=2)
+    cell = lab.sweep_plan(sweep_id).cells[0]
+    _write_shard_result(lab, cell.shard_job_ids[0], [0, 1])
+    _write_partial_result(lab, cell.shard_job_ids[1], [2], JobState.timed_out)
+
+    c = lab.aggregate_sweep(sweep_id, include_partial=False).cells[0]
+    assert c.seeds_present == [0, 1]
+    assert c.seeds_partial == []
+    assert c.missing_seeds == [2, 3]
+
+
+def test_aggregate_excludes_running_shard(tmp_path: Path):
+    """A running shard's file is still moving under the heartbeat — never read it."""
+    lab = _lab(tmp_path)
+    sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0-1", shard_size=1)
+    cell = lab.sweep_plan(sweep_id).cells[0]
+    _write_shard_result(lab, cell.shard_job_ids[0], [0])
+    out = lab.store.output_dir(cell.shard_job_ids[1])
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "results.csv").write_text("seed,acc\n1,0.1\n")
+    lab.store.update_manifest(cell.shard_job_ids[1], status=JobState.running)
+
+    c = lab.aggregate_sweep(sweep_id).cells[0]
+    assert c.seeds_present == [0] and c.missing_seeds == [1]
+
+
+def test_aggregate_excludes_unconsumed_config_shard(tmp_path: Path):
+    """Cross-fix guard via the REAL path: a timed-out shard whose effective_config.json shows
+    it never consumed a passed override has its rows excluded (wrong-config rows are what the
+    fail-closed check exists to kill; the audit records on every terminal transition)."""
+    import json as _json
+
+    lab = _lab(tmp_path)
+    sweep_id, _ = lab.sweep("true N=1000", {}, seeds="0-1", shard_size=1)
+    cell = lab.sweep_plan(sweep_id).cells[0]
+    _write_shard_result(lab, cell.shard_job_ids[0], [0])
+    # shard 2 wrote rows + an effective config that consumed only `seeds` — the argv-passed
+    # `N` went unconsumed. It then timed out; the terminal audit records unconsumed_config.
+    out = lab.store.output_dir(cell.shard_job_ids[1])
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "results.csv").write_text("seed,acc\n1,0.1\n")
+    (out / "effective_config.json").write_text(_json.dumps({"seeds": "1"}))
+    m = lab.store.update_manifest(cell.shard_job_ids[1], status=JobState.timed_out)
+    assert m.unconsumed_config == ["N"]  # recorded without flipping the timed_out verdict
+    assert m.status is JobState.timed_out
+
+    c = lab.aggregate_sweep(sweep_id).cells[0]
+    assert c.seeds_present == [0] and c.missing_seeds == [1]
+
+
+def test_old_plan_json_reads_with_default_seeds_partial(tmp_path: Path):
+    """plan.json written before seeds_partial existed must still read (backward compat)."""
+    import json as _json
+
+    lab = _lab(tmp_path)
+    sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0-1", shard_size=1)
+    p = lab.store.sweep_plan_path(sweep_id)
+    raw = _json.loads(p.read_text())
+    for c in raw["cells"]:
+        c.pop("seeds_partial", None)
+    p.write_text(_json.dumps(raw))
+    plan = lab.sweep_plan(sweep_id)
+    assert plan.cells[0].seeds_partial == []

@@ -29,6 +29,7 @@ def test_tools_registered(tmp_path: Path):
     assert asyncio.run(go()) == [
         "cancel",
         "confirm",
+        "export",
         "fetch_artifacts",
         "list",
         "logs",
@@ -57,7 +58,9 @@ def test_sweep_tool(tmp_path: Path):
         async with Client(server) as c:
             r = await c.call_tool(
                 "sweep",
-                {"command": f"{PYTHON} experiments/example_capacity.py", "grid": {"K": [1, 2]}},
+                # "steps" is a key the entrypoint consumes — sweeping an unconsumed key now
+                # correctly fails the jobs (the field-report #1 fail-closed contract).
+                {"command": f"{PYTHON} experiments/example_capacity.py", "grid": {"steps": [3, 5]}},
             )
             return r.data
 
