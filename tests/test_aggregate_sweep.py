@@ -129,13 +129,24 @@ def test_aggregate_excludes_running_shard(tmp_path: Path):
 
 
 def test_aggregate_excludes_unconsumed_config_shard(tmp_path: Path):
-    """Cross-fix guard: wrong-config rows (fix A) are not rescued by partial inclusion."""
+    """Cross-fix guard via the REAL path: a timed-out shard whose effective_config.json shows
+    it never consumed a passed override has its rows excluded (wrong-config rows are what the
+    fail-closed check exists to kill; the audit records on every terminal transition)."""
+    import json as _json
+
     lab = _lab(tmp_path)
-    sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0-1", shard_size=1)
+    sweep_id, _ = lab.sweep("true N=1000", {}, seeds="0-1", shard_size=1)
     cell = lab.sweep_plan(sweep_id).cells[0]
     _write_shard_result(lab, cell.shard_job_ids[0], [0])
-    _write_partial_result(lab, cell.shard_job_ids[1], [1], JobState.failed)
-    lab.store.update_manifest(cell.shard_job_ids[1], unconsumed_config=["typo"])
+    # shard 2 wrote rows + an effective config that consumed only `seeds` — the argv-passed
+    # `N` went unconsumed. It then timed out; the terminal audit records unconsumed_config.
+    out = lab.store.output_dir(cell.shard_job_ids[1])
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "results.csv").write_text("seed,acc\n1,0.1\n")
+    (out / "effective_config.json").write_text(_json.dumps({"seeds": "1"}))
+    m = lab.store.update_manifest(cell.shard_job_ids[1], status=JobState.timed_out)
+    assert m.unconsumed_config == ["N"]  # recorded without flipping the timed_out verdict
+    assert m.status is JobState.timed_out
 
     c = lab.aggregate_sweep(sweep_id).cells[0]
     assert c.seeds_present == [0] and c.missing_seeds == [1]

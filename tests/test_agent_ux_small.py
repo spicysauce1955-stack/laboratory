@@ -44,12 +44,22 @@ def test_cli_sweep_seeds_only_no_grid():
 
 
 def test_cli_sweep_requires_grid_or_seeds():
-    seen: dict = {}
-    with patch.object(cli_mod, "_lab", return_value=_fake_sweep_lab(seen)):
-        result = CliRunner().invoke(app, ["sweep", "-c", "python x.py"])
+    # The guard lives in Lab.sweep (thin-shell rule: one implementation for CLI+MCP);
+    # here the real core raises LabError before anything is submitted.
+    result = CliRunner().invoke(app, ["sweep", "-c", "python x.py"])
     assert result.exit_code == 1
     assert "--grid" in result.output and "--seeds" in result.output
-    assert seen == {}  # nothing submitted
+
+
+def test_core_sweep_requires_grid_or_seeds(tmp_path):
+    import pytest as _pytest
+
+    from lab.backends.local import LocalBackend
+    from lab.core import Lab, LabError
+
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=tmp_path), repo=tmp_path, home=tmp_path)
+    with _pytest.raises(LabError, match="at least one axis"):
+        lab.sweep("python x.py", {})
 
 
 # ---------------------------------------------------------------------------

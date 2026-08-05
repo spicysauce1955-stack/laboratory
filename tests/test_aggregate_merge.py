@@ -60,9 +60,11 @@ def test_merge_cross_shard_duplicate_prefers_succeeded():
 
 
 def test_merge_equal_status_last_submitted_wins():
+    """Among equally-partial shards (e.g. a timed-out original and a timed-out retry), the
+    later-submitted row wins — succeeded+succeeded duplicates raise instead (contract)."""
     a = "seed,acc\n0,0.1\n"
     b = "seed,acc\n0,0.2\n"
-    merged, present, _ = merge_seed_rows([(a, "succeeded"), (b, "succeeded")], "seed")
+    merged, present, _ = merge_seed_rows([(a, "timed_out"), (b, "timed_out")], "seed")
     assert "0.2" in merged and "0.1" not in merged
     assert present == [0]
 
@@ -99,3 +101,12 @@ def test_merge_preserves_embedded_comma_value():
     assert rows[0] == ["seed", "note", "_shard_status"]
     assert rows[1] == ["0", "foo,bar", "succeeded"]
     assert rows[2] == ["1", "plain", "succeeded"]
+
+
+def test_merge_duplicate_across_succeeded_shards_raises():
+    """Two SUCCEEDED shards claiming the same seed is a sharding-contract violation (each seed
+    belongs to exactly one shard) — restore the loud tripwire (CR finding; commit 08d92ca)."""
+    a = "seed,acc\n0,0.1\n"
+    b = "seed,acc\n0,0.2\n"
+    with pytest.raises(ValueError, match="succeeded"):
+        merge_seed_rows([(a, "succeeded"), (b, "succeeded")], "seed")

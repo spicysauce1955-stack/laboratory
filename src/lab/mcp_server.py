@@ -147,8 +147,6 @@ def build_server(lab: Lab) -> FastMCP:
             provisioner, resources = resolve_backend_profile(backend, resources)
         except LabError as e:
             raise ToolError(str(e)) from e
-        if not grid and not seeds:
-            raise ToolError("pass grid and/or seeds (a sweep needs at least one axis)")
         the_lab = _lab(provisioner)
         try:
             sweep_id, job_ids = the_lab.sweep(

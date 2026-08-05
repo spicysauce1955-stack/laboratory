@@ -237,6 +237,8 @@ to 600s); it returns the same summary shape as `done.json`.
   `lab reconcile` immediately (see §6.F below).
 - `4` — `--fail-fast` tripped: a job hit `failed`/`timed_out` while others still run.
   The summary's `pending` lists the survivors (still billing); nothing was cancelled.
+  **Exception:** if the dead job's teardown is already a confirmed leak, exit is `3`, not
+  `4` — the money alarm always outranks the fail-fast signal.
 
 `--done-file` is atomically rewritten after **each** job reaches a terminal state (with a
 `pending` list), so a watcher can react mid-wait instead of waiting for process exit.

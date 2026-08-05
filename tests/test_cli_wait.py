@@ -305,3 +305,62 @@ def test_cli_wait_bad_timeout_string_is_usage_error(monkeypatch, tmp_path):
     _patch_store(monkeypatch, tmp_path, _FakeLab())
     result = CliRunner().invoke(app, ["wait", "j1", "--timeout", "2hr"])
     assert result.exit_code == 2
+
+
+def test_cli_wait_fail_fast_with_confirmed_leak_exits_3(monkeypatch, tmp_path):
+    """A confirmed teardown leak coincident with --fail-fast must keep the URGENT exit 3 —
+    the leak alarm outranks the fail-fast signal (CR finding; FR-C2)."""
+    monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+    leaked = make_manifest("j1", "python x.py").model_copy(
+        update={"status": JobState.failed, "backend": BackendInfo(provisioner="skypilot"),
+                "teardown_status": "failed"}
+    )
+
+    class _FakeLab(_SummaryMixin):
+        wait = Lab.wait
+
+        def status(self, job_id):
+            return JobState.failed if job_id == "j1" else JobState.running
+
+        def manifest(self, job_id):
+            if job_id == "j1":
+                return leaked
+            return make_manifest("j2", "python x.py").model_copy(
+                update={"status": JobState.running,
+                        "backend": BackendInfo(provisioner="skypilot")}
+            )
+
+    _patch_store(monkeypatch, tmp_path, _FakeLab())
+    result = CliRunner().invoke(app, ["wait", "j1", "j2", "--fail-fast", "--timeout", "5"])
+    assert result.exit_code == 3  # leak alarm wins over fail-fast's 4
+
+
+def test_wait_summary_settles_offender_teardown_on_fail_fast(monkeypatch, tmp_path):
+    """On the fail-fast path the offender's lagging teardown_status must still settle —
+    a merely-lagging null would otherwise read as unconfirmed instead of its real value."""
+    monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+    lagging = make_manifest("j1", "python x.py").model_copy(
+        update={"status": JobState.failed, "backend": BackendInfo(provisioner="skypilot"),
+                "teardown_status": None}
+    )
+    settled = lagging.model_copy(update={"teardown_status": "failed"})
+    reads = {"n": 0}
+
+    class _FakeLab(_SummaryMixin):
+        wait = Lab.wait
+
+        def status(self, job_id):
+            return JobState.failed if job_id == "j1" else JobState.running
+
+        def manifest(self, job_id):
+            if job_id != "j1":
+                return make_manifest("j2", "python x.py").model_copy(
+                    update={"status": JobState.running,
+                            "backend": BackendInfo(provisioner="skypilot")}
+                )
+            reads["n"] += 1
+            return lagging if reads["n"] <= 2 else settled  # settles on a later re-read
+
+    summary = _FakeLab().wait_summary(["j1", "j2"], interval=0.01, timeout=5, fail_fast=True)
+    assert summary["failed_fast"] is True
+    assert summary["teardown_leaks"] == ["j1"]  # settled to its real value, not unconfirmed

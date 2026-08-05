@@ -221,9 +221,6 @@ def sweep(
 ) -> None:
     """Submit a parameter-grid sweep: one job per point under a sweep_id (FR-A5). A seeds-only
     sweep (no --grid) is one cell sharded over --seeds."""
-    if not grid and not seeds:
-        _emit({"error": "pass --grid and/or --seeds (a sweep needs at least one axis)"})
-        raise typer.Exit(code=1)
     resources = ResourceRequest(
         cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
         cloud=cloud, timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
@@ -464,7 +461,9 @@ def wait(
             err=True,
         )
     if summary["failed_fast"]:
-        raise typer.Exit(code=4)  # a job definitively died; survivors keep running
+        # A confirmed leak outranks the fail-fast signal: exit 3 is the documented URGENT
+        # "a paid machine may still be billing — run `lab reconcile` now" alarm (FR-C2).
+        raise typer.Exit(code=3 if teardown_leaks else 4)
     if not all_terminal:
         raise typer.Exit(code=1)
     if teardown_leaks:

@@ -71,6 +71,14 @@ def merge_seed_rows(
             row = dict(zip(header, raw))
             candidate = (1 if strict else 0, order, status, row)
             incumbent = winners.get(seed_val)
+            if incumbent is not None and incumbent[0] == 1 and candidate[0] == 1:
+                # Two SUCCEEDED shards claiming one seed can only mean a sharding-contract
+                # violation (each seed belongs to exactly one shard) — fail loud, don't absorb.
+                # Partial/retry overlap (either side non-succeeded) stays silently resolved.
+                raise ValueError(
+                    f"duplicate seed {seed_val} across two succeeded shards "
+                    "(sharding contract violation)"
+                )
             if incumbent is None or candidate[:2] >= incumbent[:2]:
                 winners[seed_val] = candidate
     if header is None or not winners:

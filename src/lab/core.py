@@ -415,6 +415,10 @@ class Lab:
         seed subset appended under ``seed_axis_key`` (e.g. ``seeds=0,1``). A ``SweepPlan`` is
         persisted for aggregation/retry. ``seeds`` absent ⇒ today's behavior, no plan written.
         """
+        if not grid and seeds is None:
+            # One guard for every shell (thin-shell rule): a "sweep" with no axis would silently
+            # run a single empty point instead of the fan-out the caller asked for.
+            raise LabError("pass --grid and/or --seeds (a sweep needs at least one axis)")
         cells = expand_grid(grid)
         if seeds is None:
             return self._sweep_unsharded(
@@ -626,8 +630,9 @@ class Lab:
                 shard_missing = [s for s in shard if s not in present]
                 if not shard_missing:
                     continue  # this shard's seeds are already covered
-                if any(set(shard_missing) <= flight for flight in in_flight_seed_sets):
-                    continue  # a live retry already covers these seeds — don't duplicate
+                in_flight_union: set[int] = set().union(*in_flight_seed_sets) if in_flight_seed_sets else set()
+                if set(shard_missing) <= in_flight_union:
+                    continue  # live retries already cover these seeds (jointly) — don't duplicate
                 point = {**cell.coords, plan.seed_axis_key: seeds_to_arg(shard_missing)}
                 spec = build_sweep_point_spec(
                     plan.command, point, seed=shard_missing[0], resources=base_resources,
@@ -1123,7 +1128,12 @@ class Lab:
         shows a null teardown."""
 
         def _unsettled(ms: list[JobManifest]) -> bool:
-            return any(m.backend.provisioner != "local" and m.teardown_status is None for m in ms)
+            return any(
+                m.status in _TERMINAL_STATES  # only terminal jobs can settle; pending never will
+                and m.backend.provisioner != "local"
+                and m.teardown_status is None
+                for m in ms
+            )
 
         for _ in range(attempts):
             if not _unsettled(manifests):
@@ -1204,7 +1214,9 @@ class Lab:
         failed_fast = fail_fast and not all_terminal and any(
             m.status in (JobState.failed, JobState.timed_out) for m in manifests
         )
-        if all_terminal:
+        if all_terminal or failed_fast:
+            # Settle on the fail-fast path too: the offender's teardown_status may be merely
+            # lagging, and a null must not hide a real leak verdict behind "unconfirmed".
             manifests = self._settle_teardown(manifests, interval=interval)
         summary = self._wait_summary_dict(manifests, failed_fast=failed_fast)
         if on_update is not None:

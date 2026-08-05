@@ -18,6 +18,13 @@ from lab._util import atomic_write_text
 from lab.metrics import snapshot_final_metrics
 from lab.models import JobManifest, JobState, SweepPlan
 
+_TERMINAL_STATES = frozenset(
+    {
+        JobState.succeeded, JobState.failed, JobState.cancelled,
+        JobState.timed_out, JobState.preempted,
+    }
+)
+
 
 def cell_id_for(coords: dict[str, Any]) -> str:
     """Deterministic, order-independent 8-hex id for a cell's non-seed coordinates."""
@@ -82,17 +89,26 @@ class JobStore:
             fm = snapshot_final_metrics(self.output_dir(job_id))
             if fm:
                 updated = updated.model_copy(update={"final_metrics": fm})
-        if updated.status is JobState.succeeded and updated.config_effective is None:
-            updated = self._audit_effective_config(job_id, updated)
+        if updated.status in _TERMINAL_STATES and updated.config_effective is None:
+            updated = self._audit_effective_config(
+                job_id, updated, flip=updated.status is JobState.succeeded
+            )
         self.write_manifest(updated)
         return updated
 
-    def _audit_effective_config(self, job_id: str, updated: JobManifest) -> JobManifest:
+    def _audit_effective_config(
+        self, job_id: str, updated: JobManifest, *, flip: bool
+    ) -> JobManifest:
         """The unconsumed-config check (see ``update_manifest``); pure function of output/.
 
         Audits the ``key=value`` overrides actually passed on the command line (parsed from
         ``entrypoint_command``) — NOT ``resolved_config``, which plain ``submit`` records as
-        metadata without ever putting it on the argv."""
+        metadata without ever putting it on the argv.
+
+        Runs on EVERY terminal transition so ``unconsumed_config`` is populated for timed-out/
+        failed shards too (the aggregator's wrong-config guard depends on it); only a succeeded
+        verdict is flipped to ``failed`` (``flip=True``) — the others already aren't successes.
+        """
         import shlex
 
         from lab.experiment import parse_overrides, read_effective_config
@@ -100,9 +116,11 @@ class JobStore:
         try:
             eff = read_effective_config(self.output_dir(job_id))
         except ValueError as e:
-            return updated.model_copy(
-                update={"status": JobState.failed, "end_reason": str(e)[:300]}
-            )
+            if flip:
+                return updated.model_copy(
+                    update={"status": JobState.failed, "end_reason": str(e)[:300]}
+                )
+            return updated  # already non-succeeded; corrupt evidence can't be recorded
         if eff is None:
             return updated  # legacy entrypoint — nothing reported, nothing to audit
         passed = set(parse_overrides(shlex.split(updated.run.entrypoint_command)))
@@ -111,7 +129,7 @@ class JobStore:
         updated = updated.model_copy(
             update={"config_effective": eff, "unconsumed_config": unconsumed}
         )
-        if unconsumed and not updated.run.allow_unknown_config:
+        if flip and unconsumed and not updated.run.allow_unknown_config:
             reason = (
                 f"unconsumed config keys: {unconsumed} — the entrypoint never consumed them "
                 "(fix the key/script, or pass allow_unknown_config to override)"
