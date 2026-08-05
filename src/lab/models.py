@@ -65,6 +65,9 @@ class RunSpec(BaseModel):
     entrypoint_command: str
     resolved_config: dict[str, Any] = Field(default_factory=dict)
     seed: int  # explicit + recorded (FR-B4)
+    # Persisted on the manifest so the store's succeeded-transition audit can read it (the
+    # unconsumed-config fail-closed check; see JobStore.update_manifest).
+    allow_unknown_config: bool = False
 
 
 class BackendInfo(BaseModel):
@@ -112,6 +115,7 @@ class JobSpec(BaseModel):
     seed: int | None = None
     resources: ResourceRequest = Field(default_factory=ResourceRequest)
     submitted_by: Submitter = "agent"
+    allow_unknown_config: bool = False  # opt out of the unconsumed-config fail-closed check
 
 
 class JobManifest(BaseModel):
@@ -142,6 +146,10 @@ class JobManifest(BaseModel):
     artifacts_uri: str | None = None  # durable object-store prefix, e.g. r2://lab-artifacts/<id>
     artifacts: list[ArtifactRecord] = Field(default_factory=list)
     final_metrics: dict[str, float] = Field(default_factory=dict)  # last value per series (FR-B4)
+    # Config-consumption handshake (field-report #1/#6): what the entrypoint reported it actually
+    # consumed (None = never reported, ≠ {} = reported empty), and the submitted keys it ignored.
+    config_effective: dict[str, Any] | None = None
+    unconsumed_config: list[str] = Field(default_factory=list)
 
 
 class SweepCell(BaseModel):
@@ -161,6 +169,8 @@ class SweepCell(BaseModel):
     seed_column: str
     aggregate_ref: str
     seeds_present: list[int] = Field(default_factory=list)
+    # Seeds whose rows came only from non-succeeded shards (partial recovery, field-report #2).
+    seeds_partial: list[int] = Field(default_factory=list)
     missing_seeds: list[int] = Field(default_factory=list)
     status: Literal["pending", "complete", "incomplete"] = "pending"
 
@@ -186,6 +196,7 @@ class SweepPlan(BaseModel):
                     "aggregate_ref": c.aggregate_ref,
                     "seeds_expected": len(c.seeds_expected),
                     "seeds_present": len(c.seeds_present),
+                    "seeds_partial": c.seeds_partial,  # full list — actionable, like missing
                     "missing_seeds": c.missing_seeds,
                     "status": c.status,
                 }

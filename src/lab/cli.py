@@ -12,7 +12,7 @@ from typing import Any
 
 import typer
 
-from lab._util import now, wrap_with_extras
+from lab._util import atomic_write_text, now, parse_duration, wrap_with_extras
 from lab.core import Lab, LabError, default_lab, job_status_view, resolve_backend_profile
 from lab.manifest import repo_root
 from lab.models import JobSpec, ResourceRequest
@@ -113,6 +113,10 @@ def submit(
         False, "--no-dirty",
         help="refuse to launch from a dirty working tree (default: snapshot the diff, FR-B1)",
     ),
+    allow_unknown_config: bool = typer.Option(
+        False, "--allow-unknown-config",
+        help="don't fail the job when the entrypoint reports it ignored some config keys",
+    ),
 ) -> None:
     """Submit a job without blocking; prints {job_id, cached, status} (FR-A1).
 
@@ -138,6 +142,7 @@ def submit(
         seed=seed,
         resources=resources,
         submitted_by="human",
+        allow_unknown_config=allow_unknown_config,
     )
     if cache and (cached_id := lab.find_cached(spec)) is not None:
         _emit({"job_id": cached_id, "cached": True, "status": lab.status(cached_id).value})
@@ -187,7 +192,7 @@ def confirm(
 @app.command()
 def sweep(
     command: str = typer.Option(..., "--command", "-c", help="entrypoint, e.g. 'python experiments/x.py'"),
-    grid: list[str] = typer.Option(..., "--grid", "-g", help="key=v1,v2,... (repeatable)"),
+    grid: list[str] = typer.Option([], "--grid", "-g", help="key=v1,v2,... (repeatable; optional when --seeds is given)"),
     backend: str = typer.Option("local", "--backend", help="local | skypilot | cpu"),
     cloud: str | None = typer.Option(None, "--cloud", help="vast | do | gcp (default vast; --backend cpu defaults to do)"),
     seed: int | None = typer.Option(None),
@@ -209,8 +214,16 @@ def sweep(
     shard_size: int | None = typer.Option(None, "--shard-size", help="max seeds per sub-job; each cell's seeds are split into shards of this size"),
     results_file: str = typer.Option("results.csv", "--results-file", help="per-run row-structured result file to aggregate per cell"),
     seed_column: str = typer.Option("seed", "--seed-column", help="column in --results-file identifying each row's seed"),
+    allow_unknown_config: bool = typer.Option(
+        False, "--allow-unknown-config",
+        help="don't fail jobs when the entrypoint reports it ignored some config keys",
+    ),
 ) -> None:
-    """Submit a parameter-grid sweep: one job per point under a sweep_id (FR-A5)."""
+    """Submit a parameter-grid sweep: one job per point under a sweep_id (FR-A5). A seeds-only
+    sweep (no --grid) is one cell sharded over --seeds."""
+    if not grid and not seeds:
+        _emit({"error": "pass --grid and/or --seeds (a sweep needs at least one axis)"})
+        raise typer.Exit(code=1)
     resources = ResourceRequest(
         cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
         cloud=cloud, timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
@@ -240,6 +253,7 @@ def sweep(
             shard_size=shard_size,
             results_file=results_file,
             seed_column=seed_column,
+            allow_unknown_config=allow_unknown_config,
         )
     except LabError as e:
         _emit({"error": str(e)})
@@ -249,6 +263,49 @@ def sweep(
         _emit(plan.view())
     else:
         _emit({"sweep_id": sweep_id, "count": len(job_ids), "job_ids": job_ids})
+
+
+@app.command()
+def export(
+    target_id: str = typer.Argument(..., help="a job id or a sweep-... id"),
+    to: Path = typer.Option(..., "--to", help="destination directory for the bundle"),
+    logs: bool = typer.Option(False, "--logs", help="also include per-job logs.txt (redacted)"),
+) -> None:
+    """Export a committable provenance bundle: manifests + result tables + resolved config +
+    code diffs (+ sweep plan/aggregates), with an index.json tying files to commits and spend.
+
+    The part of git-ignored runs/ that belongs in version control next to the paper — excluded
+    blobs are listed in the index under `skipped`, never silently dropped (field-report #5).
+    """
+    try:
+        _emit(_lab().export(target_id, to, include_logs=logs))
+    except LabError as e:
+        _emit({"error": str(e)})
+        raise typer.Exit(code=1) from e
+
+
+@app.command()
+def lint(
+    command: str = typer.Option(..., "--command", "-c", help="entrypoint, e.g. 'python experiments/x.py'"),
+    grid: list[str] = typer.Option([], "--grid", "-g", help="key=v1,v2,... (repeatable)"),
+    key: list[str] = typer.Option([], "--key", help="extra override key(s) to check (repeatable)"),
+) -> None:
+    """Pre-submit check: warn about override keys the entrypoint source never references.
+
+    A heuristic grep for legacy entrypoints that don't write effective_config.json — catches the
+    silent-dropped-override trap (field-report #1) before money is spent. Exits 1 on findings.
+    """
+    from lab.experiment import unreferenced_keys
+
+    script = next((tok for tok in command.split() if tok.endswith(".py")), None)
+    if script is None or not Path(script).exists():
+        _emit({"error": f"could not find a .py entrypoint in {command!r} to lint"})
+        raise typer.Exit(code=2)
+    keys = list(_parse_grid(grid)) + list(key)
+    missing = unreferenced_keys(Path(script).read_text(), keys)
+    _emit({"script": script, "checked_keys": sorted(keys), "missing_keys": missing})
+    if missing:
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -299,10 +356,18 @@ def sweep_status(sweep_id: str) -> None:
 
 
 @app.command(name="sweep-aggregate")
-def sweep_aggregate(sweep_id: str) -> None:
-    """Row-concatenate each cell's succeeded shards into one per-cell result (P1-2)."""
+def sweep_aggregate(
+    sweep_id: str,
+    strict: bool = typer.Option(
+        False, "--strict",
+        help="only aggregate succeeded shards (exclude recovered rows from timed-out/failed "
+        "shards; those rows carry a _shard_status column and show up in seeds_partial)",
+    ),
+) -> None:
+    """Row-concatenate each cell's shard results into one per-cell result (P1-2). By default
+    partial rows from non-succeeded shards are included (stamped + listed in seeds_partial)."""
     try:
-        plan = _lab().aggregate_sweep(sweep_id)
+        plan = _lab().aggregate_sweep(sweep_id, include_partial=not strict)
     except LabError as e:
         _emit({"error": str(e)})
         raise typer.Exit(code=1) from e
@@ -344,16 +409,30 @@ def wait(
     job_ids: list[str] = typer.Argument(None, help="job id(s) to wait for"),
     sweep: str | None = typer.Option(None, "--sweep", help="wait for all jobs in this sweep_id"),
     interval: float = typer.Option(10.0, help="seconds between cheap status polls (FR-G2)"),
-    timeout: float | None = typer.Option(None, help="give up after N seconds"),
+    timeout: str | None = typer.Option(
+        None, help="give up after this long, e.g. 600 / '10m' / '2h' (bare numbers = seconds)"
+    ),
     done_file: Path | None = typer.Option(
-        None, "--done-file", help="write the final summary here on completion (a sentinel a hook can watch)"
+        None, "--done-file",
+        help="summary JSON a hook can watch — atomically rewritten after each job finishes "
+        "(carries `pending`), and finally with the complete verdict",
+    ),
+    fail_fast: bool = typer.Option(
+        False, "--fail-fast",
+        help="exit 4 as soon as any job is failed/timed_out (preempted/cancelled don't trip it); "
+        "surviving jobs are NOT cancelled — `pending` in the summary names them",
     ),
 ) -> None:
     """Block until the job(s) reach a terminal state, then exit (FR-G1).
 
     Run as a Claude Code background task — its completion is the push signal the session acts on,
-    so the agent need not poll. Exits non-zero if it gave up on a timeout.
+    so the agent need not poll. Exit codes: 0 clean; 1 gave up on --timeout; 2 bad args;
+    3 teardown leaked (a paid machine may still bill); 4 --fail-fast tripped.
     """
+    try:
+        timeout_s = parse_duration(timeout)
+    except ValueError as e:
+        raise typer.BadParameter(f"bad --timeout {timeout!r}: {e}") from e
     ids = _lab().jobs_in_sweep(sweep) if sweep else list(job_ids or [])
     if not ids:
         msg = f"sweep {sweep!r} matched no jobs" if sweep else "pass job id(s) or --sweep <sweep_id>"
@@ -365,13 +444,18 @@ def wait(
         _emit({"error": f"unknown job id(s): {missing}"})
         raise typer.Exit(code=2)
     the_lab = _lab_for(ids[0])
-    summary = the_lab.wait_summary(ids, interval=interval, timeout=timeout)
+    on_update = (
+        (lambda s: atomic_write_text(done_file, json.dumps(s, indent=2, default=str)))
+        if done_file is not None
+        else None
+    )
+    summary = the_lab.wait_summary(
+        ids, interval=interval, timeout=timeout_s, fail_fast=fail_fast, on_update=on_update
+    )
     all_terminal = summary["all_terminal"]
     teardown_leaks = summary["teardown_leaks"]
     teardown_unconfirmed = summary["teardown_unconfirmed"]
     _emit(summary)
-    if done_file is not None:
-        done_file.write_text(json.dumps(summary, indent=2, default=str))
     if teardown_unconfirmed and not teardown_leaks:
         typer.echo(
             f"[lab] warning: teardown not confirmed for {teardown_unconfirmed} "
@@ -379,6 +463,8 @@ def wait(
             "block volume is still billing.",
             err=True,
         )
+    if summary["failed_fast"]:
+        raise typer.Exit(code=4)  # a job definitively died; survivors keep running
     if not all_terminal:
         raise typer.Exit(code=1)
     if teardown_leaks:

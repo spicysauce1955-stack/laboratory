@@ -51,6 +51,19 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   `lab sweep-retry` resubmits only the missing shards. A `SweepPlan` under the `sweep_id` is the
   cell→shards map. Guide: `docs/guides/sharded-sweeps.md`.
 
+- **Agent-UX hardening (field report 2026-08-05):** entrypoints report consumed config via
+  `$LAB_RUN_DIR/effective_config.json` (helper: `lab.experiment.get_overrides`); a succeeded job
+  with argv overrides it never consumed **flips to failed** (`--allow-unknown-config` opts out;
+  `lab lint` pre-checks legacy scripts). `sweep-aggregate` includes partial rows from terminal
+  non-succeeded shards by default (`_shard_status` column, `seeds_partial` in the view,
+  `--strict` opts out) and `sweep-retry` resubmits only missing seeds. `lab wait` gains
+  `--fail-fast` (exit 4), an incrementally-rewritten `--done-file` (with `pending`), and
+  duration-string `--timeout`. Transient local-API launch errors retry with backoff
+  (`LAB_LAUNCH_RETRIES`, `end_reason` prefix `transient:`); remote sweep submits stagger
+  (`LAB_SUBMIT_STAGGER_S`, default 1.5s). `lab export <job|sweep> --to DIR` writes the
+  committable provenance bundle (manifests + tables + diffs + index.json). `lab status` shows
+  `estimated_running_usd` + `last_log_line`. Grid is optional when `--seeds` is given.
+
 ## Conventions
 - `ruff` (line length 100), `mypy --strict` on `src/lab`. CLI and MCP server are thin shells over
   the `lab.core.Lab` library — never duplicate logic between them.

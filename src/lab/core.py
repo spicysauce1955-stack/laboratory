@@ -16,11 +16,18 @@ import platform
 import shlex
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
-from lab._util import now
+from lab._util import (
+    actual_cost,
+    atomic_write_text,
+    duration_seconds,
+    infer_artifact_type,
+    now,
+    tail_last_line,
+)
 from lab.backends.base import Backend
 from lab.backends.local import LocalBackend
 from lab.manifest import (
@@ -161,6 +168,21 @@ def check_sweep_admission(
     return worst
 
 
+def _submit_stagger_s() -> float:
+    """Delay between remote sweep submits (``LAB_SUBMIT_STAGGER_S``, default 1.5s; 0 disables).
+
+    Each skypilot submit spawns a supervisor that immediately hits the local SkyPilot API
+    server; N back-to-back spawns can refuse connections while the server cold-starts
+    (field-report #4). A short stagger lets the first submit's autostart win. Lives in the sweep
+    loops only — single submits and the (already 60s-paced) scheduler don't pay it."""
+    import os
+
+    try:
+        return max(0.0, float(os.environ.get("LAB_SUBMIT_STAGGER_S", "1.5")))
+    except ValueError:
+        return 1.5
+
+
 def build_sweep_point_spec(
     command: str,
     point: dict[str, Any],
@@ -169,6 +191,7 @@ def build_sweep_point_spec(
     resources: ResourceRequest | None = None,
     code_ref: str = "HEAD",
     submitted_by: str = "agent",
+    allow_unknown_config: bool = False,
 ) -> JobSpec:
     """One grid point -> a JobSpec, identical for immediate (``Lab.sweep``) and deferred
     (``register_sweep``) paths so they can't drift.
@@ -194,6 +217,7 @@ def build_sweep_point_spec(
         config=point,
         resources=resources or ResourceRequest(),
         submitted_by=submitted_by,  # type: ignore[arg-type]
+        allow_unknown_config=allow_unknown_config,
     )
 
 
@@ -322,6 +346,7 @@ class Lab:
                 entrypoint_command=spec.command,
                 resolved_config=spec.config or {},
                 seed=seed,
+                allow_unknown_config=spec.allow_unknown_config,
             ),
             resources=spec.resources,
             backend=BackendInfo(provisioner=self.backend.name),
@@ -373,6 +398,7 @@ class Lab:
         results_file: str = "results.csv",
         seed_column: str = "seed",
         seed_axis_key: str = "seeds",
+        allow_unknown_config: bool = False,
     ) -> tuple[str, list[str]]:
         """Submit one job per grid point under a shared sweep_id (FR-A5).
 
@@ -395,6 +421,7 @@ class Lab:
                 command, cells, resources=resources, seed=seed, code_ref=code_ref,
                 submitted_by=submitted_by, allow_dirty=allow_dirty, max_jobs=max_jobs,
                 sweep_max_cost=sweep_max_cost, daily_budget=daily_budget, committed=committed,
+                allow_unknown_config=allow_unknown_config,
             )
         if seed_axis_key in grid or "seed" in grid:
             raise LabError(
@@ -422,15 +449,19 @@ class Lab:
         sweep_id = f"sweep-{_new_job_id()}"
         all_job_ids: list[str] = []
         plan_cells: list[SweepCell] = []
+        stagger = _submit_stagger_s() if self.backend.name != "local" else 0.0
         for cell in cells:
             coords = {k: str(v) for k, v in cell.items()}
             cid = cell_id_for(coords)
             shard_job_ids: list[str] = []
             for shard in shards:
+                if all_job_ids and stagger:
+                    time.sleep(stagger)  # don't stampede the local SkyPilot API server
                 point = {**cell, seed_axis_key: seeds_to_arg(shard)}
                 spec = build_sweep_point_spec(
                     command, point, seed=shard[0], resources=resources,
                     code_ref=code_ref, submitted_by=submitted_by,
+                    allow_unknown_config=allow_unknown_config,
                 )
                 jid = self.submit(
                     spec, allow_dirty=allow_dirty, sweep_id=sweep_id, cell_id=cid
@@ -471,6 +502,7 @@ class Lab:
         sweep_max_cost: float | None,
         daily_budget: float | None,
         committed: float,
+        allow_unknown_config: bool = False,
     ) -> tuple[str, list[str]]:
         """The pre-P1-2 one-job-per-cell path (FR-A5), extracted unchanged."""
         if len(points) > max_jobs:
@@ -487,10 +519,14 @@ class Lab:
         )
         sweep_id = f"sweep-{_new_job_id()}"
         job_ids: list[str] = []
+        stagger = _submit_stagger_s() if self.backend.name != "local" else 0.0
         for point in points:
+            if job_ids and stagger:
+                time.sleep(stagger)  # don't stampede the local SkyPilot API server
             spec = build_sweep_point_spec(
                 command, point, seed=seed, resources=resources,
                 code_ref=code_ref, submitted_by=submitted_by,
+                allow_unknown_config=allow_unknown_config,
             )
             job_ids.append(self.submit(spec, allow_dirty=allow_dirty, sweep_id=sweep_id))
         return sweep_id, job_ids
@@ -501,26 +537,39 @@ class Lab:
             raise LabError(f"no shard plan for {sweep_id!r} (not a sharded sweep?)")
         return self.store.read_sweep_plan(sweep_id)
 
-    def aggregate_sweep(self, sweep_id: str) -> SweepPlan:
-        """Row-concatenate each cell's succeeded shards into one per-cell result (P1-2, FR-SS-4..7).
+    def aggregate_sweep(self, sweep_id: str, *, include_partial: bool = True) -> SweepPlan:
+        """Row-concatenate each cell's shard results into one per-cell table (P1-2, FR-SS-4..7).
 
         Idempotent pull reducer: recomputes from current shard states each call, so it is safe to run
         repeatedly as shards finish. A cell is ``complete`` iff every expected seed is present, else
         ``incomplete`` with the missing seeds named — never presents a short aggregate as complete and
         never discards recovered seeds (FR-SS-7).
+
+        By default any *terminal* shard with a readable results file contributes — the flush-per-seed
+        design means a timed-out shard's recovered rows are valid, paid-for data (field-report #2);
+        their seeds are reported under ``seeds_partial`` and their rows stamped ``_shard_status``.
+        ``include_partial=False`` restores succeeded-only aggregation. Running/queued shards are
+        always excluded (their file is still moving under the heartbeat rsync), as are shards whose
+        config was unconsumed (wrong-config rows are what the fail-closed check exists to kill).
         """
         plan = self.sweep_plan(sweep_id)
         for cell in plan.cells:
-            texts: list[str] = []
+            shard_texts: list[tuple[str, str]] = []
             for jid in cell.shard_job_ids:
-                if self.manifest(jid).status is not JobState.succeeded:
+                m = self.manifest(jid)
+                if m.status not in _TERMINAL_STATES:
+                    continue  # still moving under the heartbeat rsync — never read mid-flight
+                if not include_partial and m.status is not JobState.succeeded:
                     continue
+                if m.unconsumed_config:
+                    continue  # ran different config than requested — never aggregate its rows
                 self.fetch_artifacts(jid)  # ensure the local copy exists (R2 fallback inside)
                 rf = self.store.output_dir(jid) / cell.results_file
                 if rf.exists():
-                    texts.append(rf.read_text())
-            merged, present = merge_seed_rows(texts, cell.seed_column)
+                    shard_texts.append((rf.read_text(), m.status.value))
+            merged, present, partial = merge_seed_rows(shard_texts, cell.seed_column)
             cell.seeds_present = present
+            cell.seeds_partial = partial
             present_set = set(present)
             cell.missing_seeds = [s for s in cell.seeds_expected if s not in present_set]
             cell.status = "complete" if not cell.missing_seeds else "incomplete"
@@ -554,26 +603,35 @@ class Lab:
             if cell.status != "incomplete":
                 continue
             present = set(cell.seeds_present)
-            # Collect seed-subset strings of all currently in-flight (non-terminal) shard jobs so
-            # we can skip resubmitting a shard that already has a live retry running.
-            in_flight_subsets: set[str] = set()
+            # Collect seed SETS of all currently in-flight (non-terminal) shard jobs so we can
+            # skip resubmitting seeds that already have a live retry covering them. Sets (not
+            # exact strings): a full-shard in-flight retry "2,3" must suppress a narrowed "3".
+            in_flight_seed_sets: list[set[int]] = []
             for jid in cell.shard_job_ids:
                 m = self.manifest(jid)
                 if m.status not in _TERMINAL_STATES:
                     sub = m.run.resolved_config.get(plan.seed_axis_key)
                     if sub is not None:
-                        in_flight_subsets.add(str(sub))
+                        try:
+                            in_flight_seed_sets.append(set(parse_seeds(str(sub))))
+                        except ValueError:
+                            pass  # unparseable subset — can't prove coverage, don't suppress
             # inherit the original shard resources (timeout/backend/etc.) from an existing shard
             # [0] is safe: an incomplete cell always has >=1 shard (seeds_expected is non-empty)
-            base_resources = self.manifest(cell.shard_job_ids[0]).resources
+            base_manifest = self.manifest(cell.shard_job_ids[0])
+            base_resources = base_manifest.resources
             for shard in cell.shard_seeds:
-                if all(s in present for s in shard):
+                # Partial recovery (field-report #2): resubmit only the seeds still missing from
+                # this shard — a timed-out shard's recovered rows are kept, not re-bought.
+                shard_missing = [s for s in shard if s not in present]
+                if not shard_missing:
                     continue  # this shard's seeds are already covered
-                if seeds_to_arg(shard) in in_flight_subsets:
-                    continue  # a prior retry for this exact subset is still running — don't duplicate
-                point = {**cell.coords, plan.seed_axis_key: seeds_to_arg(shard)}
+                if any(set(shard_missing) <= flight for flight in in_flight_seed_sets):
+                    continue  # a live retry already covers these seeds — don't duplicate
+                point = {**cell.coords, plan.seed_axis_key: seeds_to_arg(shard_missing)}
                 spec = build_sweep_point_spec(
-                    plan.command, point, seed=shard[0], resources=base_resources
+                    plan.command, point, seed=shard_missing[0], resources=base_resources,
+                    allow_unknown_config=base_manifest.run.allow_unknown_config,
                 )
                 jid = self.submit(
                     spec, allow_dirty=allow_dirty, sweep_id=sweep_id, cell_id=cell.cell_id
@@ -713,6 +771,121 @@ class Lab:
 
     def jobs_in_sweep(self, sweep_id: str) -> list[str]:
         return [j.job_id for j in self.list_jobs() if j.sweep_id == sweep_id]
+
+    def export(
+        self,
+        target_id: str,
+        dest: Path,
+        *,
+        include_logs: bool = False,
+        max_file_mb: float = 32.0,
+    ) -> dict[str, Any]:
+        """Export a committable provenance bundle for a job or a whole sweep (field-report #5).
+
+        ``runs/`` is git-ignored and lives only in the lab repo — the analysis repo (where the
+        paper is written) has no supported route to the manifests and result tables behind a
+        figure. This writes exactly the small, durable subset that belongs in version control:
+        per job ``manifest.json``, ``resolved_config.json``, ``code_diff.tar.gz`` when present,
+        and the figure/table artifacts under a size cap (blobs like ``.npz``/checkpoints are
+        excluded — recorded in the index under ``skipped``, never silently dropped). Sweeps also
+        bundle ``plan.json`` + the per-cell aggregates. ``index.json`` ties every file to a
+        commit, seed, state, and spend. Idempotent; returns the index.
+        """
+        dest = Path(dest)
+        if target_id.startswith("sweep-"):
+            kind = "sweep"
+            job_ids = self.jobs_in_sweep(target_id)
+            if not job_ids:
+                raise LabError(f"sweep {target_id!r} matched no jobs in {self.home}")
+        else:
+            kind = "job"
+            if not self.store.manifest_path(target_id).exists():
+                raise LabError(f"unknown job or sweep id {target_id!r}")
+            job_ids = [target_id]
+
+        max_bytes = int(max_file_mb * 1024 * 1024)
+        jobs_index: list[dict[str, Any]] = []
+        for jid in sorted(job_ids):
+            m = self.manifest(jid)
+            try:
+                self.fetch_artifacts(jid)  # R2 fallback for outputs that only live durably
+            except Exception as e:  # noqa: BLE001 — export what exists locally
+                print(f"[lab] export: fetch_artifacts({jid}) failed, exporting local state: {e}")
+            jdir = dest / jid
+            jdir.mkdir(parents=True, exist_ok=True)
+            (jdir / "manifest.json").write_text(self.store.manifest_path(jid).read_text())
+            (jdir / "resolved_config.json").write_text(
+                json.dumps(m.run.resolved_config, indent=2, sort_keys=True, default=str)
+            )
+            files = ["manifest.json", "resolved_config.json"]
+            diff = self.store.job_dir(jid) / "code_diff.tar.gz"
+            if diff.exists():
+                (jdir / "code_diff.tar.gz").write_bytes(diff.read_bytes())
+                files.append("code_diff.tar.gz")
+            if include_logs and self.store.logs_path(jid).exists():
+                (jdir / "logs.txt").write_text(
+                    self.store.logs_path(jid).read_text(errors="replace")
+                )
+                files.append("logs.txt")
+            skipped: list[dict[str, str]] = []
+            out = self.store.output_dir(jid)
+            if out.exists():
+                for f in sorted(p for p in out.rglob("*") if p.is_file()):
+                    rel = f.relative_to(out).as_posix()
+                    if rel.startswith("."):
+                        continue
+                    atype = infer_artifact_type(f.name)
+                    if atype not in ("figure", "table"):
+                        skipped.append({"file": rel, "reason": f"type {atype} (blob)"})
+                        continue
+                    size = f.stat().st_size
+                    if size > max_bytes:
+                        skipped.append(
+                            {"file": rel, "reason": f"size {size}B > {max_file_mb}MB cap"}
+                        )
+                        continue
+                    target = jdir / "output" / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(f.read_bytes())
+                    files.append(f"output/{rel}")
+            jobs_index.append(
+                {
+                    "job_id": jid,
+                    "state": m.status.value,
+                    "git_commit": m.code.git_commit,
+                    "git_dirty": m.code.git_dirty,
+                    "diff_ref": m.code.diff_ref,
+                    "seed": m.run.seed,
+                    "sweep_id": m.sweep_id,
+                    "cell_id": m.cell_id,
+                    "end_reason": m.end_reason,
+                    "actual_usd": m.cost.actual_usd if m.cost else None,
+                    "files": files,
+                    "skipped": skipped,
+                }
+            )
+
+        sweep_block: dict[str, Any] | None = None
+        if kind == "sweep" and self.store.has_sweep_plan(target_id):
+            plan = self.sweep_plan(target_id)
+            (dest / "plan.json").write_text(self.store.sweep_plan_path(target_id).read_text())
+            for cell in plan.cells:
+                agg = Path(cell.aggregate_ref)
+                if agg.exists():
+                    target = dest / "cells" / cell.cell_id / agg.name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(agg.read_bytes())
+            sweep_block = {"sweep_id": target_id, "plan_exported": True, **plan.view()}
+
+        index: dict[str, Any] = {
+            "exported_at": now().isoformat(),
+            "source_id": target_id,
+            "kind": kind,
+            "jobs": jobs_index,
+            "sweep": sweep_block,
+        }
+        atomic_write_text(dest / "index.json", json.dumps(index, indent=2, default=str))
+        return index
 
     def sweep_summary(self, sweep_id: str) -> dict[str, Any]:
         """Aggregate a sweep's outcomes for trustworthy reporting (preemptions, fallback, spend)."""
@@ -959,19 +1132,18 @@ class Lab:
             manifests = [self.manifest(m.job_id) for m in manifests]
         return manifests
 
-    def wait_summary(
-        self, job_ids: list[str], *, interval: float = 10.0, timeout: float | None = None
+    def _wait_summary_dict(
+        self, manifests: list[JobManifest], *, failed_fast: bool
     ) -> dict[str, Any]:
-        """:meth:`wait`, then classify the FR-C2 verdict as data — shared by CLI ``lab wait``
-        and the MCP ``wait`` tool so both surfaces expose the same leak signal.
-
-        ``teardown_leaks`` non-empty means a paid machine may still be running;
-        ``teardown_unconfirmed`` means a remote job's teardown never recorded either way (a null
-        must not masquerade as clean — run ``lab reconcile`` to be sure)."""
-        manifests = self.wait(job_ids, interval=interval, timeout=timeout)
+        """The FR-C2 verdict as data (one shape for CLI + MCP + done-file snapshots)."""
         all_terminal = all(m.status in _TERMINAL_STATES for m in manifests)
-        if all_terminal:
-            manifests = self._settle_teardown(manifests, interval=interval)
+        pending = [m.job_id for m in manifests if m.status not in _TERMINAL_STATES]
+        if failed_fast:
+            # Offender-first ordering so a watcher's first glance lands on what died.
+            manifests = sorted(
+                manifests,
+                key=lambda m: m.status not in (JobState.failed, JobState.timed_out),
+            )
         teardown_leaks = [m.job_id for m in manifests if m.teardown_status == "failed"]
         teardown_unconfirmed = [
             m.job_id
@@ -982,6 +1154,8 @@ class Lab:
         ]
         return {
             "all_terminal": all_terminal,
+            "failed_fast": failed_fast,
+            "pending": pending,  # still running — and, for remote jobs, still billing
             "teardown_leaks": teardown_leaks,
             "teardown_unconfirmed": teardown_unconfirmed,
             "jobs": [
@@ -995,20 +1169,90 @@ class Lab:
             ],
         }
 
+    def wait_summary(
+        self,
+        job_ids: list[str],
+        *,
+        interval: float = 10.0,
+        timeout: float | None = None,
+        fail_fast: bool = False,
+        on_update: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """:meth:`wait`, then classify the FR-C2 verdict as data — shared by CLI ``lab wait``
+        and the MCP ``wait`` tool so both surfaces expose the same leak signal.
+
+        ``teardown_leaks`` non-empty means a paid machine may still be running;
+        ``teardown_unconfirmed`` means a remote job's teardown never recorded either way (a null
+        must not masquerade as clean — run ``lab reconcile`` to be sure). ``on_update`` receives
+        a fresh summary snapshot after each job's terminal transition and once more with the
+        final summary — the incremental done-file feed (field-report #3). ``fail_fast`` returns
+        as soon as any job is failed/timed_out; no surviving job is ever cancelled."""
+
+        def _on_terminal(_m: JobManifest) -> None:
+            if on_update is not None:
+                on_update(
+                    self._wait_summary_dict(
+                        [self.manifest(j) for j in job_ids], failed_fast=False
+                    )
+                )
+
+        manifests = self.wait(
+            job_ids, interval=interval, timeout=timeout, fail_fast=fail_fast,
+            on_terminal=_on_terminal,
+        )
+        all_terminal = all(m.status in _TERMINAL_STATES for m in manifests)
+        failed_fast = fail_fast and not all_terminal and any(
+            m.status in (JobState.failed, JobState.timed_out) for m in manifests
+        )
+        if all_terminal:
+            manifests = self._settle_teardown(manifests, interval=interval)
+        summary = self._wait_summary_dict(manifests, failed_fast=failed_fast)
+        if on_update is not None:
+            try:
+                on_update(summary)
+            except Exception as e:  # noqa: BLE001 — a watcher crash must not eat the verdict
+                print(f"[lab] wait on_update callback failed: {e}")
+        return summary
+
     def wait(
-        self, job_ids: list[str], *, interval: float = 10.0, timeout: float | None = None
+        self,
+        job_ids: list[str],
+        *,
+        interval: float = 10.0,
+        timeout: float | None = None,
+        fail_fast: bool = False,
+        on_terminal: Callable[[JobManifest], None] | None = None,
     ) -> list[JobManifest]:
         """Block until every job reaches a terminal state (or ``timeout``), then return manifests.
 
         Meant to run as a Claude Code background task: its completion is the push signal, so the
         agent need not poll (FR-G1). Uses cheap status reads (FR-G2); status reads the store, so
         this works for jobs of any backend.
+
+        ``on_terminal`` fires once per job on its first observed terminal transition (errors are
+        logged, never fatal). ``fail_fast`` returns immediately when any job reaches
+        ``failed``/``timed_out`` — preempted (retryable) and cancelled (operator-initiated) do
+        not trigger it. ``wait`` never mutates jobs: nothing is cancelled on the way out.
         """
         deadline = time.monotonic() + timeout if timeout is not None else None
         pending = list(job_ids)
         while pending:
-            pending = [j for j in pending if self.status(j) not in _TERMINAL_STATES]
-            if not pending:
+            still_pending: list[str] = []
+            tripwire = False
+            for j in pending:
+                state = self.status(j)
+                if state not in _TERMINAL_STATES:
+                    still_pending.append(j)
+                    continue
+                if on_terminal is not None:
+                    try:
+                        on_terminal(self.manifest(j))
+                    except Exception as e:  # noqa: BLE001 — callback must never abort the wait
+                        print(f"[lab] wait on_terminal callback failed: {e}")
+                if fail_fast and state in (JobState.failed, JobState.timed_out):
+                    tripwire = True
+            pending = still_pending
+            if tripwire or not pending:
                 break
             if deadline is None:
                 time.sleep(max(0.05, interval))  # guard against a busy-loop on interval<=0
@@ -1053,10 +1297,15 @@ def job_status_view(home: Path, repo: Path, job_id: str) -> dict[str, Any]:
     lab = Lab(backend=build_backend(m.backend.provisioner, home=home, repo=repo), repo=repo, home=home)
     state = lab.status(job_id)
     m = store.read_manifest(job_id)  # re-read: status may have just finalized/torn down the job
-    return _status_fields(m, state=state.value, mirrored=False)
+    return _status_fields(
+        m, state=state.value, mirrored=False, logs_path=store.logs_path(job_id)
+    )
 
 
-def _status_fields(m: JobManifest, *, state: str, mirrored: bool) -> dict[str, Any]:
+def _status_fields(
+    m: JobManifest, *, state: str, mirrored: bool, logs_path: Path | None = None
+) -> dict[str, Any]:
+    last_line, last_at = tail_last_line(logs_path) if logs_path is not None else (None, None)
     return {
         "job_id": m.job_id,
         "state": state,
@@ -1065,8 +1314,17 @@ def _status_fields(m: JobManifest, *, state: str, mirrored: bool) -> dict[str, A
         "exit_code": m.exit_code,
         "end_reason": m.end_reason,
         "cost": m.cost.model_dump() if m.cost else None,
+        # Burn-rate visibility mid-run (field-report #7): a derived estimate, not a meter.
+        "estimated_running_usd": (
+            actual_cost(m.cost.hourly_usd, duration_seconds(m.started_at, now()))
+            if state == "running" and m.cost is not None and m.started_at is not None
+            else None
+        ),
         "teardown_status": m.teardown_status,  # FR-C2 — "failed" means a box may still bill
         "sweep_id": m.sweep_id,
+        # Progressing-vs-wedged signal for long runs that don't log metrics.
+        "last_log_line": last_line,
+        "last_log_at": last_at,
         "code": {
             "git_commit": m.code.git_commit,
             "git_dirty": m.code.git_dirty,

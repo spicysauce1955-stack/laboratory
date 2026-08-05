@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 from typing import Any
 
+from lab._util import atomic_write_text
 from lab.metrics import snapshot_final_metrics
 from lab.models import JobManifest, JobState, SweepPlan
 
@@ -70,13 +70,55 @@ class JobStore:
         On any transition to ``succeeded``, snapshot the run's final metric values into the manifest
         (FR-B4 durable baseline) unless the caller supplied them — so every backend's finalize path
         captures the baseline ``lab confirm`` compares against, without having to remember to.
+
+        The succeeded transition also audits the config-consumption handshake: if the entrypoint
+        reported an ``effective_config.json`` and some submitted keys went unconsumed, the verdict
+        flips to ``failed`` (unless the run opted out) — a "success" that ran different config
+        than requested is the worst kind of wrong answer (field-report #1). Legacy entrypoints
+        (no file) are unaffected. Runs once (guarded on ``config_effective is None``).
         """
         updated = self.read_manifest(job_id).model_copy(update=fields)
         if updated.status is JobState.succeeded and not updated.final_metrics:
             fm = snapshot_final_metrics(self.output_dir(job_id))
             if fm:
                 updated = updated.model_copy(update={"final_metrics": fm})
+        if updated.status is JobState.succeeded and updated.config_effective is None:
+            updated = self._audit_effective_config(job_id, updated)
         self.write_manifest(updated)
+        return updated
+
+    def _audit_effective_config(self, job_id: str, updated: JobManifest) -> JobManifest:
+        """The unconsumed-config check (see ``update_manifest``); pure function of output/.
+
+        Audits the ``key=value`` overrides actually passed on the command line (parsed from
+        ``entrypoint_command``) — NOT ``resolved_config``, which plain ``submit`` records as
+        metadata without ever putting it on the argv."""
+        import shlex
+
+        from lab.experiment import parse_overrides, read_effective_config
+
+        try:
+            eff = read_effective_config(self.output_dir(job_id))
+        except ValueError as e:
+            return updated.model_copy(
+                update={"status": JobState.failed, "end_reason": str(e)[:300]}
+            )
+        if eff is None:
+            return updated  # legacy entrypoint — nothing reported, nothing to audit
+        passed = set(parse_overrides(shlex.split(updated.run.entrypoint_command)))
+        passed.discard("seed")  # a grid 'seed' key is consumed by the lab itself (sets LAB_SEED)
+        unconsumed = sorted(passed - set(eff))
+        updated = updated.model_copy(
+            update={"config_effective": eff, "unconsumed_config": unconsumed}
+        )
+        if unconsumed and not updated.run.allow_unknown_config:
+            reason = (
+                f"unconsumed config keys: {unconsumed} — the entrypoint never consumed them "
+                "(fix the key/script, or pass allow_unknown_config to override)"
+            )
+            updated = updated.model_copy(
+                update={"status": JobState.failed, "end_reason": reason[:300]}
+            )
         return updated
 
     def write_runtime(self, job_id: str, **fields: Any) -> None:
@@ -117,7 +159,4 @@ class JobStore:
 
     @staticmethod
     def _atomic_write(path: Path, text: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(text)
-        os.replace(tmp, path)
+        atomic_write_text(path, text)

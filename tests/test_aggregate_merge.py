@@ -5,52 +5,97 @@ import pytest
 from lab.aggregate import merge_seed_rows
 
 
-def test_merge_concatenates_and_sorts_by_seed():
+def test_merge_concatenates_sorts_and_stamps_status():
     a = "seed,acc\n2,0.9\n3,0.8\n"
     b = "seed,acc\n0,0.7\n1,0.6\n"
-    merged, present = merge_seed_rows([b, a], "seed")
-    assert merged == "seed,acc\n0,0.7\n1,0.6\n2,0.9\n3,0.8\n"
+    merged, present, partial = merge_seed_rows([(b, "succeeded"), (a, "succeeded")], "seed")
+    assert merged == (
+        "seed,acc,_shard_status\n0,0.7,succeeded\n1,0.6,succeeded\n"
+        "2,0.9,succeeded\n3,0.8,succeeded\n"
+    )
     assert present == [0, 1, 2, 3]
+    assert partial == []
 
 
 def test_merge_preserves_row_content_unaltered():
     a = "seed,note\n0,hello world\n"
-    merged, present = merge_seed_rows([a], "seed")
+    merged, present, _ = merge_seed_rows([(a, "succeeded")], "seed")
     assert "hello world" in merged
     assert present == [0]
 
 
 def test_merge_rejects_mismatched_headers():
     with pytest.raises(ValueError, match="header"):
-        merge_seed_rows(["seed,acc\n0,1\n", "seed,loss\n1,2\n"], "seed")
+        merge_seed_rows(
+            [("seed,acc\n0,1\n", "succeeded"), ("seed,loss\n1,2\n", "succeeded")], "seed"
+        )
 
 
 def test_merge_rejects_missing_seed_column():
     with pytest.raises(ValueError, match="seed_column"):
-        merge_seed_rows(["acc\n0.9\n"], "seed")
+        merge_seed_rows([("acc\n0.9\n", "succeeded")], "seed")
 
 
 def test_merge_empty():
-    assert merge_seed_rows([], "seed") == ("", [])
+    assert merge_seed_rows([], "seed") == ("", [], [])
 
 
-def test_merge_rejects_duplicate_seed_across_shards():
-    a = "seed,acc\n0,0.9\n1,0.8\n"
-    b = "seed,acc\n1,0.7\n2,0.6\n"  # seed 1 appears in both shards
+def test_merge_duplicate_within_one_file_still_raises():
+    a = "seed,acc\n0,0.9\n0,0.8\n"
     with pytest.raises(ValueError, match="duplicate"):
-        merge_seed_rows([a, b], "seed")
+        merge_seed_rows([(a, "succeeded")], "seed")
+
+
+def test_merge_cross_shard_duplicate_prefers_succeeded():
+    """A seed recovered from a timed-out shard AND re-run by a succeeded retry: the succeeded
+    row wins, no raise — retries + partial recovery must compose."""
+    partial_shard = "seed,acc\n1,0.111\n2,0.222\n"
+    retry_shard = "seed,acc\n1,0.999\n"
+    merged, present, partial = merge_seed_rows(
+        [(partial_shard, "timed_out"), (retry_shard, "succeeded")], "seed"
+    )
+    assert "0.999" in merged and "0.111" not in merged
+    assert present == [1, 2]
+    assert partial == [2]  # seed 2 only exists via the timed-out shard
+
+
+def test_merge_equal_status_last_submitted_wins():
+    a = "seed,acc\n0,0.1\n"
+    b = "seed,acc\n0,0.2\n"
+    merged, present, _ = merge_seed_rows([(a, "succeeded"), (b, "succeeded")], "seed")
+    assert "0.2" in merged and "0.1" not in merged
+    assert present == [0]
+
+
+def test_merge_returns_partial_seeds():
+    ok = "seed,acc\n0,0.5\n"
+    cut = "seed,acc\n1,0.6\n2,0.7\n"
+    _, present, partial = merge_seed_rows([(ok, "succeeded"), (cut, "timed_out")], "seed")
+    assert present == [0, 1, 2]
+    assert partial == [1, 2]
+
+
+def test_merge_tolerates_truncated_tail_in_partial_shard_only():
+    """A heartbeat-rsynced CSV can end mid-row: skip the bad tail for non-succeeded shards,
+    still fail loud for succeeded ones (a bad row there is an entrypoint bug)."""
+    really_cut = "seed,acc\n0,0.5\n1"  # row too short — seed unparseable? no: seed=1 col ok
+    bad = "seed,acc\nnotint,0.5\n"
+    merged, present, partial = merge_seed_rows([(bad, "timed_out")], "seed")
+    assert (merged, present, partial) == ("", [], [])  # unparseable rows skipped, not fatal
+    with pytest.raises(ValueError):
+        merge_seed_rows([(bad, "succeeded")], "seed")
+    m2, p2, _ = merge_seed_rows([(really_cut, "timed_out")], "seed")
+    assert p2 == [0, 1]  # short-but-parseable tail row kept
 
 
 def test_merge_preserves_embedded_comma_value():
-    """Verify that CSV values containing commas round-trip verbatim (quoted by csv module)."""
     import csv
     import io
 
     a = 'seed,note\n0,"foo,bar"\n1,plain\n'
-    merged, present = merge_seed_rows([a], "seed")
+    merged, present, _ = merge_seed_rows([(a, "succeeded")], "seed")
     assert present == [0, 1]
-    # the comma-containing field must survive as a single quoted field, not split into two columns
     rows = list(csv.reader(io.StringIO(merged)))
-    assert rows[0] == ["seed", "note"]
-    assert rows[1] == ["0", "foo,bar"]
-    assert rows[2] == ["1", "plain"]
+    assert rows[0] == ["seed", "note", "_shard_status"]
+    assert rows[1] == ["0", "foo,bar", "succeeded"]
+    assert rows[2] == ["1", "plain", "succeeded"]

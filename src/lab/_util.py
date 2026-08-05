@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import shlex
 from datetime import datetime, timezone
+from pathlib import Path
 
 _UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
 
@@ -49,8 +51,9 @@ def wrap_with_extras(command: str, extras: list[str] | None) -> str:
     return f"uv run {flags} {command}"
 
 
-def parse_duration(value: str | None) -> float | None:
-    """Parse a wall-clock limit (FR-I1). ``'2h'``/``'30m'``/``'45s'``/``'1d'`` or plain seconds.
+def parse_duration(value: str | float | None) -> float | None:
+    """Parse a wall-clock limit (FR-I1). ``'2h'``/``'30m'``/``'45s'``/``'1d'`` or plain seconds
+    (string or number).
 
     Returns seconds, or ``None`` for no limit.
     """
@@ -62,6 +65,31 @@ def parse_duration(value: str | None) -> float | None:
     if s[-1] in _UNITS:
         return float(s[:-1]) * _UNITS[s[-1]]
     return float(s)
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Write via a same-directory temp file + ``os.replace`` so readers never see a torn file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def tail_last_line(path: Path, max_bytes: int = 1024) -> tuple[str | None, datetime | None]:
+    """Last non-empty line of ``path`` (reading at most the final ``max_bytes``) + its mtime,
+    or ``(None, None)`` if the file is missing/empty. Cheap enough for a status poll."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            f.seek(max(0, size - max_bytes))
+            chunk = f.read().decode(errors="replace")
+    except OSError:
+        return None, None
+    lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
+    if not lines:
+        return None, None
+    mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    return lines[-1], mtime
 
 
 def timeout_reason(seconds: int) -> str:
