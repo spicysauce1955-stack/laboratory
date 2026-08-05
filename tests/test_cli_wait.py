@@ -8,7 +8,15 @@ from typer.testing import CliRunner
 import lab.cli as cli_mod
 from helpers import make_manifest
 from lab.cli import app
+from lab.core import Lab
 from lab.models import BackendInfo, JobState
+
+
+class _SummaryMixin:
+    """Borrow the real summary/settle logic so the fakes exercise Lab.wait_summary."""
+
+    wait_summary = Lab.wait_summary
+    _settle_teardown = Lab._settle_teardown
 
 
 def _patch_store(monkeypatch, tmp_path, fake_lab):
@@ -32,7 +40,7 @@ def test_wait_exits_1_on_timeout_without_completion(monkeypatch, tmp_path):
         update={"status": JobState.running}
     )
 
-    class _FakeLab:
+    class _FakeLab(_SummaryMixin):
         def wait(self, ids, *, interval, timeout):
             return [running]  # never reached terminal -> the timeout path
 
@@ -68,7 +76,7 @@ def test_wait_flags_unconfirmed_teardown_on_remote_job(monkeypatch, tmp_path):
     monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
     term = _terminal("j1", provisioner="skypilot", teardown=None)
 
-    class _FakeLab:
+    class _FakeLab(_SummaryMixin):
         def wait(self, ids, *, interval, timeout):
             return [term]
 
@@ -91,7 +99,7 @@ def test_wait_does_not_flag_local_job(monkeypatch, tmp_path):
     monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
     term = _terminal("j1", provisioner="local", teardown=None)
 
-    class _FakeLab:
+    class _FakeLab(_SummaryMixin):
         def wait(self, ids, *, interval, timeout):
             return [term]
 
@@ -113,7 +121,7 @@ def test_wait_settles_a_lagging_teardown(monkeypatch, tmp_path):
     at_terminal = _terminal("j1", provisioner="skypilot", teardown=None)
     settled = _terminal("j1", provisioner="skypilot", teardown="succeeded")
 
-    class _FakeLab:
+    class _FakeLab(_SummaryMixin):
         def wait(self, ids, *, interval, timeout):
             return [at_terminal]  # null at the moment it went terminal
 

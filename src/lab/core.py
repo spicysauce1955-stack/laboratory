@@ -199,6 +199,10 @@ def build_sweep_point_spec(
 
 SUPPORTED_CLOUDS: tuple[str, ...] = ("vast", "do", "gcp")
 
+# How long a non-terminal skypilot job may lack a live supervisor pid before `reconcile` stops
+# treating its cluster as protected (covers the submit->runtime-write race on fresh jobs).
+UNSUPERVISED_GRACE_S = 300.0
+
 CPU_DEFAULT_CLOUD = "do"
 # Keep defaults within a fresh DigitalOcean account's tier: 8-vCPU sizes and a 256GB block volume
 # (SkyPilot's default disk_size) are both tier-restricted and fail provisioning until a tier bump.
@@ -774,8 +778,14 @@ class Lab:
         carries ``vast_pass`` explaining why — while the cloud-agnostic ``sky.status`` pass and
         the DO volume pass still run. Any other listing failure raises :class:`LabError`: when
         the SDK *is* present there is no safe degraded mode for a leak-detection command.
+
+        A non-terminal skypilot job whose supervisor pid is dead (past a short grace window) does
+        NOT protect its cluster: the canonical leak is a supervisor crash that freezes the
+        manifest at ``running`` — counting that cluster as healthy would hide the still-billing
+        box from every pass. Such jobs are reported under ``unsupervised``.
         """
         from lab.backends.skypilot import (  # local import: skypilot is an optional extra
+            _alive,
             _instance_label,
             cluster_name_for,
             list_vast_instances,
@@ -790,11 +800,19 @@ class Lab:
         except Exception as e:  # noqa: BLE001
             raise LabError(f"could not list Vast.ai rentals: {e}") from e
 
-        running_clusters = {
-            cluster_name_for(j.job_id): j.job_id
-            for j in self.list_jobs()
-            if j.status not in _TERMINAL_STATES
-        }
+        unsupervised: list[dict[str, str]] = []
+        running_clusters: dict[str, str] = {}
+        for j in self.list_jobs():
+            if j.status in _TERMINAL_STATES:
+                continue
+            cluster = cluster_name_for(j.job_id)
+            if j.backend.provisioner == "skypilot":
+                age = (now() - (j.started_at or j.created_at)).total_seconds()
+                pid = self.store.read_runtime(j.job_id).get("runner_pid")
+                if age > UNSUPERVISED_GRACE_S and not _alive(pid):
+                    unsupervised.append({"job_id": j.job_id, "cluster": cluster})
+                    continue  # dead supervisor -> the cluster is NOT protected
+            running_clusters[cluster] = j.job_id
 
         orphans: list[dict[str, Any]] = []
         matched_clusters: set[str] = set()
@@ -866,9 +884,49 @@ class Lab:
                     except Exception as e:  # noqa: BLE001
                         print(f"[lab] reconcile delete volume {vol_id} failed: {e}")
 
+        # GCP pass (best-effort): out-of-band instance + unattached-disk sweep via the compute
+        # API — `sky.status` only sees clusters SkyPilot still tracks, and a GCP persistent disk
+        # that outlives its VM keeps billing (same failure mode as the DO volume leak). Skipped
+        # silently when GCP isn't configured (no ADC), since not every account uses GCP.
+        from lab.backends.skypilot import delete_gcp_disk, delete_gcp_instance
+        from lab.backends.skypilot import gcp_disk_orphans as _find_gcp_disk_orphans
+        from lab.backends.skypilot import gcp_instance_orphans as _find_gcp_instance_orphans
+        from lab.backends.skypilot import list_gcp_disks, list_gcp_instances
+
+        gcp_orphans: list[dict[str, Any]] = []
+        gcp_destroyed: list[str] = []
+        gcp_disk_orphans: list[dict[str, Any]] = []
+        gcp_disks_destroyed: list[str] = []
+        try:
+            gcp_instances = list_gcp_instances()
+        except Exception:  # noqa: BLE001 — GCP not configured/unavailable: skip the pass
+            gcp_instances = None
+        if gcp_instances is not None:
+            gcp_orphans = _find_gcp_instance_orphans(gcp_instances, set(running_clusters))
+            if apply and gcp_orphans:
+                for inst in gcp_orphans:
+                    try:
+                        delete_gcp_instance(str(inst["name"]), str(inst["zone"]))
+                        gcp_destroyed.append(str(inst["name"]))
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[lab] reconcile delete gcp instance {inst['name']} failed: {e}")
+            try:
+                gcp_disks = list_gcp_disks()
+            except Exception:  # noqa: BLE001 — instances listed but disks failed: report what we have
+                gcp_disks = []
+            gcp_disk_orphans = _find_gcp_disk_orphans(gcp_disks, set(running_clusters))
+            if apply and gcp_disk_orphans:
+                for disk in gcp_disk_orphans:
+                    try:
+                        delete_gcp_disk(str(disk["name"]), str(disk["zone"]))
+                        gcp_disks_destroyed.append(str(disk["name"]))
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[lab] reconcile delete gcp disk {disk['name']} failed: {e}")
+
         return {
             "vast_pass": vast_pass,
             "instances_total": len(instances),
+            "unsupervised": unsupervised,  # running manifests with a dead supervisor (FR-C2)
             "orphans": orphans,
             "destroyed": destroyed,
             "ghosts": ghosts,
@@ -876,7 +934,65 @@ class Lab:
             "sky_destroyed": sky_destroyed,
             "do_volume_orphans": do_volume_orphans,
             "do_volumes_destroyed": do_volumes_destroyed,
+            "gcp_orphans": gcp_orphans,
+            "gcp_destroyed": gcp_destroyed,
+            "gcp_disk_orphans": gcp_disk_orphans,
+            "gcp_disks_destroyed": gcp_disks_destroyed,
             "applied": apply,
+        }
+
+    def _settle_teardown(
+        self, manifests: list[JobManifest], *, interval: float, attempts: int = 3
+    ) -> list[JobManifest]:
+        """Re-read manifests briefly so a teardown_status that's merely lagging (a job reports
+        terminal a tick before its teardown is recorded) settles to its real value before we
+        classify clean vs. leaked vs. unconfirmed. Only re-reads while some remote job still
+        shows a null teardown."""
+
+        def _unsettled(ms: list[JobManifest]) -> bool:
+            return any(m.backend.provisioner != "local" and m.teardown_status is None for m in ms)
+
+        for _ in range(attempts):
+            if not _unsettled(manifests):
+                break
+            time.sleep(min(interval, 5.0))
+            manifests = [self.manifest(m.job_id) for m in manifests]
+        return manifests
+
+    def wait_summary(
+        self, job_ids: list[str], *, interval: float = 10.0, timeout: float | None = None
+    ) -> dict[str, Any]:
+        """:meth:`wait`, then classify the FR-C2 verdict as data — shared by CLI ``lab wait``
+        and the MCP ``wait`` tool so both surfaces expose the same leak signal.
+
+        ``teardown_leaks`` non-empty means a paid machine may still be running;
+        ``teardown_unconfirmed`` means a remote job's teardown never recorded either way (a null
+        must not masquerade as clean — run ``lab reconcile`` to be sure)."""
+        manifests = self.wait(job_ids, interval=interval, timeout=timeout)
+        all_terminal = all(m.status in _TERMINAL_STATES for m in manifests)
+        if all_terminal:
+            manifests = self._settle_teardown(manifests, interval=interval)
+        teardown_leaks = [m.job_id for m in manifests if m.teardown_status == "failed"]
+        teardown_unconfirmed = [
+            m.job_id
+            for m in manifests
+            if m.status in _TERMINAL_STATES
+            and m.backend.provisioner != "local"
+            and m.teardown_status is None
+        ]
+        return {
+            "all_terminal": all_terminal,
+            "teardown_leaks": teardown_leaks,
+            "teardown_unconfirmed": teardown_unconfirmed,
+            "jobs": [
+                {
+                    "job_id": m.job_id,
+                    "state": m.status.value,
+                    "exit_code": m.exit_code,
+                    "teardown_status": m.teardown_status,
+                }
+                for m in manifests
+            ],
         }
 
     def wait(
@@ -914,6 +1030,50 @@ def build_backend(name: str, *, home: Path, repo: Path) -> Backend:
 
         return SkyPilotBackend(home=home, repo=repo)
     return LocalBackend(home=home, repo=repo)
+
+
+def job_status_view(home: Path, repo: Path, job_id: str) -> dict[str, Any]:
+    """One status shape for both shells (FR-A2/FR-I2/FR-C2), with a mirrored-manifest fallback.
+
+    Reads the local manifest and the live backend status (which finalizes dead-supervisor jobs);
+    a job absent from local ``runs/`` falls back to the scheduler queue's mirrored manifest
+    (spec §4.3) so deferred jobs are observable from every surface, not write-only. Raises
+    :class:`FileNotFoundError` when the job exists in neither place.
+    """
+    store = JobStore(home)
+    try:
+        m = store.read_manifest(job_id)
+    except FileNotFoundError:
+        from lab.scheduler.queue import default_queue  # local import: avoids a module cycle
+
+        mirrored = default_queue().read_mirrored(job_id)
+        if mirrored is None:
+            raise
+        return _status_fields(mirrored, state=mirrored.status.value, mirrored=True)
+    lab = Lab(backend=build_backend(m.backend.provisioner, home=home, repo=repo), repo=repo, home=home)
+    state = lab.status(job_id)
+    m = store.read_manifest(job_id)  # re-read: status may have just finalized/torn down the job
+    return _status_fields(m, state=state.value, mirrored=False)
+
+
+def _status_fields(m: JobManifest, *, state: str, mirrored: bool) -> dict[str, Any]:
+    return {
+        "job_id": m.job_id,
+        "state": state,
+        "started_at": m.started_at,
+        "ended_at": m.ended_at,
+        "exit_code": m.exit_code,
+        "end_reason": m.end_reason,
+        "cost": m.cost.model_dump() if m.cost else None,
+        "teardown_status": m.teardown_status,  # FR-C2 — "failed" means a box may still bill
+        "sweep_id": m.sweep_id,
+        "code": {
+            "git_commit": m.code.git_commit,
+            "git_dirty": m.code.git_dirty,
+            "diff_ref": m.code.diff_ref,
+        },
+        "mirrored": mirrored,  # True = read from the scheduler mirror; may be a tick stale
+    }
 
 
 def default_lab(home: Path | None = None, backend: str = "local") -> Lab:

@@ -67,16 +67,15 @@ class Scheduler:
     def _cluster_alive(self, cluster: str, cloud: str = "vast") -> bool:
         """Does an instance still back this cluster? Test seam.
 
-        Vast has a provider-direct listing; other clouds (DO/GCP) go through ``sky.status`` —
-        the Vast path would always read "gone" for them and the watchdog would mark a job with a
-        dead supervisor as failed while its instance keeps billing."""
+        Vast liveness is label matching via :func:`confirm_no_rental` — NOT price lookup: a
+        rental with a missing/unparseable ``dph_total`` is still billing, and a listing error
+        must read as "unknown, assume alive" (the alive branch respawns an adopt supervisor,
+        which is harmless; the gone branch marks the job failed). Other clouds (DO/GCP) go
+        through ``sky.status``."""
         if cloud == "vast":
-            from lab.backends.skypilot import vast_hourly_for_cluster
+            from lab.backends.skypilot import confirm_no_rental
 
-            try:
-                return vast_hourly_for_cluster(cluster) is not None
-            except Exception:  # noqa: BLE001
-                return False
+            return not confirm_no_rental(cluster)
         try:
             import sky
 
@@ -255,6 +254,11 @@ class Scheduler:
                     started = manifest.started_at or manifest.created_at
                     overdue = (self.now_fn() - started).total_seconds() > deadline_s + 300
                     if not self._cluster_alive(cluster, cloud):
+                        # Tear down anyway before marking failed — harmless if the instance is
+                        # truly gone, and closes the leak where a false "gone" reading left a
+                        # billing rental with no teardown call (tear_down_and_record persists
+                        # teardown_status either way).
+                        self._teardown(cluster, reg.job_id, cloud)
                         manifest = self.store.update_manifest(
                             reg.job_id, status=JobState.failed, ended_at=self.now_fn(),
                             end_reason="supervisor died; instance gone",

@@ -18,7 +18,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
 from lab._util import wrap_with_extras
-from lab.core import Lab, LabError, default_lab, resolve_backend_profile
+from lab.core import Lab, LabError, default_lab, job_status_view, resolve_backend_profile
 from lab.models import JobManifest, JobSpec, ResourceRequest
 from lab.store import JobStore
 
@@ -169,18 +169,37 @@ def build_server(lab: Lab) -> FastMCP:
 
     @mcp.tool
     def status(job_id: str) -> dict[str, Any]:
-        """Return a job's state + timing (FR-A2); cheap to poll (FR-G2)."""
-        m = _require(job_id)
-        state = _lab_for(job_id).status(job_id)
-        return {
-            "job_id": job_id,
-            "state": state.value,
-            "started_at": _iso(m.started_at),
-            "ended_at": _iso(m.ended_at),
-            "exit_code": m.exit_code,
-            "end_reason": m.end_reason,
-            "cost": m.cost.model_dump() if m.cost else None,
-        }
+        """Return a job's state + timing + cost + teardown_status (FR-A2/FR-I2/FR-C2); cheap to poll (FR-G2). teardown_status "failed" is a money alarm: a paid machine may still be running — call reconcile. Scheduler-launched (deferred) jobs are read from the mirrored manifest (mirrored=true; may be a tick stale)."""
+        try:
+            view = job_status_view(home, lab.repo, job_id)
+        except FileNotFoundError as e:
+            raise ToolError(f"job '{job_id}' not found (locally or in the scheduler mirror)") from e
+        view["started_at"] = _iso(view["started_at"])
+        view["ended_at"] = _iso(view["ended_at"])
+        return view
+
+    @mcp.tool
+    def wait(
+        job_ids: list[str] | None = None,
+        sweep: str | None = None,
+        timeout: float = 600,
+        interval: float = 10,
+    ) -> dict[str, Any]:
+        """Block until the job(s) (or every job in a sweep) reach a terminal state, up to timeout seconds, then return the FR-C2 verdict: {all_terminal, teardown_leaks, teardown_unconfirmed, jobs}. Non-empty teardown_leaks = a paid machine may still be billing — call reconcile. teardown_unconfirmed = teardown never recorded either way; treat as suspect, not clean."""
+        ids = _lab().jobs_in_sweep(sweep) if sweep else list(job_ids or [])
+        if not ids:
+            raise ToolError("pass job id(s) or sweep=<sweep_id>")
+        for j in ids:
+            _require(j)
+        return _lab_for(ids[0]).wait_summary(ids, interval=interval, timeout=timeout)
+
+    @mcp.tool
+    def reconcile() -> dict[str, Any]:
+        """Dry-run cloud leak sweep (FR-C2): cross-checks provider instances (Vast rentals, SkyPilot-tracked clusters covering DO/GCP, DO volumes) against local jobs. Read-only — it never destroys anything; run `lab reconcile --apply` at the CLI to clean up. Non-empty orphans/sky_orphans/unsupervised means something may still be billing."""
+        try:
+            return _lab("skypilot").reconcile(apply=False)
+        except LabError as e:
+            raise ToolError(str(e)) from e
 
     @mcp.tool
     def metrics(

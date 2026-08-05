@@ -37,10 +37,13 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   restricted / "invalid size specified") — bigger needs a DO tier-increase ticket. `disk_size` lives on
   `ResourceRequest` → `sky.Resources`. The cloud is selectable via `--cloud vast|do|gcp` on
   submit/sweep/register (validated in `validate_cloud`); `--backend cpu --cloud gcp` runs the cpu
-  profile on GCP (spot allowed there — only DO forces spot off). `lab reconcile` is cloud-agnostic
-  (a `sky.status` orphan pass; the Vast-direct pass is skipped without vastai-sdk) but checks
-  **instances, not volumes**. Price/offer triggers (`--max-hourly`/`--offer-query`) are Vast-only
-  and rejected for other clouds. Guides: `docs/guides/cpu-backend.md`, `docs/guides/gcp-backend.md`.
+  profile on GCP (spot allowed there — only DO forces spot off). `lab reconcile` runs a
+  cloud-agnostic `sky.status` orphan pass (Vast-direct pass skipped without vastai-sdk), a GCP
+  compute-API pass (`lab-*` instances + unattached `lab-*` disks), and flags `unsupervised`
+  running jobs whose supervisor pid is dead; DO volumes remain uncovered. `robust_teardown` has a
+  gcp-direct fallback mirroring the vastai one. Price/offer triggers
+  (`--max-hourly`/`--offer-query`) are Vast-only and rejected for other clouds. Guides:
+  `docs/guides/cpu-backend.md`, `docs/guides/gcp-backend.md`.
 - **Sharded sweeps (FR P1-2):** `lab sweep --seeds 0-31 --shard-size 8` splits each grid cell's
   seeds into independently-bounded shard jobs (own timeout + teardown), then `lab sweep-aggregate`
   row-concatenates the succeeded shards into one per-cell `results.csv` (seed column overridable),

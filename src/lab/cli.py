@@ -6,7 +6,6 @@ Wired to the local backend by default; structured JSON output mirrors the MCP §
 from __future__ import annotations
 
 import json
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -14,9 +13,9 @@ from typing import Any
 import typer
 
 from lab._util import now, wrap_with_extras
-from lab.core import Lab, LabError, default_lab, resolve_backend_profile
+from lab.core import Lab, LabError, default_lab, job_status_view, resolve_backend_profile
 from lab.manifest import repo_root
-from lab.models import JobSpec, JobState, ResourceRequest
+from lab.models import JobSpec, ResourceRequest
 from lab.scheduler.models import Guardrails, RegState, Triggers
 from lab.scheduler.price import PriceFeed
 from lab.scheduler.queue import QueueStore, default_queue
@@ -26,10 +25,6 @@ from lab.scheduler.register import register_sweep as sched_register_sweep
 from lab.scheduler.register import worst_case_cost
 from lab.scheduler.tick import Scheduler
 from lab.store import JobStore
-
-_TERMINAL = {
-    JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out, JobState.preempted
-}
 
 app = typer.Typer(
     help="Laboratory — remote experiment runner (CLI mirror of the MCP tools, spec §9).",
@@ -68,25 +63,6 @@ def _lab_for_or_fail(job_id: str) -> Lab:
 
 def _emit(obj: Any) -> None:
     typer.echo(json.dumps(obj, indent=2, default=str))
-
-
-def _settle_teardown(lab: Lab, manifests: list[Any], *, interval: float, attempts: int = 3) -> list[Any]:
-    """Re-read manifests briefly so a teardown_status that's merely lagging (a job reports terminal
-    a tick before its teardown is recorded) settles to its real value before we classify clean vs.
-    leaked vs. unconfirmed. Only re-reads while some remote job still shows a null teardown."""
-
-    def _unsettled(ms: list[Any]) -> bool:
-        return any(
-            m.backend.provisioner != "local" and m.teardown_status is None for m in ms
-        )
-
-    for _ in range(attempts):
-        if not _unsettled(manifests):
-            break
-        time.sleep(min(interval, 5.0))
-        manifests = [lab.manifest(m.job_id) for m in manifests]
-    return manifests
-
 
 
 def _parse_grid(items: list[str]) -> dict[str, list[str]]:
@@ -277,38 +253,13 @@ def sweep(
 
 @app.command()
 def status(job_id: str) -> None:
-    """Show a job's state + cost + teardown_status (FR-A2, FR-I2, FR-C2)."""
+    """Show a job's state + cost + teardown_status (FR-A2, FR-I2, FR-C2); scheduler-launched
+    jobs fall back to the mirrored manifest (spec §4.3). Same shape as the MCP status tool."""
     try:
-        lab = _lab_for(job_id)
+        _emit(job_status_view(repo_root() / "runs", repo_root(), job_id))
     except FileNotFoundError:
-        mirrored = default_queue().read_mirrored(job_id)  # scheduler-launched job (spec §4.3)
-        if mirrored is None:
-            _emit({"error": f"unknown job id {job_id!r}"})
-            raise typer.Exit(code=2) from None
-        _emit(
-            {
-                "job_id": job_id,
-                "state": mirrored.status.value,
-                "exit_code": mirrored.exit_code,
-                "cost": mirrored.cost.model_dump() if mirrored.cost else None,
-                "teardown_status": mirrored.teardown_status,
-                "end_reason": mirrored.end_reason,
-                "mirrored": True,  # may be up to one tick stale
-            }
-        )
-        return
-    state = lab.status(job_id)
-    m = lab.manifest(job_id)
-    _emit(
-        {
-            "job_id": job_id,
-            "state": state.value,
-            "exit_code": m.exit_code,
-            "cost": m.cost.model_dump() if m.cost else None,
-            "teardown_status": m.teardown_status,
-            "end_reason": m.end_reason,
-        }
-    )
+        _emit({"error": f"unknown job id {job_id!r}"})
+        raise typer.Exit(code=2) from None
 
 
 @app.command()
@@ -414,35 +365,10 @@ def wait(
         _emit({"error": f"unknown job id(s): {missing}"})
         raise typer.Exit(code=2)
     the_lab = _lab_for(ids[0])
-    manifests = the_lab.wait(ids, interval=interval, timeout=timeout)
-    all_terminal = all(m.status in _TERMINAL for m in manifests)
-    if all_terminal:
-        manifests = _settle_teardown(the_lab, manifests, interval=interval)
-    teardown_leaks = [m.job_id for m in manifests if m.teardown_status == "failed"]
-    # A remote job that's terminal but whose teardown_status never settled is neither clean
-    # ("succeeded") nor a confirmed leak ("failed") — don't let that null masquerade as a clean
-    # exit 0. (Local jobs provision nothing, so their null teardown_status is expected.)
-    teardown_unconfirmed = [
-        m.job_id
-        for m in manifests
-        if m.status in _TERMINAL
-        and m.backend.provisioner != "local"
-        and m.teardown_status is None
-    ]
-    summary = {
-        "all_terminal": all_terminal,
-        "teardown_leaks": teardown_leaks,  # FR-C2 — non-empty == a paid rental may still be running
-        "teardown_unconfirmed": teardown_unconfirmed,  # null teardown — run `lab reconcile` to be sure
-        "jobs": [
-            {
-                "job_id": m.job_id,
-                "state": m.status.value,
-                "exit_code": m.exit_code,
-                "teardown_status": m.teardown_status,
-            }
-            for m in manifests
-        ],
-    }
+    summary = the_lab.wait_summary(ids, interval=interval, timeout=timeout)
+    all_terminal = summary["all_terminal"]
+    teardown_leaks = summary["teardown_leaks"]
+    teardown_unconfirmed = summary["teardown_unconfirmed"]
     _emit(summary)
     if done_file is not None:
         done_file.write_text(json.dumps(summary, indent=2, default=str))

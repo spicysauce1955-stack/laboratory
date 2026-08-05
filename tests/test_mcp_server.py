@@ -37,6 +37,7 @@ def test_tools_registered(tmp_path: Path):
         "queue_list",
         "queue_pause",
         "queue_show",
+        "reconcile",
         "register",
         "register_sweep",
         "status",
@@ -45,6 +46,7 @@ def test_tools_registered(tmp_path: Path):
         "sweep_aggregate",
         "sweep_retry",
         "sweep_status",
+        "wait",
     ]
 
 

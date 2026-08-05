@@ -91,6 +91,154 @@ def test_reconcile_still_raises_on_non_import_listing_failure(tmp_path, monkeypa
 
 
 # ---------------------------------------------------------------------------
+# GCP second teardown channel: compute-API orphan passes + robust_teardown branch
+# ---------------------------------------------------------------------------
+
+
+def test_gcp_instance_orphans_flags_untracked_lab_instances():
+    from lab.backends.skypilot import gcp_instance_orphans
+
+    instances = [
+        {"name": "lab-job-dead-3dd1-head", "zone": "us-central1-a", "status": "RUNNING"},
+        {"name": "lab-job-alive-3dd1-head", "zone": "us-central1-a", "status": "RUNNING"},
+        {"name": "someone-else-vm", "zone": "us-central1-a", "status": "RUNNING"},
+    ]
+    orphans = gcp_instance_orphans(instances, running_clusters={"lab-job-alive"})
+    assert [o["name"] for o in orphans] == ["lab-job-dead-3dd1-head"]
+
+
+def test_gcp_disk_orphans_flags_unattached_lab_disks():
+    """A persistent disk that outlived its VM keeps billing — the GCP analogue of the DO
+    volume-leak pass. Attached disks die with their instance teardown; only unattached ones leak."""
+    from lab.backends.skypilot import gcp_disk_orphans
+
+    disks = [
+        {"name": "lab-job-dead-3dd1-head", "zone": "us-central1-a", "users": []},
+        {"name": "lab-job-alive-3dd1-head", "zone": "us-central1-a",
+         "users": ["projects/p/zones/z/instances/lab-job-alive-3dd1-head"]},
+        {"name": "someone-else-disk", "zone": "us-central1-a", "users": []},
+    ]
+    orphans = gcp_disk_orphans(disks, running_clusters=set())
+    assert [o["name"] for o in orphans] == ["lab-job-dead-3dd1-head"]
+
+
+def test_list_gcp_instances_parses_aggregated_list():
+    from lab.backends.skypilot import list_gcp_instances
+
+    class _Req:
+        def execute(self):
+            return {
+                "items": {
+                    "zones/us-central1-a": {
+                        "instances": [
+                            {"name": "lab-x-1a2b-head",
+                             "zone": "https://.../zones/us-central1-a", "status": "RUNNING"}
+                        ]
+                    },
+                    "zones/us-east1-b": {"warning": {"code": "NO_RESULTS_ON_PAGE"}},
+                }
+            }
+
+    class _Instances:
+        def aggregatedList(self, project):  # noqa: N802 — mirrors googleapiclient
+            return _Req()
+
+        def aggregatedList_next(self, previous_request, previous_response):  # noqa: N802
+            return None
+
+    class _Compute:
+        def instances(self):
+            return _Instances()
+
+    out = list_gcp_instances(_Compute(), "proj")
+    assert out == [{"name": "lab-x-1a2b-head", "zone": "us-central1-a", "status": "RUNNING"}]
+
+
+def test_robust_teardown_gcp_uses_gcp_fallback(monkeypatch):
+    from lab.backends.skypilot import robust_teardown
+
+    class _SkyDownFails:
+        def down(self, cluster):
+            raise RuntimeError("sky.down boom")
+
+        def get(self, x):
+            return x
+
+    monkeypatch.setattr(
+        "lab.backends.skypilot._gcp_destroy_matching", lambda c: ["lab-x-1a2b-head"]
+    )
+    out = robust_teardown(_SkyDownFails(), "lab-x", backoffs=(), cloud="gcp")
+    assert out["status"] == "succeeded"
+    assert out["gcp_destroyed"] == ["lab-x-1a2b-head"]
+
+
+def test_robust_teardown_gcp_fallback_failure_is_failed(monkeypatch):
+    from lab.backends.skypilot import robust_teardown
+
+    class _SkyDownFails:
+        def down(self, cluster):
+            raise RuntimeError("sky.down boom")
+
+        def get(self, x):
+            return x
+
+    monkeypatch.setattr(
+        "lab.backends.skypilot._gcp_destroy_matching",
+        lambda c: (_ for _ in ()).throw(RuntimeError("no ADC")),
+    )
+    out = robust_teardown(_SkyDownFails(), "lab-x", backoffs=(), cloud="gcp")
+    assert out["status"] == "failed"
+    assert "gcp-direct" in (out["error"] or "")
+
+
+def test_reconcile_gcp_pass_flags_and_destroys_orphans(tmp_path, monkeypatch):
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=tmp_path), repo=tmp_path, home=tmp_path)
+    monkeypatch.setattr("lab.backends.skypilot.list_vast_instances", lambda *a, **k: [])
+    monkeypatch.setattr(Lab, "_sky_status_orphans", lambda self, running_clusters: [])
+    monkeypatch.setattr("lab.backends.skypilot.list_do_volumes", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "lab.backends.skypilot.list_gcp_instances",
+        lambda *a, **k: [{"name": "lab-leak-1a2b-head", "zone": "us-central1-a",
+                          "status": "RUNNING"}],
+    )
+    monkeypatch.setattr(
+        "lab.backends.skypilot.list_gcp_disks",
+        lambda *a, **k: [{"name": "lab-leak-1a2b-head", "zone": "us-central1-a", "users": []}],
+    )
+    deleted: list[tuple] = []
+    monkeypatch.setattr(
+        "lab.backends.skypilot.delete_gcp_instance",
+        lambda name, zone, **kw: deleted.append(("inst", name, zone)),
+    )
+    monkeypatch.setattr(
+        "lab.backends.skypilot.delete_gcp_disk",
+        lambda name, zone, **kw: deleted.append(("disk", name, zone)),
+    )
+
+    report = lab.reconcile(apply=True)
+    assert [o["name"] for o in report["gcp_orphans"]] == ["lab-leak-1a2b-head"]
+    assert report["gcp_destroyed"] == ["lab-leak-1a2b-head"]
+    assert [o["name"] for o in report["gcp_disk_orphans"]] == ["lab-leak-1a2b-head"]
+    assert report["gcp_disks_destroyed"] == ["lab-leak-1a2b-head"]
+    assert ("inst", "lab-leak-1a2b-head", "us-central1-a") in deleted
+    assert ("disk", "lab-leak-1a2b-head", "us-central1-a") in deleted
+
+
+def test_reconcile_gcp_pass_skips_when_unconfigured(tmp_path, monkeypatch):
+    """No ADC / GCP not set up: the GCP pass skips silently (best-effort), like the DO pass."""
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=tmp_path), repo=tmp_path, home=tmp_path)
+    monkeypatch.setattr("lab.backends.skypilot.list_vast_instances", lambda *a, **k: [])
+    monkeypatch.setattr(Lab, "_sky_status_orphans", lambda self, running_clusters: [])
+    monkeypatch.setattr("lab.backends.skypilot.list_do_volumes", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "lab.backends.skypilot.list_gcp_instances",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no application default creds")),
+    )
+    report = lab.reconcile()
+    assert report["gcp_orphans"] == [] and report["gcp_destroyed"] == []
+
+
+# ---------------------------------------------------------------------------
 # CLI surface: --cloud on submit/sweep
 # ---------------------------------------------------------------------------
 

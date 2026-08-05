@@ -54,16 +54,19 @@ time-window/dependency triggers instead.
 
 ## Cost-safety
 
-- Teardown is `sky.down` with retries + idle autostop + the on-box poweroff backstop. There is
-  **no provider-direct kill fallback** for GCP (that exists for Vast only); a persistent teardown
-  failure flips `teardown_status="failed"` on the manifest and `lab wait` exits 3.
-- `lab reconcile` covers GCP via the cloud-agnostic `sky.status` orphan pass
-  (`sky_orphans`/`sky_destroyed` in its report); the Vast-direct pass is skipped when vastai-sdk
-  isn't installed. Dry-run exits 3 when either pass finds orphans.
+GCP has **two teardown channels**, mirroring the Vast design:
+
+- In-band: `sky.down` with retries + idle autostop + the on-box poweroff backstop. If every
+  `sky.down` attempt fails, `robust_teardown` falls back to a **gcp-direct destroy** via the
+  compute API (bypassing SkyPilot's registry), same as the vastai-sdk fallback on Vast. Only if
+  *that* also fails does `teardown_status="failed"` land on the manifest (`lab wait` exits 3).
+- Out-of-band: `lab reconcile` runs (a) the cloud-agnostic `sky.status` orphan pass and (b) a
+  **GCP compute-API pass** listing `lab-*` instances and **unattached `lab-*` persistent disks**
+  (a disk that outlives its VM keeps billing — the GCP analogue of the DO volume leak).
+  `--apply` deletes both. The pass skips silently when GCP isn't configured (no ADC).
 - Manual double-check if you suspect a leak:
-  `gcloud compute instances list --filter="name~'^lab-'"`.
-- SkyPilot's GCP teardown deletes the boot disk with the VM; no static IPs are allocated per
-  cluster, so there is no GCP analogue of the DO volume-leak pass.
+  `gcloud compute instances list --filter="name~'^lab-'"` and
+  `gcloud compute disks list --filter="name~'^lab-' AND -users:*"`.
 
 ## Limitations (v1)
 
