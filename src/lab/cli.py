@@ -6,7 +6,6 @@ Wired to the local backend by default; structured JSON output mirrors the MCP §
 from __future__ import annotations
 
 import json
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -14,9 +13,9 @@ from typing import Any
 import typer
 
 from lab._util import now, wrap_with_extras
-from lab.core import Lab, LabError, default_lab, resolve_backend_profile
+from lab.core import Lab, LabError, default_lab, job_status_view, resolve_backend_profile
 from lab.manifest import repo_root
-from lab.models import JobSpec, JobState, ResourceRequest
+from lab.models import JobSpec, ResourceRequest
 from lab.scheduler.models import Guardrails, RegState, Triggers
 from lab.scheduler.price import PriceFeed
 from lab.scheduler.queue import QueueStore, default_queue
@@ -26,10 +25,6 @@ from lab.scheduler.register import register_sweep as sched_register_sweep
 from lab.scheduler.register import worst_case_cost
 from lab.scheduler.tick import Scheduler
 from lab.store import JobStore
-
-_TERMINAL = {
-    JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out, JobState.preempted
-}
 
 app = typer.Typer(
     help="Laboratory — remote experiment runner (CLI mirror of the MCP tools, spec §9).",
@@ -70,25 +65,6 @@ def _emit(obj: Any) -> None:
     typer.echo(json.dumps(obj, indent=2, default=str))
 
 
-def _settle_teardown(lab: Lab, manifests: list[Any], *, interval: float, attempts: int = 3) -> list[Any]:
-    """Re-read manifests briefly so a teardown_status that's merely lagging (a job reports terminal
-    a tick before its teardown is recorded) settles to its real value before we classify clean vs.
-    leaked vs. unconfirmed. Only re-reads while some remote job still shows a null teardown."""
-
-    def _unsettled(ms: list[Any]) -> bool:
-        return any(
-            m.backend.provisioner != "local" and m.teardown_status is None for m in ms
-        )
-
-    for _ in range(attempts):
-        if not _unsettled(manifests):
-            break
-        time.sleep(min(interval, 5.0))
-        manifests = [lab.manifest(m.job_id) for m in manifests]
-    return manifests
-
-
-
 def _parse_grid(items: list[str]) -> dict[str, list[str]]:
     """Parse repeated `--grid key=v1,v2,...` options into {key: [values]}.
 
@@ -113,6 +89,7 @@ def _parse_grid(items: list[str]) -> dict[str, list[str]]:
 def submit(
     command: str = typer.Option(..., "--command", "-c", help="entrypoint, e.g. 'python experiments/x.py'"),
     backend: str = typer.Option("local", "--backend", help="local | skypilot | cpu"),
+    cloud: str | None = typer.Option(None, "--cloud", help="vast | do | gcp (default vast; --backend cpu defaults to do)"),
     cache: bool = typer.Option(False, "--cache", help="reuse a prior succeeded identical job (FR-B5)"),
     seed: int | None = typer.Option(None, help="explicit seed (recorded in the manifest)"),
     code_ref: str = typer.Option("HEAD", help="git ref to pin"),
@@ -146,12 +123,12 @@ def submit(
     """
     resources = ResourceRequest(
         cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
-        timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
+        cloud=cloud, timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
         spot_fallback=not no_fallback,
     )
     try:
         provisioner, resources = resolve_backend_profile(backend, resources)
-    except LabError as e:  # e.g. --backend cpu with --accelerators (FR-F3)
+    except LabError as e:  # e.g. --backend cpu with --accelerators, unknown --cloud (FR-F3)
         _emit({"error": str(e)})
         raise typer.Exit(code=1) from e
     lab = _lab(provisioner)
@@ -212,6 +189,7 @@ def sweep(
     command: str = typer.Option(..., "--command", "-c", help="entrypoint, e.g. 'python experiments/x.py'"),
     grid: list[str] = typer.Option(..., "--grid", "-g", help="key=v1,v2,... (repeatable)"),
     backend: str = typer.Option("local", "--backend", help="local | skypilot | cpu"),
+    cloud: str | None = typer.Option(None, "--cloud", help="vast | do | gcp (default vast; --backend cpu defaults to do)"),
     seed: int | None = typer.Option(None),
     cpus: int | None = typer.Option(None),
     memory: str | None = typer.Option(None),
@@ -235,7 +213,7 @@ def sweep(
     """Submit a parameter-grid sweep: one job per point under a sweep_id (FR-A5)."""
     resources = ResourceRequest(
         cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
-        timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
+        cloud=cloud, timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
         spot_fallback=not no_fallback,
     )
     try:
@@ -275,38 +253,13 @@ def sweep(
 
 @app.command()
 def status(job_id: str) -> None:
-    """Show a job's state + cost + teardown_status (FR-A2, FR-I2, FR-C2)."""
+    """Show a job's state + cost + teardown_status (FR-A2, FR-I2, FR-C2); scheduler-launched
+    jobs fall back to the mirrored manifest (spec §4.3). Same shape as the MCP status tool."""
     try:
-        lab = _lab_for(job_id)
+        _emit(job_status_view(repo_root() / "runs", repo_root(), job_id))
     except FileNotFoundError:
-        mirrored = default_queue().read_mirrored(job_id)  # scheduler-launched job (spec §4.3)
-        if mirrored is None:
-            _emit({"error": f"unknown job id {job_id!r}"})
-            raise typer.Exit(code=2) from None
-        _emit(
-            {
-                "job_id": job_id,
-                "state": mirrored.status.value,
-                "exit_code": mirrored.exit_code,
-                "cost": mirrored.cost.model_dump() if mirrored.cost else None,
-                "teardown_status": mirrored.teardown_status,
-                "end_reason": mirrored.end_reason,
-                "mirrored": True,  # may be up to one tick stale
-            }
-        )
-        return
-    state = lab.status(job_id)
-    m = lab.manifest(job_id)
-    _emit(
-        {
-            "job_id": job_id,
-            "state": state.value,
-            "exit_code": m.exit_code,
-            "cost": m.cost.model_dump() if m.cost else None,
-            "teardown_status": m.teardown_status,
-            "end_reason": m.end_reason,
-        }
-    )
+        _emit({"error": f"unknown job id {job_id!r}"})
+        raise typer.Exit(code=2) from None
 
 
 @app.command()
@@ -412,35 +365,10 @@ def wait(
         _emit({"error": f"unknown job id(s): {missing}"})
         raise typer.Exit(code=2)
     the_lab = _lab_for(ids[0])
-    manifests = the_lab.wait(ids, interval=interval, timeout=timeout)
-    all_terminal = all(m.status in _TERMINAL for m in manifests)
-    if all_terminal:
-        manifests = _settle_teardown(the_lab, manifests, interval=interval)
-    teardown_leaks = [m.job_id for m in manifests if m.teardown_status == "failed"]
-    # A remote job that's terminal but whose teardown_status never settled is neither clean
-    # ("succeeded") nor a confirmed leak ("failed") — don't let that null masquerade as a clean
-    # exit 0. (Local jobs provision nothing, so their null teardown_status is expected.)
-    teardown_unconfirmed = [
-        m.job_id
-        for m in manifests
-        if m.status in _TERMINAL
-        and m.backend.provisioner != "local"
-        and m.teardown_status is None
-    ]
-    summary = {
-        "all_terminal": all_terminal,
-        "teardown_leaks": teardown_leaks,  # FR-C2 — non-empty == a paid rental may still be running
-        "teardown_unconfirmed": teardown_unconfirmed,  # null teardown — run `lab reconcile` to be sure
-        "jobs": [
-            {
-                "job_id": m.job_id,
-                "state": m.status.value,
-                "exit_code": m.exit_code,
-                "teardown_status": m.teardown_status,
-            }
-            for m in manifests
-        ],
-    }
+    summary = the_lab.wait_summary(ids, interval=interval, timeout=timeout)
+    all_terminal = summary["all_terminal"]
+    teardown_leaks = summary["teardown_leaks"]
+    teardown_unconfirmed = summary["teardown_unconfirmed"]
     _emit(summary)
     if done_file is not None:
         done_file.write_text(json.dumps(summary, indent=2, default=str))
@@ -476,11 +404,12 @@ def reconcile(
         False, "--apply", help="destroy orphaned rentals (default: dry-run report only)"
     ),
 ) -> None:
-    """Cross-check Vast.ai rentals against local jobs to find leaks (FR-C2).
+    """Cross-check cloud instances against local jobs to find leaks (FR-C2).
 
-    Dry-run by default. ``--apply`` destroys every Vast.ai rental whose label matches the lab
-    cluster pattern but has no live local job — use this to clean up after a teardown failure
-    (look for ``teardown_status: "failed"`` in ``lab status``). Exits 3 if orphans are found in
+    Dry-run by default. ``--apply`` destroys every Vast.ai rental and SkyPilot-tracked ``lab-*``
+    cluster (the ``sky.status`` pass covers DO/GCP) with no live local job — use this to clean up
+    after a teardown failure (look for ``teardown_status: "failed"`` in ``lab status``). The
+    Vast-direct pass is skipped when vastai-sdk isn't installed. Exits 3 if orphans are found in
     dry-run mode — re-run with --apply, or destroy by hand via ``vastai destroy_instance <id>``.
     """
     try:
@@ -489,7 +418,7 @@ def reconcile(
         _emit({"error": str(e)})
         raise typer.Exit(code=2) from e
     _emit(report)
-    if report["orphans"] and not apply:
+    if (report["orphans"] or report["sky_orphans"]) and not apply:
         raise typer.Exit(code=3)  # action required: re-run with --apply
 
 
@@ -516,6 +445,9 @@ def register(
     gpus: int | None = typer.Option(None),
     accelerators: str | None = typer.Option(
         None, "--gpu", "--accelerators", help="e.g. RTX_4090:1"
+    ),
+    cloud: str | None = typer.Option(
+        None, "--cloud", help="vast | do | gcp (default vast; price/offer triggers are Vast-only)"
     ),
     timeout: str | None = typer.Option(
         None, help="wall-clock limit per job, e.g. 2h (cost bound, FR-I1)"
@@ -568,8 +500,8 @@ def register(
         command=command,
         seed=seed,
         resources=ResourceRequest(
-            cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
-            use_spot=spot, spot_fallback=not no_fallback,
+            cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, cloud=cloud,
+            timeout=timeout, use_spot=spot, spot_fallback=not no_fallback,
         ),
         submitted_by="human",
     )
@@ -606,6 +538,9 @@ def register_sweep(
     gpus: int | None = typer.Option(None),
     accelerators: str | None = typer.Option(
         None, "--gpu", "--accelerators", help="e.g. RTX_4090:1"
+    ),
+    cloud: str | None = typer.Option(
+        None, "--cloud", help="vast | do | gcp (default vast; price/offer triggers are Vast-only)"
     ),
     timeout: str | None = typer.Option(
         None, help="wall-clock limit per job, e.g. 2h (cost bound, FR-I1)"
@@ -657,8 +592,8 @@ def register_sweep(
     )
     guardrails = Guardrails(expires_at=expires_at, max_cost_usd=max_cost)
     resources = ResourceRequest(
-        cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
-        use_spot=spot, spot_fallback=not no_fallback,
+        cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, cloud=cloud,
+        timeout=timeout, use_spot=spot, spot_fallback=not no_fallback,
     )
     try:
         sweep_id, regs = sched_register_sweep(

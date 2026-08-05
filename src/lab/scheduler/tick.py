@@ -64,12 +64,24 @@ class Scheduler:
             home=self.home,
         )
 
-    def _cluster_alive(self, cluster: str) -> bool:
-        """Does a Vast rental back this cluster? Test seam."""
-        from lab.backends.skypilot import vast_hourly_for_cluster
+    def _cluster_alive(self, cluster: str, cloud: str = "vast") -> bool:
+        """Does an instance still back this cluster? Test seam.
 
+        Vast liveness is label matching via :func:`confirm_no_rental` — NOT price lookup: a
+        rental with a missing/unparseable ``dph_total`` is still billing, and a listing error
+        must read as "unknown, assume alive" (the alive branch respawns an adopt supervisor,
+        which is harmless; the gone branch marks the job failed). Other clouds (DO/GCP) go
+        through ``sky.status``."""
+        if cloud == "vast":
+            from lab.backends.skypilot import confirm_no_rental
+
+            return not confirm_no_rental(cluster)
         try:
-            return vast_hourly_for_cluster(cluster) is not None
+            import sky
+
+            from lab.sky_runner import _cluster_up
+
+            return _cluster_up(sky, cluster)
         except Exception:  # noqa: BLE001
             return False
 
@@ -86,13 +98,13 @@ class Scheduler:
             )
         self.store.write_runtime(job_id, runner_pid=proc.pid)
 
-    def _teardown(self, cluster: str, job_id: str) -> bool:
+    def _teardown(self, cluster: str, job_id: str, cloud: str = "vast") -> bool:
         """Robust teardown of an overdue orphan. Test seam."""
         import sky
 
-        from lab.backends.skypilot import tear_down_and_record
+        from lab.backends import skypilot
 
-        return tear_down_and_record(sky, cluster, self.store, job_id)
+        return skypilot.tear_down_and_record(sky, cluster, self.store, job_id, cloud=cloud)
 
     def _reconcile(self, apply: bool) -> dict[str, object]:
         """FR-C2 sweep. Test seam."""
@@ -237,16 +249,22 @@ class Scheduler:
                     from lab.backends.skypilot import cluster_name_for
 
                     cluster = str(rt.get("cluster") or cluster_name_for(reg.job_id))
+                    cloud = manifest.resources.cloud or "vast"
                     deadline_s = parse_duration(manifest.resources.timeout) or 3600.0
                     started = manifest.started_at or manifest.created_at
                     overdue = (self.now_fn() - started).total_seconds() > deadline_s + 300
-                    if not self._cluster_alive(cluster):
+                    if not self._cluster_alive(cluster, cloud):
+                        # Tear down anyway before marking failed — harmless if the instance is
+                        # truly gone, and closes the leak where a false "gone" reading left a
+                        # billing rental with no teardown call (tear_down_and_record persists
+                        # teardown_status either way).
+                        self._teardown(cluster, reg.job_id, cloud)
                         manifest = self.store.update_manifest(
                             reg.job_id, status=JobState.failed, ended_at=self.now_fn(),
                             end_reason="supervisor died; instance gone",
                         )
                     elif overdue:
-                        ok = self._teardown(cluster, reg.job_id)
+                        ok = self._teardown(cluster, reg.job_id, cloud)
                         manifest = self.store.update_manifest(
                             reg.job_id, status=JobState.timed_out, ended_at=self.now_fn(),
                             end_reason="watchdog: past timeout with dead supervisor",

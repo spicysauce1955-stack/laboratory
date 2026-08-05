@@ -66,7 +66,9 @@ def test_cloud_for_maps_names():
     assert isinstance(_cloud_for("do"), sky.clouds.DO)
     assert isinstance(_cloud_for("vast"), sky.clouds.Vast)
     assert isinstance(_cloud_for("gcp"), sky.clouds.GCP)
-    assert isinstance(_cloud_for("unknown"), sky.clouds.Vast)  # fallback
+    assert isinstance(_cloud_for(None), sky.clouds.Vast)  # default
+    with pytest.raises(LabError, match="unknown cloud"):
+        _cloud_for("unknown")  # no silent Vast fallback
 
 
 def test_build_task_uses_do_cloud_no_accelerators(tmp_path: Path):

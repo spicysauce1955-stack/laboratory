@@ -23,6 +23,9 @@ dependencies = [
 skypilot = ["skypilot[vast]>=0.12", "vastai-sdk>=1.0", "pip"]
 # DigitalOcean CPU backend (`--backend cpu`): SkyPilot's DO provisioner + its pydo client.
 do = ["skypilot[do]>=0.12", "pydo"]
+# Google Cloud (`--cloud gcp`, CPU + GPU): SkyPilot's GCP provisioner (google-api-python-client
+# + google-cloud-storage). `pip` for SkyPilot's local pip3 shell-outs (same note as [vast]).
+gcp = ["skypilot[gcp]>=0.12", "pip"]
 # Durable artifact storage on Cloudflare R2 (S3-compatible) for the lab control plane.
 r2 = ["boto3>=1.34"]
 # Experiment tracking (opt-in; not needed to run the lab or most experiments).

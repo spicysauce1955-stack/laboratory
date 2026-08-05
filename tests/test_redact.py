@@ -57,3 +57,30 @@ def test_install_log_redaction_scrubs_fd_output(tmp_path, capfd):
     content = log.read_text()
     assert secret not in content
     assert "REDACTED" in content
+
+
+GCP_TOKEN = "ya29.a0AfH6SMBx7-fake-token-value_123"
+
+
+def test_redact_masks_gcp_oauth_token_in_json():
+    out = redact(f'{{"access_token": "{GCP_TOKEN}", "expires_in": 3599}}')
+    assert GCP_TOKEN not in out
+    assert '"access_token"' in out and "REDACTED" in out
+
+
+def test_redact_masks_gcp_refresh_token_and_private_key_fields():
+    assert "1//fake-refresh" not in redact('{"refresh_token": "1//fake-refresh"}')
+    key_material = "-----BEGIN PRIVATE KEY-----\\nMIIfake\\n-----END PRIVATE KEY-----\\n"
+    assert "MIIfake" not in redact(f'{{"private_key": "{key_material}"}}')
+    assert "sekret" not in redact('{"client_secret": "sekret"}')
+
+
+def test_redact_masks_bare_ya29_token_anywhere():
+    # gcloud/SkyPilot log OAuth tokens outside JSON too, e.g. in curl commands/URLs.
+    out = redact(f"curl -H 'X-Auth: {GCP_TOKEN}' https://compute.googleapis.com/")
+    assert GCP_TOKEN not in out and "ya29." in out and "REDACTED" in out
+
+
+def test_redact_gcp_patterns_are_idempotent():
+    once = redact(f'{{"access_token": "{GCP_TOKEN}"}} and bare {GCP_TOKEN}')
+    assert redact(once) == once

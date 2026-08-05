@@ -14,7 +14,13 @@ from pathlib import Path
 from typing import Any
 
 from lab._util import now, parse_duration
-from lab.core import LabError, build_sweep_point_spec, check_sweep_admission, expand_grid
+from lab.core import (
+    LabError,
+    build_sweep_point_spec,
+    check_sweep_admission,
+    expand_grid,
+    validate_cloud,
+)
 from lab.models import CodeRef, JobSpec, ResourceRequest
 from lab.scheduler.bundle import create_bundle
 from lab.scheduler.models import DailyWindow, Guardrails, Registration, Triggers
@@ -82,6 +88,18 @@ def _snapshot_bundle(repo: Path, td: Path, key: str, queue: QueueStore) -> tuple
     return bundle_key, code
 
 
+def _check_cloud_triggers(resources: ResourceRequest, triggers: Triggers) -> None:
+    """Fail-loud (FR-F3): price/offer triggers query the Vast offer feed only — gating a DO/GCP
+    job on Vast prices would silently never (or always) fire."""
+    validate_cloud(resources.cloud)
+    cloud = resources.cloud or "vast"
+    if cloud != "vast" and (triggers.max_hourly_usd is not None or triggers.offer_query):
+        raise LabError(
+            f"--max-hourly/--offer-query gate on Vast offer prices and cannot apply to "
+            f"cloud={cloud!r}; drop the price trigger or use the Vast default"
+        )
+
+
 def register(
     repo: Path,
     queue: QueueStore,
@@ -89,6 +107,7 @@ def register(
     triggers: Triggers,
     guardrails: Guardrails,
 ) -> Registration:
+    _check_cloud_triggers(spec.resources, triggers)
     reg_id = _new_reg_id()
     with tempfile.TemporaryDirectory() as td:
         bundle_key, code = _snapshot_bundle(repo, Path(td), reg_id, queue)
@@ -128,6 +147,7 @@ def register_sweep(
     ``sweep_max_cost`` (default = worst case, so it only fires as a leak alarm). Bundle once, share
     by key (Decision A); write the bundle first and the entries last (integrity ordering, spec §5).
     """
+    _check_cloud_triggers(resources, triggers)
     points = expand_grid(grid)
     if len(points) > max_jobs:
         raise LabError(
