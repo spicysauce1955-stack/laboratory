@@ -168,6 +168,9 @@ class SweepCell(BaseModel):
     results_file: str
     seed_column: str
     aggregate_ref: str
+    # Columns identifying a result row; None = [seed_column] (one row per seed). Experiments
+    # sweeping an axis inside the job (one row per (seed, alpha)) set e.g. ["seed", "alpha"].
+    row_key: list[str] | None = None
     seeds_present: list[int] = Field(default_factory=list)
     # Seeds whose rows came only from non-succeeded shards (partial recovery, field-report #2).
     seeds_partial: list[int] = Field(default_factory=list)

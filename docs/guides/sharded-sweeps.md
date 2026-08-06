@@ -35,7 +35,11 @@ Override the key name with `--seed-column` if your config uses a different name.
 ### 2. Emit one row per seed into a results file
 
 Each shard must write a row-structured CSV to `$LAB_RUN_DIR/results.csv` (default name) that
-includes a column identifying the seed. Example output for a shard with `seeds=0,1,2,3`:
+includes a column identifying the seed. If your experiment sweeps an axis *inside* the job (e.g.
+α sharing a compiled kernel) and therefore writes **multiple rows per seed**, declare the row
+identity at sweep time — `lab sweep ... --row-key seed,alpha` — and duplicate detection is
+applied to the full key instead of the seed alone. Example output for a shard with
+`seeds=0,1,2,3`:
 
 ```csv
 seed,N,accuracy

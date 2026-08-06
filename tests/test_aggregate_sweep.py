@@ -165,3 +165,38 @@ def test_old_plan_json_reads_with_default_seeds_partial(tmp_path: Path):
     p.write_text(_json.dumps(raw))
     plan = lab.sweep_plan(sweep_id)
     assert plan.cells[0].seeds_partial == []
+
+
+def test_sweep_row_key_flows_to_aggregation(tmp_path: Path):
+    """--row-key seed,alpha: multi-row-per-seed shard results aggregate instead of raising
+    (verification report 2026-08-06 §2 — the layout behind the hand-stitched headline data)."""
+    lab = _lab(tmp_path)
+    sweep_id, _ = lab.sweep(
+        "true", {"N": [1000]}, seeds="0-1", shard_size=1, row_key="seed,alpha"
+    )
+    plan = lab.sweep_plan(sweep_id)
+    cell = plan.cells[0]
+    assert cell.row_key == ["seed", "alpha"]
+    for i, jid in enumerate(cell.shard_job_ids):
+        out = lab.store.output_dir(jid)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "results.csv").write_text(
+            f"seed,alpha,acc\n{i},2.7,0.9\n{i},2.72,0.8\n"
+        )
+        lab.store.update_manifest(jid, status=JobState.succeeded)
+
+    c = lab.aggregate_sweep(sweep_id).cells[0]
+    assert c.status == "complete"
+    assert c.seeds_present == [0, 1]
+    agg = Path(c.aggregate_ref).read_text()
+    assert agg.count("\n") == 5  # header + 4 rows (2 seeds x 2 alphas)
+
+
+def test_sweep_row_key_must_contain_seed_column(tmp_path: Path):
+    lab = _lab(tmp_path)
+    import pytest as _pytest
+
+    from lab.core import LabError
+
+    with _pytest.raises(LabError, match="seed"):
+        lab.sweep("true", {"N": [1]}, seeds="0-1", shard_size=1, row_key="alpha")

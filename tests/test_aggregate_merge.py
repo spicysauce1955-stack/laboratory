@@ -110,3 +110,58 @@ def test_merge_duplicate_across_succeeded_shards_raises():
     b = "seed,acc\n0,0.2\n"
     with pytest.raises(ValueError, match="succeeded"):
         merge_seed_rows([(a, "succeeded"), (b, "succeeded")], "seed")
+
+
+# ---------------------------------------------------------------------------
+# Composite row keys (verification report 2026-08-06 §2): one row per (seed, alpha)
+# ---------------------------------------------------------------------------
+
+
+def test_merge_row_key_allows_multiple_rows_per_seed():
+    """The snn-research layout: alpha swept inside the job -> one row per (seed, alpha)."""
+    a = "seed,alpha,acc\n100,2.7,0.9\n100,2.72,0.8\n101,2.7,0.7\n"
+    merged, present, partial = merge_seed_rows(
+        [(a, "succeeded")], "seed", row_key=["seed", "alpha"]
+    )
+    assert present == [100, 101]
+    assert partial == []
+    assert merged.count("\n") == 4  # header + 3 rows, none dropped
+
+
+def test_merge_row_key_duplicate_full_key_within_file_raises():
+    a = "seed,alpha,acc\n100,2.7,0.9\n100,2.7,0.8\n"
+    with pytest.raises(ValueError, match="duplicate"):
+        merge_seed_rows([(a, "succeeded")], "seed", row_key=["seed", "alpha"])
+
+
+def test_merge_row_key_retry_overlap_resolves_per_row():
+    """A timed-out shard recovered (100, 2.7) and (100, 2.72); a succeeded retry re-ran only
+    alpha 2.7. The retry's 2.7 row wins; the partial 2.72 row is kept."""
+    cut = "seed,alpha,acc\n100,2.7,0.111\n100,2.72,0.222\n"
+    retry = "seed,alpha,acc\n100,2.7,0.999\n"
+    merged, present, partial = merge_seed_rows(
+        [(cut, "timed_out"), (retry, "succeeded")], "seed", row_key=["seed", "alpha"]
+    )
+    assert "0.999" in merged and "0.111" not in merged and "0.222" in merged
+    assert present == [100]
+    assert partial == [100]  # some of seed 100's surviving rows are still partial
+
+
+def test_merge_row_key_succeeded_duplicate_still_raises():
+    a = "seed,alpha,acc\n100,2.7,0.1\n"
+    b = "seed,alpha,acc\n100,2.7,0.2\n"
+    with pytest.raises(ValueError, match="succeeded"):
+        merge_seed_rows([(a, "succeeded"), (b, "succeeded")], "seed", row_key=["seed", "alpha"])
+
+
+def test_merge_row_key_missing_column_raises():
+    a = "seed,acc\n0,0.9\n"
+    with pytest.raises(ValueError, match="row_key"):
+        merge_seed_rows([(a, "succeeded")], "seed", row_key=["seed", "alpha"])
+
+
+def test_merge_default_row_key_unchanged():
+    """No row_key -> exactly the one-row-per-seed contract as before."""
+    a = "seed,acc\n0,0.9\n0,0.8\n"
+    with pytest.raises(ValueError, match="duplicate"):
+        merge_seed_rows([(a, "succeeded")], "seed")

@@ -148,3 +148,22 @@ def test_cli_export_prints_index(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["jobs"][0]["job_id"] == "j6"
     assert (dest / "index.json").exists()
+
+
+def test_fetch_artifacts_survives_missing_r2_extra(tmp_path, monkeypatch):
+    """LAB_R2_ENDPOINT set but boto3 not installed must not crash a local fetch
+    (verification report 2026-08-06, minor finding)."""
+    import lab.core as core_mod
+
+    lab = _lab(tmp_path)
+    _job(lab, "jr2", files={})  # empty output -> the R2 fallback branch is taken
+    monkeypatch.setattr(core_mod, "r2_enabled", lambda: True)
+
+    class _NoBoto:
+        @staticmethod
+        def from_env():
+            raise ImportError("No module named 'boto3'")
+
+    monkeypatch.setattr(core_mod, "R2Store", _NoBoto)
+    arts = lab.fetch_artifacts("jr2")  # must not raise
+    assert arts == []
