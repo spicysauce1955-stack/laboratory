@@ -35,15 +35,34 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   `cloud="do"`, resolved in `resolve_backend_profile`. Defaults stay inside a **fresh DO account tier**:
   8-vCPU sizes AND SkyPilot's default 256 GB volume both `422` on an untouched account (size
   restricted / "invalid size specified") — bigger needs a DO tier-increase ticket. `disk_size` lives on
-  `ResourceRequest` → `sky.Resources`. The cloud is configurable (`vast`/`do`/`gcp`). `lab reconcile`
-  is cloud-agnostic (a `sky.status` orphan pass) but checks **instances, not volumes**. Guide:
-  `docs/guides/cpu-backend.md`.
+  `ResourceRequest` → `sky.Resources`. The cloud is selectable via `--cloud vast|do|gcp` on
+  submit/sweep/register (validated in `validate_cloud`); `--backend cpu --cloud gcp` runs the cpu
+  profile on GCP (spot allowed there — only DO forces spot off). `lab reconcile` runs a
+  cloud-agnostic `sky.status` orphan pass (Vast-direct pass skipped without vastai-sdk), a GCP
+  compute-API pass (`lab-*` instances + unattached `lab-*` disks), and flags `unsupervised`
+  running jobs whose supervisor pid is dead; DO volumes remain uncovered. `robust_teardown` has a
+  gcp-direct fallback mirroring the vastai one. Price/offer triggers
+  (`--max-hourly`/`--offer-query`) are Vast-only and rejected for other clouds. Guides:
+  `docs/guides/cpu-backend.md`, `docs/guides/gcp-backend.md`.
 - **Sharded sweeps (FR P1-2):** `lab sweep --seeds 0-31 --shard-size 8` splits each grid cell's
   seeds into independently-bounded shard jobs (own timeout + teardown), then `lab sweep-aggregate`
   row-concatenates the succeeded shards into one per-cell `results.csv` (seed column overridable),
   reporting `seeds_present` vs expected and naming missing seeds on partial failure;
   `lab sweep-retry` resubmits only the missing shards. A `SweepPlan` under the `sweep_id` is the
   cell→shards map. Guide: `docs/guides/sharded-sweeps.md`.
+
+- **Agent-UX hardening (field report 2026-08-05):** entrypoints report consumed config via
+  `$LAB_RUN_DIR/effective_config.json` (helper: `lab.experiment.get_overrides`); a succeeded job
+  with argv overrides it never consumed **flips to failed** (`--allow-unknown-config` opts out;
+  `lab lint` pre-checks legacy scripts). `sweep-aggregate` includes partial rows from terminal
+  non-succeeded shards by default (`_shard_status` column, `seeds_partial` in the view,
+  `--strict` opts out) and `sweep-retry` resubmits only missing seeds. `lab wait` gains
+  `--fail-fast` (exit 4), an incrementally-rewritten `--done-file` (with `pending`), and
+  duration-string `--timeout`. Transient local-API launch errors retry with backoff
+  (`LAB_LAUNCH_RETRIES`, `end_reason` prefix `transient:`); remote sweep submits stagger
+  (`LAB_SUBMIT_STAGGER_S`, default 1.5s). `lab export <job|sweep> --to DIR` writes the
+  committable provenance bundle (manifests + tables + diffs + index.json). `lab status` shows
+  `estimated_running_usd` + `last_log_line`. Grid is optional when `--seeds` is given.
 
 ## Conventions
 - `ruff` (line length 100), `mypy --strict` on `src/lab`. CLI and MCP server are thin shells over

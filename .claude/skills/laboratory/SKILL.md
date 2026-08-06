@@ -87,8 +87,10 @@ read its assigned seed subset from a config key (default `seeds`, a comma list l
 and emit **one row per seed** into a row-structured result file (default `results.csv`) that includes
 a column identifying the seed (default `seed`). The lab row-concatenates those per-shard files into one
 per-cell aggregate and uses the seed column to report present-vs-expected and name missing seeds. Both
-the file and the column are overridable (`--results-file` / `--seed-column`). Guide:
-`docs/guides/sharded-sweeps.md`.
+the file and the column are overridable (`--results-file` / `--seed-column`). **Multiple rows per
+seed** (an axis swept inside the job, e.g. one row per (seed, α)) are supported by declaring the
+row identity at sweep time: `--row-key seed,alpha` — duplicates are then judged on the full key.
+Guide: `docs/guides/sharded-sweeps.md`.
 
 ## 4. The MCP tool surface
 
@@ -153,9 +155,23 @@ retry), then re-aggregate and return the updated cell view.
 > seed view; use `sweep_aggregate` for that.
 
 ### `mcp__lab__status`
-`{job_id}` → `{state, started_at, ended_at, exit_code, end_reason, cost}`.
-States: `queued`, `running`, `succeeded`, `failed`, `cancelled`, `timed_out`.
-Cheap to poll.
+`{job_id}` → `{state, started_at, ended_at, exit_code, end_reason, cost,
+teardown_status, sweep_id, code: {git_commit, git_dirty, diff_ref}, mirrored}`.
+States: `queued`, `running`, `succeeded`, `failed`, `cancelled`, `timed_out`,
+`preempted`. Cheap to poll. **`teardown_status: "failed"` is the FR-C2 money
+alarm** — call `mcp__lab__reconcile` immediately. Scheduler-launched (deferred)
+jobs are read from the mirrored manifest (`mirrored: true`; may be a tick stale).
+
+### `mcp__lab__wait`
+`{job_ids?, sweep?, timeout?=600, interval?=10}` → `{all_terminal, teardown_leaks,
+teardown_unconfirmed, jobs}`. Blocks up to `timeout` seconds. Non-empty
+`teardown_leaks` = a paid machine may still be billing. For long runs prefer
+`lab wait` as a background task (below); this tool is for bounded waits.
+
+### `mcp__lab__reconcile`
+`{}` → the dry-run leak report (`orphans`, `sky_orphans`, `unsupervised`,
+`ghosts`, …). Read-only: it never destroys anything — cleanup is
+`lab reconcile --apply` at the CLI.
 
 ### `mcp__lab__metrics`
 `{job_id, names?, since_step?}` → `{"series": {name: [{step, value, wall_time}, ...]}}`.
@@ -188,7 +204,8 @@ of snapshotting it.) Sharded-sweep CLI form:
 `lab sweep-aggregate <sweep_id>` (idempotent; also the per-cell status view) and
 `lab sweep-retry <sweep_id>` (resubmit only missing shards).
 
-Two commands are CLI-only by design:
+Two commands have their full form on the CLI (MCP carries a bounded `wait` and
+a read-only `reconcile`; `--apply` cleanup and unbounded waits stay CLI):
 
 ### `uv run lab wait` — the push-notify primitive
 
@@ -207,10 +224,11 @@ uv run lab wait <job_id> --timeout 1800 --done-file done.json
 > takes a raw number of seconds (e.g. `1800` for 30 min). Passing `30m` here
 > exits `2` (bad args). Convert first.
 
-Why CLI-only: the right pattern is to run `lab wait` as a **Claude Code
+For long runs the right pattern is still to run `lab wait` as a **Claude Code
 background task**, keep working in the foreground, and let the task's
 process-exit notify the harness — at which point you read `done.json` and
-proceed.
+proceed. Use `mcp__lab__wait` only for bounded waits (its `timeout` defaults
+to 600s); it returns the same summary shape as `done.json`.
 
 **Exit codes:**
 - `0` — all jobs terminal AND all teardowns clean.
@@ -219,6 +237,14 @@ proceed.
 - `3` — all terminal BUT at least one **teardown leaked** (`teardown_status: "failed"`).
   Treat as an urgent signal — a paid GPU rental may still be running. Run
   `lab reconcile` immediately (see §6.F below).
+- `4` — `--fail-fast` tripped: a job hit `failed`/`timed_out` while others still run.
+  The summary's `pending` lists the survivors (still billing); nothing was cancelled.
+  **Exception:** if the dead job's teardown is already a confirmed leak, exit is `3`, not
+  `4` — the money alarm always outranks the fail-fast signal.
+
+`--done-file` is atomically rewritten after **each** job reaches a terminal state (with a
+`pending` list), so a watcher can react mid-wait instead of waiting for process exit.
+`--timeout` accepts durations (`"10m"`, `"2h"`) as well as bare seconds.
 
 ### `uv run lab reconcile [--apply]` — leak detection & cleanup (FR-C2)
 
@@ -417,9 +443,9 @@ record artifact **URIs**, never credentials (spec FR-J1).
   `sky.down` for ~3.5 min and falls back to direct vastai-sdk destroy; a
   `"failed"` value means even that failed. **Always follow up with
   `lab reconcile --apply`** to stop the bleed.
-- **No MCP `wait` or `reconcile` tools.** By design: agents shouldn't block
-  an MCP call for hours, and reconcile is an operational/destructive command.
-  Both live on the CLI; use `lab wait` as a background task.
+- **MCP `wait` is bounded; MCP `reconcile` is read-only.** Don't block an MCP
+  call for hours — use `lab wait` as a background task for long runs. Destroying
+  orphans (`--apply`) is deliberately CLI-only.
 - **Skypilot jobs need explicit `accelerators` and `timeout`.** Missing
   either is the most common mistake.
 - **Grid values are strings on the argv.** The experiment (Hydra/typer/argparse)

@@ -29,6 +29,7 @@ def test_tools_registered(tmp_path: Path):
     assert asyncio.run(go()) == [
         "cancel",
         "confirm",
+        "export",
         "fetch_artifacts",
         "list",
         "logs",
@@ -37,6 +38,7 @@ def test_tools_registered(tmp_path: Path):
         "queue_list",
         "queue_pause",
         "queue_show",
+        "reconcile",
         "register",
         "register_sweep",
         "status",
@@ -45,6 +47,7 @@ def test_tools_registered(tmp_path: Path):
         "sweep_aggregate",
         "sweep_retry",
         "sweep_status",
+        "wait",
     ]
 
 
@@ -55,7 +58,9 @@ def test_sweep_tool(tmp_path: Path):
         async with Client(server) as c:
             r = await c.call_tool(
                 "sweep",
-                {"command": f"{PYTHON} experiments/example_capacity.py", "grid": {"K": [1, 2]}},
+                # "steps" is a key the entrypoint consumes — sweeping an unconsumed key now
+                # correctly fails the jobs (the field-report #1 fail-closed contract).
+                {"command": f"{PYTHON} experiments/example_capacity.py", "grid": {"steps": [3, 5]}},
             )
             return r.data
 
@@ -279,3 +284,34 @@ def test_sweep_aggregate_tool(tmp_path: Path):
     result_cell = agg_data["cells"][0]
     assert result_cell["status"] == "complete"
     assert result_cell["seeds_present"] == 4
+
+
+def test_submit_cloud_recorded(tmp_path: Path):
+    """The MCP submit tool accepts cloud and records it on the spec's resources (GCP support)."""
+    lab, server = _make(tmp_path)
+
+    async def do_submit() -> str:
+        async with Client(server) as c:
+            r = await c.call_tool(
+                "submit",
+                {
+                    "command": f"{PYTHON} experiments/example_capacity.py",
+                    "backend": "local",
+                    "cloud": "gcp",
+                },
+            )
+            return r.data["job_id"]
+
+    job_id = asyncio.run(do_submit())
+    assert lab.manifest(job_id).resources.cloud == "gcp"
+
+
+def test_submit_unknown_cloud_is_tool_error(tmp_path: Path):
+    _, server = _make(tmp_path)
+
+    async def go():
+        async with Client(server) as c:
+            await c.call_tool("submit", {"command": "python x.py", "cloud": "aws"})
+
+    with pytest.raises(ToolError, match="unknown cloud"):
+        asyncio.run(go())

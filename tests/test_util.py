@@ -50,3 +50,43 @@ def test_infer_artifact_type():
     assert infer_artifact_type("run.log") == "log"
     assert infer_artifact_type("weird.xyz") == "other"
     assert infer_artifact_type("noext") == "other"
+
+
+def test_parse_duration_accepts_numbers():
+    from lab._util import parse_duration
+
+    assert parse_duration(90) == 90.0
+    assert parse_duration(90.5) == 90.5
+    assert parse_duration("2m") == 120.0
+    assert parse_duration(None) is None
+
+
+def test_atomic_write_text_replaces_and_leaves_no_tmp(tmp_path):
+    from lab._util import atomic_write_text
+
+    p = tmp_path / "sub" / "out.json"
+    atomic_write_text(p, "one")
+    atomic_write_text(p, "two")
+    assert p.read_text() == "two"
+    assert [f.name for f in p.parent.iterdir()] == ["out.json"]  # no .tmp leftovers
+
+
+def test_tail_last_line_returns_last_nonempty_line_and_mtime(tmp_path):
+    from datetime import datetime
+
+    from lab._util import tail_last_line
+
+    p = tmp_path / "logs.txt"
+    p.write_text("x" * 3000 + "\nline-a\nline-b\n\n")
+    line, at = tail_last_line(p)
+    assert line == "line-b"
+    assert isinstance(at, datetime) and at.tzinfo is not None
+
+
+def test_tail_last_line_missing_or_empty(tmp_path):
+    from lab._util import tail_last_line
+
+    assert tail_last_line(tmp_path / "nope.txt") == (None, None)
+    p = tmp_path / "empty.txt"
+    p.write_text("")
+    assert tail_last_line(p) == (None, None)

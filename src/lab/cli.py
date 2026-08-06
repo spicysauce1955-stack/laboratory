@@ -6,17 +6,16 @@ Wired to the local backend by default; structured JSON output mirrors the MCP §
 from __future__ import annotations
 
 import json
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import typer
 
-from lab._util import now, wrap_with_extras
-from lab.core import Lab, LabError, default_lab, resolve_backend_profile
+from lab._util import atomic_write_text, now, parse_duration, wrap_with_extras
+from lab.core import Lab, LabError, default_lab, job_status_view, resolve_backend_profile
 from lab.manifest import repo_root
-from lab.models import JobSpec, JobState, ResourceRequest
+from lab.models import JobSpec, ResourceRequest
 from lab.scheduler.models import Guardrails, RegState, Triggers
 from lab.scheduler.price import PriceFeed
 from lab.scheduler.queue import QueueStore, default_queue
@@ -26,10 +25,6 @@ from lab.scheduler.register import register_sweep as sched_register_sweep
 from lab.scheduler.register import worst_case_cost
 from lab.scheduler.tick import Scheduler
 from lab.store import JobStore
-
-_TERMINAL = {
-    JobState.succeeded, JobState.failed, JobState.cancelled, JobState.timed_out, JobState.preempted
-}
 
 app = typer.Typer(
     help="Laboratory — remote experiment runner (CLI mirror of the MCP tools, spec §9).",
@@ -70,25 +65,6 @@ def _emit(obj: Any) -> None:
     typer.echo(json.dumps(obj, indent=2, default=str))
 
 
-def _settle_teardown(lab: Lab, manifests: list[Any], *, interval: float, attempts: int = 3) -> list[Any]:
-    """Re-read manifests briefly so a teardown_status that's merely lagging (a job reports terminal
-    a tick before its teardown is recorded) settles to its real value before we classify clean vs.
-    leaked vs. unconfirmed. Only re-reads while some remote job still shows a null teardown."""
-
-    def _unsettled(ms: list[Any]) -> bool:
-        return any(
-            m.backend.provisioner != "local" and m.teardown_status is None for m in ms
-        )
-
-    for _ in range(attempts):
-        if not _unsettled(manifests):
-            break
-        time.sleep(min(interval, 5.0))
-        manifests = [lab.manifest(m.job_id) for m in manifests]
-    return manifests
-
-
-
 def _parse_grid(items: list[str]) -> dict[str, list[str]]:
     """Parse repeated `--grid key=v1,v2,...` options into {key: [values]}.
 
@@ -113,6 +89,7 @@ def _parse_grid(items: list[str]) -> dict[str, list[str]]:
 def submit(
     command: str = typer.Option(..., "--command", "-c", help="entrypoint, e.g. 'python experiments/x.py'"),
     backend: str = typer.Option("local", "--backend", help="local | skypilot | cpu"),
+    cloud: str | None = typer.Option(None, "--cloud", help="vast | do | gcp (default vast; --backend cpu defaults to do)"),
     cache: bool = typer.Option(False, "--cache", help="reuse a prior succeeded identical job (FR-B5)"),
     seed: int | None = typer.Option(None, help="explicit seed (recorded in the manifest)"),
     code_ref: str = typer.Option("HEAD", help="git ref to pin"),
@@ -136,6 +113,10 @@ def submit(
         False, "--no-dirty",
         help="refuse to launch from a dirty working tree (default: snapshot the diff, FR-B1)",
     ),
+    allow_unknown_config: bool = typer.Option(
+        False, "--allow-unknown-config",
+        help="don't fail the job when the entrypoint reports it ignored some config keys",
+    ),
 ) -> None:
     """Submit a job without blocking; prints {job_id, cached, status} (FR-A1).
 
@@ -146,12 +127,12 @@ def submit(
     """
     resources = ResourceRequest(
         cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
-        timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
+        cloud=cloud, timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
         spot_fallback=not no_fallback,
     )
     try:
         provisioner, resources = resolve_backend_profile(backend, resources)
-    except LabError as e:  # e.g. --backend cpu with --accelerators (FR-F3)
+    except LabError as e:  # e.g. --backend cpu with --accelerators, unknown --cloud (FR-F3)
         _emit({"error": str(e)})
         raise typer.Exit(code=1) from e
     lab = _lab(provisioner)
@@ -161,6 +142,7 @@ def submit(
         seed=seed,
         resources=resources,
         submitted_by="human",
+        allow_unknown_config=allow_unknown_config,
     )
     if cache and (cached_id := lab.find_cached(spec)) is not None:
         _emit({"job_id": cached_id, "cached": True, "status": lab.status(cached_id).value})
@@ -210,8 +192,9 @@ def confirm(
 @app.command()
 def sweep(
     command: str = typer.Option(..., "--command", "-c", help="entrypoint, e.g. 'python experiments/x.py'"),
-    grid: list[str] = typer.Option(..., "--grid", "-g", help="key=v1,v2,... (repeatable)"),
+    grid: list[str] = typer.Option([], "--grid", "-g", help="key=v1,v2,... (repeatable; optional when --seeds is given)"),
     backend: str = typer.Option("local", "--backend", help="local | skypilot | cpu"),
+    cloud: str | None = typer.Option(None, "--cloud", help="vast | do | gcp (default vast; --backend cpu defaults to do)"),
     seed: int | None = typer.Option(None),
     cpus: int | None = typer.Option(None),
     memory: str | None = typer.Option(None),
@@ -231,11 +214,21 @@ def sweep(
     shard_size: int | None = typer.Option(None, "--shard-size", help="max seeds per sub-job; each cell's seeds are split into shards of this size"),
     results_file: str = typer.Option("results.csv", "--results-file", help="per-run row-structured result file to aggregate per cell"),
     seed_column: str = typer.Option("seed", "--seed-column", help="column in --results-file identifying each row's seed"),
+    row_key: str | None = typer.Option(
+        None, "--row-key",
+        help="comma-separated columns identifying a result row, e.g. 'seed,alpha' when an "
+        "inner-loop axis writes multiple rows per seed (default: the seed column alone)",
+    ),
+    allow_unknown_config: bool = typer.Option(
+        False, "--allow-unknown-config",
+        help="don't fail jobs when the entrypoint reports it ignored some config keys",
+    ),
 ) -> None:
-    """Submit a parameter-grid sweep: one job per point under a sweep_id (FR-A5)."""
+    """Submit a parameter-grid sweep: one job per point under a sweep_id (FR-A5). A seeds-only
+    sweep (no --grid) is one cell sharded over --seeds."""
     resources = ResourceRequest(
         cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
-        timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
+        cloud=cloud, timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
         spot_fallback=not no_fallback,
     )
     try:
@@ -262,6 +255,8 @@ def sweep(
             shard_size=shard_size,
             results_file=results_file,
             seed_column=seed_column,
+            row_key=row_key,
+            allow_unknown_config=allow_unknown_config,
         )
     except LabError as e:
         _emit({"error": str(e)})
@@ -274,39 +269,57 @@ def sweep(
 
 
 @app.command()
-def status(job_id: str) -> None:
-    """Show a job's state + cost + teardown_status (FR-A2, FR-I2, FR-C2)."""
+def export(
+    target_id: str = typer.Argument(..., help="a job id or a sweep-... id"),
+    to: Path = typer.Option(..., "--to", help="destination directory for the bundle"),
+    logs: bool = typer.Option(False, "--logs", help="also include per-job logs.txt (redacted)"),
+) -> None:
+    """Export a committable provenance bundle: manifests + result tables + resolved config +
+    code diffs (+ sweep plan/aggregates), with an index.json tying files to commits and spend.
+
+    The part of git-ignored runs/ that belongs in version control next to the paper — excluded
+    blobs are listed in the index under `skipped`, never silently dropped (field-report #5).
+    """
     try:
-        lab = _lab_for(job_id)
+        _emit(_lab().export(target_id, to, include_logs=logs))
+    except LabError as e:
+        _emit({"error": str(e)})
+        raise typer.Exit(code=1) from e
+
+
+@app.command()
+def lint(
+    command: str = typer.Option(..., "--command", "-c", help="entrypoint, e.g. 'python experiments/x.py'"),
+    grid: list[str] = typer.Option([], "--grid", "-g", help="key=v1,v2,... (repeatable)"),
+    key: list[str] = typer.Option([], "--key", help="extra override key(s) to check (repeatable)"),
+) -> None:
+    """Pre-submit check: warn about override keys the entrypoint source never references.
+
+    A heuristic grep for legacy entrypoints that don't write effective_config.json — catches the
+    silent-dropped-override trap (field-report #1) before money is spent. Exits 1 on findings.
+    """
+    from lab.experiment import unreferenced_keys
+
+    script = next((tok for tok in command.split() if tok.endswith(".py")), None)
+    if script is None or not Path(script).exists():
+        _emit({"error": f"could not find a .py entrypoint in {command!r} to lint"})
+        raise typer.Exit(code=2)
+    keys = list(_parse_grid(grid)) + list(key)
+    missing = unreferenced_keys(Path(script).read_text(), keys)
+    _emit({"script": script, "checked_keys": sorted(keys), "missing_keys": missing})
+    if missing:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def status(job_id: str) -> None:
+    """Show a job's state + cost + teardown_status (FR-A2, FR-I2, FR-C2); scheduler-launched
+    jobs fall back to the mirrored manifest (spec §4.3). Same shape as the MCP status tool."""
+    try:
+        _emit(job_status_view(repo_root() / "runs", repo_root(), job_id))
     except FileNotFoundError:
-        mirrored = default_queue().read_mirrored(job_id)  # scheduler-launched job (spec §4.3)
-        if mirrored is None:
-            _emit({"error": f"unknown job id {job_id!r}"})
-            raise typer.Exit(code=2) from None
-        _emit(
-            {
-                "job_id": job_id,
-                "state": mirrored.status.value,
-                "exit_code": mirrored.exit_code,
-                "cost": mirrored.cost.model_dump() if mirrored.cost else None,
-                "teardown_status": mirrored.teardown_status,
-                "end_reason": mirrored.end_reason,
-                "mirrored": True,  # may be up to one tick stale
-            }
-        )
-        return
-    state = lab.status(job_id)
-    m = lab.manifest(job_id)
-    _emit(
-        {
-            "job_id": job_id,
-            "state": state.value,
-            "exit_code": m.exit_code,
-            "cost": m.cost.model_dump() if m.cost else None,
-            "teardown_status": m.teardown_status,
-            "end_reason": m.end_reason,
-        }
-    )
+        _emit({"error": f"unknown job id {job_id!r}"})
+        raise typer.Exit(code=2) from None
 
 
 @app.command()
@@ -346,10 +359,23 @@ def sweep_status(sweep_id: str) -> None:
 
 
 @app.command(name="sweep-aggregate")
-def sweep_aggregate(sweep_id: str) -> None:
-    """Row-concatenate each cell's succeeded shards into one per-cell result (P1-2)."""
+def sweep_aggregate(
+    sweep_id: str,
+    strict: bool = typer.Option(
+        False, "--strict",
+        help="only aggregate succeeded shards (exclude recovered rows from timed-out/failed "
+        "shards; those rows carry a _shard_status column and show up in seeds_partial)",
+    ),
+    row_key: str | None = typer.Option(
+        None, "--row-key",
+        help="declare the columns identifying a result row (e.g. 'seed,alpha') for sweeps "
+        "created before --row-key existed; persisted onto the plan for future aggregates",
+    ),
+) -> None:
+    """Row-concatenate each cell's shard results into one per-cell result (P1-2). By default
+    partial rows from non-succeeded shards are included (stamped + listed in seeds_partial)."""
     try:
-        plan = _lab().aggregate_sweep(sweep_id)
+        plan = _lab().aggregate_sweep(sweep_id, include_partial=not strict, row_key=row_key)
     except LabError as e:
         _emit({"error": str(e)})
         raise typer.Exit(code=1) from e
@@ -391,16 +417,30 @@ def wait(
     job_ids: list[str] = typer.Argument(None, help="job id(s) to wait for"),
     sweep: str | None = typer.Option(None, "--sweep", help="wait for all jobs in this sweep_id"),
     interval: float = typer.Option(10.0, help="seconds between cheap status polls (FR-G2)"),
-    timeout: float | None = typer.Option(None, help="give up after N seconds"),
+    timeout: str | None = typer.Option(
+        None, help="give up after this long, e.g. 600 / '10m' / '2h' (bare numbers = seconds)"
+    ),
     done_file: Path | None = typer.Option(
-        None, "--done-file", help="write the final summary here on completion (a sentinel a hook can watch)"
+        None, "--done-file",
+        help="summary JSON a hook can watch — atomically rewritten after each job finishes "
+        "(carries `pending`), and finally with the complete verdict",
+    ),
+    fail_fast: bool = typer.Option(
+        False, "--fail-fast",
+        help="exit 4 as soon as any job is failed/timed_out (preempted/cancelled don't trip it); "
+        "surviving jobs are NOT cancelled — `pending` in the summary names them",
     ),
 ) -> None:
     """Block until the job(s) reach a terminal state, then exit (FR-G1).
 
     Run as a Claude Code background task — its completion is the push signal the session acts on,
-    so the agent need not poll. Exits non-zero if it gave up on a timeout.
+    so the agent need not poll. Exit codes: 0 clean; 1 gave up on --timeout; 2 bad args;
+    3 teardown leaked (a paid machine may still bill); 4 --fail-fast tripped.
     """
+    try:
+        timeout_s = parse_duration(timeout)
+    except ValueError as e:
+        raise typer.BadParameter(f"bad --timeout {timeout!r}: {e}") from e
     ids = _lab().jobs_in_sweep(sweep) if sweep else list(job_ids or [])
     if not ids:
         msg = f"sweep {sweep!r} matched no jobs" if sweep else "pass job id(s) or --sweep <sweep_id>"
@@ -412,38 +452,18 @@ def wait(
         _emit({"error": f"unknown job id(s): {missing}"})
         raise typer.Exit(code=2)
     the_lab = _lab_for(ids[0])
-    manifests = the_lab.wait(ids, interval=interval, timeout=timeout)
-    all_terminal = all(m.status in _TERMINAL for m in manifests)
-    if all_terminal:
-        manifests = _settle_teardown(the_lab, manifests, interval=interval)
-    teardown_leaks = [m.job_id for m in manifests if m.teardown_status == "failed"]
-    # A remote job that's terminal but whose teardown_status never settled is neither clean
-    # ("succeeded") nor a confirmed leak ("failed") — don't let that null masquerade as a clean
-    # exit 0. (Local jobs provision nothing, so their null teardown_status is expected.)
-    teardown_unconfirmed = [
-        m.job_id
-        for m in manifests
-        if m.status in _TERMINAL
-        and m.backend.provisioner != "local"
-        and m.teardown_status is None
-    ]
-    summary = {
-        "all_terminal": all_terminal,
-        "teardown_leaks": teardown_leaks,  # FR-C2 — non-empty == a paid rental may still be running
-        "teardown_unconfirmed": teardown_unconfirmed,  # null teardown — run `lab reconcile` to be sure
-        "jobs": [
-            {
-                "job_id": m.job_id,
-                "state": m.status.value,
-                "exit_code": m.exit_code,
-                "teardown_status": m.teardown_status,
-            }
-            for m in manifests
-        ],
-    }
+    on_update = (
+        (lambda s: atomic_write_text(done_file, json.dumps(s, indent=2, default=str)))
+        if done_file is not None
+        else None
+    )
+    summary = the_lab.wait_summary(
+        ids, interval=interval, timeout=timeout_s, fail_fast=fail_fast, on_update=on_update
+    )
+    all_terminal = summary["all_terminal"]
+    teardown_leaks = summary["teardown_leaks"]
+    teardown_unconfirmed = summary["teardown_unconfirmed"]
     _emit(summary)
-    if done_file is not None:
-        done_file.write_text(json.dumps(summary, indent=2, default=str))
     if teardown_unconfirmed and not teardown_leaks:
         typer.echo(
             f"[lab] warning: teardown not confirmed for {teardown_unconfirmed} "
@@ -451,6 +471,10 @@ def wait(
             "block volume is still billing.",
             err=True,
         )
+    if summary["failed_fast"]:
+        # A confirmed leak outranks the fail-fast signal: exit 3 is the documented URGENT
+        # "a paid machine may still be billing — run `lab reconcile` now" alarm (FR-C2).
+        raise typer.Exit(code=3 if teardown_leaks else 4)
     if not all_terminal:
         raise typer.Exit(code=1)
     if teardown_leaks:
@@ -476,11 +500,12 @@ def reconcile(
         False, "--apply", help="destroy orphaned rentals (default: dry-run report only)"
     ),
 ) -> None:
-    """Cross-check Vast.ai rentals against local jobs to find leaks (FR-C2).
+    """Cross-check cloud instances against local jobs to find leaks (FR-C2).
 
-    Dry-run by default. ``--apply`` destroys every Vast.ai rental whose label matches the lab
-    cluster pattern but has no live local job — use this to clean up after a teardown failure
-    (look for ``teardown_status: "failed"`` in ``lab status``). Exits 3 if orphans are found in
+    Dry-run by default. ``--apply`` destroys every Vast.ai rental and SkyPilot-tracked ``lab-*``
+    cluster (the ``sky.status`` pass covers DO/GCP) with no live local job — use this to clean up
+    after a teardown failure (look for ``teardown_status: "failed"`` in ``lab status``). The
+    Vast-direct pass is skipped when vastai-sdk isn't installed. Exits 3 if orphans are found in
     dry-run mode — re-run with --apply, or destroy by hand via ``vastai destroy_instance <id>``.
     """
     try:
@@ -489,7 +514,7 @@ def reconcile(
         _emit({"error": str(e)})
         raise typer.Exit(code=2) from e
     _emit(report)
-    if report["orphans"] and not apply:
+    if (report["orphans"] or report["sky_orphans"]) and not apply:
         raise typer.Exit(code=3)  # action required: re-run with --apply
 
 
@@ -516,6 +541,9 @@ def register(
     gpus: int | None = typer.Option(None),
     accelerators: str | None = typer.Option(
         None, "--gpu", "--accelerators", help="e.g. RTX_4090:1"
+    ),
+    cloud: str | None = typer.Option(
+        None, "--cloud", help="vast | do | gcp (default vast; price/offer triggers are Vast-only)"
     ),
     timeout: str | None = typer.Option(
         None, help="wall-clock limit per job, e.g. 2h (cost bound, FR-I1)"
@@ -568,8 +596,8 @@ def register(
         command=command,
         seed=seed,
         resources=ResourceRequest(
-            cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
-            use_spot=spot, spot_fallback=not no_fallback,
+            cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, cloud=cloud,
+            timeout=timeout, use_spot=spot, spot_fallback=not no_fallback,
         ),
         submitted_by="human",
     )
@@ -606,6 +634,9 @@ def register_sweep(
     gpus: int | None = typer.Option(None),
     accelerators: str | None = typer.Option(
         None, "--gpu", "--accelerators", help="e.g. RTX_4090:1"
+    ),
+    cloud: str | None = typer.Option(
+        None, "--cloud", help="vast | do | gcp (default vast; price/offer triggers are Vast-only)"
     ),
     timeout: str | None = typer.Option(
         None, help="wall-clock limit per job, e.g. 2h (cost bound, FR-I1)"
@@ -657,8 +688,8 @@ def register_sweep(
     )
     guardrails = Guardrails(expires_at=expires_at, max_cost_usd=max_cost)
     resources = ResourceRequest(
-        cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, timeout=timeout,
-        use_spot=spot, spot_fallback=not no_fallback,
+        cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, cloud=cloud,
+        timeout=timeout, use_spot=spot, spot_fallback=not no_fallback,
     )
     try:
         sweep_id, regs = sched_register_sweep(

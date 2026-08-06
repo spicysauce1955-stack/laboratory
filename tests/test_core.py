@@ -65,9 +65,9 @@ def test_sweep_local(tmp_path: Path):
     backend = LocalBackend(home=tmp_path, repo=repo)
     lab = Lab(backend=backend, repo=repo, home=tmp_path)
 
-    sweep_id, job_ids = lab.sweep(
-        f"{PYTHON} experiments/example_capacity.py", {"K": [1, 2], "alpha": [0.5]}
-    )
+    # Schema-less inline entrypoint (legacy path): this test pins sweep mechanics, and
+    # example_capacity's handshake would (correctly) refuse the unknown K/alpha knobs.
+    sweep_id, job_ids = lab.sweep(f"{PYTHON} -c pass", {"K": [1, 2], "alpha": [0.5]})
     assert sweep_id.startswith("sweep-")
     assert len(job_ids) == 2  # 2 x 1 grid
 
@@ -86,8 +86,10 @@ def test_sweep_quotes_values(tmp_path: Path):
     repo = repo_root(Path.cwd())
     backend = LocalBackend(home=tmp_path, repo=repo)
     lab = Lab(backend=backend, repo=repo, home=tmp_path)
-    # a value with a space + shell metachars must be quoted into one safe token (no injection)
-    _, job_ids = lab.sweep(f"{PYTHON} experiments/example_capacity.py", {"x": ["a b; echo hi"]})
+    # a value with a space + shell metachars must be quoted into one safe token (no injection).
+    # Uses a schema-less inline entrypoint (legacy path): example_capacity now refuses unknown
+    # keys at runtime, and 'x' is not a knob it declares.
+    _, job_ids = lab.sweep(f"{PYTHON} -c pass", {"x": ["a b; echo hi"]})
     cmd = lab.manifest(job_ids[0]).run.entrypoint_command
     assert "'x=a b; echo hi'" in cmd
     assert wait_terminal(backend, job_ids[0]) == JobState.succeeded
@@ -112,7 +114,7 @@ def test_wait_returns_when_jobs_terminal(tmp_path: Path):
     repo = repo_root(Path.cwd())
     backend = LocalBackend(home=tmp_path, repo=repo)
     lab = Lab(backend=backend, repo=repo, home=tmp_path)
-    _, job_ids = lab.sweep(f"{PYTHON} experiments/example_capacity.py", {"K": [1, 2]})
+    _, job_ids = lab.sweep(f"{PYTHON} experiments/example_capacity.py", {"steps": [3, 5]})
     manifests = lab.wait(job_ids, interval=0.2, timeout=30)
     assert all(m.status == JobState.succeeded for m in manifests)
 
@@ -282,7 +284,9 @@ def test_reconcile_tolerates_do_unconfigured(tmp_path: Path, monkeypatch: pytest
     assert report["do_volumes_destroyed"] == []
 
 
-def test_reconcile_propagates_import_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_reconcile_skips_vast_pass_without_sdk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A missing vastai-sdk (DO/GCP-only install) skips the Vast pass instead of failing —
+    the sky.status pass still provides cloud-agnostic leak detection."""
     repo = repo_root(Path.cwd())
     lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
 
@@ -290,8 +294,11 @@ def test_reconcile_propagates_import_error(tmp_path: Path, monkeypatch: pytest.M
         raise ImportError("no vastai-sdk")
 
     monkeypatch.setattr(skypilot_mod, "list_vast_instances", _boom)
-    with pytest.raises(LabError, match="vastai-sdk not installed"):
-        lab.reconcile()
+    _patch_empty_sky(monkeypatch)
+    monkeypatch.setattr(skypilot_mod, "list_do_volumes", lambda client=None: [])
+    report = lab.reconcile()
+    assert report["vast_pass"] == "skipped (vastai-sdk not installed)"
+    assert report["orphans"] == []
 
 
 def test_find_cached(tmp_path: Path):

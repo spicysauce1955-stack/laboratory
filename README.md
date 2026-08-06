@@ -28,6 +28,7 @@ Next (see `research/16-decisions.md`): push notifications; sweeps; leaner remote
 ```bash
 uv sync                                # local backend + CLI/MCP (lean default)
 uv sync --extra skypilot --extra r2    # + remote (Vast) backend & durable R2 (full dev)
+uv sync --extra do --extra gcp         # + DigitalOcean / Google Cloud clouds (--cloud, --backend cpu)
 
 # CLI
 uv run lab submit -c "python experiments/example_capacity.py" --seed 42
@@ -47,6 +48,10 @@ uv run python -m lab.mcp_server
 # Remote backend (Vast.ai via SkyPilot): uv sync --extra skypilot, set a Vast API key, then:
 uv run lab submit -c "python experiments/example_capacity.py" \
   --backend skypilot --accelerators RTX4090:1 --timeout 20m
+
+# Other clouds via --cloud (vast default | do | gcp; docs/guides/gcp-backend.md):
+uv run lab submit -c "python experiments/x.py" \
+  --backend skypilot --cloud gcp --accelerators T4:1 --timeout 20m
 
 # Durable artifacts on Cloudflare R2 (optional): uv sync --extra r2, creds in
 # ~/.cloudflare/r2.credentials, then export before submitting/fetching:

@@ -9,6 +9,7 @@ Entry point:  python -m lab.sky_runner <job_dir>
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from collections.abc import Callable
@@ -24,9 +25,9 @@ from lab.backends.skypilot import (
     ProvisionTimeout,
     build_task,
     cluster_name_for,
-    confirm_no_rental,
     confirm_success,
     map_job_status,
+    preempted_teardown_confirmed,
     promote_timeout,
     provision_with_watchdog,
     tear_down_and_record,
@@ -160,15 +161,96 @@ def _resolve_hourly(cluster: str, handle: Any, cloud: str) -> float | None:
     return _hourly_cost(handle)
 
 
+class TransientLaunchError(RuntimeError):
+    """A launch that never reached the cloud (local API server overloaded/cold), exhausted
+    after retries. ``end_reason`` gets a ``transient:`` prefix so supervisors can auto-retry
+    without string-matching a traceback (field-report #4)."""
+
+
+_LOCAL_MARKERS = ("127.0.0.1", "localhost")
+_CONNECTION_MARKERS = (
+    "connection refused",
+    "connectionerror",
+    "newconnectionerror",
+    "failed to establish a new connection",
+    "max retries exceeded",
+    "remotedisconnected",
+    "connection aborted",
+)
+
+
+def is_transient_launch_error(e: BaseException) -> bool:
+    """True iff a launch error is a connection failure to the submitter's OWN local SkyPilot API
+    server — the one case where retrying is provably safe (the request never reached a provider).
+
+    Requires BOTH a localhost marker and a connection-failure marker: a connection error to a
+    cloud endpoint stays a terminal failure (fail-toward-alarm). Pure."""
+    text = f"{type(e).__name__}: {e}".lower()
+    return any(m in text for m in _LOCAL_MARKERS) and any(
+        m in text for m in _CONNECTION_MARKERS
+    )
+
+
+def _launch_with_retry(
+    sky_mod: Any,
+    task: Any,
+    cluster: str,
+    *,
+    attempts: int | None = None,
+    base_s: float = 2.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Any:
+    """``sky.launch`` with backoff+jitter retries on transient local-API errors.
+
+    Every attempt uses the SAME cluster name, so a retry can never double-provision: a refused
+    connection never reached the server, and SkyPilot keys clusters on their name. Non-transient
+    errors re-raise immediately; exhaustion raises :class:`TransientLaunchError`.
+    """
+    import random
+
+    if attempts is None:
+        attempts = int(os.environ.get("LAB_LAUNCH_RETRIES", "3"))
+    last: BaseException | None = None
+    for attempt in range(attempts):
+        try:
+            return sky_mod.launch(
+                task,
+                cluster_name=cluster,
+                down=True,
+                idle_minutes_to_autostop=DEFAULT_AUTOSTOP_MIN,
+            )
+        except Exception as e:  # noqa: BLE001 — classified below
+            if not is_transient_launch_error(e):
+                raise
+            last = e
+            if attempt < attempts - 1:
+                delay = base_s * (2**attempt) * (0.5 + random.random())
+                print(
+                    f"[lab] transient launch error (attempt {attempt + 1}/{attempts}), "
+                    f"retrying in {delay:.1f}s: {e}"
+                )
+                sleep(delay)
+    raise TransientLaunchError(
+        f"local SkyPilot API unreachable after {attempts} attempts: {last}"
+    ) from last
+
+
 def provision_failure_reason(generic: str, cloud: str) -> str:
     """Enrich a generic provision-failure message per cloud (§8).
 
     Vast returns 400 on a depleted balance, surfaced generically — consult the balance and say so.
-    For DigitalOcean, point at the most common cause: DO not enabled / no doctl token / quota."""
+    For DigitalOcean/GCP, point at the most common causes: cloud not enabled in `sky check`,
+    missing credentials, or quota."""
     if cloud == "do":
         return (
             f"{generic} — if this is a DigitalOcean setup issue, check `sky check` shows DO enabled "
             "(doctl token at ~/.config/doctl/config.yaml) and your DO vCPU quota covers the size"
+        )
+    if cloud == "gcp":
+        return (
+            f"{generic} — if this is a GCP setup issue, check `sky check gcp` passes "
+            "(`gcloud auth application-default login`), the Compute Engine API is enabled, and "
+            "your regional quota covers the accelerator family (per-family quota for L4/T4)"
         )
     if cloud == "vast":
         bal = vast_balance()
@@ -184,6 +266,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
     install_log_redaction(store.logs_path(job_id))  # scrub secrets before any SkyPilot output
     manifest = store.read_manifest(job_id)
     cluster = cluster_name_for(job_id)
+    cloud = manifest.resources.cloud or "vast"
 
     if not adopt:
         started = now()
@@ -202,12 +285,8 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
     try:
         if not adopt:
             task = build_task(manifest, workdir=Path.cwd())
-            request_id = sky.launch(
-                task,
-                cluster_name=cluster,
-                down=True,
-                idle_minutes_to_autostop=DEFAULT_AUTOSTOP_MIN,
-            )
+            # Retries transient local-API failures (submit stampede) before giving up (fieldrep #4).
+            request_id = _launch_with_retry(sky, task, cluster)
             # stream_and_get blocks until the job is submitted (0.12), i.e. until the host is UP.
             # Bound it so a dead Vast offer stuck in "loading" can't hang the supervisor forever
             # (FR-I1).
@@ -219,7 +298,6 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             # Record cost up-front so a running job already shows it (FR-I2). The host is UP now,
             # so the Vast rental exists — bill at its real dph_total, not SkyPilot's low catalog
             # estimate.
-            cloud = manifest.resources.cloud or "vast"
             hourly_usd = _resolve_hourly(cluster, handle, cloud)
             estimated_usd = actual_cost(hourly_usd, parse_duration(manifest.resources.timeout))
             # Record which instance kind SkyPilot actually launched (spot vs on-demand) — with
@@ -240,7 +318,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                 ),
             )
         else:
-            hourly_usd = _resolve_hourly(cluster, None, manifest.resources.cloud or "vast")
+            hourly_usd = _resolve_hourly(cluster, None, cloud)
             estimated_usd = manifest.cost.estimated_usd if manifest.cost else None
             sky_job_id = None  # match any job in the cluster queue
 
@@ -280,14 +358,23 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                 "(host never reached UP — likely a dead Vast offer; resubmit for a fresh host)"
             )[:300],
         )
-        tear_down_and_record(sky, cluster, store, job_id, manifest.resources.cloud or "vast")
+        tear_down_and_record(sky, cluster, store, job_id, cloud)
         return 1
-    except Exception as e:  # noqa: BLE001
-        reason = provision_failure_reason(f"launch error: {e}", manifest.resources.cloud or "vast")
+    except TransientLaunchError as e:
+        # The launch never reached a provider — safe to auto-retry; the `transient:` prefix is
+        # the machine-readable hint (no traceback string-matching needed).
+        reason = f"transient: {provision_failure_reason(f'launch error: {e}', cloud)}"
         store.update_manifest(
             job_id, status=JobState.failed, ended_at=now(), end_reason=reason[:300]
         )
-        tear_down_and_record(sky, cluster, store, job_id, manifest.resources.cloud or "vast")
+        tear_down_and_record(sky, cluster, store, job_id, cloud)
+        return 1
+    except Exception as e:  # noqa: BLE001
+        reason = provision_failure_reason(f"launch error: {e}", cloud)
+        store.update_manifest(
+            job_id, status=JobState.failed, ended_at=now(), end_reason=reason[:300]
+        )
+        tear_down_and_record(sky, cluster, store, job_id, cloud)
         return 1
 
     try:
@@ -363,8 +450,8 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             cost=cost,
         )
 
-    teardown_ok = tear_down_and_record(sky, cluster, store, job_id, manifest.resources.cloud or "vast")
-    if final is JobState.preempted and not confirm_no_rental(cluster):
+    teardown_ok = tear_down_and_record(sky, cluster, store, job_id, cloud)
+    if final is JobState.preempted and not preempted_teardown_confirmed(cloud, cluster):
         # The instance vanished (preemption inferred), but we can't confirm the Vast rental is
         # actually gone — flag it so `lab wait` exits 3 and the operator can run `lab reconcile`
         # before any auto-resubmitter builds on a potentially-still-billing orphan (FR-C2).

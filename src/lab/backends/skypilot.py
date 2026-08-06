@@ -238,6 +238,139 @@ def do_volume_orphans(
     return orphans
 
 
+def _get_gcp_compute() -> tuple[Any, str]:
+    """GCP compute client + project via application-default credentials (the same creds
+    SkyPilot's GCP provisioner uses). Test seam: monkeypatch to inject a fake."""
+    import google.auth
+    from googleapiclient import discovery  # type: ignore[import-untyped]
+
+    creds, project = google.auth.default()
+    if not project:
+        raise RuntimeError("no GCP project configured (run `gcloud config set project <id>`)")
+    compute = discovery.build("compute", "v1", credentials=creds, cache_discovery=False)
+    return compute, str(project)
+
+
+def _zone_name(url: str) -> str:
+    """'https://…/zones/us-central1-a' (or 'zones/us-central1-a') -> 'us-central1-a'."""
+    return url.rsplit("/", 1)[-1]
+
+
+def list_gcp_instances(compute: Any | None = None, project: str | None = None) -> list[dict[str, Any]]:
+    """Every GCE instance on the project as ``{name, zone, status}`` dicts, via
+    ``instances.aggregatedList`` (all zones, paginated). Raises if GCP isn't configured —
+    best-effort callers (the reconcile pass) swallow that."""
+    if compute is None or project is None:
+        compute, project = _get_gcp_compute()
+    out: list[dict[str, Any]] = []
+    req = compute.instances().aggregatedList(project=project)
+    while req is not None:
+        resp = req.execute()
+        for _scope, data in (resp.get("items") or {}).items():
+            for inst in data.get("instances") or []:
+                out.append(
+                    {
+                        "name": str(inst.get("name", "")),
+                        "zone": _zone_name(str(inst.get("zone", ""))),
+                        "status": inst.get("status"),
+                    }
+                )
+        req = compute.instances().aggregatedList_next(previous_request=req, previous_response=resp)
+    return out
+
+
+def list_gcp_disks(compute: Any | None = None, project: str | None = None) -> list[dict[str, Any]]:
+    """Every persistent disk on the project as ``{name, zone, users}`` dicts (``users`` = URLs of
+    instances the disk is attached to; empty = unattached and still billing)."""
+    if compute is None or project is None:
+        compute, project = _get_gcp_compute()
+    out: list[dict[str, Any]] = []
+    req = compute.disks().aggregatedList(project=project)
+    while req is not None:
+        resp = req.execute()
+        for _scope, data in (resp.get("items") or {}).items():
+            for disk in data.get("disks") or []:
+                out.append(
+                    {
+                        "name": str(disk.get("name", "")),
+                        "zone": _zone_name(str(disk.get("zone", ""))),
+                        "users": list(disk.get("users") or []),
+                    }
+                )
+        req = compute.disks().aggregatedList_next(previous_request=req, previous_response=resp)
+    return out
+
+
+def gcp_instance_orphans(
+    instances: list[dict[str, Any]], running_clusters: set[str]
+) -> list[dict[str, Any]]:
+    """``lab-*`` GCE instances not tied to any running cluster — the out-of-band GCP analogue of
+    the Vast rental pass (SkyPilot names instances after their cluster, so a running cluster name
+    is a substring of its instance names). Pure."""
+    orphans: list[dict[str, Any]] = []
+    for inst in instances:
+        name = str(inst.get("name", ""))
+        if not name.startswith("lab-"):
+            continue  # not ours — leave it alone
+        if any(c.lower() in name.lower() for c in running_clusters):
+            continue  # backs a live job
+        orphans.append(inst)
+    return orphans
+
+
+def gcp_disk_orphans(
+    disks: list[dict[str, Any]], running_clusters: set[str]
+) -> list[dict[str, Any]]:
+    """Unattached ``lab-*`` persistent disks — a disk that outlived its VM keeps billing (the GCP
+    analogue of the DO volume-leak pass). Attached disks are skipped: they die with the VM. Pure."""
+    orphans: list[dict[str, Any]] = []
+    for disk in disks:
+        name = str(disk.get("name", ""))
+        if not name.startswith("lab-"):
+            continue
+        if disk.get("users"):
+            continue  # attached — deleted together with its instance
+        if any(c.lower() in name.lower() for c in running_clusters):
+            continue
+        orphans.append(disk)
+    return orphans
+
+
+def delete_gcp_instance(
+    name: str, zone: str, compute: Any | None = None, project: str | None = None
+) -> None:
+    """Provider-direct instance delete (bypasses SkyPilot's registry)."""
+    if compute is None or project is None:
+        compute, project = _get_gcp_compute()
+    compute.instances().delete(project=project, zone=zone, instance=name).execute()
+
+
+def delete_gcp_disk(
+    name: str, zone: str, compute: Any | None = None, project: str | None = None
+) -> None:
+    """Provider-direct disk delete (unattached leftovers only — attached deletes 400)."""
+    if compute is None or project is None:
+        compute, project = _get_gcp_compute()
+    compute.disks().delete(project=project, zone=zone, disk=name).execute()
+
+
+def _gcp_destroy_matching(cluster: str) -> list[str]:
+    """Destroy every GCE instance whose name contains ``cluster``; return their names."""
+    compute, project = _get_gcp_compute()
+    needle = cluster.lower()
+    destroyed: list[str] = []
+    for inst in list_gcp_instances(compute, project):
+        if needle not in inst["name"].lower():
+            continue
+        try:
+            delete_gcp_instance(inst["name"], inst["zone"], compute, project)
+            destroyed.append(inst["name"])
+            print(f"[lab] gcp-direct destroyed instance {inst['name']} (cluster={cluster})")
+        except Exception as e:  # noqa: BLE001 — best-effort; the next instance might still go
+            print(f"[lab] gcp-direct destroy {inst['name']} failed: {e}")
+    return destroyed
+
+
 def confirm_no_rental(cluster: str) -> bool:
     """True iff no Vast rental labelled for this cluster remains. Best-effort: returns False on any
     match OR if the listing fails — we never claim 'gone' under uncertainty (FR-C2)."""
@@ -247,6 +380,15 @@ def confirm_no_rental(cluster: str) -> bool:
         return False
     needle = cluster.lower()
     return not any(needle in _instance_label(inst) for inst in instances)  # _instance_label is lower
+
+
+def preempted_teardown_confirmed(cloud: str, cluster: str) -> bool:
+    """Whether a preempted job's instance is confirmably gone. Vast has a provider-direct listing
+    to double-check against (:func:`confirm_no_rental`); other clouds have none, so the
+    :func:`tear_down_and_record` outcome is already the authoritative answer."""
+    if cloud != "vast":
+        return True
+    return confirm_no_rental(cluster)
 
 
 def vast_hourly_for_cluster(cluster: str, client: Any | None = None) -> float | None:
@@ -319,13 +461,14 @@ def _vast_destroy_matching(cluster: str, client: Any | None = None) -> list[int]
 def robust_teardown(
     sky_mod: Any, cluster: str, *, backoffs: tuple[int, ...] = TEARDOWN_BACKOFFS, cloud: str = "vast"
 ) -> dict[str, Any]:
-    """Tear down a SkyPilot cluster with retry + vastai-sdk fallback.
+    """Tear down a SkyPilot cluster with retry + a provider-direct fallback (Vast/GCP).
 
     Why this exists: a single ``sky.down`` call that swallows transient errors (network hiccup,
-    Vast.ai API timeout) used to leak rentals — the cluster kept billing while we marked the
+    provider API timeout) used to leak rentals — the cluster kept billing while we marked the
     job ``failed`` and moved on. We now retry sky.down with exponential backoff, then bypass
-    SkyPilot's local registry entirely and ask Vast.ai itself to destroy any rental whose
-    label matches the cluster name.
+    SkyPilot's local registry entirely and ask the provider itself to destroy any instance
+    matching the cluster name (vastai-sdk on Vast, the compute API on GCP; DO has no direct
+    channel and reports the failure).
 
     Returns a structured outcome suitable for persistence on the manifest:
 
@@ -364,8 +507,32 @@ def robust_teardown(
             )
 
     # SkyPilot teardown didn't take.
+    if cloud == "gcp":
+        # Talk to the GCP compute API directly — bypasses SkyPilot's registry.
+        print(f"[lab] sky.down exhausted for {cluster}; falling back to gcp-direct destroy")
+        try:
+            gcp_destroyed = _gcp_destroy_matching(cluster)
+            return {
+                "status": "succeeded",  # destroyed-or-none-found are both safe outcomes
+                "attempts": len(delays),
+                "vast_fallback_used": False,
+                "vast_destroyed": [],
+                "gcp_fallback_used": True,
+                "gcp_destroyed": gcp_destroyed,
+                "error": last_err,
+            }
+        except Exception as e:  # noqa: BLE001
+            return {
+                "status": "failed",
+                "attempts": len(delays),
+                "vast_fallback_used": False,
+                "vast_destroyed": [],
+                "gcp_fallback_used": True,
+                "gcp_destroyed": [],
+                "error": f"sky.down: {last_err}; gcp-direct: {type(e).__name__}: {e}",
+            }
     if cloud != "vast":
-        # No provider-direct fallback for non-Vast clouds; sky.down + autostop + the poweroff
+        # No provider-direct fallback for this cloud (DO); sky.down + autostop + the poweroff
         # backstop + `lab reconcile` (sky.status pass) are the safety net. Report the failure.
         return {
             "status": "failed",
@@ -396,28 +563,57 @@ def robust_teardown(
 
 
 def tear_down_and_record(
-    sky_mod: Any, cluster: str, store: JobStore, job_id: str, cloud: str = "vast"
+    sky_mod: Any,
+    cluster: str,
+    store: JobStore,
+    job_id: str,
+    cloud: str = "vast",
+    *,
+    backoffs: tuple[int, ...] | None = None,
 ) -> bool:
     """Call :func:`robust_teardown` and persist its outcome on the job manifest.
 
     Returns ``True`` iff teardown succeeded. On failure, ``teardown_status='failed'`` is
     written and ``end_reason`` is annotated with an actionable instruction so the leak is
-    visible in ``lab status`` / ``lab dashboard`` / ``lab wait``.
+    visible in ``lab status`` / ``lab dashboard`` / ``lab wait``. ``backoffs`` overrides the
+    retry ladder for callers that must stay quick (e.g. a status poll); None keeps the default.
     """
-    outcome = robust_teardown(sky_mod, cluster, cloud=cloud)
+    if backoffs is None:
+        outcome = robust_teardown(sky_mod, cluster, cloud=cloud)
+    else:
+        outcome = robust_teardown(sky_mod, cluster, cloud=cloud, backoffs=backoffs)
     succeeded: bool = outcome["status"] == "succeeded"
     fields: dict[str, Any] = {"teardown_status": "succeeded" if succeeded else "failed"}
     annotation: str | None = None
     if not succeeded:
+        if cloud == "vast":
+            remedy = (
+                "AND vast-sdk fallback. Run `lab reconcile --apply` "
+                "(or `vastai destroy_instance <id>`) to stop the bleed."
+            )
+        elif cloud == "gcp":
+            remedy = (
+                "AND gcp-direct fallback. Run `lab reconcile --apply` and check "
+                "`gcloud compute instances list --filter=\"name~'^lab-'\"` to stop the bleed."
+            )
+        else:
+            remedy = (
+                f"(no provider-direct fallback for {cloud}). Run `lab reconcile --apply` and "
+                f"check `sky status` / the {cloud} console to stop the bleed."
+            )
         annotation = (
             f"TEARDOWN FAILED for cluster {cluster!r}: {outcome['error']} after "
-            f"{outcome['attempts']} sky.down attempts AND vast-sdk fallback. "
-            "Run `lab reconcile --apply` (or `vastai destroy_instance <id>`) to stop the bleed."
+            f"{outcome['attempts']} sky.down attempts {remedy}"
         )
     elif outcome["vast_fallback_used"]:
         annotation = (
             f"sky.down failed ({outcome['error']}); vast-sdk fallback destroyed "
             f"{outcome['vast_destroyed']}"
+        )
+    elif outcome.get("gcp_fallback_used"):
+        annotation = (
+            f"sky.down failed ({outcome['error']}); gcp-direct fallback destroyed "
+            f"{outcome.get('gcp_destroyed')}"
         )
     if annotation is not None:
         print(f"[lab] {annotation}")
@@ -477,14 +673,22 @@ def provision_with_watchdog(sky_mod: Any, request_id: Any, *, timeout_s: float) 
 
 
 def _cloud_for(name: str | None) -> "sky.clouds.Cloud":
-    """Map a lab cloud name to a SkyPilot cloud object. Unknown/None -> Vast (the default)."""
+    """Map a lab cloud name to a SkyPilot cloud object. None -> Vast (the default); an unknown
+    name raises rather than silently landing on Vast (defense in depth for hand-edited
+    manifests — the CLI/MCP already validate via ``validate_cloud``)."""
     import sky
 
-    return {
+    from lab.core import LabError
+
+    clouds = {
         "vast": sky.clouds.Vast,
         "do": sky.clouds.DO,
         "gcp": sky.clouds.GCP,
-    }.get(name or "vast", sky.clouds.Vast)()
+    }
+    key = name or "vast"
+    if key not in clouds:
+        raise LabError(f"unknown cloud {key!r} on manifest; supported: {', '.join(clouds)}")
+    return clouds[key]()
 
 
 def build_task(manifest: JobManifest, workdir: Path) -> sky.Task:
@@ -574,6 +778,22 @@ class SkyPilotBackend:
         if m.status not in _TERMINAL:
             rt = self.store.read_runtime(job_id)
             if rt.get("runner_pid") and not _alive(rt["runner_pid"]):
+                # The supervisor died before recording terminal state, so its teardown very
+                # likely never ran — attempt it here (idempotent) rather than flip to `failed`
+                # on a possibly-still-billing box (FR-C2). Quick backoffs: this is a status
+                # poll; `lab reconcile` is the heavier net. Once terminal, this branch can't
+                # re-enter, so the attempt runs at most once.
+                cluster = rt.get("cluster") or cluster_name_for(job_id)
+                try:
+                    import sky
+
+                    tear_down_and_record(
+                        sky, cluster, self.store, job_id, m.resources.cloud or "vast",
+                        backoffs=(5,),
+                    )
+                except Exception as e:  # noqa: BLE001 — the alarm must survive a crashed attempt
+                    print(f"[lab] teardown attempt for dead-supervisor job {job_id} crashed: {e}")
+                    self.store.update_manifest(job_id, teardown_status="failed")
                 return self.store.update_manifest(
                     job_id,
                     status=JobState.failed,
