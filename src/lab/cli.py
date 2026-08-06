@@ -214,6 +214,11 @@ def sweep(
     shard_size: int | None = typer.Option(None, "--shard-size", help="max seeds per sub-job; each cell's seeds are split into shards of this size"),
     results_file: str = typer.Option("results.csv", "--results-file", help="per-run row-structured result file to aggregate per cell"),
     seed_column: str = typer.Option("seed", "--seed-column", help="column in --results-file identifying each row's seed"),
+    row_key: str | None = typer.Option(
+        None, "--row-key",
+        help="comma-separated columns identifying a result row, e.g. 'seed,alpha' when an "
+        "inner-loop axis writes multiple rows per seed (default: the seed column alone)",
+    ),
     allow_unknown_config: bool = typer.Option(
         False, "--allow-unknown-config",
         help="don't fail jobs when the entrypoint reports it ignored some config keys",
@@ -250,6 +255,7 @@ def sweep(
             shard_size=shard_size,
             results_file=results_file,
             seed_column=seed_column,
+            row_key=row_key,
             allow_unknown_config=allow_unknown_config,
         )
     except LabError as e:

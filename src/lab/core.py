@@ -399,6 +399,7 @@ class Lab:
         seed_column: str = "seed",
         seed_axis_key: str = "seeds",
         allow_unknown_config: bool = False,
+        row_key: str | list[str] | None = None,
     ) -> tuple[str, list[str]]:
         """Submit one job per grid point under a shared sweep_id (FR-A5).
 
@@ -419,6 +420,18 @@ class Lab:
             # One guard for every shell (thin-shell rule): a "sweep" with no axis would silently
             # run a single empty point instead of the fan-out the caller asked for.
             raise LabError("pass --grid and/or --seeds (a sweep needs at least one axis)")
+        row_key_cols: list[str] | None = None
+        if row_key is not None:
+            row_key_cols = (
+                [c.strip() for c in row_key.split(",") if c.strip()]
+                if isinstance(row_key, str)
+                else list(row_key)
+            )
+            if seed_column not in row_key_cols:
+                raise LabError(
+                    f"--row-key {row_key_cols} must include the seed column {seed_column!r} "
+                    "(presence/retry accounting is keyed on seeds)"
+                )
         cells = expand_grid(grid)
         if seeds is None:
             return self._sweep_unsharded(
@@ -481,6 +494,7 @@ class Lab:
                     shard_job_ids=shard_job_ids,
                     results_file=results_file,
                     seed_column=seed_column,
+                    row_key=row_key_cols,
                     aggregate_ref=str(self.home / sweep_id / "cells" / cid / results_file),
                 )
             )
@@ -571,7 +585,9 @@ class Lab:
                 rf = self.store.output_dir(jid) / cell.results_file
                 if rf.exists():
                     shard_texts.append((rf.read_text(), m.status.value))
-            merged, present, partial = merge_seed_rows(shard_texts, cell.seed_column)
+            merged, present, partial = merge_seed_rows(
+                shard_texts, cell.seed_column, row_key=cell.row_key
+            )
             cell.seeds_present = present
             cell.seeds_partial = partial
             present_set = set(present)
@@ -762,10 +778,15 @@ class Lab:
         out = self.store.output_dir(job_id)
         has_local = out.exists() and any(out.iterdir())
         if not has_local and r2_enabled():  # local copy gone — pull the durable copy from R2
-            manifest = self.store.read_manifest(job_id)
-            r2 = R2Store.from_env()
-            if manifest.artifacts_uri and r2 is not None:
-                r2.download_dir(job_id, out)
+            try:
+                manifest = self.store.read_manifest(job_id)
+                r2 = R2Store.from_env()
+                if manifest.artifacts_uri and r2 is not None:
+                    r2.download_dir(job_id, out)
+            except ImportError as e:
+                # R2 env configured but the `r2` extra isn't installed — the fallback is
+                # best-effort recovery, never a reason to fail a local operation.
+                print(f"[lab] R2 fallback unavailable ({e}); using local state only")
         return self.backend.collect_artifacts(job_id, dest or str(self.store.job_dir(job_id)))
 
     def manifest(self, job_id: str) -> JobManifest:

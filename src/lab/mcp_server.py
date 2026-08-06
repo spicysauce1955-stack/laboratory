@@ -133,9 +133,10 @@ def build_server(lab: Lab) -> FastMCP:
         shard_size: int | None = None,
         results_file: str = "results.csv",
         seed_column: str = "seed",
+        row_key: str | list[str] | None = None,
         allow_unknown_config: bool = False,
     ) -> dict[str, Any]:
-        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5). with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. sweep_max_cost is an up-front admission cap: the sweep is refused if its total would exceed the daily budget (during-run enforcement is on register_sweep). disk_size sizes the boot/attached volume in GB (skypilot; DO volume size). cloud picks the skypilot cloud: vast (default) | do | gcp. backend="cpu" provisions a cheap CPU box (DigitalOcean by default, cloud="gcp" to override; default 4 vCPU + 50GB volume, up to 48; --accelerators rejected). With seeds + shard_size each cell's seeds are split into shards of at most shard_size, run as independent jobs (own timeout + teardown) and aggregated per cell; returns {sweep_id, cells:[{coords, shard_job_ids, aggregate_ref, seeds_expected, seeds_present, status}]}. results_file/seed_column name the per-run result table and its seed column."""
+        """Submit a parameter-grid sweep (one job per point under a sweep_id); {sweep_id, job_ids} (FR-A5). with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. sweep_max_cost is an up-front admission cap: the sweep is refused if its total would exceed the daily budget (during-run enforcement is on register_sweep). disk_size sizes the boot/attached volume in GB (skypilot; DO volume size). cloud picks the skypilot cloud: vast (default) | do | gcp. backend="cpu" provisions a cheap CPU box (DigitalOcean by default, cloud="gcp" to override; default 4 vCPU + 50GB volume, up to 48; --accelerators rejected). With seeds + shard_size each cell's seeds are split into shards of at most shard_size, run as independent jobs (own timeout + teardown) and aggregated per cell; returns {sweep_id, cells:[{coords, shard_job_ids, aggregate_ref, seeds_expected, seeds_present, status}]}. results_file/seed_column name the per-run result table and its seed column; row_key (e.g. 'seed,alpha') names the columns identifying a row when an inner-loop axis writes multiple rows per seed."""
         from lab.scheduler.queue import default_queue
 
         resources = ResourceRequest(
@@ -164,6 +165,7 @@ def build_server(lab: Lab) -> FastMCP:
                 shard_size=shard_size,
                 results_file=results_file,
                 seed_column=seed_column,
+                row_key=row_key,
                 allow_unknown_config=allow_unknown_config,
             )
         except LabError as e:

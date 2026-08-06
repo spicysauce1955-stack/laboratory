@@ -87,8 +87,10 @@ read its assigned seed subset from a config key (default `seeds`, a comma list l
 and emit **one row per seed** into a row-structured result file (default `results.csv`) that includes
 a column identifying the seed (default `seed`). The lab row-concatenates those per-shard files into one
 per-cell aggregate and uses the seed column to report present-vs-expected and name missing seeds. Both
-the file and the column are overridable (`--results-file` / `--seed-column`). Guide:
-`docs/guides/sharded-sweeps.md`.
+the file and the column are overridable (`--results-file` / `--seed-column`). **Multiple rows per
+seed** (an axis swept inside the job, e.g. one row per (seed, α)) are supported by declaring the
+row identity at sweep time: `--row-key seed,alpha` — duplicates are then judged on the full key.
+Guide: `docs/guides/sharded-sweeps.md`.
 
 ## 4. The MCP tool surface
 
