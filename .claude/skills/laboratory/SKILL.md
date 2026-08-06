@@ -1,9 +1,9 @@
 ---
 name: laboratory
-description: "Run/execute a reproducible ML or compute experiment via the lab runner (MCP tools / `lab` CLI) — in this repo this is the right way to actually launch a training/experiment job, not running the script directly. Use when the user wants the work done, not just discussed: run, submit, or kick off an experiment; sweep a grid over hyperparameters/seeds and report which config won; shard a large-seed sweep into independently-bounded per-seed sub-jobs and aggregate one per-cell result (sweep-aggregate / sweep-retry); put a job on a remote GPU (RTX 4090 on Vast.ai via SkyPilot), cap its cost or runtime; REGISTER/schedule an experiment for later — run tonight/off-hours, run when a GPU price drops, run after another job, queue/hold/cancel deferred runs while the laptop is closed; stream live metrics and kill a diverging run early; fetch results/artifacts; reproduce a prior run; or diagnose a billing/teardown leak ('am I still being charged?', stuck Vast rental, `lab wait` exit 3). Triggers: lab submit, lab sweep, lab sweep-aggregate, lab sweep-retry, lab wait, lab register, lab queue, lab scheduler. Skip for merely writing an experiment script or reading saved results."
+description: "Run/execute a reproducible ML or compute experiment via the lab runner (MCP tools / `lab` CLI) — in this repo this is the right way to actually launch a training/experiment job, not running the script directly. Use when the user wants the work done, not just discussed: run, submit, or kick off an experiment; sweep a grid over hyperparameters/seeds and report which config won; shard a large-seed sweep into independently-bounded per-seed sub-jobs and aggregate one per-cell result (sweep-aggregate / sweep-retry); put a job on a remote GPU (RTX 4090 on Vast.ai via SkyPilot; T4/L4 on GCP) or a cheap remote CPU box (DigitalOcean/GCP, --backend cpu), cap its cost or runtime; REGISTER/schedule an experiment for later — run tonight/off-hours, run when a GPU price drops, run after another job, queue/hold/cancel deferred runs while the laptop is closed; stream live metrics and kill a diverging run early; fetch results/artifacts; reproduce a prior run or verify a result still reproduces (lab confirm); export a committable provenance bundle for the paper (lab export); or diagnose a billing/teardown leak ('am I still being charged?', stuck Vast rental, `lab wait` exit 3). Triggers: lab submit, lab sweep, lab sweep-aggregate, lab sweep-retry, lab wait, lab confirm, lab export, lab lint, lab register, lab queue, lab scheduler, lab reconcile. Skip for merely writing an experiment script or reading saved results."
 metadata:
-  version: "0.6.0"
-  last_updated: "2026-06-18"
+  version: "0.7.0"
+  last_updated: "2026-08-06"
   status: active
 ---
 
@@ -17,7 +17,8 @@ artifacts, and pinning everything to a reproducible manifest (commit + uv.lock
 
 You will normally use the **MCP tools** (`mcp__lab__*`) registered by the repo's
 `.mcp.json`. For push-notify (block-until-done as a background task), use the
-**CLI** `uv run lab wait` — there is no MCP `wait` tool by design.
+**CLI** `uv run lab wait` — the MCP `wait` tool is deliberately bounded (default
+600s) and is only for short waits.
 
 ## 1. When to use this skill
 
@@ -30,9 +31,11 @@ Invoke this skill when the user asks (in any phrasing):
   `sweep(seeds=…, shard_size=…)` + `sweep-aggregate`).
 - "Watch the run live and stop it if it's off-track" (live early-kill).
 - "Fetch the results / artifacts of job `<id>`."
-- "Reproduce job `<id>` / re-run with the same config."
-- Anything that wants a remote GPU on Vast.ai, or a cost-bounded job, or a
-  manifest-tracked run.
+- "Reproduce job `<id>` / re-run with the same config" / "does this result
+  still hold?" (`lab confirm`).
+- "Export these results so they can be committed / cited" (`lab export`).
+- Anything that wants a remote GPU (Vast.ai or GCP) or a cheap remote CPU box,
+  or a cost-bounded job, or a manifest-tracked run.
 
 **Don't** invoke this skill for a one-off local sanity check that doesn't need
 tracking — just running `uv run python experiments/foo.py` is fine.
@@ -44,9 +47,11 @@ Run from the lab repo root.
 - **Sync deps.**
   - `uv sync` — local backend + CLI + MCP server (lean default).
   - `uv sync --extra skypilot --extra r2` — also enables remote (Vast.ai via
-    SkyPilot) and durable artifacts on Cloudflare R2.
-- **Remote creds (only for `--backend skypilot`).**
-  - Vast API key in `~/.config/vastai/vast_api_key`.
+    SkyPilot) and durable artifacts on Cloudflare R2. Add `--extra gcp` for
+    `--cloud gcp`.
+- **Remote creds (only for remote backends).**
+  - Vast API key in `~/.config/vastai/vast_api_key` (`--cloud vast`, the default).
+  - GCP: gcloud ADC auth + project + GPU quota — see §7 / `docs/guides/gcp-backend.md`.
   - R2 (optional, for durable artifacts):
     - Creds in `~/.cloudflare/r2.credentials` (S3-compat: Access Key + Secret).
     - Env: `LAB_R2_ENDPOINT="https://<account>.r2.cloudflarestorage.com"` and
@@ -75,6 +80,15 @@ If asked to *write* a new experiment, the entrypoint MUST:
 | Log metrics incrementally                         | One JSON object per line into `$LAB_RUN_DIR/metrics.jsonl` (helper: `lab.metrics.log_metric(name, value, step)`) |
 | Exit non-zero on failure                          | `sys.exit(1)` or raise                             |
 | Accept grid overrides as `key=value` argv         | e.g. Hydra picks up `seed=3 K=200` from `sys.argv` |
+| Report the config it actually consumed            | Write `$LAB_RUN_DIR/effective_config.json` (one call: `lab.experiment.get_overrides(known={...})`) |
+
+**The config-consumption handshake (field-report #1).** A *succeeded* job whose argv
+overrides were never consumed (no `effective_config.json`, or the file omits submitted keys)
+is **flipped to `failed`** at the succeeded transition — a typo'd or stale key must not
+silently run a different experiment than requested. `allow_unknown_config=true`
+(CLI `--allow-unknown-config`) opts a legacy entrypoint out; better, pre-check it with
+`uv run lab lint -c "<cmd>" --grid k=v` (heuristic grep for override keys the script never
+references; exits 1 on findings).
 
 A metric line is `{"name": "...", "value": <float>, "step": <int>, "wall_time": <float>}`.
 The lab tolerates a half-written trailing line, so you can write line-by-line
@@ -103,8 +117,9 @@ Submit one job. Non-blocking — returns immediately with the `job_id`.
 | Input            | Type           | Notes |
 |------------------|----------------|-------|
 | `command`        | str (required) | e.g. `"python experiments/example_capacity.py"` |
-| `backend`        | str            | `"local"` (default), `"skypilot"`, or `"cpu"` (cheap DO CPU droplet) |
-| `cloud`          | str            | SkyPilot cloud override; `cpu` backend sets `"do"`. Default `"vast"`. |
+| `backend`        | str            | `"local"` (default), `"skypilot"`, or `"cpu"` (cheap CPU box: 4 vCPU + 50 GB volume, DO by default) |
+| `cloud`          | str            | SkyPilot cloud: `"vast"` (default) \| `"do"` \| `"gcp"`. `--backend cpu --cloud gcp` runs the cpu profile on GCP (spot allowed there; DO has none). GCP GPUs: `accelerators="T4:1"`/`"L4:1"`. |
+| `disk_size`      | int            | Boot/attached volume GB (skypilot; sizes the DO volume) |
 | `cache`          | bool           | If true and a prior identical-`(commit, command, config, seed)` succeeded job exists on a clean tree, reuse it |
 | `seed`           | int            | Recorded + injected as `$LAB_SEED` |
 | `code_ref`       | str            | Git ref to pin; default `"HEAD"` |
@@ -113,6 +128,7 @@ Submit one job. Non-blocking — returns immediately with the `job_id`.
 | `timeout`        | str            | Wall-clock cap; `"30m"`, `"2h"`, `"45s"`. On overrun the job is killed, the machine torn down, and the manifest reads `status: timed_out`, `end_reason: "timed out after <N>s wall-clock cap"` |
 | `with_pkg`       | list[str]      | Per-job extra runtime deps (e.g. `["scipy", "scikit-learn>=1.4"]`) — layered via `uv run --with` |
 | `allow_dirty`    | bool           | Default `true` (dirty tree → snapshot the diff). Set `false` to **refuse** a dirty submit (FR-B1) |
+| `allow_unknown_config` | bool     | Default `false`. `true` skips the config-consumption check (§3) for legacy entrypoints |
 
 Returns: `{"job_id": "...", "cached": bool, "status": "queued"|"succeeded"|...}`.
 
@@ -127,28 +143,37 @@ Submit a Cartesian-product grid of jobs under one `sweep_id`. Same kwargs as
 | `shard_size` | int | Max seeds per sub-job. Each cell's `seeds` are split into shards of at most this size (`shard_size ≥ len(seeds)` ⇒ one shard per cell = today's behavior). `timeout`/`backend`/`accelerators` apply **per shard**. |
 | `results_file` | str | Per-run row-structured result file to row-concatenate per cell (default `"results.csv"`). |
 | `seed_column` | str | Column in `results_file` identifying each row's seed (default `"seed"`). |
+| `row_key` | str \| list | Columns identifying a row when the job writes multiple rows per seed (e.g. `"seed,alpha"` for an inner α loop); duplicates judged on the full key. |
 
 Grid values become `key=value` overrides on the experiment's argv (string-valued
 — Hydra/typer coerce). If `seed` is a grid key, it sets each job's recorded seed.
 It is an error to declare seeds in both `seeds` and a grid key (`seed`/the
-seed-axis key).
+seed-axis key). **`grid` is optional when `seeds` is given** — a pure seed sweep
+needs no grid.
 
 Returns (plain grid): `{"sweep_id": "...", "job_ids": [...]}`.
 Returns (sharded, i.e. `seeds` given): `{"sweep_id": "...", "cells": [{coords,
 cell_id, shard_job_ids, aggregate_ref, seeds_expected, seeds_present, status}, ...]}`.
 
 ### `mcp__lab__sweep_aggregate`
-**Sharded sweeps only.** `{sweep_id}` → row-concatenate each cell's **succeeded**
-shards' `results_file` into one per-cell aggregate at `aggregate_ref`, and return
-the cell view. **Idempotent** — safe to re-run as shards finish; it is also the
-way to view current per-cell status (`status` is `complete` iff every expected
-seed is present, else `incomplete` with `missing_seeds` named — never reports a
-short aggregate as complete, never discards recovered seeds).
+**Sharded sweeps only.** `{sweep_id, strict?, row_key?}` → row-concatenate each
+cell's shards' `results_file` into one per-cell aggregate at `aggregate_ref`, and
+return the cell view. **By default it also salvages partial rows** from terminal
+*non-succeeded* shards (timed-out etc.) — those rows carry a `_shard_status`
+column and the cell view lists them in `seeds_partial`; `strict=true` (CLI
+`--strict`) aggregates succeeded shards only. **Idempotent** — safe to re-run as
+shards finish; it is also the way to view current per-cell status (`status` is
+`complete` iff every expected seed is present, else `incomplete` with
+`missing_seeds` named — never reports a short aggregate as complete, never
+discards recovered seeds). `row_key` (e.g. `"seed,alpha"`, CLI `--row-key`)
+retrofits the row identity onto a plan created before `row_key` existed (pre-v0.2.1)
+and persists it for future aggregates.
 
 ### `mcp__lab__sweep_retry`
-**Sharded sweeps only.** `{sweep_id}` → resubmit **only** the missing shards of
-incomplete cells (skipping any shard already covered or with an in-flight prior
-retry), then re-aggregate and return the updated cell view.
+**Sharded sweeps only.** `{sweep_id}` → resubmit **only** the missing seeds of
+incomplete cells (skipping seeds already covered — including partial-salvaged
+ones — or with an in-flight prior retry), then re-aggregate and return the
+updated cell view.
 
 > Note: `mcp__lab__sweep_status` remains the *outcome/cost* summary
 > (states, preemptions, per-point spend) — it does **not** carry the per-cell
@@ -156,7 +181,10 @@ retry), then re-aggregate and return the updated cell view.
 
 ### `mcp__lab__status`
 `{job_id}` → `{state, started_at, ended_at, exit_code, end_reason, cost,
-teardown_status, sweep_id, code: {git_commit, git_dirty, diff_ref}, mirrored}`.
+estimated_running_usd, last_log_line, teardown_status, sweep_id,
+code: {git_commit, git_dirty, diff_ref}, mirrored}`. A running remote job shows
+its spend-so-far (`estimated_running_usd`) and latest log line — enough to judge
+"is it alive and worth its bill" from one cheap call.
 States: `queued`, `running`, `succeeded`, `failed`, `cancelled`, `timed_out`,
 `preempted`. Cheap to poll. **`teardown_status: "failed"` is the FR-C2 money
 alarm** — call `mcp__lab__reconcile` immediately. Scheduler-launched (deferred)
@@ -168,9 +196,30 @@ teardown_unconfirmed, jobs}`. Blocks up to `timeout` seconds. Non-empty
 `teardown_leaks` = a paid machine may still be billing. For long runs prefer
 `lab wait` as a background task (below); this tool is for bounded waits.
 
+### `mcp__lab__confirm`
+`{run_id, metric?, rtol?=1e-3, atol?, wait?}` → the **reproducibility gate (FR-B)**:
+relaunch `run_id` fresh (no cache) from its pinned commit, compare the re-run's
+final metrics against the original within tolerance → verdict
+`"match" | "drift" | "rerun_failed"` with per-metric deltas. Refuses a
+non-succeeded or **dirty** producer (no honest result to re-derive).
+`wait=false` submits the re-run and returns `{confirm_id, verdict: "pending"}`.
+CLI: `uv run lab confirm <run_id>`.
+
+### `mcp__lab__export`
+`{job_or_sweep_id, to, include_logs?}` → write the **committable provenance
+bundle** to a directory: manifests + result tables + resolved configs + code
+diffs (+ sweep plan/aggregates), tied together by an `index.json` with commits
+and spend. The part of git-ignored `runs/` that belongs in version control next
+to the paper; excluded blobs are listed under `skipped`, never silently dropped.
+CLI: `uv run lab export <job|sweep_id> --to DIR [--logs]`.
+
 ### `mcp__lab__reconcile`
-`{}` → the dry-run leak report (`orphans`, `sky_orphans`, `unsupervised`,
-`ghosts`, …). Read-only: it never destroys anything — cleanup is
+`{}` → the dry-run leak report. Multi-pass and cloud-aware: a Vast-direct pass
+(`orphans`; skipped without vastai-sdk), a cloud-agnostic `sky.status` pass
+covering DO/GCP clusters (`sky_orphans`), a DO detached-volume pass, a GCP
+compute-API pass (`lab-*` instances + unattached `lab-*` disks), plus `ghosts`
+and `unsupervised` (running jobs whose supervisor pid is dead — their clusters
+are NOT counted as healthy). Read-only: it never destroys anything — cleanup is
 `lab reconcile --apply` at the CLI.
 
 ### `mcp__lab__metrics`
@@ -195,14 +244,14 @@ the local output is empty (e.g. after a fresh clone).
 
 ## 5. The CLI surface (and the CLI-only commands)
 
-Every MCP tool has a matching CLI command (`uv run lab submit / sweep /
-sweep-aggregate / sweep-retry / status / logs / metrics / fetch / cancel /
-list`). The `lab` CLI prints JSON mirroring the MCP returns. (`lab submit
+Every MCP tool has a matching CLI command (`uv run lab submit / confirm / sweep /
+sweep-aggregate / sweep-retry / export / lint / status / logs / metrics / fetch /
+cancel / list`). The `lab` CLI prints JSON mirroring the MCP returns. (`lab submit
 --no-dirty` is the CLI form of `allow_dirty=false` — refuse a dirty tree instead
 of snapshotting it.) Sharded-sweep CLI form:
 `lab sweep -c "<cmd>" --grid N=1000,1500 --seeds 0-31 --shard-size 8`, then
 `lab sweep-aggregate <sweep_id>` (idempotent; also the per-cell status view) and
-`lab sweep-retry <sweep_id>` (resubmit only missing shards).
+`lab sweep-retry <sweep_id>` (resubmit only missing seeds).
 
 Two commands have their full form on the CLI (MCP carries a bounded `wait` and
 a read-only `reconcile`; `--apply` cleanup and unbounded waits stay CLI):
@@ -215,14 +264,11 @@ Block until one or more jobs reach a terminal state:
 uv run lab wait <job_id_1> <job_id_2> --done-file done.json
 # or:
 uv run lab wait --sweep <sweep_id> --done-file done.json
-# with a deadline — NOTE: --timeout here is SECONDS (a number), not "30m":
-uv run lab wait <job_id> --timeout 1800 --done-file done.json
+# with a deadline (duration string or bare seconds):
+uv run lab wait <job_id> --timeout 30m --done-file done.json
+# stop waiting the moment any job fails (exit 4; survivors keep running/billing):
+uv run lab wait --sweep <sweep_id> --fail-fast --done-file done.json
 ```
-
-> **Gotcha — `wait --timeout` is in seconds, not a duration string.** Unlike
-> `submit`/`sweep` `--timeout`, which accept `"30m"`/`"2h"`, `lab wait --timeout`
-> takes a raw number of seconds (e.g. `1800` for 30 min). Passing `30m` here
-> exits `2` (bad args). Convert first.
 
 For long runs the right pattern is still to run `lab wait` as a **Claude Code
 background task**, keep working in the foreground, and let the task's
@@ -236,7 +282,7 @@ to 600s); it returns the same summary shape as `done.json`.
 - `2` — bad arguments (no job ids / unknown id / empty sweep).
 - `3` — all terminal BUT at least one **teardown leaked** (`teardown_status: "failed"`).
   Treat as an urgent signal — a paid GPU rental may still be running. Run
-  `lab reconcile` immediately (see §6.F below).
+  `lab reconcile` immediately (see §6.H below).
 - `4` — `--fail-fast` tripped: a job hit `failed`/`timed_out` while others still run.
   The summary's `pending` lists the survivors (still billing); nothing was cancelled.
   **Exception:** if the dead job's teardown is already a confirmed leak, exit is `3`, not
@@ -248,20 +294,25 @@ to 600s); it returns the same summary shape as `done.json`.
 
 ### `uv run lab reconcile [--apply]` — leak detection & cleanup (FR-C2)
 
-Lists active Vast.ai rentals directly via the vastai-sdk and cross-checks
-them against the local job DB. **Always run this after seeing
-`teardown_status: "failed"` or `lab wait` exiting 3.**
+Cross-checks live cloud resources against the local job DB, across all three
+clouds (Vast-direct via vastai-sdk, a cloud-agnostic `sky.status` pass for
+DO/GCP clusters, DO detached volumes, GCP `lab-*` instances + unattached disks).
+**Always run this after seeing `teardown_status: "failed"` or `lab wait`
+exiting 3.**
 
 ```bash
 uv run lab reconcile             # dry-run: print orphans + ghosts
 uv run lab reconcile --apply     # destroy the orphans
 ```
 
-- **Orphans** = Vast.ai rentals labelled `lab-*` but not tied to any running
+- **Orphans** = cloud resources labelled `lab-*` but not tied to any running
   lab job (probable leaks; bill until destroyed).
-- **Ghosts** = lab jobs whose manifest still says `running` but Vast has no
+- **Ghosts** = lab jobs whose manifest still says `running` but the cloud has no
   matching rental (supervisor probably died; safe to investigate via
   `lab status <id>`).
+- **Unsupervised** = non-terminal jobs whose supervisor pid is dead — their
+  clusters do NOT count as healthy, so a frozen `running` manifest can't hide a
+  still-billing box.
 
 Exit code: `0` if nothing to do, `3` if orphans were found in dry-run
 mode (re-run with `--apply`), `2` on error.
@@ -298,7 +349,7 @@ uv run lab register -c "uv run experiments/v3_capacity_sweep.py" \
 |---|---|---|
 | daily window | `--window HH:MM-HH:MM --tz <IANA>` | gates *start* only; may cross midnight |
 | absolute earliest | `--not-before <ISO>` | |
-| price gate | `--max-hourly <$/h>` (+ `--offer-query`) | see headroom gotcha below |
+| price gate | `--max-hourly <$/h>` (+ `--offer-query`) | **Vast-only** (queries the Vast offer feed; rejected for `--cloud do|gcp`); see headroom gotcha below |
 | dependency | `--after <reg_id>` (repeatable) | dead/typo'd dep ⇒ auto-cancel, so get the id right |
 | run-by deadline | `--expires +2d` / ISO | **required**; entry expires, never fires late |
 | per-job cap | `--max-cost <$>` | vs best-offer×timeout |
@@ -307,7 +358,8 @@ uv run lab register -c "uv run experiments/v3_capacity_sweep.py" \
 **Manage:** `lab queue list` (states, skip reasons, `heartbeat_age_s` — >120s means the
 scheduler is down) · `queue show <reg_id>` · `queue cancel|hold|release <reg_id>` ·
 `queue pause|resume` · `queue budget --per-day 5 --max-concurrent 4 [--clear-budget]`.
-MCP mirrors: `register`, `queue_list/show/cancel/pause`.
+`lab register-sweep` registers a whole (optionally sharded) sweep the same way; both take
+`--cloud vast|do|gcp`. MCP mirrors: `register`, `register_sweep`, `queue_list/show/cancel/pause`.
 
 **Next morning:** `lab queue list` → `lab status <job_id>` (works from the laptop via the
 R2-mirrored manifest, incl. cost) → `lab fetch <job_id>` (artifacts come from R2) →
@@ -353,7 +405,7 @@ chunking by hand. Pattern: `mcp__lab__sweep(grid=…, seeds="0-31", shard_size=8
 → background `lab wait --sweep <sweep_id>` → on wake, `mcp__lab__sweep_aggregate
 (<sweep_id>)` to get one per-cell `results.csv` plus `seeds_present`/`status`
 per cell → if a cell is `incomplete`, `mcp__lab__sweep_retry(<sweep_id>)` reruns
-only the missing shards, then aggregate again. Each shard is a normal job (own
+only the missing seeds, then aggregate again. Each shard is a normal job (own
 timeout + teardown + manifest); the experiment must honor the sharded results
 contract in §3. Guide: `docs/guides/sharded-sweeps.md`.
 
@@ -377,7 +429,17 @@ The remote env is lean (numpy/pydantic/hydra only). For a one-off dep:
 This wraps the command as `uv run --with scipy python experiments/needs_scipy.py`
 (see `tests/test_util.py:12-23`). Same on the CLI: `lab submit -c "..." --with scipy`.
 
-### F. Recover from a teardown leak (FR-C2)
+### F. Verify a result still reproduces
+`mcp__lab__confirm(run_id)` relaunches the run from its pinned commit and
+compares final metrics → `match`/`drift`/`rerun_failed`. Producers must be
+succeeded and clean (commit first). Use before building on a surprising result.
+
+### G. Export results for the paper / repo
+`mcp__lab__export(job_or_sweep_id, to="artifacts/<name>")` (CLI
+`lab export <id> --to DIR`) writes the committable bundle — manifests, tables,
+configs, diffs, `index.json`. This is how results leave git-ignored `runs/`.
+
+### H. Recover from a teardown leak (FR-C2)
 See **`examples/04-reconcile-leak.md`**. Pattern: `lab wait` exits 3 (or you
 see `teardown_status: "failed"` in `lab status`) → `lab reconcile` (dry-run)
 → inspect the orphans → `lab reconcile --apply` to destroy them. The lab
@@ -390,8 +452,19 @@ that fails.
 | Backend | When to use | Required kwargs |
 |---------|-------------|-----------------|
 | `local` | Dev, smoke tests, CPU experiments on the local machine. Free. | none |
-| `skypilot` | GPU work, parallel jobs, anything that shouldn't tie up the local machine. Costs money (Vast.ai). | `accelerators` (e.g. `"RTX4090:1"`) AND `timeout` (e.g. `"30m"`) |
-| `cpu` | Remote CPU work on a cheap DigitalOcean droplet (8 vCPU default, up to 48); on-demand. | none (accelerators rejected) |
+| `skypilot` | GPU work, parallel jobs, anything that shouldn't tie up the local machine. Costs money. | `accelerators` (e.g. `"RTX4090:1"` on Vast, `"T4:1"`/`"L4:1"` on GCP) AND `timeout` (e.g. `"30m"`) |
+| `cpu` | Remote CPU work on a cheap on-demand box: **4 vCPU + 50 GB volume** default (DigitalOcean), up to 48 vCPU. | none (accelerators rejected) |
+
+The **cloud** is orthogonal: `--cloud vast|do|gcp` (default `vast`) on
+submit/sweep/register. `--backend cpu --cloud gcp` runs the cpu profile on GCP
+— unlike DO, GCP allows spot there. GCP needs `uv sync --extra gcp`, gcloud ADC
+auth, and (for GPUs) per-family regional quota; guide:
+`docs/guides/gcp-backend.md`.
+
+The cpu-profile defaults are deliberately inside a **fresh DO account's tier**:
+8-vCPU sizes and SkyPilot's default 256 GB volume both `422` on an untouched
+account — bigger needs a DO tier-increase ticket (`disk_size` overrides the
+volume GB).
 
 If `accelerators` is omitted on `skypilot`, SkyPilot may land you on a non-GPU
 host — pass it explicitly. `timeout` is a hard wall-clock cap; the job is killed
@@ -423,9 +496,18 @@ record artifact **URIs**, never credentials (spec FR-J1).
 ## 9. Common gotchas
 
 - **Dirty tree disables cache.** Cache lookups skip when `git_dirty: true`.
+- **A succeeded job can flip to `failed` on unconsumed overrides.** If you pass
+  `k=v` overrides and the entrypoint never writes them into
+  `effective_config.json`, the lab fails the job at the succeeded transition
+  (§3). Pre-check legacy scripts with `lab lint`; opt out with
+  `--allow-unknown-config`.
 - **Vast marketplace flakiness.** A single failed launch (machine vanished
   mid-provision) is not "the pipeline is broken" — resubmit; SkyPilot will
-  pick a different offer.
+  pick a different offer. Transient *local-API* launch errors are already
+  retried with backoff (`LAB_LAUNCH_RETRIES`, default 3; a give-up marks the
+  job `failed` with an `end_reason` prefixed `transient:` — safe to resubmit).
+  Remote sweep submits stagger by `LAB_SUBMIT_STAGGER_S` (default 1.5s) to
+  avoid racing the provisioner.
 - **Provisioning watchdog → `failed` with "provisioning exceeded …".** A dead
   Vast host stuck in "loading" used to hang the job forever. The lab now aborts
   any host that doesn't reach UP within the provision timeout (default **8m**,
@@ -440,8 +522,8 @@ record artifact **URIs**, never credentials (spec FR-J1).
   exit code, you'll mistakenly see "ok" — check `teardown_status` via
   `mcp__lab__status` to be sure.
 - **`teardown_status: "failed"` is a money alarm.** The lab already retries
-  `sky.down` for ~3.5 min and falls back to direct vastai-sdk destroy; a
-  `"failed"` value means even that failed. **Always follow up with
+  `sky.down` for ~3.5 min and falls back to a cloud-direct destroy (vastai-sdk
+  on Vast, compute API on GCP); a `"failed"` value means even that failed. **Always follow up with
   `lab reconcile --apply`** to stop the bleed.
 - **MCP `wait` is bounded; MCP `reconcile` is read-only.** Don't block an MCP
   call for hours — use `lab wait` as a background task for long runs. Destroying
@@ -456,6 +538,7 @@ record artifact **URIs**, never credentials (spec FR-J1).
 - **Full reference (human-facing):** `DELIVERY.md` at the repo root.
 - **Provenance & timeouts guide (human-facing):** `docs/guides/provenance-and-timeouts.md`.
 - **CPU backend guide:** `docs/guides/cpu-backend.md`.
+- **GCP backend guide:** `docs/guides/gcp-backend.md`.
 - **Sharded sweeps guide:** `docs/guides/sharded-sweeps.md`.
 - **Spec:** `LAB-REQUIREMENTS.md` (RFC-2119, FR/AC/NFR).
 - **Design decisions:** `research/16-decisions.md`.
