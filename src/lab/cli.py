@@ -366,11 +366,16 @@ def sweep_aggregate(
         help="only aggregate succeeded shards (exclude recovered rows from timed-out/failed "
         "shards; those rows carry a _shard_status column and show up in seeds_partial)",
     ),
+    row_key: str | None = typer.Option(
+        None, "--row-key",
+        help="declare the columns identifying a result row (e.g. 'seed,alpha') for sweeps "
+        "created before --row-key existed; persisted onto the plan for future aggregates",
+    ),
 ) -> None:
     """Row-concatenate each cell's shard results into one per-cell result (P1-2). By default
     partial rows from non-succeeded shards are included (stamped + listed in seeds_partial)."""
     try:
-        plan = _lab().aggregate_sweep(sweep_id, include_partial=not strict)
+        plan = _lab().aggregate_sweep(sweep_id, include_partial=not strict, row_key=row_key)
     except LabError as e:
         _emit({"error": str(e)})
         raise typer.Exit(code=1) from e

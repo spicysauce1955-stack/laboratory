@@ -260,10 +260,14 @@ def build_server(lab: Lab) -> FastMCP:
         return _lab().sweep_summary(sweep_id)
 
     @mcp.tool
-    def sweep_aggregate(sweep_id: str, strict: bool = False) -> dict[str, Any]:
-        """Row-concatenate each cell's shard results into one per-cell result; returns the cell view (P1-2). By default rows recovered from non-succeeded shards (timed-out etc.) are included — stamped with a _shard_status column and listed per-cell in seeds_partial. strict=True aggregates succeeded shards only."""
+    def sweep_aggregate(
+        sweep_id: str, strict: bool = False, row_key: str | list[str] | None = None
+    ) -> dict[str, Any]:
+        """Row-concatenate each cell's shard results into one per-cell result; returns the cell view (P1-2). By default rows recovered from non-succeeded shards (timed-out etc.) are included — stamped with a _shard_status column and listed per-cell in seeds_partial. strict=True aggregates succeeded shards only. row_key (e.g. 'seed,alpha') declares the columns identifying a row for sweeps created before row_key existed; it persists onto the plan."""
         try:
-            return _lab().aggregate_sweep(sweep_id, include_partial=not strict).view()
+            return _lab().aggregate_sweep(
+                sweep_id, include_partial=not strict, row_key=row_key
+            ).view()
         except LabError as e:
             raise ToolError(str(e)) from e
 

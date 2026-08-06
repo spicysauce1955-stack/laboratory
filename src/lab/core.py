@@ -168,6 +168,22 @@ def check_sweep_admission(
     return worst
 
 
+def _parse_row_key(row_key: str | list[str], seed_column: str) -> list[str]:
+    """Parse/validate a row-key spec ('seed,alpha' or a list). Must include the seed column —
+    presence/retry accounting is keyed on seeds. Pure; raises :class:`LabError`."""
+    cols = (
+        [c.strip() for c in row_key.split(",") if c.strip()]
+        if isinstance(row_key, str)
+        else list(row_key)
+    )
+    if seed_column not in cols:
+        raise LabError(
+            f"--row-key {cols} must include the seed column {seed_column!r} "
+            "(presence/retry accounting is keyed on seeds)"
+        )
+    return cols
+
+
 def _submit_stagger_s() -> float:
     """Delay between remote sweep submits (``LAB_SUBMIT_STAGGER_S``, default 1.5s; 0 disables).
 
@@ -420,18 +436,7 @@ class Lab:
             # One guard for every shell (thin-shell rule): a "sweep" with no axis would silently
             # run a single empty point instead of the fan-out the caller asked for.
             raise LabError("pass --grid and/or --seeds (a sweep needs at least one axis)")
-        row_key_cols: list[str] | None = None
-        if row_key is not None:
-            row_key_cols = (
-                [c.strip() for c in row_key.split(",") if c.strip()]
-                if isinstance(row_key, str)
-                else list(row_key)
-            )
-            if seed_column not in row_key_cols:
-                raise LabError(
-                    f"--row-key {row_key_cols} must include the seed column {seed_column!r} "
-                    "(presence/retry accounting is keyed on seeds)"
-                )
+        row_key_cols = _parse_row_key(row_key, seed_column) if row_key is not None else None
         cells = expand_grid(grid)
         if seeds is None:
             return self._sweep_unsharded(
@@ -555,7 +560,13 @@ class Lab:
             raise LabError(f"no shard plan for {sweep_id!r} (not a sharded sweep?)")
         return self.store.read_sweep_plan(sweep_id)
 
-    def aggregate_sweep(self, sweep_id: str, *, include_partial: bool = True) -> SweepPlan:
+    def aggregate_sweep(
+        self,
+        sweep_id: str,
+        *,
+        include_partial: bool = True,
+        row_key: str | list[str] | None = None,
+    ) -> SweepPlan:
         """Row-concatenate each cell's shard results into one per-cell table (P1-2, FR-SS-4..7).
 
         Idempotent pull reducer: recomputes from current shard states each call, so it is safe to run
@@ -572,6 +583,10 @@ class Lab:
         """
         plan = self.sweep_plan(sweep_id)
         for cell in plan.cells:
+            if row_key is not None:
+                # Aggregate-time declaration for plans that predate --row-key (persisted below
+                # via write_sweep_plan, so later aggregates/retries inherit it).
+                cell.row_key = _parse_row_key(row_key, cell.seed_column)
             shard_texts: list[tuple[str, str]] = []
             for jid in cell.shard_job_ids:
                 m = self.manifest(jid)

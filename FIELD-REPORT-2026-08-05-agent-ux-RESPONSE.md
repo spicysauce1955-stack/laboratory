@@ -162,3 +162,15 @@ now warns and proceeds with local state instead of raising `ModuleNotFoundError`
 
 Shipped as **v0.2.1** (PR #8). With this, hand-aggregation of the headline data should no longer
 be necessary — if the real sweep still resists mechanical aggregation, that's a new report.
+
+**Replay proof (2026-08-06, v0.2.2):** `sweep-aggregate` also gained an aggregate-time
+`--row-key` override for plans that predate v0.2.1 — and we ran it against your real sweep:
+
+```
+lab sweep-aggregate sweep-20260804-124022-0a188f --row-key seed,alpha
+→ 108 rows aggregated (your exact hand-stitched count), 30/48 seeds present (all partial,
+  stamped _shard_status=timed_out), missing seeds 124-141 named, status: incomplete
+```
+
+The mechanical aggregate now lives at `runs/sweep-20260804-124022-0a188f/cells/efb125e7/results.csv`
+with the row key persisted on the plan. Hand-aggregation of this data is no longer necessary.

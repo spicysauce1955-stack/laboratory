@@ -200,3 +200,42 @@ def test_sweep_row_key_must_contain_seed_column(tmp_path: Path):
 
     with _pytest.raises(LabError, match="seed"):
         lab.sweep("true", {"N": [1]}, seeds="0-1", shard_size=1, row_key="alpha")
+
+
+def test_aggregate_row_key_override_for_pre_existing_plans(tmp_path: Path):
+    """Sweeps created before --row-key existed (plan has none) can declare it at AGGREGATE
+    time — the real 2026-08-04 headline sweep predates v0.2.1 and must not need plan.json
+    hand-edits. The override persists onto the plan for future aggregates/retries."""
+    lab = _lab(tmp_path)
+    sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0-1", shard_size=1)  # no row_key
+    cell = lab.sweep_plan(sweep_id).cells[0]
+    for i, jid in enumerate(cell.shard_job_ids):
+        out = lab.store.output_dir(jid)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "results.csv").write_text(f"seed,alpha,acc\n{i},2.7,0.9\n{i},2.72,0.8\n")
+        lab.store.update_manifest(jid, status=JobState.timed_out)
+
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="duplicate"):
+        lab.aggregate_sweep(sweep_id)  # default seed-only key still rejects the layout
+
+    c = lab.aggregate_sweep(sweep_id, row_key="seed,alpha").cells[0]
+    assert c.seeds_present == [0, 1] and c.seeds_partial == [0, 1]
+    assert Path(c.aggregate_ref).read_text().count("\n") == 5  # header + 4 rows
+
+    # Persisted: a later aggregate WITHOUT the override keeps working.
+    c2 = lab.aggregate_sweep(sweep_id).cells[0]
+    assert c2.seeds_present == [0, 1]
+    assert lab.sweep_plan(sweep_id).cells[0].row_key == ["seed", "alpha"]
+
+
+def test_aggregate_row_key_override_must_contain_seed_column(tmp_path: Path):
+    import pytest as _pytest
+
+    from lab.core import LabError
+
+    lab = _lab(tmp_path)
+    sweep_id, _ = lab.sweep("true", {"N": [1]}, seeds="0-1", shard_size=1)
+    with _pytest.raises(LabError, match="seed"):
+        lab.aggregate_sweep(sweep_id, row_key="alpha")
