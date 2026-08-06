@@ -1,0 +1,129 @@
+{
+  "all_terminal": true,
+  "teardown_leaks": [],
+  "teardown_unconfirmed": [
+    "20260728-111745-ca42ad"
+  ],
+  "jobs": [
+    {
+      "job_id": "20260728-111736-6c5c63",
+      "state": "timed_out",
+      "exit_code": 1,
+      "teardown_status": "succeeded"
+    },
+    {
+      "job_id": "20260728-111737-cb1223",
+      "state": "timed_out",
+      "exit_code": 1,
+      "teardown_status": "succeeded"
+    },
+    {
+      "job_id": "20260728-111738-9213f9",
+      "state": "failed",
+      "exit_code": null,
+      "teardown_status": "succeeded"
+    },
+    {
+      "job_id": "20260728-111739-71312e",
+      "state": "timed_out",
+      "exit_code": 1,
+      "teardown_status": "succeeded"
+    },
+    {
+      "job_id": "20260728-111740-c58eee",
+      "state": "timed_out",
+      "exit_code": 1,
+      "teardown_status": "succeeded"
+    },
+    {
+      "job_id": "20260728-111741-f199a1",
+      "state": "timed_out",
+      "exit_code": 1,
+      "teardown_status": "succeeded"
+    },
+    {
+      "job_id": "20260728-111742-0eec47",
+      "state": "failed",
+      "exit_code": null,
+      "teardown_status": "succeeded"
+    },
+    {
+      "job_id": "20260728-111743-f3c524",
+      "state": "failed",
+      "exit_code": null,
+      "teardown_status": "succeeded"
+    },
+    {
+      "job_id": "20260728-111744-1f3bf9",
+      "state": "succeeded",
+      "exit_code": 0,
+      "teardown_status": "succeeded"
+    },
+    {
+      "job_id": "20260728-111745-ca42ad",
+      "state": "timed_out",
+      "exit_code": 1,
+      "teardown_status": null
+    },
+    {
+      "job_id": "20260728-111746-074557",
+      "state": "failed",
+      "exit_code": null,
+      "teardown_status": "succeeded"
+    },
+    {
+      "job_id": "20260728-111747-73e3d8",
+      "state": "timed_out",
+      "exit_code": 1,
+      "teardown_status": "succeeded"
+    },
+    {
+      "job_id": "20260728-111748-9f42e2",
+      "state": "succeeded",
+      "exit_code": 0,
+      "teardown_status": "succeeded"
+    },
+    {
+      "job_id": "20260728-111749-16ec39",
+      "state": "failed",
+      "exit_code": 1,
+      "teardown_status": "succeeded"
+    },
+    {
+      "job_id": "20260728-111749-4b890f",
+      "state": "failed",
+      "exit_code": null,
+      "teardown_status": "succeeded"
+    },
+    {
+      "job_id": "20260728-111751-fe3e16",
+      "state": "failed",
+      "exit_code": null,
+      "teardown_status": "succeeded"
+    },
+    {
+      "job_id": "20260728-111752-832aef",
+      "state": "succeeded",
+      "exit_code": 0,
+      "teardown_status": "succeeded"
+    },
+    {
+      "job_id": "20260728-111753-569997",
+      "state": "failed",
+      "exit_code": null,
+      "teardown_status": "succeeded"
+    },
+    {
+      "job_id": "20260728-111754-46344c",
+      "state": "failed",
+      "exit_code": null,
+      "teardown_status": "succeeded"
+    },
+    {
+      "job_id": "20260728-111755-623a16",
+      "state": "timed_out",
+      "exit_code": 1,
+      "teardown_status": "succeeded"
+    }
+  ]
+}

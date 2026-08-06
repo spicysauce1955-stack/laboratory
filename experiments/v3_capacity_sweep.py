@@ -1132,6 +1132,27 @@ def main() -> int:
                     "p_solve_multi": (int(conv_multi.sum().item()) / n_seeds) if do_restart else -1.0,
                 }
                 rows.append(row)
+                # --- Incremental result write (added 2026-08-05, audit finding) -------------------
+                # This study previously wrote results.csv ONCE, at the end (see the final write
+                # below). A wall-clock timeout therefore lost every completed cell -- which is
+                # exactly what happened to the 2026-08-04 patience control: both arms ran the full
+                # 60 min cap and returned metrics.jsonl but no results.csv at all. The sibling
+                # studies (v6/v8/v9/v13) already flush per cell; v3 never got that fix.
+                # Append-and-fsync each cell as it completes. The final write below re-opens with
+                # "w" and rewrites the complete set, so a run that finishes is byte-identical to
+                # before; only the timeout path changes (partial instead of empty).
+                try:
+                    _res_path = run_dir / "results.csv"
+                    _write_header = not _res_path.exists()
+                    with _res_path.open("a", newline="") as _f:
+                        _w = csv.DictWriter(_f, fieldnames=list(row.keys()))
+                        if _write_header:
+                            _w.writeheader()
+                        _w.writerow(row)
+                        _f.flush()
+                        os.fsync(_f.fileno())
+                except Exception as _exc:  # never let bookkeeping kill a paid run
+                    print(f"[warn] incremental results.csv write failed: {_exc}", flush=True)
                 if capture:
                     # Assemble the per-cell raw store: per-seed per-epoch trajectories (NaN-padded to
                     # the cell's max epochs, concatenated over seed-batches) + final per-seed state +
