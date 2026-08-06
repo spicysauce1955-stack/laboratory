@@ -136,3 +136,29 @@ Every fix above carries tests named after your scenarios (`tests/test_effective_
 `test_aggregate_merge.py`, `test_cli_wait.py`, `test_sky_launch_retry.py`, `test_export.py`).
 If a next session finds these guarantees not holding as described, file another report like
 this one — it worked.
+
+---
+
+## Addendum (2026-08-06): §2 unblocked in v0.2.1
+
+Your verification report's §2 finding — the duplicate-seed guard rejecting this project's
+one-row-per-(seed, α) layout — is resolved with your preferred **option 1 (composite row key)**:
+
+```
+lab sweep -c "..." --seeds 0-47 --shard-size 6 --row-key seed,alpha
+```
+
+`--row-key` (MCP: `row_key="seed,alpha"`) declares the columns that identify a result row; it is
+stored on the sweep plan, and every duplicate rule — the within-one-file raise, the
+succeeded+succeeded contract tripwire, and the partial/retry winner resolution — is judged on the
+full key. The default remains the seed column alone, so nothing changes for one-row-per-seed
+sweeps. It must include the seed column (`seeds_present`/`seeds_partial`/`missing_seeds` are
+still seed-accounted). Replaying your `sweep-20260804-124022-0a188f` layout is covered by tests
+mirroring your exact case, including a timed-out shard's (100, 2.72) row surviving a succeeded
+retry of (100, 2.7).
+
+Your minor finding is also fixed: `fetch_artifacts` with `LAB_R2_ENDPOINT` set but no `r2` extra
+now warns and proceeds with local state instead of raising `ModuleNotFoundError`.
+
+Shipped as **v0.2.1** (PR #8). With this, hand-aggregation of the headline data should no longer
+be necessary — if the real sweep still resists mechanical aggregation, that's a new report.
