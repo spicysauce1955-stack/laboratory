@@ -302,6 +302,26 @@ leaked cpu-profile disk, for no reason anyone chose.
 **fix:** default `disk_size` for the gcp GPU path the way the cpu profile does.
 
 ---
+**`GCP-COST-4` — `lab register` reports `worst_case_cost_usd: null` for non-Vast clouds**
+`area: cost` · `severity: medium` · `confidence: observed` · `precedent: GCP-COST-3, its sibling`
+
+Found while registering a live GCP probe (2026-08-11): the registration returned
+`"worst_case_cost_usd": null`. `worst_case_cost()` returns None unless `triggers.max_hourly_usd`
+is set — and price triggers are Vast-only, so it is None for every GCP/DO registration.
+
+GCP-COST-3 fixed the *scheduler's* launch-time admission control. This is the **registration-time
+authorization** number: the figure the user is shown when they commit to a deferred job, and (for
+sweeps) the `per_point_cap` fallback when `max_cost_usd` isn't given — so a GCP sweep registered
+without an explicit cap admits against `per_point_cap=None`.
+
+**failure_mode:** "run this overnight, worst case null dollars." The one number whose entire job
+is to make the user's exposure legible before they close the laptop is blank on two of three
+clouds — and blank reads as "free", not as "unknown".
+
+**fix:** same source as GCP-COST-3 — fall back to `catalog_hourly(resources)` when there is no
+offer price. The helper already exists; this is one call site.
+
+---
 **`GCP-COST-3` — the scheduler's daily budget and per-job cost cap silently no-op on GCP** ✅ **FIXED 2026-08-11**
 `area: cost` · `severity: high` · `confidence: confirmed`
 · `precedent: memory "cost-safety design philosophy" — admission control is the guardrail`
