@@ -20,6 +20,8 @@ from fastmcp.exceptions import ToolError
 
 from lab._util import parse_duration, wrap_with_extras
 from lab.core import Lab, LabError, default_lab, job_status_view, resolve_backend_profile
+from lab.env import load_lab_env
+from lab.manifest import repo_root
 from lab.models import JobManifest, JobSpec, ResourceRequest
 from lab.store import JobStore
 
@@ -483,4 +485,6 @@ def build_server(lab: Lab) -> FastMCP:
 
 
 if __name__ == "__main__":
+    # Before default_lab(): the .env carries the cloud project/credentials the backends read.
+    load_lab_env(repo_root())
     build_server(default_lab()).run()

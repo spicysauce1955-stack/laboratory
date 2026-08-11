@@ -67,4 +67,7 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
 ## Conventions
 - `ruff` (line length 100), `mypy --strict` on `src/lab`. CLI and MCP server are thin shells over
   the `lab.core.Lab` library — never duplicate logic between them.
-- **Secrets** never in repo/manifest/logs (FR-J1); manifests record URIs, not keys.
+- **Secrets** never in repo/manifest/logs (FR-J1); manifests record URIs, not keys. Machine-local
+  settings (GCP project + service-account key **path**, R2 endpoint/bucket) go in a git-ignored
+  `.env` at the repo root, loaded by `lab.env.load_lab_env` at CLI/MCP startup; the committed
+  `.env.example` is placeholders-only. Real env wins over the file; blank means unset.

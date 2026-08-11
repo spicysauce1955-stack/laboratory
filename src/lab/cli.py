@@ -14,6 +14,7 @@ import typer
 
 from lab._util import atomic_write_text, now, parse_duration, wrap_with_extras
 from lab.core import Lab, LabError, default_lab, job_status_view, resolve_backend_profile
+from lab.env import load_lab_env
 from lab.manifest import repo_root
 from lab.models import JobSpec, ResourceRequest
 from lab.scheduler.models import Guardrails, RegState, Triggers
@@ -30,6 +31,12 @@ app = typer.Typer(
     help="Laboratory — remote experiment runner (CLI mirror of the MCP tools, spec §9).",
     no_args_is_help=True,
 )
+
+
+@app.callback()
+def _load_env() -> None:
+    """Apply the git-ignored ``.env`` before any command (cloud creds/project; real env wins)."""
+    load_lab_env(repo_root())
 
 
 def _lab(backend: str = "local") -> Lab:
