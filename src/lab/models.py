@@ -32,8 +32,14 @@ class ResourceRequest(BaseModel):
     disk_size: int | None = None  # boot/attached volume size in GB (skypilot; DO volume size)
     accelerators: str | None = None  # SkyPilot accelerator spec, e.g. "RTX_3070:1" (remote)
     cloud: str | None = None  # SkyPilot cloud: "vast" (default) | "do" | "gcp"; None -> "vast"
+    region: str | None = None  # pin the cloud region, e.g. "europe-west1"; None -> optimizer picks
+    zone: str | None = None  # pin the zone, e.g. "europe-west1-b"; implies its region
+    # Ceiling on the compute $/hr SkyPilot may accept (sky.Resources(max_hourly_cost=...)). Unlike
+    # a price *trigger* (Vast-only, a wait-until condition), this is enforced by the optimizer at
+    # launch, so the worst case it implies is provable rather than estimated.
+    max_hourly_usd: float | None = None
     timeout: str | None = None  # wall-clock limit, e.g. "2h" (FR-I1)
-    provision_timeout: str | None = None  # max time to reach UP, e.g. "10m" (default 8m; skypilot)
+    provision_timeout: str | None = None  # max time to reach UP, e.g. "10m" (per-cloud default)
     use_spot: bool = False  # opt into spot/interruptible instances (skypilot)
     spot_fallback: bool = True  # if spot capacity is unavailable, fall back to on-demand
 
@@ -74,16 +80,27 @@ class BackendInfo(BaseModel):
     provisioner: str  # "local" | "skypilot" | ...
     machine_type: str | None = None
     region: str | None = None
+    zone: str | None = None  # the zone actually launched into (GCP prices/exhausts per zone)
     launched_spot: bool | None = None  # actual kind launched (None = local/on-demand-only)
 
 
 class CostInfo(BaseModel):
     """Per-job cost/compute (FR-I2): an up-front estimate plus the actual. hourly/estimated/actual
     are 0 for the local backend (own machine). For remote jobs ``duration_seconds`` is billed
-    wall-clock (includes provisioning/setup, which clouds charge for)."""
+    wall-clock (includes provisioning/setup, which clouds charge for).
+
+    ``hourly_usd`` is the **total** billed rate — compute plus attached storage. It was
+    compute-only until 2026-08-11, which understated GCP jobs materially: a default 256 GB
+    pd-balanced disk is $0.0351/hr against a $0.0340/hr spot n4-standard-4. Keeping the total in
+    the field everything already reads (``estimated_usd``, admission control, the dashboard) means
+    those consumers got the storage line for free; the breakdown below is for humans.
+    """
 
     duration_seconds: float | None = None
-    hourly_usd: float | None = None
+    hourly_usd: float | None = None  # total: compute + storage
+    compute_hourly_usd: float | None = None  # instance (+ accelerators)
+    storage_hourly_usd: float | None = None  # boot/attached disk
+    hourly_basis: str | None = None  # provenance, e.g. "gcp catalog n4-standard-4 spot ..."
     estimated_usd: float | None = None  # hourly x wall-clock budget, known at launch
     actual_usd: float | None = None
 

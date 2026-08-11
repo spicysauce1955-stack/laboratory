@@ -248,6 +248,15 @@ CPU_DEFAULT_CLOUD = "do"
 # (SkyPilot's default disk_size) are both tier-restricted and fail provisioning until a tier bump.
 CPU_DEFAULT_VCPUS = 4
 CPU_DEFAULT_DISK_GB = 50
+# Accelerated jobs need room for a CUDA image plus wheels and a checkpoint; 100 GB is comfortable
+# without paying for SkyPilot's 256. See STORAGE_BILLING_CLOUDS for why any number beats None.
+GPU_DEFAULT_DISK_GB = 100
+# Clouds that bill attached storage as a separate line item. On these, letting `disk_size` fall
+# through to SkyPilot's 256 GB default is never right: on DO it hard-failed with a 422 (which is
+# why the cpu profile pins 50), and on GCP it succeeds quietly at $0.0351/hr — more than the
+# $0.0340/hr spot n4-standard-4 it is attached to. Loud on one cloud, expensive on the other, so
+# every launch here carries an explicit size.
+STORAGE_BILLING_CLOUDS = ("gcp", "do")
 
 
 def validate_cloud(cloud: str | None) -> str | None:
@@ -259,6 +268,20 @@ def validate_cloud(cloud: str | None) -> str | None:
     return cloud
 
 
+def default_disk_gb(resources: ResourceRequest) -> int | None:
+    """The explicit ``disk_size`` a spec should carry, or None to leave it alone.
+
+    Only clouds that bill storage separately get a default (see STORAGE_BILLING_CLOUDS): on Vast
+    the disk is part of the rental's ``dph_total``, so imposing a size there would change
+    provisioning behaviour to fix a cost problem Vast does not have. Pure.
+    """
+    if resources.disk_size is not None:
+        return resources.disk_size
+    if (resources.cloud or "vast") not in STORAGE_BILLING_CLOUDS:
+        return None
+    return GPU_DEFAULT_DISK_GB if resources.accelerators else CPU_DEFAULT_DISK_GB
+
+
 def resolve_backend_profile(
     backend: str, resources: ResourceRequest
 ) -> tuple[str, ResourceRequest]:
@@ -267,11 +290,18 @@ def resolve_backend_profile(
     ``cpu`` is sugar for the SkyPilot provisioner on a cheap CPU cloud (DigitalOcean by default,
     overridable via ``resources.cloud``): it clears accelerators and defaults to
     ``CPU_DEFAULT_VCPUS`` vCPUs. Spot is forced off only on DO (which has none) — GCP CPU jobs
-    may use preemptible. Other backends pass through unchanged (identity), so the CLI and MCP
-    stay thin shells. Pure; no I/O.
+    may use preemptible.
+
+    Every skypilot spec — cpu profile or not — also leaves here with an explicit ``disk_size`` on
+    the storage-billing clouds, so no path can inherit SkyPilot's 256 GB default. That default was
+    only ever noticed on DO, where it 422s loudly; on GCP it provisions fine and quietly doubles a
+    spot job's bill. Pure; no I/O.
     """
     validate_cloud(resources.cloud)
     if backend != "cpu":
+        disk = default_disk_gb(resources)
+        if backend == "skypilot" and disk != resources.disk_size:
+            return backend, resources.model_copy(update={"disk_size": disk})
         return backend, resources
     if resources.accelerators:
         raise LabError("--backend cpu provisions a CPU-only box; drop --accelerators")
@@ -294,6 +324,26 @@ class Lab:
         self.home = Path(home)
         self.store = JobStore(self.home)
 
+    def preflight(self, spec: JobSpec) -> None:
+        """Refuse a remote launch that a cheap local check proves cannot work (FR-F3).
+
+        Only definitive negatives block — a quota of zero, a disabled API, an absent permission.
+        A check that merely *fails to answer* is skipped, because a preflight that blocked on its
+        own breakage would be worse than none. See :mod:`lab.doctor`.
+        """
+        if self.backend.name == "local":
+            return
+        from lab.doctor import format_report, preflight
+
+        blocking = preflight(spec.resources.cloud, spec.resources, home=self.home)
+        if not blocking:
+            return
+        raise LabError(
+            "preflight refused this launch — it would fail after provisioning:\n"
+            + format_report(blocking)
+            + "\n(pass --no-preflight / preflight=False to launch anyway)"
+        )
+
     def submit(
         self,
         spec: JobSpec,
@@ -304,12 +354,15 @@ class Lab:
         code: CodeRef | None = None,
         registration_id: str | None = None,
         confirms: str | None = None,
+        preflight: bool = True,
     ) -> str:
         """Build + persist the manifest, then launch via the backend (FR-A1, FR-B).
 
         ``code`` overrides git introspection — used by the scheduler, which submits from an
         extracted bundle (not a git repo) with provenance captured at registration time.
         """
+        if preflight:
+            self.preflight(spec)
         job_id = _new_job_id()
         if code is None:
             dirty = is_dirty(self.repo)
@@ -1382,6 +1435,18 @@ def _status_fields(
             else None
         ),
         "teardown_status": m.teardown_status,  # FR-C2 — "failed" means a box may still bill
+        # Where it actually landed. GCP prices and exhausts per zone, so "which zone" is the
+        # difference between a $0.034/hr job and a $0.12/hr one.
+        "placement": {
+            "cloud": m.resources.cloud or "vast",
+            "machine_type": m.backend.machine_type,
+            "region": m.backend.region,
+            "zone": m.backend.zone,
+            "spot": m.backend.launched_spot,
+        },
+        # spot_fallback defaults on, so `--spot` can land on-demand at ~5x the price the user was
+        # budgeting for. `launched_spot` recorded that all along; nothing ever surfaced it.
+        "spot_downgraded": bool(m.resources.use_spot and m.backend.launched_spot is False),
         "sweep_id": m.sweep_id,
         # Progressing-vs-wedged signal for long runs that don't log metrics.
         "last_log_line": last_line,

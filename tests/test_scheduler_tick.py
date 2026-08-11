@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from helpers import PYTHON, make_manifest, wait_terminal
 from test_scheduler_bundle import _make_repo
 
@@ -414,26 +415,39 @@ def test_vast_price_trigger_still_wins_over_the_catalog(tmp_path: Path, monkeypa
 
 
 def test_catalog_hourly_prices_the_requested_resources(monkeypatch):
-    """The estimate comes from SkyPilot's catalog — a local lookup, no provisioning."""
-    import types
+    """The estimate comes from SkyPilot's catalog — a local lookup, no provisioning.
 
-    import lab.backends.skypilot as sky_mod
+    It is the WORST admissible rate, not a point estimate: this feeds admission control, and the
+    previous implementation returned ``get_cost()`` on an unpinned ``Resources``, which is the
+    *minimum* across every region offering the shape. A guardrail checking the best case is not a
+    guardrail. Storage rides along for the same reason — it is billed, so it is exposure.
+    """
+    import lab.placement as placement_mod
+    from lab.backends import skypilot as sky_mod
 
     monkeypatch.setattr(
-        sky_mod, "_catalog_resources", lambda res: types.SimpleNamespace(get_cost=lambda s: 0.42)
+        placement_mod,
+        "estimate",
+        lambda res, memo=None: placement_mod.Estimate(
+            instance_type="n4-standard-4",
+            low_usd=0.10,
+            high_usd=0.42,
+            storage_usd=0.01,
+            regions=3,
+            excluded_zones=0,
+            basis="test",
+        ),
     )
-    assert sky_mod.catalog_hourly(ResourceRequest(cloud="gcp", cpus=4)) == 0.42
+    assert sky_mod.catalog_hourly(ResourceRequest(cloud="gcp", cpus=4)) == pytest.approx(0.43)
 
 
 def test_catalog_hourly_returns_none_when_the_catalog_cannot_price_it(monkeypatch):
     """No catalog entry / no cloud extra installed -> None, and the caller falls back to the
     existing behaviour rather than blocking a launch on a missing price."""
-    import lab.backends.skypilot as sky_mod
+    import lab.placement as placement_mod
+    from lab.backends import skypilot as sky_mod
 
-    def _boom(res):
-        raise RuntimeError("no such instance type")
-
-    monkeypatch.setattr(sky_mod, "_catalog_resources", _boom)
+    monkeypatch.setattr(placement_mod, "estimate", lambda res, memo=None: None)
     assert sky_mod.catalog_hourly(ResourceRequest(cloud="gcp", cpus=4)) is None
 
 

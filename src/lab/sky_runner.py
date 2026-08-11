@@ -19,7 +19,6 @@ from typing import Any
 from lab._util import actual_cost, duration_seconds, now, parse_duration, timeout_reason
 from lab.backends.skypilot import (
     DEFAULT_AUTOSTOP_MIN,
-    DEFAULT_PROVISION_TIMEOUT_MIN,
     REMOTE_RUN_DIR,
     TIMEOUT_SENTINEL,
     ProvisionTimeout,
@@ -29,12 +28,14 @@ from lab.backends.skypilot import (
     map_job_status,
     preempted_teardown_confirmed,
     promote_timeout,
+    provision_timeout_min,
     provision_with_watchdog,
     tear_down_and_record,
     vast_balance,
     vast_hourly_for_cluster,
 )
-from lab.models import BackendInfo, CostInfo, JobState
+from lab.models import BackendInfo, CostInfo, JobManifest, JobState
+from lab.placement import CapacityMemo
 from lab.preemption import classify_terminal
 from lab.redact import install_log_redaction
 from lab.storage import R2Store, r2_enabled
@@ -164,8 +165,13 @@ def _hourly_cost(handle: Any) -> float | None:
 
 
 def _resolve_hourly(cluster: str, handle: Any, cloud: str) -> float | None:
-    """Prefer the rental's real billed price for Vast (``dph_total``, which SkyPilot under-reports
-    ~4x); for every other cloud (DO/GCP) SkyPilot's catalog estimate is accurate, so use it."""
+    """Compute-only USD/hour for the launched cluster.
+
+    Prefers the rental's real billed price on Vast (``dph_total``, which SkyPilot under-reports
+    ~4x). On DO/GCP the catalog is accurate *for the region actually launched into*, which is what
+    ``handle.launched_resources`` carries — the pre-launch estimate cannot know that, which is why
+    it quotes a band and this quotes a number.
+    """
     if cloud == "vast":
         try:
             actual = vast_hourly_for_cluster(cluster)
@@ -175,6 +181,87 @@ def _resolve_hourly(cluster: str, handle: Any, cloud: str) -> float | None:
         if actual is not None:
             return actual
     return _hourly_cost(handle)
+
+
+def resolve_cost(
+    cluster: str, handle: Any, manifest: JobManifest, cloud: str, *, instance_type: str | None
+) -> CostInfo:
+    """The launched job's billed rate, storage included (FR-I2).
+
+    ``hourly_usd`` is compute + storage. Storage was absent from this number until 2026-08-11 and
+    is not a rounding error: SkyPilot's default 256 GB disk costs $0.0351/hr against a $0.0340/hr
+    spot n4-standard-4. Everything downstream reads ``hourly_usd``, so folding the disk in there
+    fixes ``estimated_usd``, the dashboard, and the scheduler's spend accounting at once.
+    """
+    from lab.placement import storage_hourly_usd
+
+    compute = _resolve_hourly(cluster, handle, cloud)
+    storage = storage_hourly_usd(cloud, manifest.resources.disk_size, instance_type)
+    total = None if compute is None else compute + storage
+    estimated = actual_cost(total, parse_duration(manifest.resources.timeout))
+    disk = manifest.resources.disk_size or 0
+    shape = f"{cloud} {instance_type or 'unknown instance type'}"
+    priced = "compute unknown" if compute is None else f"compute ${compute:.4f}/hr"
+    return CostInfo(
+        hourly_usd=total,
+        compute_hourly_usd=compute,
+        storage_hourly_usd=storage,
+        hourly_basis=f"{shape} {priced} + {disk}GiB disk ${storage:.4f}/hr",
+        estimated_usd=estimated,
+    )
+
+
+def record_capacity_exhaustion(
+    home: Path, manifest: JobManifest, cloud: str, *, error_text: str, log_text: str = ""
+) -> list[str]:
+    """Remember zones that just reported "no capacity" so the next submit skips them.
+
+    Best-effort and deliberately silent about failure: this runs on the error path of a job that
+    has already failed, and nothing here may make that worse. Returns the zones recorded (for
+    logging and tests).
+    """
+    try:
+        from lab.placement import CapacityMemo, parse_exhausted_zones, resolve_instance_type
+
+        zones = parse_exhausted_zones(f"{error_text}\n{log_text}")
+        if not zones:
+            return []
+        instance_type = resolve_instance_type(manifest.resources)
+        if instance_type is None:
+            return []
+        CapacityMemo.for_home(home).record(cloud, instance_type, zones)
+        print(f"[lab] capacity memo: {cloud}/{instance_type} exhausted in {', '.join(zones)}")
+        return zones
+    except Exception as e:  # noqa: BLE001 — never worsen an already-failing job
+        print(f"[lab] capacity memo not updated: {e}")
+        return []
+
+
+# How much of the job log to scan for exhaustion markers. SkyPilot prints one warning per failed
+# zone, so the evidence is near the end and a bounded tail is plenty.
+_CAPACITY_LOG_TAIL_BYTES = 200_000
+
+
+def _remember_capacity(
+    store: JobStore, job_id: str, manifest: JobManifest, cloud: str, *, error_text: str
+) -> list[str]:
+    """Scan this job's log tail (plus the raised error) for capacity exhaustion and memoise it.
+
+    The zones are usually only in the log: SkyPilot logs a per-zone warning during failover and
+    then raises a summary error that names none of them.
+    """
+    log_text = ""
+    try:
+        path = store.logs_path(job_id)
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            f.seek(max(0, size - _CAPACITY_LOG_TAIL_BYTES))
+            log_text = f.read().decode(errors="replace")
+    except OSError:
+        pass
+    return record_capacity_exhaustion(
+        store.home, manifest, cloud, error_text=error_text, log_text=log_text
+    )
 
 
 class TransientLaunchError(RuntimeError):
@@ -350,22 +437,21 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
 
     try:
         if not adopt:
-            task = build_task(manifest, workdir=Path.cwd())
+            memo = CapacityMemo.for_home(store.home)
+            task = build_task(manifest, workdir=Path.cwd(), memo=memo)
             # Retries transient local-API failures (submit stampede) before giving up (fieldrep #4).
             request_id = _launch_with_retry(sky, task, cluster)
             # stream_and_get blocks until the job is submitted (0.12), i.e. until the host is UP.
             # Bound it so a dead Vast offer stuck in "loading" can't hang the supervisor forever
-            # (FR-I1).
+            # (FR-I1). The budget is per-cloud: Vast waits on one host, GCP walks a failover path.
             provision_s = (
                 parse_duration(manifest.resources.provision_timeout)
-                or DEFAULT_PROVISION_TIMEOUT_MIN * 60
+                or provision_timeout_min(cloud) * 60
             )
             sky_job_id, handle = provision_with_watchdog(sky, request_id, timeout_s=provision_s)
             # Record cost up-front so a running job already shows it (FR-I2). The host is UP now,
             # so the Vast rental exists — bill at its real dph_total, not SkyPilot's low catalog
             # estimate.
-            hourly_usd = _resolve_hourly(cluster, handle, cloud)
-            estimated_usd = actual_cost(hourly_usd, parse_duration(manifest.resources.timeout))
             # Record which instance kind SkyPilot actually launched (spot vs on-demand) — with
             # spot_fallback the optimizer may pick on-demand, and the classifier must only infer
             # preemption for a genuinely-spot launch. None when unknown / on-demand-only.
@@ -373,19 +459,36 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             launched_spot = getattr(launched, "use_spot", None)
             machine_type = getattr(launched, "instance_type", None)
             region = getattr(launched, "region", None)
+            zone = getattr(launched, "zone", None)
+            if manifest.resources.use_spot and launched_spot is False:
+                # spot_fallback let the optimizer land on-demand, which on GCP is ~5x the spot
+                # price the user was budgeting for. Say so; nothing surfaced this before.
+                print(
+                    "[lab] NOTE: requested spot but launched ON-DEMAND (spot capacity was "
+                    "scarce). Pass --no-fallback to refuse this."
+                )
+            cost_info = resolve_cost(cluster, handle, manifest, cloud, instance_type=machine_type)
             store.update_manifest(
                 job_id,
-                cost=CostInfo(hourly_usd=hourly_usd, estimated_usd=estimated_usd),
+                cost=cost_info,
                 backend=BackendInfo(
                     provisioner="skypilot",
                     machine_type=machine_type,
                     region=region,
+                    zone=zone,
                     launched_spot=launched_spot,
                 ),
             )
         else:
-            hourly_usd = _resolve_hourly(cluster, None, cloud)
-            estimated_usd = manifest.cost.estimated_usd if manifest.cost else None
+            # Adopting a running cluster: re-price it, but keep the estimate agreed at launch —
+            # that number was the user's authorisation and must not drift under them.
+            cost_info = resolve_cost(
+                cluster, None, manifest, cloud, instance_type=manifest.backend.machine_type
+            )
+            if manifest.cost is not None and manifest.cost.estimated_usd is not None:
+                cost_info = cost_info.model_copy(
+                    update={"estimated_usd": manifest.cost.estimated_usd}
+                )
             sky_job_id = None  # match any job in the cluster queue
 
         # Wait for the run to actually finish before fetching artifacts / tearing down.
@@ -415,6 +518,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         )
         final = raw_final
     except ProvisionTimeout:
+        _remember_capacity(store, job_id, manifest, cloud, error_text="")
         store.update_manifest(
             job_id,
             status=JobState.failed,
@@ -436,6 +540,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         tear_down_and_record(sky, cluster, store, job_id, cloud)
         return 1
     except Exception as e:  # noqa: BLE001
+        _remember_capacity(store, job_id, manifest, cloud, error_text=f"{type(e).__name__}: {e}")
         reason = provision_failure_reason(f"launch error: {e}", cloud)
         store.update_manifest(
             job_id, status=JobState.failed, ended_at=now(), end_reason=reason[:300]
@@ -490,11 +595,11 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
 
     ended = now()
     dur = duration_seconds(started, ended)
-    cost = CostInfo(
-        duration_seconds=dur,
-        hourly_usd=hourly_usd,
-        estimated_usd=estimated_usd,
-        actual_usd=actual_cost(hourly_usd, dur),
+    cost = cost_info.model_copy(
+        update={
+            "duration_seconds": dur,
+            "actual_usd": actual_cost(cost_info.hourly_usd, dur),
+        }
     )
 
     if final is JobState.timed_out:

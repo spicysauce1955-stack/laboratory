@@ -13,7 +13,15 @@ from typing import Any
 import typer
 
 from lab._util import atomic_write_text, now, parse_duration, wrap_with_extras
-from lab.core import Lab, LabError, default_lab, job_status_view, resolve_backend_profile
+from lab.core import (
+    Lab,
+    LabError,
+    default_lab,
+    default_disk_gb,
+    job_status_view,
+    resolve_backend_profile,
+    validate_cloud,
+)
 from lab.env import load_lab_env
 from lab.manifest import repo_root
 from lab.models import JobSpec, ResourceRequest
@@ -109,7 +117,10 @@ def submit(
         None, help="hard wall-clock cap, e.g. 2h / 30m / 45s — on overrun the job is killed, the "
         "machine torn down, and the run marked timed_out (FR-I1)"
     ),
-    provision_timeout: str | None = typer.Option(None, "--provision-timeout", help="abort if the host doesn't reach UP in time, e.g. 10m (skypilot; default 8m)"),
+    provision_timeout: str | None = typer.Option(None, "--provision-timeout", help="abort if the host doesn't reach UP in time, e.g. 10m (skypilot; default per-cloud: vast 8m, do 12m, gcp 20m)"),
+    region: str | None = typer.Option(None, "--region", help="pin the cloud region, e.g. europe-west1 (skypilot; default: the optimizer picks)"),
+    zone: str | None = typer.Option(None, "--zone", help="pin the zone, e.g. europe-west1-b (skypilot)"),
+    price_cap: float | None = typer.Option(None, "--price-cap", help="refuse any instance above this compute $/hr — enforced by SkyPilot's optimizer, so the worst case is a ceiling not an estimate"),
     with_pkg: list[str] = typer.Option(None, "--with", help="extra runtime package(s) for this job (repeatable; layered via uv run --with)"),
     spot: bool = typer.Option(False, "--spot", help="use spot/interruptible instances (skypilot)"),
     no_fallback: bool = typer.Option(
@@ -119,6 +130,10 @@ def submit(
     no_dirty: bool = typer.Option(
         False, "--no-dirty",
         help="refuse to launch from a dirty working tree (default: snapshot the diff, FR-B1)",
+    ),
+    no_preflight: bool = typer.Option(
+        False, "--no-preflight",
+        help="skip the pre-launch credential/quota checks (see `lab doctor`)",
     ),
     allow_unknown_config: bool = typer.Option(
         False, "--allow-unknown-config",
@@ -134,7 +149,8 @@ def submit(
     """
     resources = ResourceRequest(
         cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
-        cloud=cloud, timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
+        cloud=cloud, region=region, zone=zone, max_hourly_usd=price_cap,
+        timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
         spot_fallback=not no_fallback,
     )
     try:
@@ -155,7 +171,7 @@ def submit(
         _emit({"job_id": cached_id, "cached": True, "status": lab.status(cached_id).value})
         return
     try:
-        job_id = lab.submit(spec, allow_dirty=not no_dirty)
+        job_id = lab.submit(spec, allow_dirty=not no_dirty, preflight=not no_preflight)
     except LabError as e:  # fail-loud, actionable (FR-F3)
         _emit({"error": str(e)})
         raise typer.Exit(code=1) from e
@@ -209,7 +225,10 @@ def sweep(
     disk_size: int | None = typer.Option(None, "--disk-size", help="boot/attached volume size in GB per job (skypilot; DO volume size). cpu backend defaults to 50"),
     accelerators: str | None = typer.Option(None, "--accelerators"),
     timeout: str | None = typer.Option(None, help="wall-clock per job, e.g. 2h"),
-    provision_timeout: str | None = typer.Option(None, "--provision-timeout", help="abort a host that doesn't reach UP in time, e.g. 10m (skypilot; default 8m)"),
+    provision_timeout: str | None = typer.Option(None, "--provision-timeout", help="abort a host that doesn't reach UP in time, e.g. 10m (skypilot; default per-cloud: vast 8m, do 12m, gcp 20m)"),
+    region: str | None = typer.Option(None, "--region", help="pin the cloud region for every job, e.g. europe-west1 (skypilot)"),
+    zone: str | None = typer.Option(None, "--zone", help="pin the zone for every job, e.g. europe-west1-b (skypilot)"),
+    price_cap: float | None = typer.Option(None, "--price-cap", help="refuse any instance above this compute $/hr, per job (enforced by SkyPilot's optimizer)"),
     with_pkg: list[str] = typer.Option(None, "--with", help="extra runtime package(s) per job (repeatable; layered via uv run --with)"),
     spot: bool = typer.Option(False, "--spot", help="use spot/interruptible instances (skypilot)"),
     no_fallback: bool = typer.Option(
@@ -235,7 +254,8 @@ def sweep(
     sweep (no --grid) is one cell sharded over --seeds."""
     resources = ResourceRequest(
         cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
-        cloud=cloud, timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
+        cloud=cloud, region=region, zone=zone, max_hourly_usd=price_cap,
+        timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
         spot_fallback=not no_fallback,
     )
     try:
@@ -546,6 +566,53 @@ def _repo() -> Path:
 
 
 @app.command()
+def doctor(
+    cloud: str | None = typer.Option(None, "--cloud", help="vast | do | gcp (default vast)"),
+    accelerators: str | None = typer.Option(
+        None, "--gpu", "--accelerators", help="check quota for this accelerator, e.g. T4:1"
+    ),
+    cpus: int | None = typer.Option(None, help="check vCPU quota for this size"),
+    disk_size: int | None = typer.Option(None, "--disk-size", help="check disk quota for this size"),
+    region: str | None = typer.Option(None, "--region", help="check quota in this region"),
+    zone: str | None = typer.Option(None, "--zone", help="check quota in this zone's region"),
+    spot: bool = typer.Option(False, "--spot", help="price the spec as spot"),
+    as_json: bool = typer.Option(False, "--json", help="emit the structured findings"),
+    no_cache: bool = typer.Option(False, "--no-cache", help="re-run every check, ignoring the cache"),
+) -> None:
+    """Check whether a launch on this cloud would work, before it costs a provision.
+
+    Verifies credentials (including SkyPilot's daemon, which does not inherit ``.env``), project
+    and billing, enabled APIs, IAM permissions, and quota for the shape you ask about — then
+    reports what the catalog says it will cost. Exits 1 if any check fails.
+
+    Quota is checked at both levels GCP enforces: a fresh project can hold regional GPU quota and
+    still be blocked by a global ``GPUS_ALL_REGIONS`` of 0.
+    """
+    from lab.doctor import format_report, run_checks
+
+    resources = ResourceRequest(
+        cpus=cpus, disk_size=disk_size, accelerators=accelerators,
+        cloud=cloud, region=region, zone=zone, use_spot=spot,
+    )
+    try:
+        validate_cloud(cloud)
+    except LabError as e:
+        _emit({"error": str(e)})
+        raise typer.Exit(code=2) from e
+    # Apply the same disk defaults a real submit would, so the quota check asks about the size
+    # that would actually be provisioned rather than the one the user happened to type.
+    resources = resources.model_copy(update={"disk_size": default_disk_gb(resources)})
+    results = run_checks(cloud, resources, home=_repo() / "runs", use_cache=not no_cache)
+    if as_json:
+        _emit({"cloud": cloud or "vast", "checks": [r.model_dump() for r in results]})
+    else:
+        typer.echo(f"lab doctor — {cloud or 'vast'}")
+        typer.echo(format_report(results))
+    if any(r.status == "fail" for r in results):
+        raise typer.Exit(code=1)
+
+
+@app.command()
 def register(
     command: str = typer.Option(
         ..., "--command", "-c", help="entrypoint, e.g. 'uv run experiments/x.py'"
@@ -564,6 +631,15 @@ def register(
     ),
     cloud: str | None = typer.Option(
         None, "--cloud", help="vast | do | gcp (default vast; price/offer triggers are Vast-only)"
+    ),
+    region: str | None = typer.Option(
+        None, "--region", help="pin the cloud region, e.g. europe-west1 (skypilot)"
+    ),
+    zone: str | None = typer.Option(None, "--zone", help="pin the zone, e.g. europe-west1-b"),
+    price_cap: float | None = typer.Option(
+        None, "--price-cap",
+        help="refuse any instance above this compute $/hr (enforced by SkyPilot's optimizer; "
+             "unlike --max-hourly this is a ceiling, not a wait-until trigger)",
     ),
     timeout: str | None = typer.Option(
         None, help="wall-clock limit per job, e.g. 2h (cost bound, FR-I1)"
@@ -617,6 +693,7 @@ def register(
         seed=seed,
         resources=ResourceRequest(
             cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, cloud=cloud,
+            region=region, zone=zone, max_hourly_usd=price_cap,
             timeout=timeout, use_spot=spot, spot_fallback=not no_fallback,
         ),
         submitted_by="human",
@@ -657,6 +734,15 @@ def register_sweep(
     ),
     cloud: str | None = typer.Option(
         None, "--cloud", help="vast | do | gcp (default vast; price/offer triggers are Vast-only)"
+    ),
+    region: str | None = typer.Option(
+        None, "--region", help="pin the cloud region, e.g. europe-west1 (skypilot)"
+    ),
+    zone: str | None = typer.Option(None, "--zone", help="pin the zone, e.g. europe-west1-b"),
+    price_cap: float | None = typer.Option(
+        None, "--price-cap",
+        help="refuse any instance above this compute $/hr (enforced by SkyPilot's optimizer; "
+             "unlike --max-hourly this is a ceiling, not a wait-until trigger)",
     ),
     timeout: str | None = typer.Option(
         None, help="wall-clock limit per job, e.g. 2h (cost bound, FR-I1)"
@@ -709,6 +795,7 @@ def register_sweep(
     guardrails = Guardrails(expires_at=expires_at, max_cost_usd=max_cost)
     resources = ResourceRequest(
         cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, cloud=cloud,
+            region=region, zone=zone, max_hourly_usd=price_cap,
         timeout=timeout, use_spot=spot, spot_fallback=not no_fallback,
     )
     try:

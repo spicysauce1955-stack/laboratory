@@ -36,11 +36,31 @@ def _new_sweep_id() -> str:
 
 
 def worst_case_cost(triggers: Triggers, resources: ResourceRequest) -> float | None:
-    """What the user authorizes at registration time: max $/h x wall-clock timeout."""
+    """What the user authorizes at registration time: max $/h x wall-clock timeout.
+
+    The hourly rate comes from the Vast price trigger when there is one, and otherwise from
+    SkyPilot's catalog. Without that fallback this returned None for **every** GCP and DO
+    registration — price triggers being Vast-only — so the one number whose whole job is to make a
+    deferred job's exposure legible before the user closes the laptop was blank on two of three
+    clouds. Blank reads as free, not as unknown. It also fed ``per_point_cap`` for sweeps, so a GCP
+    sweep registered without an explicit cap admitted against nothing (GCP-COST-4).
+
+    Still None when there is genuinely nothing to price (a plain local registration, or a spec the
+    catalog cannot resolve), preserving the previous behaviour exactly where it was already right.
+    """
     secs = parse_duration(resources.timeout)
-    if triggers.max_hourly_usd is None or secs is None:
+    if secs is None:
         return None
-    return round(triggers.max_hourly_usd * secs / 3600.0, 6)
+    hourly = triggers.max_hourly_usd
+    if hourly is None and (resources.cloud is not None or resources.accelerators):
+        try:
+            from lab.backends import skypilot
+        except ImportError:  # no skypilot extra on this host — nothing to price with
+            return None
+        hourly = skypilot.catalog_hourly(resources)
+    if hourly is None:
+        return None
+    return round(hourly * secs / 3600.0, 6)
 
 
 def parse_expires(value: str) -> datetime:

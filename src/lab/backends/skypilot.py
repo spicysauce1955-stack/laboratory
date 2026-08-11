@@ -42,6 +42,17 @@ DEFAULT_AUTOSTOP_MIN = 5  # safety-net teardown if the supervisor process dies
 # Provisioning watchdog: a healthy Vast host reaches UP in ~2-4 min, so 8 min clears
 # slow-but-alive hosts while catching ones stuck in "loading" forever (a dead offer).
 DEFAULT_PROVISION_TIMEOUT_MIN = 8
+# ...but that number is Vast-shaped, and the hyperscalers spend their time somewhere else. A GCP
+# launch that meets ZONE_RESOURCE_POOL_EXHAUSTED fails over zone by zone and region by region, so
+# its clock is spent in the optimizer's walk rather than on one stuck host — and killing that walk
+# mid-provision is the LAB-BUGS §4 leak scenario, where autostop is not set yet. Give the clouds
+# that fail over the room to finish failing over.
+PROVISION_TIMEOUT_MIN_BY_CLOUD = {"vast": 8, "do": 12, "gcp": 20}
+
+
+def provision_timeout_min(cloud: str | None) -> int:
+    """Minutes to allow for provisioning on a cloud (pure)."""
+    return PROVISION_TIMEOUT_MIN_BY_CLOUD.get(cloud or "vast", DEFAULT_PROVISION_TIMEOUT_MIN)
 # Teardown retry budget: ~3.5 min total (first attempt + 5 retries spaced 5/15/30/60/120 s).
 # Long enough to ride out a transient DNS/API hiccup; short enough that a cluster that's
 # genuinely stuck still gets nuked via the vast-sdk fallback in well under 5 minutes.
@@ -498,22 +509,8 @@ def vast_hourly_for_cluster(cluster: str, client: Any | None = None) -> float | 
     return None
 
 
-def _catalog_resources(res: ResourceRequest) -> Any:
-    """A ``sky.Resources`` for a *requested* spec (no launch). Test seam."""
-    import sky
-
-    return sky.Resources(
-        cloud=_cloud_for(res.cloud),
-        cpus=res.cpus,
-        memory=res.memory,
-        accelerators=res.accelerators or None,
-        disk_size=res.disk_size,
-        use_spot=res.use_spot or None,
-    )
-
-
 def catalog_hourly(res: ResourceRequest) -> float | None:
-    """USD/hour for a spec from SkyPilot's catalog — a **local** lookup, no provisioning.
+    """Worst-case USD/hour for a spec from SkyPilot's catalog — a **local** lookup, no provisioning.
 
     Vast has a live offer feed, so its registrations price themselves from real offers. Every
     other cloud has none, which left the scheduler's cost guardrails with no number to check and
@@ -521,12 +518,21 @@ def catalog_hourly(res: ResourceRequest) -> float | None:
     is the pre-launch estimate for those clouds. Returns None if the catalog can't price the spec,
     so a missing price never blocks a launch — the guardrail degrades to its old behaviour rather
     than becoming a new failure mode.
+
+    **This deliberately returns the top of the price band, not a point estimate.** It used to call
+    ``sky.Resources(...).get_cost()`` with no region pinned, which returns the *minimum* across
+    every region offering the resource — so the guardrail that was meant to cap a job's spend was
+    checking its best case, under-estimating by up to 3.6x on GCP spot. Its callers are admission
+    controls; an admission control that under-estimates admits jobs it should refuse. See
+    :func:`lab.placement.estimate` for how the ceiling accounts for spot fallback and storage.
     """
-    try:
-        return float(_catalog_resources(res).get_cost(3600))
-    except Exception as e:  # noqa: BLE001 — best-effort estimate; caller falls back to None
-        print(f"[lab] catalog price unavailable for {res.cloud or 'vast'}: {e}")
+    from lab import placement
+
+    est = placement.estimate(res)
+    if est is None:
+        print(f"[lab] catalog price unavailable for {res.cloud or 'vast'}")
         return None
+    return est.worst_hourly_usd
 
 
 def vast_balance(client: Any | None = None) -> float | None:
@@ -830,9 +836,45 @@ def _cloud_for(name: str | None) -> "sky.clouds.Cloud":
     return clouds[key]()
 
 
-def build_task(manifest: JobManifest, workdir: Path) -> sky.Task:
+def narrowed_regions(res: ResourceRequest, memo: Any | None) -> list[str | None]:
+    """Regions to offer SkyPilot, or ``[None]`` meaning "don't narrow — use the full search space".
+
+    We narrow for exactly one reason: the capacity memo knows some zones just ran out, and without
+    that knowledge every shard of a sweep independently walks into them. Narrowing is skipped
+    whenever it would be guesswork or harm:
+
+    * nothing excluded -> ``[None]``, byte-identical to the pre-memo behaviour;
+    * an explicit ``--region``/``--zone`` -> ``[None]``, because the pin is already the constraint
+      and the memo must not silently override what the user asked for;
+    * every region excluded -> ``[None]``, because a memo that would block the launch entirely is
+      worse than a memo that is ignored.
+
+    Ordering stays SkyPilot's: it prices the set we hand it and picks the cheapest available.
+    """
+    if memo is None or res.region is not None or res.zone is not None:
+        return [None]
+    from lab import placement
+
+    instance_type = placement.resolve_instance_type(res)
+    if instance_type is None:
+        return [None]
+    cloud = res.cloud or "vast"
+    if not memo.exhausted_zones(cloud, instance_type):
+        return [None]
+    surviving = placement.candidates(res, instance_type=instance_type, memo=memo)
+    if not surviving:
+        print("[lab] capacity memo would exclude every region; ignoring it for this launch")
+        return [None]
+    names = [c.region for c in surviving[: placement.MAX_NARROWED_REGIONS]]
+    print(f"[lab] capacity memo: narrowed to {len(names)} region(s), cheapest {names[0]}")
+    return list(names)
+
+
+def build_task(manifest: JobManifest, workdir: Path, *, memo: Any | None = None) -> sky.Task:
     """Translate a JobManifest into a SkyPilot Task (no cloud calls; unit-tested)."""
     import sky
+
+    from lab import placement
 
     task = sky.Task(
         name=cluster_name_for(manifest.job_id),
@@ -845,34 +887,40 @@ def build_task(manifest: JobManifest, workdir: Path) -> sky.Task:
         },
         workdir=str(workdir),
     )
-    cloud_name = manifest.resources.cloud or "vast"
-    if cloud_name == "do" and manifest.resources.use_spot:
+    res = manifest.resources
+    cloud_name = res.cloud or "vast"
+    if cloud_name == "do" and res.use_spot:
         from lab.core import LabError  # lazy: avoid import cycle
 
         raise LabError("DigitalOcean has no spot instances; drop --spot")
+    placement.validate_placement(res)  # a bad region name fails here, before anything bills
     _cloud = _cloud_for(cloud_name)
-    _cpus = manifest.resources.cpus
-    _memory = manifest.resources.memory
-    _accels = manifest.resources.accelerators or None
-    _disk = manifest.resources.disk_size
 
-    def _res(*, use_spot: bool | None = None) -> sky.Resources:
+    def _res(*, use_spot: bool | None = None, region: str | None = None) -> sky.Resources:
         return sky.Resources(
             cloud=_cloud,
-            cpus=_cpus,
-            memory=_memory,
-            accelerators=_accels,
-            disk_size=_disk,
+            cpus=res.cpus,
+            memory=res.memory,
+            accelerators=res.accelerators or None,
+            disk_size=res.disk_size,
             use_spot=use_spot,
+            region=region or res.region,
+            zone=res.zone,
+            # A ceiling the optimizer itself honours: it will not select an option above this, so
+            # the worst case we quote the user is enforced rather than merely predicted.
+            max_hourly_cost=res.max_hourly_usd,
         )
 
-    if not manifest.resources.use_spot:
-        task.set_resources(_res())
-    elif manifest.resources.spot_fallback:
+    if not res.use_spot:
+        spots: list[bool | None] = [None]
+    elif res.spot_fallback:
         # Prefer spot (cheaper); SkyPilot's optimizer fails over to on-demand if spot is scarce.
-        task.set_resources([_res(use_spot=True), _res(use_spot=False)])
+        spots = [True, False]
     else:
-        task.set_resources(_res(use_spot=True))  # spot-only, no fallback
+        spots = [True]  # spot-only, no fallback
+
+    options = [_res(use_spot=s, region=r) for r in narrowed_regions(res, memo) for s in spots]
+    task.set_resources(options[0] if len(options) == 1 else options)
     return task
 
 

@@ -60,6 +60,9 @@ def build_server(lab: Lab) -> FastMCP:
         disk_size: int | None = None,
         accelerators: str | None = None,
         cloud: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
+        price_cap: float | None = None,
         timeout: str | None = None,
         provision_timeout: str | None = None,
         with_pkg: list[str] | None = None,
@@ -67,11 +70,13 @@ def build_server(lab: Lab) -> FastMCP:
         spot_fallback: bool = True,
         allow_dirty: bool = True,
         allow_unknown_config: bool = False,
+        preflight: bool = True,
     ) -> dict[str, Any]:
-        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. allow_dirty=False refuses a dirty working tree (default snapshots the diff, FR-B1). disk_size sizes the boot/attached volume in GB (skypilot; DO volume size). cloud picks the skypilot cloud: vast (default) | do | gcp — GCP runs both CPU and GPU jobs (accelerators e.g. 'T4:1'/'L4:1', spot allowed). backend="cpu" provisions a cheap CPU box (DigitalOcean by default, cloud="gcp" to override; default 4 vCPU + 50GB volume, up to 48; --accelerators rejected)."""
+        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m', default 8m) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. allow_dirty=False refuses a dirty working tree (default snapshots the diff, FR-B1). disk_size sizes the boot/attached volume in GB (skypilot; DO volume size). cloud picks the skypilot cloud: vast (default) | do | gcp — GCP runs both CPU and GPU jobs (accelerators e.g. 'T4:1'/'L4:1', spot allowed). backend="cpu" provisions a cheap CPU box (DigitalOcean by default, cloud="gcp" to override; default 4 vCPU + 50GB volume, up to 48; --accelerators rejected). region/zone pin where it lands (default: SkyPilot's optimizer picks the cheapest available). price_cap is a hard $/hr ceiling on compute enforced by the optimizer. preflight=False skips the pre-launch credential/quota checks (see the doctor tool)."""
         resources = ResourceRequest(
             cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
-            cloud=cloud, timeout=timeout, provision_timeout=provision_timeout, use_spot=use_spot,
+            cloud=cloud, region=region, zone=zone, max_hourly_usd=price_cap,
+            timeout=timeout, provision_timeout=provision_timeout, use_spot=use_spot,
             spot_fallback=spot_fallback,
         )
         try:
@@ -90,7 +95,7 @@ def build_server(lab: Lab) -> FastMCP:
         if cache and (cached_id := the_lab.find_cached(spec)) is not None:
             return {"job_id": cached_id, "cached": True, "status": the_lab.status(cached_id).value}
         try:
-            job_id = the_lab.submit(spec, allow_dirty=allow_dirty)
+            job_id = the_lab.submit(spec, allow_dirty=allow_dirty, preflight=preflight)
         except LabError as e:
             raise ToolError(str(e)) from e
         return {"job_id": job_id, "cached": False, "status": the_lab.status(job_id).value}
@@ -125,6 +130,9 @@ def build_server(lab: Lab) -> FastMCP:
         disk_size: int | None = None,
         accelerators: str | None = None,
         cloud: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
+        price_cap: float | None = None,
         timeout: str | None = None,
         provision_timeout: str | None = None,
         with_pkg: list[str] | None = None,
@@ -143,7 +151,8 @@ def build_server(lab: Lab) -> FastMCP:
 
         resources = ResourceRequest(
             cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
-            cloud=cloud, timeout=timeout, provision_timeout=provision_timeout, use_spot=use_spot,
+            cloud=cloud, region=region, zone=zone, max_hourly_usd=price_cap,
+            timeout=timeout, provision_timeout=provision_timeout, use_spot=use_spot,
             spot_fallback=spot_fallback,
         )
         try:
@@ -225,6 +234,37 @@ def build_server(lab: Lab) -> FastMCP:
             return _lab("skypilot").reconcile(apply=False)
         except LabError as e:
             raise ToolError(str(e)) from e
+
+    @mcp.tool
+    def doctor(
+        cloud: str | None = None,
+        accelerators: str | None = None,
+        cpus: int | None = None,
+        disk_size: int | None = None,
+        region: str | None = None,
+        zone: str | None = None,
+        use_spot: bool = False,
+    ) -> dict[str, Any]:
+        """Check whether a launch on this cloud would work, BEFORE it costs a provision — run this when a submit fails to provision, or before the first job on a new cloud/shape. Returns {cloud, ok, checks:[{name,status,detail,fix}], blocking:[...]} where status is ok|warn|fail|skip. Verifies credentials (including SkyPilot's API-server daemon, which does not inherit .env), project, billing, enabled APIs, IAM permissions, and quota for the requested shape, then reports the catalog's instance type and price band. GCP GPU quota is checked at both levels Google enforces: a project can hold regional NVIDIA_*_GPUS quota and still be blocked by a global GPUS_ALL_REGIONS of 0. status="skip" means the check could not answer and is never a blocker; only "fail" is a definitive negative."""
+        from lab.core import default_disk_gb, validate_cloud
+        from lab.doctor import run_checks
+
+        try:
+            validate_cloud(cloud)
+        except LabError as e:
+            raise ToolError(str(e)) from e
+        resources = ResourceRequest(
+            cpus=cpus, disk_size=disk_size, accelerators=accelerators,
+            cloud=cloud, region=region, zone=zone, use_spot=use_spot,
+        )
+        resources = resources.model_copy(update={"disk_size": default_disk_gb(resources)})
+        results = run_checks(cloud, resources, home=home)
+        return {
+            "cloud": cloud or "vast",
+            "ok": not any(r.status == "fail" for r in results),
+            "checks": [r.model_dump() for r in results],
+            "blocking": [r.model_dump() for r in results if r.status == "fail"],
+        }
 
     @mcp.tool
     def metrics(
