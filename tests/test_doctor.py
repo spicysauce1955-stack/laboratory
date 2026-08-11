@@ -202,6 +202,29 @@ def test_quota_cache_is_keyed_on_the_requested_shape(tmp_path):
     assert cache.get(key_b) is None
 
 
+def test_shape_key_separates_specs_that_would_get_different_verdicts():
+    """Every field that can change a shape-dependent verdict must be in the key.
+
+    `max_hourly_usd` is the subtle one — no check reads it directly, but it changes which regions
+    are candidates, and the quota checks ask about the cheapest candidates. Caught live: a
+    `--price-cap 0.001` run left no candidates, fell back to checking us-central1, and cached that
+    under the key an uncapped run of the same size looks up.
+    """
+    base = ResourceRequest(cloud="gcp", cpus=4, disk_size=50, use_spot=True)
+    variants = [
+        base.model_copy(update={"max_hourly_usd": 0.001}),
+        base.model_copy(update={"spot_fallback": False}),
+        base.model_copy(update={"cpus": 8}),
+        base.model_copy(update={"disk_size": 100}),
+        base.model_copy(update={"accelerators": "T4:1"}),
+        base.model_copy(update={"region": "europe-west1"}),
+        base.model_copy(update={"zone": "europe-west1-b"}),
+        base.model_copy(update={"use_spot": False}),
+    ]
+    keys = [D._shape_key(base)] + [D._shape_key(v) for v in variants]
+    assert len(set(keys)) == len(keys), "two distinguishable specs share a cache key"
+
+
 def test_context_producing_checks_are_never_cached(monkeypatch, tmp_path):
     """A cached verdict carries the answer but not the side effect. Serving `adc` from cache left
     every later check credential-less, which read as "no GCP project selected"."""

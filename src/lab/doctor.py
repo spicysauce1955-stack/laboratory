@@ -70,7 +70,17 @@ _SHAPE_DEPENDENT = frozenset({"quota_cpu", "quota_gpu", "quota_disk"})
 
 
 def _shape_key(res: ResourceRequest) -> str:
-    return f"{res.cpus}/{res.disk_size}/{res.accelerators}/{res.region}/{res.zone}/{res.use_spot}"
+    """Fingerprint of everything that can change a shape-dependent verdict.
+
+    ``max_hourly_usd`` belongs here even though no check reads it directly: it changes which
+    regions are *candidates*, and the quota checks ask about the cheapest candidates. Caught live —
+    a `--price-cap 0.001` run left no candidates at all, fell back to checking us-central1, and
+    cached that under the key an uncapped run of the same size would look up.
+    """
+    return (
+        f"{res.cpus}/{res.disk_size}/{res.accelerators}/{res.region}/{res.zone}"
+        f"/{res.use_spot}/{res.spot_fallback}/{res.max_hourly_usd}"
+    )
 
 
 # Project-level permissions SkyPilot needs on GCP. Verified against the live project: GCP's

@@ -288,7 +288,7 @@ The GPU path was exercised as a *prediction test*: `lab doctor --cloud gcp --gpu
 `Quota 'GPUS_ALL_REGIONS' exceeded. Limit: 0.0 globally`. The preflight is a true positive, not a
 guess — and it cost nothing to establish, because no VM ever started.
 
-**Six defects that running it found and reading it did not.** All fixed and tested:
+**Seven defects that running it found and reading it did not.** All fixed and tested:
 
 1. **`GCP-PROV-6`** — the failure diagnosis was appended after SkyPilot's ~290-character message
    and truncated off the 300-character `end_reason`. GCP-PROV-3 was marked fixed and its output
@@ -317,6 +317,15 @@ guess — and it cost nothing to establish, because no VM ever started.
    credentials for a problem that was in their own flag. SkyPilot's log had already said
    "Max hourly cost limit ($0.001/hr) may be too restrictive"; the manifest just wasn't reading
    it. Same failure class as GCP-PROV-3, one layer along.
+
+7. **The doctor cache key omitted the price cap.** Spotted by noticing that
+   `lab doctor --cloud gcp --cpus 4 --spot` named `us-central1` as its quota region when the
+   cheapest spot regions are europe-west1/asia-east2/us-west3. An earlier `--price-cap 0.001` run
+   had left *no* candidates, fallen back to checking us-central1, and cached that verdict under
+   the key an uncapped run of the same size looks up. `max_hourly_usd` changes which regions are
+   candidates even though no check reads it directly, so it (and `spot_fallback`) now belong to
+   the shape fingerprint. Same family as #3, and the second time a cache key was too coarse —
+   the lesson is that a key must cover everything upstream of the verdict, not just its inputs.
 
 **Two more from self-review**: the hyperdisk family check matched on a prefix, so `n4a-*` would
 have been priced 20% low; and a memo entry that cost no region still collapsed the search space
