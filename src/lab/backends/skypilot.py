@@ -530,7 +530,7 @@ def catalog_hourly(res: ResourceRequest) -> float | None:
 
     est = placement.estimate(res)
     if est is None:
-        print(f"[lab] catalog price unavailable for {res.cloud or 'vast'}")
+        placement._note(f"[lab] catalog price unavailable for {res.cloud or 'vast'}")
         return None
     return est.worst_hourly_usd
 
@@ -863,10 +863,19 @@ def narrowed_regions(res: ResourceRequest, memo: Any | None) -> list[str | None]
         return [None]
     surviving = placement.candidates(res, instance_type=instance_type, memo=memo)
     if not surviving:
-        print("[lab] capacity memo would exclude every region; ignoring it for this launch")
+        placement._note(
+            "[lab] capacity memo would exclude every region; ignoring it for this launch"
+        )
+        return [None]
+    # Narrow only if the memo actually cost us a region. A single dead zone in a multi-zone region
+    # leaves that region usable, so the memo can be non-empty while changing nothing — and
+    # narrowing anyway would silently trade 40 regions of failover for 10, buying nothing.
+    if len(surviving) == len(placement.candidates(res, instance_type=instance_type, memo=None)):
         return [None]
     names = [c.region for c in surviving[: placement.MAX_NARROWED_REGIONS]]
-    print(f"[lab] capacity memo: narrowed to {len(names)} region(s), cheapest {names[0]}")
+    placement._note(
+        f"[lab] capacity memo: narrowed to {len(names)} region(s), cheapest {names[0]}"
+    )
     return list(names)
 
 

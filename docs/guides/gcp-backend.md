@@ -23,14 +23,54 @@ uv run lab register --cloud gcp --gpu T4:1 --timeout 2h --expires +3d -c "..."
 keeps the cpu profile's defaults (4 vCPU, 50 GB disk, no accelerators) but provisions on GCP —
 and unlike DO, GCP CPU jobs may use `--spot` (preemptible).
 
-Rough on-demand prices (us-central1; spot is ~60-70% off but reclaimable):
+### What it costs
 
-| Resource | ~$/hr |
-|---|---|
-| `e2-standard-4` (4 vCPU, cpu profile pick) | ~$0.13 |
-| `n1-standard-4 + T4:1` | ~$0.55 |
-| `g2-standard-4 + L4:1` | ~$0.70 |
-| `a2-highgpu-1g + A100:1` | ~$3.70 |
+Don't budget from a table — ask the catalog, which is a local file and always current:
+
+```bash
+uv run lab doctor --cloud gcp --cpus 4          # -> n4-standard-4, 41 regions, $0.19-$0.30/hr
+uv run lab doctor --cloud gcp --gpu T4:1 --spot # -> n1-highmem-4, 23 regions, $0.17-$0.36/hr
+```
+
+For orientation only (catalog, 2026-08-11), **compute plus the lab's default disk**:
+
+| Shape | resolves to | on-demand $/hr | spot $/hr (cheapest-dearest region) |
+|---|---|---:|---|
+| cpu profile (4 vCPU) | `n4-standard-4` | 0.181-0.290 | **0.034**-0.123 |
+| `--accelerators T4:1` | `n1-highmem-4` | 0.600-0.869 | 0.157-0.346 |
+
+Two things that table makes visible and the old one hid:
+
+- **Region matters more than anything else you can choose.** Spot `n4-standard-4` is 3.6x dearer
+  in its worst region than its best. The optimizer already shops for you; `--region` overrides it.
+- **`--spot` without `--no-fallback` can bill on-demand.** `spot_fallback` defaults on, so the
+  worst case for a spot cpu job is **$0.290/hr**, not $0.123 — about 8.5x the price you were
+  probably budgeting. That is the number `lab register` now authorises against, and
+  `lab status` reports `spot_downgraded: true` when it actually happens.
+
+Storage is billed separately and is now on the manifest. It is not a rounding error: SkyPilot's
+default 256 GB boot disk costs **$0.028/hr**, which is *more than a $0.034/hr spot
+`n4-standard-4`*. The lab therefore never lets that default apply — every GCP job carries an
+explicit size (**50 GB** cpu profile, **100 GB** GPU).
+
+### Choosing where it lands
+
+```bash
+--region europe-west1        # pin a region (validated against the catalog before anything bills)
+--zone   europe-west1-b      # pin a zone
+--price-cap 0.06             # refuse any instance above $0.06/hr compute
+```
+
+`--price-cap` is a **ceiling enforced by SkyPilot's optimizer**, not an estimate: it will not
+select an option above it. Note it is not `--max-hourly` on `lab register`, which is a Vast-only
+*wait-until* price trigger — a scheduling condition, not a limit.
+
+With no pins the optimizer searches every region cheapest-first, as before. The one thing the lab
+adds is a **capacity memo**: when a launch fails with `ZONE_RESOURCE_POOL_EXHAUSTED`, the zones
+named are remembered for 30 minutes (`LAB_CAPACITY_MEMO_TTL_S`) and excluded from the next
+launch's search space. This matters most for sweeps — without it, all 32 shards independently
+walk into the zone the first shard already found empty. The memo is advisory: if it is missing,
+corrupt, or would exclude every region, it is ignored rather than allowed to block a launch.
 
 Preempted spot jobs are classified `preempted` (not `failed`) and the scheduler's
 auto-resubmit applies to them like any spot job.
@@ -190,13 +230,14 @@ GCP has **two teardown channels**, mirroring the Vast design:
   absent), so setup died with `FAILED_SETUP`. Pinning 3.12 restores the wheel path (verified:
   remote came up on 3.12.13, zero sdist builds). This is latent for every remote backend, not
   just GCP — the lockfile pins packages but not the interpreter that resolves them.
-- **`n4` capacity is tight, and the lab cannot steer around it.** SkyPilot's GCP catalog resolves
-  every `cpus`/`memory` combination the cpu profile can express to the **n4** family
-  (`n4-standard-4` for the 4-vCPU default). When n4 is exhausted you get
-  `ZONE_RESOURCE_POOL_EXHAUSTED` — observed across all four `us-central1` zones *and* `us-east1-b`
-  in one run — and `ResourceRequest` exposes no instance-type or region override. **`use_spot=true`
-  (with `spot_fallback`) is the practical workaround**: it re-prices the search and pushed the
-  optimizer to `europe-west1-b`, which had capacity, at $0.034/hr instead of $0.18.
+- **`n4` capacity is tight.** SkyPilot's GCP catalog resolves every `cpus`/`memory` combination
+  the cpu profile can express to the **n4** family (`n4-standard-4` for the 4-vCPU default). When
+  n4 is exhausted you get `ZONE_RESOURCE_POOL_EXHAUSTED` — observed across all four `us-central1`
+  zones *and* `us-east1-b` in one run. Three levers now exist: `--region`/`--zone` to steer
+  directly, the capacity memo to stop repeating a known-empty zone, and a **20-minute** GCP
+  provisioning budget (was 8, a figure calibrated to Vast host behaviour). That last one was the
+  real bug in the original run: SkyPilot's failover *was* working, and the watchdog killed it
+  part-way through. `--spot` remains a good idea, but as a price choice, not a capacity workaround.
 - **A failed provision reports as a runtime-setup error.** When no zone yields a VM, the surfaced
   message is `Failed to set up SkyPilot runtime on cluster` /
   `Could not find any head instance` — that is the *downstream* symptom. Grep the log for
@@ -208,6 +249,8 @@ GCP has **two teardown channels**, mirroring the Vast design:
 
 ## Limitations (v1)
 
-- No region/zone pinning — SkyPilot's optimizer picks the cheapest feasible region; the launched
-  region is recorded in the manifest (`backend.region`).
-- Billed cost uses SkyPilot's catalog estimate (accurate for on-demand; spot varies by zone).
+- Billed cost is compute (catalog, priced for the region actually launched into) plus disk. It
+  excludes **egress** and **sustained-use discounts**, so it reads slightly high on a long
+  on-demand run and does not model data transfer at all.
+- Quota preflight checks the cheapest three candidate regions, not all ~40; a launch can still
+  fail on quota in a region the optimizer reached and `lab doctor` did not sample.

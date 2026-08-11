@@ -13,6 +13,9 @@ from lab.cli import app
 from lab.models import JobSpec, ResourceRequest
 
 runner = CliRunner()
+# Parse `result.stdout`, never `result.output`: the CLI's contract is that stdout carries only the
+# structured payload and diagnostics go to stderr, but `.output` merges the two, which makes an
+# entirely correct CLI look like it emits malformed JSON.
 
 
 def _make_fake_lab(submitted_specs: list[JobSpec]) -> MagicMock:
@@ -153,7 +156,7 @@ def test_register_spot_no_fallback(tmp_path: Path):
     )
 
     assert result.exit_code == 0, f"Exit {result.exit_code}: {result.output}"
-    out = json.loads(result.output)
+    out = json.loads(result.stdout)
     reg_id = out["reg_id"]
 
     from lab.scheduler.queue import LocalQueueStore

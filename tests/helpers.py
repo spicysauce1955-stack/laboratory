@@ -29,7 +29,16 @@ def make_manifest(
     seed: int = 0,
     timeout: str | None = None,
     accelerators: str | None = None,
+    resources: ResourceRequest | None = None,
 ) -> JobManifest:
+    """A minimal manifest. Pass ``resources`` for a full spec (region/zone/disk/spot); the
+    ``timeout``/``accelerators`` shorthands still apply on top of it."""
+    res = resources or ResourceRequest()
+    update = {}
+    if timeout is not None:
+        update["timeout"] = timeout
+    if accelerators is not None:
+        update["accelerators"] = accelerators
     return JobManifest(
         job_id=job_id,
         created_at=now(),
@@ -37,7 +46,7 @@ def make_manifest(
         code=CodeRef(git_commit="0" * 40, git_dirty=False),
         env=EnvInfo(uv_lock_sha256="test", python_version="3.12"),
         run=RunSpec(entrypoint_command=command, seed=seed),
-        resources=ResourceRequest(timeout=timeout, accelerators=accelerators),
+        resources=res.model_copy(update=update) if update else res,
         backend=BackendInfo(provisioner="local"),
         status=JobState.queued,
     )

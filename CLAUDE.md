@@ -44,6 +44,24 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   gcp-direct fallback mirroring the vastai one. Price/offer triggers
   (`--max-hourly`/`--offer-query`) are Vast-only and rejected for other clouds. Guides:
   `docs/guides/cpu-backend.md`, `docs/guides/gcp-backend.md`.
+- **Placement & pricing (`lab.placement`):** the only module that talks to `sky.catalog` (a local
+  CSV; no credentials, no cloud calls). It resolves the instance type a spec lands on, prices every
+  region, and remembers zones that just returned `ZONE_RESOURCE_POOL_EXHAUSTED` (30 min TTL,
+  advisory — a broken memo is ignored, never fatal) so a sweep's later shards skip them.
+  `--region`/`--zone` pin; `--price-cap` maps to `sky.Resources(max_hourly_cost=)`, a ceiling the
+  optimizer enforces. **Estimates are bands and guardrails check the top** — `get_cost()` on an
+  unpinned `Resources` returns the cheapest region's price, which made admission control
+  systematically permissive; the ceiling is priced on-demand whenever `spot_fallback` could land
+  there. `CostInfo.hourly_usd` is **compute + storage**; no gcp/do job may inherit SkyPilot's
+  256 GB disk (50 GB cpu, 100 GB GPU — `default_disk_gb`). Provision timeouts are per-cloud
+  (gcp 20m). Diagnostics from these paths go to **stderr**: stdout carries only JSON.
+- **Preflight (`lab doctor`, `lab.doctor`):** checks credentials (incl. SkyPilot's daemon, which
+  does not inherit `.env`), project, billing, APIs, IAM permissions and quota before a launch
+  costs a provision; the cheap subset runs automatically on submit (`--no-preflight` opts out).
+  **Only definitive negatives block** — a check that cannot answer is `skip` and never blocks.
+  GCP GPU quota is checked at both levels Google enforces: a project can hold regional
+  `NVIDIA_*_GPUS` and still be blocked by a global `GPUS_ALL_REGIONS` of 0. `PREEMPTIBLE_CPUS=0`
+  is *not* a blocker (spot falls back to standard `CPUS` quota).
 - **Sharded sweeps (FR P1-2):** `lab sweep --seeds 0-31 --shard-size 8` splits each grid cell's
   seeds into independently-bounded shard jobs (own timeout + teardown), then `lab sweep-aggregate`
   row-concatenates the succeeded shards into one per-cell `results.csv` (seed column overridable),

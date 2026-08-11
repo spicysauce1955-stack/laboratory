@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,17 @@ from typing import Any, Iterable
 
 from lab._util import atomic_write_text
 from lab.models import ResourceRequest
+
+
+def _note(message: str) -> None:
+    """Diagnostics go to **stderr**, never stdout.
+
+    The CLI emits its results as JSON on stdout and callers parse it. A stray "[lab] catalog price
+    unavailable" on stdout is not a log line, it is a corrupted payload — which is exactly what
+    happened once pricing started running on the `lab register` path.
+    """
+    print(message, file=sys.stderr)
+
 
 # --------------------------------------------------------------------------------------------
 # Storage pricing
@@ -95,11 +107,13 @@ def storage_hourly_usd(cloud: str | None, disk_gb: int | None, instance_type: st
         return 0.0
     key = cloud or "vast"
     if key == "gcp":
-        family = (instance_type or "").split("-")[0:2]
-        joined = "-".join(family)
-        hyperdisk = (instance_type or "").startswith(
-            _GCP_HYPERDISK_ONLY_FAMILIES
-        ) or joined in _GCP_HYPERDISK_ONLY_FAMILIES
+        # Match on whole family tokens, not a prefix: `n4-standard-4` is hyperdisk-only but
+        # `n4a-standard-4` is a different family that is not, and a `startswith("n4")` would
+        # quietly price it 20% low.
+        tokens = (instance_type or "").split("-")
+        hyperdisk = tokens[0] in _GCP_HYPERDISK_ONLY_FAMILIES or (
+            "-".join(tokens[:2]) in _GCP_HYPERDISK_ONLY_FAMILIES
+        )
         rate = (
             _GCP_HYPERDISK_BALANCED_USD_GIB_HR if hyperdisk else _GCP_PD_BALANCED_USD_GIB_HR
         )
@@ -195,7 +209,7 @@ class CapacityMemo:
                 self.path, json.dumps({"version": 1, "entries": entries}, sort_keys=True)
             )
         except Exception as e:  # noqa: BLE001 — a memo write must never fail a job
-            print(f"[lab] capacity memo write skipped: {e}")
+            _note(f"[lab] capacity memo write skipped: {e}")
 
 
 def parse_exhausted_zones(text: str) -> list[str]:
@@ -288,7 +302,7 @@ def resolve_instance_type(res: ResourceRequest) -> str | None:
         )
         return str(found) if found else None
     except Exception as e:  # noqa: BLE001 — unpriceable is a normal outcome, not a failure
-        print(f"[lab] catalog could not resolve an instance type for {cloud}: {e}")
+        _note(f"[lab] catalog could not resolve an instance type for {cloud}: {e}")
         return None
 
 
@@ -370,7 +384,7 @@ def candidates(
                 instance_type, use_spot=use_spot, clouds=cloud
             )
     except Exception as e:  # noqa: BLE001 — no candidates is a valid degraded answer
-        print(f"[lab] catalog region lookup failed for {cloud}: {e}")
+        _note(f"[lab] catalog region lookup failed for {cloud}: {e}")
         return []
 
     excluded = memo.exhausted_zones(cloud, instance_type) if memo is not None else set()

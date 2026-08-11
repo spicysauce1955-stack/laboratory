@@ -350,10 +350,20 @@ _GCP_FAILURE_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
         "reaches a zone with capacity), or resubmit later",
     ),
     (
+        # Checked before the generic quota marker: GCP enforces GPU quota at two levels and a
+        # fresh project fails the *global* one while its regional quota looks fine, so naming the
+        # regional metric here would send the user to the wrong console page. Seen live.
+        ("gpus_all_regions",),
+        "the GLOBAL 'GPUs (all regions)' quota is 0 — this blocks GPU launches in every region "
+        "even when the per-region NVIDIA_*_GPUS quota is non-zero. Request an increase for "
+        "GPUS_ALL_REGIONS (Global) in IAM & Admin > Quotas; `lab doctor --cloud gcp --gpu T4:1` "
+        "checks both levels before you spend a launch on it",
+    ),
+    (
         ("quota_exceeded", "quota '", "quota exceeded", "exceeded quota"),
         "a GCP quota is exhausted — request a quota increase for that metric/region in the "
         "console (a fresh project has 0 GPU quota, and GPUs are per-family: NVIDIA_T4_GPUS, "
-        "NVIDIA_L4_GPUS)",
+        "NVIDIA_L4_GPUS, plus the separate global GPUS_ALL_REGIONS)",
     ),
     (
         ("has not been used in project", "service_disabled", "api is disabled"),
@@ -396,15 +406,23 @@ def provision_failure_reason(generic: str, cloud: str) -> str:
     """Enrich a generic provision-failure message per cloud (§8).
 
     Vast returns 400 on a depleted balance, surfaced generically — consult the balance and say so.
-    For DigitalOcean/GCP, point at the most common causes: cloud not enabled in `sky check`,
-    missing credentials, or quota."""
+    For DigitalOcean/GCP, diagnose from the error text.
+
+    **The diagnosis goes first.** ``end_reason`` is truncated to 300 characters on the manifest,
+    and SkyPilot's generic message alone exceeds that ("Failed to provision all possible launchable
+    resources… To keep retrying… Reasons for provision failures…"). Appending the actionable part
+    meant it was reliably cut off — observed live on a GPU launch whose real cause,
+    ``Quota 'GPUS_ALL_REGIONS' exceeded``, never reached the manifest at all. Leading with it means
+    the one sentence worth reading is the one that survives.
+    """
     if cloud == "do":
         return (
-            f"{generic} — if this is a DigitalOcean setup issue, check `sky check` shows DO enabled "
-            "(doctl token at ~/.config/doctl/config.yaml) and your DO vCPU quota covers the size"
+            "if this is a DigitalOcean setup issue, check `sky check` shows DO enabled "
+            f"(doctl token at ~/.config/doctl/config.yaml) and your DO vCPU quota covers the size "
+            f"— {generic}"
         )
     if cloud == "gcp":
-        return f"{generic} — {_gcp_failure_hint(generic)}"
+        return f"{_gcp_failure_hint(generic)} — {generic}"
     if cloud == "vast":
         bal = vast_balance()
         if bal is not None and bal <= 0:

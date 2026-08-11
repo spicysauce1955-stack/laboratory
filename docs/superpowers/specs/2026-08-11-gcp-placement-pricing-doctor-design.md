@@ -176,8 +176,11 @@ No new logic in `cli.py` or `mcp_server.py` — both stay thin shells.
   provenance string, e.g. `"gcp catalog n4-standard-4 spot europe-west1-b + 50GiB hyperdisk"`.
 - `core.resolve_backend_profile` — the invariant: **no skypilot job on a storage-billing cloud may
   reach SkyPilot's 256 GB default.** cpu profile 50 GB (unchanged), GPU path 100 GB
-  (`GPU_DEFAULT_DISK_GB`). 100 GB leaves room for a CUDA image plus wheels and a checkpoint at
-  $0.011/hr, against $0.0281/hr for the default, and caps a leaked GPU disk at $8/mo not $20/mo.
+  (`GPU_DEFAULT_DISK_GB`). The two profiles bill at *different rates*: SkyPilot's GCP adapter maps
+  its default disk tier to `pd-balanced`, except n4/a3-ultragpu/a4 which support only
+  `hyperdisk-balanced`. So the cpu profile's n4 is $0.000109589/GiB/hr and the GPU path's n1 is
+  $0.000136986 — 100 GB on the GPU path is **$0.0137/hr**, against $0.0351/hr had the 256 GB
+  default applied there.
 - `backends/skypilot.build_task` — pin region/zone when given; narrow when the memo says so; pass
   `max_hourly_cost`.
 - `backends/skypilot.catalog_hourly` — delegates to `placement.estimate`, worst-case basis,
@@ -261,3 +264,48 @@ regional quota passes, and `PREEMPTIBLE_CPUS = 0` must not fail.
    carrying zone, spot-ness, and an `hourly_usd` that includes storage and matches the catalog for
    the region it actually landed in.
 5. `lab reconcile` clean afterwards.
+
+
+---
+
+## 7. Outcome (2026-08-11)
+
+Built, tested, and verified live against project `myproject-505213`. 106 new unit tests; the full
+suite, `ruff`, and `mypy --strict` are clean.
+
+**What the live runs proved.** A real spot CPU job ran end to end and landed in **europe-west1-b**
+— the cheapest spot region — recording `compute $0.03401/hr` against a catalog price of $0.0340
+for that exact region, plus `storage $0.00548/hr` (50 GiB hyperdisk, to the cent), for a total of
+$0.0395/hr and an actual spend of $0.0014 over 131 seconds. Storage is 14% of that bill and was
+invisible before. Teardown succeeded and `lab reconcile` was clean.
+
+The GPU path was exercised as a *prediction test*: `lab doctor --cloud gcp --gpu T4:1` failed on
+`GPUS_ALL_REGIONS = 0`, the submit was refused in seconds, and the same launch run with
+`--no-preflight` failed after attempting to provision with exactly
+`Quota 'GPUS_ALL_REGIONS' exceeded. Limit: 0.0 globally`. The preflight is a true positive, not a
+guess — and it cost nothing to establish, because no VM ever started.
+
+**Four defects the live work found that reading the code did not.** All are fixed and tested:
+
+1. **`GCP-PROV-6`** — the failure diagnosis was appended after SkyPilot's ~290-character message
+   and truncated off the 300-character `end_reason`. GCP-PROV-3 was marked fixed and its output
+   was being discarded. The diagnosis now leads.
+2. **The doctor cache dropped context.** A cached `adc` result carried the verdict but not the
+   credentials it publishes, so every later check reported "no GCP project selected" on the second
+   invocation. Context-producing checks are never cached now.
+3. **The doctor cache ignored shape.** A `--cpus 4` run's 50 GB disk verdict was served to a
+   `--gpu T4:1` run that asks about 100 GB in a different region set. Quota keys carry a shape
+   fingerprint now.
+4. **Diagnostics polluted stdout.** Pricing began running on the `lab register` path, whose stdout
+   is JSON that callers parse; `[lab] catalog price unavailable` corrupted the payload. All
+   placement diagnostics go to stderr.
+
+Two smaller ones came from self-review: the hyperdisk family check matched on a prefix, so
+`n4a-*` would have been priced 20% low; and a memo entry that cost no region still collapsed the
+search space from 41 regions to 10.
+
+**Deliberately not done.** `--instance-type` (the catalog resolves it from `--cpus`/`--memory`, and
+a third way to say the same thing invites conflicts); egress and sustained-use discounts in the
+cost model (both need usage data the lab does not hold — the guide now states the exclusion rather
+than the old claim that the estimate was "accurate"); and `GCP-LEAK-7`/`-8`/`-9`, `GCP-PREEMPT-1`,
+`GCP-CREDS-2`…`-5`, which remain open in the gap schema.

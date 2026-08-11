@@ -1,8 +1,17 @@
 # GCP backend — capability & gap schema
 
-**Status (2026-08-11).** **Fixed:** `GCP-LEAK-1`…`GCP-LEAK-6`, `VAST-LEAK-1`, `GCP-COST-3`,
-`GCP-PROV-3`, `GCP-PREEMPT-3`, `GCP-TEST-2`. **Partly:** `GCP-TEST-1` (harness written, never
-run), `GCP-CREDS-1` (runbook fixed, live host unverified). Everything else is analysis.
+**Status (2026-08-11, second pass).** **Fixed:** `GCP-LEAK-1`…`GCP-LEAK-6`, `VAST-LEAK-1`,
+`GCP-COST-1`…`GCP-COST-6`, `GCP-PROV-1`, `GCP-PROV-2`, `GCP-PROV-3`, `GCP-PROV-5`, `GCP-PROV-6`,
+`GCP-PREEMPT-2`, `GCP-PREEMPT-3`, `GCP-TEST-1`, `GCP-TEST-2`, `GCP-DOC-1`.
+**Partly:** `GCP-PROV-4` (GPU path attempted live; blocked by a project quota, not a lab defect —
+now predicted by `lab doctor` instead of discovered by a failed launch), `GCP-CREDS-1` (runbook
+fixed, live host unverified). Remaining analysis: `GCP-LEAK-7`…`-9`, `GCP-PREEMPT-1`,
+`GCP-CREDS-2`…`-5`.
+
+The second pass added two records that did not exist when this document was written, both found
+by instrumenting or running the thing rather than reading it: `GCP-COST-5` (the pre-launch
+estimate was the cheapest region's price, so the guardrail checked the best case) and
+`GCP-PROV-6` (the failure diagnosis was truncated off the manifest before anyone could read it).
 **Scope:** everything `--cloud gcp` touches — provisioning, cost, teardown, leak detection,
 preemption, the scheduler, credentials, and test coverage.
 **Basis:** the code as of `96b02b3` + the first live GCP run (2026-08-11, job
@@ -51,7 +60,12 @@ The fastest way to see the shape of the gaps. Each column is a capability Vast h
 | Storage pass survives an instance-API failure | n/a | ✅ | ✅ | ~~GCP-LEAK-3~~ fixed |
 | Listing failure is loud, not silently "clean" | ✅ | ❌ | ✅ | ~~GCP-LEAK-2~~ fixed |
 | Orphans wired into `reconcile`'s exit code | ✅ | ✅ | ✅ | ~~GCP-LEAK-1~~ fixed |
-| Real booked price on the manifest | ✅ | ⚠️ | ⚠️ | GCP-COST-1 |
+| Real booked price on the manifest | ✅ | ⚠️ | ✅ | ~~GCP-COST-1~~ fixed |
+| Pre-launch estimate is a ceiling, not a floor | ⚠️ | ✅ | ✅ | ~~GCP-COST-5~~ fixed |
+| Storage on the billed rate | n/a | ❌ | ✅ | ~~GCP-COST-2~~ fixed |
+| Region / zone control | n/a | ❌ | ✅ | ~~GCP-PROV-1~~ fixed |
+| Capacity memory across jobs | ❌ | ❌ | ✅ | ~~GCP-PROV-1~~ fixed |
+| Pre-launch preflight (`lab doctor`) | ⚠️ | ⚠️ | ✅ | ~~GCP-PROV-5~~ fixed |
 | Failure diagnosed from the real cause | ✅ | ❌ | ✅ | ~~GCP-PROV-3~~ fixed |
 | Pre-launch budget estimate for the scheduler | ✅ | ✅ | ✅ | ~~GCP-COST-3~~ fixed |
 | Liveness-unknown fails safe (assume alive) | ✅ | ✅ | ✅ | ~~GCP-PREEMPT-3~~ fixed |
@@ -267,7 +281,7 @@ the poweroff backstop is compute-only on GCP and does not release storage.
 ### Cost (FR-I2)
 
 ---
-**`GCP-COST-1` — no booked-price verification; the catalog is trusted**
+**`GCP-COST-1` — no booked-price verification; the catalog is trusted** ✅ **FIXED 2026-08-11**
 `area: cost` · `severity: medium` · `confidence: confirmed` · `precedent: LAB-BUGS §5`
 
 `_resolve_hourly` queries the real rate for Vast only: "for every other cloud (DO/GCP) SkyPilot's
@@ -286,7 +300,7 @@ resources. Then state the exclusions (disk, egress, SUD) in the guide instead of
 "accurate".
 
 ---
-**`GCP-COST-2` — the GPU path inherits SkyPilot's 256 GB default boot disk**
+**`GCP-COST-2` — the GPU path inherits SkyPilot's 256 GB default boot disk** ✅ **FIXED 2026-08-11**
 `area: cost` · `severity: medium` · `confidence: confirmed` · `precedent: the DO 422 (memory: DO tier limits)`
 
 The `cpu` profile pins `disk_size=50`. `--backend skypilot --cloud gcp --accelerators T4:1` leaves
@@ -302,7 +316,7 @@ leaked cpu-profile disk, for no reason anyone chose.
 **fix:** default `disk_size` for the gcp GPU path the way the cpu profile does.
 
 ---
-**`GCP-COST-4` — `lab register` reports `worst_case_cost_usd: null` for non-Vast clouds**
+**`GCP-COST-4` — `lab register` reports `worst_case_cost_usd: null` for non-Vast clouds** ✅ **FIXED 2026-08-11**
 `area: cost` · `severity: medium` · `confidence: observed` · `precedent: GCP-COST-3, its sibling`
 
 Found while registering a live GCP probe (2026-08-11): the registration returned
@@ -348,11 +362,61 @@ help and the skill; it does not hold. `lab register --cloud gcp --gpu T4:1` is u
 call `_hourly_cost` already makes post-launch.
 
 ---
+**`GCP-COST-5` — the pre-launch estimate was the cheapest region's price** ✅ **FIXED 2026-08-11**
+`area: cost` · `severity: high` · `confidence: confirmed` · `precedent: GCP-COST-3, which introduced it`
+
+Found while wiring the region system, not by reading the gap list. `catalog_hourly` built a
+`sky.Resources` with no region and called `get_cost()`. SkyPilot's source is explicit about what
+that returns: the **minimum** across every region that offers the shape, chosen deliberately so a
+multi-component price cannot mix regions.
+
+So the number GCP-COST-3 had just wired into the scheduler's admission control — the fix for a
+guardrail that silently did nothing — was the globally cheapest price. On GCP spot that is
+**$0.0340 against a real worst case of $0.1226**, a 3.6× under-estimate; with `spot_fallback` live
+the true ceiling is the on-demand $0.2902, 8.5×.
+
+**failure_mode:** an admission check that under-estimates admits jobs it should refuse. `--max-cost`
+and the daily budget both compare against this number, so both were systematically too permissive
+— the same shape of failure as GCP-COST-3 itself, one layer down and harder to see, because the
+guardrail now *did* return a number and the number looked plausible.
+
+**fix:** price a *band*. `placement.estimate()` returns `(low, high)` over the candidate regions
+and every guardrail checks `high`; the ceiling is priced on-demand whenever `spot_fallback` could
+land there. A `--price-cap` maps to `sky.Resources(max_hourly_cost=)`, which makes the ceiling
+enforced rather than predicted.
+
+---
+**`GCP-PROV-6` — the failure diagnosis was truncated off the manifest** ✅ **FIXED 2026-08-11**
+`area: provision` · `severity: medium` · `confidence: observed` · `precedent: GCP-PROV-3, which it silently undid`
+
+Observed on a live GPU launch. `provision_failure_reason` appended its diagnosis *after* SkyPilot's
+generic message, and `end_reason` is capped at 300 characters on the manifest. SkyPilot's generic
+message alone is ~290:
+
+```
+Failed to provision all possible launchable resources. Relax the task's resource requirements: …
+To keep retrying until the cluster is up, use the `--retry-until-up` flag.
+Reasons for provision failures (for details, please check the log above):
+```
+
+The real cause — `Quota 'GPUS_ALL_REGIONS' exceeded. Limit: 0.0 globally`, sitting in the log — never
+reached the manifest at all. GCP-PROV-3 was marked fixed and its output was being thrown away.
+
+**failure_mode:** the user reads `lab status`, sees a generic "failed to provision", and goes
+looking in the wrong place. This is the exact experience GCP-PROV-3 was written to end.
+
+**test:** the real 290-character SkyPilot error plus a quota line still yields a diagnosis inside
+the first 300 characters.
+**fix:** lead with the diagnosis. Also added a `GPUS_ALL_REGIONS`-specific hint ahead of the generic
+quota one, because the generic hint names the *regional* metric and would send the user to the
+wrong console page.
+
+---
 
 ### Provisioning
 
 ---
-**`GCP-PROV-1` — no region / zone / instance-type control**
+**`GCP-PROV-1` — no region / zone / instance-type control** ✅ **FIXED 2026-08-11**
 `area: provision` · `severity: high` · `confidence: observed` · `precedent: none — the live blocker`
 
 `ResourceRequest` exposes `cpus`, `gpus`, `memory`, `disk_size`, `accelerators`, `cloud`,
@@ -369,7 +433,7 @@ problem, and which the guide now recommends.
 `--instance-type`. Both are additive.
 
 ---
-**`GCP-PROV-2` — the provision watchdog is calibrated to Vast**
+**`GCP-PROV-2` — the provision watchdog is calibrated to Vast** ✅ **FIXED 2026-08-11**
 `area: provision` · `severity: medium` · `confidence: suspected`
 · `precedent: skypilot.py:42-44, written for Vast`
 
@@ -418,7 +482,7 @@ guide advertises T4/L4/A100 with a price table.
 **fix:** run one. Then a preflight (below).
 
 ---
-**`GCP-PROV-5` — no preflight; every misconfiguration is discovered by burning a launch**
+**`GCP-PROV-5` — no preflight; every misconfiguration is discovered by burning a launch** ✅ **FIXED 2026-08-11**
 `area: provision` · `severity: medium` · `confidence: confirmed` · `precedent: LAB-BUGS §8 asked for it`
 
 §8 closed with "a `lab status`/`lab doctor` balance readout would also pre-empt it." It was never
@@ -450,7 +514,7 @@ answer exists and isn't fetched.
 **fix:** an optional cloud probe feeding `sky_state`, leaving the pure classifier untouched.
 
 ---
-**`GCP-PREEMPT-2` — `spot_fallback` can land on-demand at ~5× with no warning**
+**`GCP-PREEMPT-2` — `spot_fallback` can land on-demand at ~5× with no warning** ✅ **FIXED 2026-08-11**
 `area: preempt` · `severity: low-medium` · `confidence: confirmed`
 
 `spot_fallback` defaults True, and the guide now recommends `--spot` as the n4 capacity
@@ -588,7 +652,7 @@ Neither is a bug. Both are load-bearing for the current design and will fail lou
 changes — which is what they're for.
 
 ---
-**`GCP-DOC-1` — the guide's price table is stale**
+**`GCP-DOC-1` — the guide's price table is stale** ✅ **FIXED 2026-08-11**
 `area: surface` · `severity: low` · `confidence: observed`
 
 The table quotes `e2-standard-4` at ~$0.13 as "cpu profile pick". The catalog now resolves the
