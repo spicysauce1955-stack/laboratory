@@ -12,6 +12,14 @@ The second pass added two records that did not exist when this document was writ
 by instrumenting or running the thing rather than reading it: `GCP-COST-5` (the pre-launch
 estimate was the cheapest region's price, so the guardrail checked the best case) and
 `GCP-PROV-6` (the failure diagnosis was truncated off the manifest before anyone could read it).
+
+Six further defects surfaced only once the code ran against the live project — two in the doctor's
+cache, one in stdout hygiene, one where the disk invariant missed the *deferred* launch path
+entirely, one where a working `--price-cap` was diagnosed as a credentials problem, plus the
+truncation above. They are itemised in
+`docs/superpowers/specs/2026-08-11-gcp-placement-pricing-doctor-design.md` §7. The pattern is
+worth naming: **every one of them was invisible to code reading and obvious within a minute of
+running the thing.**
 **Scope:** everything `--cloud gcp` touches — provisioning, cost, teardown, leak detection,
 preemption, the scheduler, credentials, and test coverage.
 **Basis:** the code as of `96b02b3` + the first live GCP run (2026-08-11, job

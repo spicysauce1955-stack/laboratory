@@ -270,8 +270,9 @@ regional quota passes, and `PREEMPTIBLE_CPUS = 0` must not fail.
 
 ## 7. Outcome (2026-08-11)
 
-Built, tested, and verified live against project `myproject-505213`. 106 new unit tests; the full
-suite, `ruff`, and `mypy --strict` are clean.
+Built, tested, and verified live against project `myproject-505213`. 93 new unit tests across
+three new modules (634 in the suite); the full suite, `ruff`, and `mypy --strict` are clean, and
+the live integration harness now asserts every claim below so none of it is anecdotal.
 
 **What the live runs proved.** A real spot CPU job ran end to end and landed in **europe-west1-b**
 — the cheapest spot region — recording `compute $0.03401/hr` against a catalog price of $0.0340
@@ -285,7 +286,7 @@ The GPU path was exercised as a *prediction test*: `lab doctor --cloud gcp --gpu
 `Quota 'GPUS_ALL_REGIONS' exceeded. Limit: 0.0 globally`. The preflight is a true positive, not a
 guess — and it cost nothing to establish, because no VM ever started.
 
-**Four defects the live work found that reading the code did not.** All are fixed and tested:
+**Six defects that running it found and reading it did not.** All fixed and tested:
 
 1. **`GCP-PROV-6`** — the failure diagnosis was appended after SkyPilot's ~290-character message
    and truncated off the 300-character `end_reason`. GCP-PROV-3 was marked fixed and its output
@@ -299,24 +300,31 @@ guess — and it cost nothing to establish, because no VM ever started.
 4. **Diagnostics polluted stdout.** Pricing began running on the `lab register` path, whose stdout
    is JSON that callers parse; `[lab] catalog price unavailable` corrupted the payload. All
    placement diagnostics go to stderr.
+5. **The disk invariant missed the deferred path.** Found by checking an acceptance number rather
+   than a test: `lab register --cloud gcp` quoted a worst case whose storage term was exactly $0.
+   The rule was enforced in `resolve_backend_profile`, which is on the CLI/MCP submit path — and
+   **the scheduler launches registrations straight through `Lab.submit`**, so a deferred GCP job
+   would still have inherited SkyPilot's 256 GB. The rule now lives in
+   `lab.placement.effective_disk_gb`, applied in `build_task`, which every launch goes through;
+   `core` re-exports it so there is one definition. The registration now quotes $0.591439 for a
+   2-hour spot cpu job, which is `(0.29024 compute + 0.00548 disk) x 2` to the cent.
+6. **A price cap was diagnosed as a setup problem.** `--price-cap 0.001` worked exactly as
+   designed — the optimizer rejected every option before touching the cloud, nothing provisioned,
+   $0 billed — but the manifest said "check `sky check gcp` passes, the Compute Engine API is
+   enabled, and your regional quota covers the accelerator family", sending the reader to look at
+   credentials for a problem that was in their own flag. SkyPilot's log had already said
+   "Max hourly cost limit ($0.001/hr) may be too restrictive"; the manifest just wasn't reading
+   it. Same failure class as GCP-PROV-3, one layer along.
 
-Two smaller ones came from self-review: the hyperdisk family check matched on a prefix, so
-`n4a-*` would have been priced 20% low; and a memo entry that cost no region still collapsed the
-search space from 41 regions to 10.
+**Two more from self-review**: the hyperdisk family check matched on a prefix, so `n4a-*` would
+have been priced 20% low; and a memo entry that cost no region still collapsed the search space
+from 41 regions to 10, silently trading failover breadth for nothing.
 
-A fifth was found by checking an acceptance number rather than a test: `lab register --cloud gcp`
-quoted a worst case whose storage term was exactly $0. The disk invariant was enforced in
-`resolve_backend_profile`, which is on the CLI/MCP submit path — and **the scheduler launches
-registrations straight through `Lab.submit`**, so a deferred GCP job would still have inherited
-SkyPilot's 256 GB. The rule now lives in `lab.placement.effective_disk_gb` and is applied in
-`build_task`, which every launch goes through; `core` re-exports it so there is one definition.
-The registration now quotes $0.591439 for a 2-hour spot cpu job, which is
-`(0.29024 compute + 0.00548 disk) x 2` to the cent.
-
-The live reconcile assertion also had to change: `lab.wait` returns when the *job* is terminal,
-but `sky.down` and GCE's delete operation run after that, so reconcile legitimately saw a head
-node still `RUNNING` (gone ~40s later). The test now asserts convergence within a settle window
-rather than instant cleanliness — a flaky leak alarm is worse than none.
+**And one bug in a test I had just written.** The live reconcile assertion raced teardown:
+`lab.wait` returns when the *job* is terminal, but `sky.down` and GCE's delete operation run after
+that, so reconcile legitimately saw a head node still `RUNNING` (gone ~40s later — confirmed by
+the compute API directly, no leak). It now asserts convergence within a settle window rather than
+instant cleanliness. A flaky leak alarm is worse than no alarm.
 
 **Deliberately not done.** `--instance-type` (the catalog resolves it from `--cpus`/`--memory`, and
 a third way to say the same thing invites conflicts); egress and sustained-use discounts in the
