@@ -90,10 +90,10 @@ class CostInfo(BaseModel):
     wall-clock (includes provisioning/setup, which clouds charge for).
 
     ``hourly_usd`` is the **total** billed rate — compute plus attached storage. It was
-    compute-only until 2026-08-11, which understated GCP jobs materially: a default 256 GB
-    pd-balanced disk is $0.0351/hr against a $0.0340/hr spot n4-standard-4. Keeping the total in
-    the field everything already reads (``estimated_usd``, admission control, the dashboard) means
-    those consumers got the storage line for free; the breakdown below is for humans.
+    compute-only until 2026-08-11, which understated GCP jobs materially: a default 256 GB disk is
+    $0.028-$0.035/hr depending on disk type, against a $0.034/hr spot n4-standard-4. Keeping the
+    total in the field everything already reads (``estimated_usd``, admission control, the
+    dashboard) means those consumers got the storage line for free; the breakdown is for humans.
     """
 
     duration_seconds: float | None = None

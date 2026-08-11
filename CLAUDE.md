@@ -53,8 +53,10 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   unpinned `Resources` returns the cheapest region's price, which made admission control
   systematically permissive; the ceiling is priced on-demand whenever `spot_fallback` could land
   there. `CostInfo.hourly_usd` is **compute + storage**; no gcp/do job may inherit SkyPilot's
-  256 GB disk (50 GB cpu, 100 GB GPU — `default_disk_gb`). Provision timeouts are per-cloud
-  (gcp 20m). Diagnostics from these paths go to **stderr**: stdout carries only JSON.
+  256 GB disk (50 GB cpu, 100 GB GPU — `placement.effective_disk_gb`, applied in **`build_task`**
+  because the scheduler launches registrations without calling `resolve_backend_profile`).
+  Provision timeouts are per-cloud (gcp 20m). Diagnostics from these paths go to **stderr**:
+  stdout carries only JSON, which callers parse.
 - **Preflight (`lab doctor`, `lab.doctor`):** checks credentials (incl. SkyPilot's daemon, which
   does not inherit `.env`), project, billing, APIs, IAM permissions and quota before a launch
   costs a provision; the cheap subset runs automatically on submit (`--no-preflight` opts out).

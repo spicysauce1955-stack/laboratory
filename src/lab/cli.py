@@ -588,7 +588,7 @@ def doctor(
     Quota is checked at both levels GCP enforces: a fresh project can hold regional GPU quota and
     still be blocked by a global ``GPUS_ALL_REGIONS`` of 0.
     """
-    from lab.doctor import format_report, run_checks
+    from lab.doctor import doctor_view, format_report, run_checks
 
     resources = ResourceRequest(
         cpus=cpus, disk_size=disk_size, accelerators=accelerators,
@@ -604,7 +604,7 @@ def doctor(
     resources = resources.model_copy(update={"disk_size": default_disk_gb(resources)})
     results = run_checks(cloud, resources, home=_repo() / "runs", use_cache=not no_cache)
     if as_json:
-        _emit({"cloud": cloud or "vast", "checks": [r.model_dump() for r in results]})
+        _emit(doctor_view(cloud, results))
     else:
         typer.echo(f"lab doctor — {cloud or 'vast'}")
         typer.echo(format_report(results))

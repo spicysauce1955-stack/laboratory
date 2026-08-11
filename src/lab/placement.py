@@ -64,6 +64,38 @@ _DO_VOLUME_USD_GIB_HR = 0.000136986
 # billed rate and already includes its storage. Adding a term here would double-count it.
 _VAST_STORAGE_USD_GIB_HR = 0.0
 
+# Clouds that bill attached storage as a separate line item. On these, letting `disk_size` fall
+# through to SkyPilot's 256 GB default is never right: on DO it hard-failed with a 422 (which is
+# why the cpu profile pins 50), and on GCP it succeeds quietly at $0.028/hr (hyperdisk, what n4
+# must use) to $0.035/hr (pd-balanced) — 82-103% of the $0.034/hr spot n4-standard-4 it is
+# attached to, so it roughly doubles a cheap job's bill. Loud on one cloud, silent on the other.
+STORAGE_BILLING_CLOUDS = ("gcp", "do")
+# Keep the cpu default inside a fresh DigitalOcean account's tier: 8-vCPU sizes and a 256 GB block
+# volume are both tier-restricted and fail provisioning until a tier bump.
+CPU_DEFAULT_DISK_GB = 50
+# Accelerated jobs need room for a CUDA image plus wheels and a checkpoint; 100 GB is comfortable
+# without paying for SkyPilot's 256.
+GPU_DEFAULT_DISK_GB = 100
+
+
+def effective_disk_gb(res: ResourceRequest) -> int | None:
+    """The ``disk_size`` a spec should actually launch with, or None to leave it alone.
+
+    Only clouds that bill storage separately get a default: on Vast the disk is part of the
+    rental's ``dph_total``, so imposing a size there would change provisioning behaviour to fix a
+    cost problem Vast does not have.
+
+    This lives here, not only in ``resolve_backend_profile``, because that function is on the
+    CLI/MCP submit path and **the scheduler's launch path does not call it** — a registered GCP
+    job would otherwise still inherit SkyPilot's 256 GB. Pure.
+    """
+    if res.disk_size is not None:
+        return res.disk_size
+    if (res.cloud or "vast") not in STORAGE_BILLING_CLOUDS:
+        return None
+    return GPU_DEFAULT_DISK_GB if res.accelerators else CPU_DEFAULT_DISK_GB
+
+
 # How long a zone stays excluded after it reports a capacity exhaustion. GCP capacity comes back
 # on the order of minutes-to-hours; 30 min is long enough to steer a sweep's remaining shards away
 # and short enough that a recovered zone is not blacklisted for a whole session.
@@ -100,8 +132,8 @@ def storage_hourly_usd(cloud: str | None, disk_gb: int | None, instance_type: st
     """USD/hour for a job's boot/attached disk. Zero when we have no rate for the cloud.
 
     This term has never been on the manifest, and it is not small: SkyPilot's default 256 GB disk
-    costs $0.0351/hr on pd-balanced, against a $0.0340/hr spot n4-standard-4. An untuned boot disk
-    can cost more than the machine it is attached to.
+    costs $0.028/hr (hyperdisk) to $0.035/hr (pd-balanced) — 82-103% of a $0.034/hr spot
+    n4-standard-4. An untuned boot disk is the same order of cost as the machine it hangs off.
     """
     if not disk_gb:
         return 0.0
@@ -482,11 +514,14 @@ def estimate(res: ResourceRequest, *, memo: CapacityMemo | None = None) -> Estim
     kind = "spot" if res.use_spot else "on-demand"
     if res.use_spot and res.spot_fallback:
         kind = "spot w/ on-demand fallback"
-    disk = storage_hourly_usd(cloud, res.disk_size, instance_type)
+    # Price the disk the launch will actually get, not the one the spec happens to name — a
+    # registration carries no disk_size and would otherwise be quoted as if storage were free.
+    disk_gb = effective_disk_gb(res)
+    disk = storage_hourly_usd(cloud, disk_gb, instance_type)
     where = res.zone or res.region or f"{len(best)} regions"
     basis = (
         f"{cloud} catalog {instance_type} {kind} {where}"
-        f" + {res.disk_size or 0}GiB disk (${disk:.4f}/hr)"
+        f" + {disk_gb or 0}GiB disk (${disk:.4f}/hr)"
     )
     return Estimate(
         instance_type=instance_type,

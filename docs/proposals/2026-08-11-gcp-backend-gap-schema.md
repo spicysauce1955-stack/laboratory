@@ -301,6 +301,12 @@ resources. Then state the exclusions (disk, egress, SUD) in the guide instead of
 
 ---
 **`GCP-COST-2` — the GPU path inherits SkyPilot's 256 GB default boot disk** ✅ **FIXED 2026-08-11**
+> **Wider than recorded.** The gap named the GPU path, but the hole was the *deferred* path too:
+> `resolve_backend_profile` is only on the CLI/MCP submit path, and the scheduler launches
+> registrations straight through `Lab.submit`, so any registered GCP job — cpu profile included —
+> inherited the 256 GB default. Found by noticing `lab register --cloud gcp` quoted a worst case
+> whose storage term was exactly $0. The rule now lives in `placement.effective_disk_gb` and is
+> applied in `build_task`, which every launch goes through.
 `area: cost` · `severity: medium` · `confidence: confirmed` · `precedent: the DO 422 (memory: DO tier limits)`
 
 The `cpu` profile pins `disk_size=50`. `--backend skypilot --cloud gcp --accelerators T4:1` leaves

@@ -38,6 +38,7 @@ from lab.manifest import (
     repo_root,
     uv_lock_sha256,
 )
+from lab import placement
 from lab.metrics import final_values, group_series
 from lab.storage import R2Store, r2_enabled
 from lab.models import (
@@ -244,19 +245,15 @@ SUPPORTED_CLOUDS: tuple[str, ...] = ("vast", "do", "gcp")
 UNSUPERVISED_GRACE_S = 300.0
 
 CPU_DEFAULT_CLOUD = "do"
-# Keep defaults within a fresh DigitalOcean account's tier: 8-vCPU sizes and a 256GB block volume
-# (SkyPilot's default disk_size) are both tier-restricted and fail provisioning until a tier bump.
 CPU_DEFAULT_VCPUS = 4
-CPU_DEFAULT_DISK_GB = 50
-# Accelerated jobs need room for a CUDA image plus wheels and a checkpoint; 100 GB is comfortable
-# without paying for SkyPilot's 256. See STORAGE_BILLING_CLOUDS for why any number beats None.
-GPU_DEFAULT_DISK_GB = 100
-# Clouds that bill attached storage as a separate line item. On these, letting `disk_size` fall
-# through to SkyPilot's 256 GB default is never right: on DO it hard-failed with a 422 (which is
-# why the cpu profile pins 50), and on GCP it succeeds quietly at $0.0351/hr — more than the
-# $0.0340/hr spot n4-standard-4 it is attached to. Loud on one cloud, expensive on the other, so
-# every launch here carries an explicit size.
-STORAGE_BILLING_CLOUDS = ("gcp", "do")
+# The disk defaults and the "which clouds bill storage separately" rule live in lab.placement,
+# because build_task needs them too: the scheduler launches registrations without ever calling
+# resolve_backend_profile, so the invariant has to be enforced closer to the launch than this.
+# Re-exported here since this is where callers already look for the profile constants.
+CPU_DEFAULT_DISK_GB = placement.CPU_DEFAULT_DISK_GB
+GPU_DEFAULT_DISK_GB = placement.GPU_DEFAULT_DISK_GB
+STORAGE_BILLING_CLOUDS = placement.STORAGE_BILLING_CLOUDS
+default_disk_gb = placement.effective_disk_gb
 
 
 def validate_cloud(cloud: str | None) -> str | None:
@@ -266,20 +263,6 @@ def validate_cloud(cloud: str | None) -> str | None:
             f"unknown cloud {cloud!r}; supported: {', '.join(SUPPORTED_CLOUDS)} (default: vast)"
         )
     return cloud
-
-
-def default_disk_gb(resources: ResourceRequest) -> int | None:
-    """The explicit ``disk_size`` a spec should carry, or None to leave it alone.
-
-    Only clouds that bill storage separately get a default (see STORAGE_BILLING_CLOUDS): on Vast
-    the disk is part of the rental's ``dph_total``, so imposing a size there would change
-    provisioning behaviour to fix a cost problem Vast does not have. Pure.
-    """
-    if resources.disk_size is not None:
-        return resources.disk_size
-    if (resources.cloud or "vast") not in STORAGE_BILLING_CLOUDS:
-        return None
-    return GPU_DEFAULT_DISK_GB if resources.accelerators else CPU_DEFAULT_DISK_GB
 
 
 def resolve_backend_profile(

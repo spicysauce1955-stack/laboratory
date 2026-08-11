@@ -5,7 +5,7 @@
 `GCP-PROV-4` (GPU path never run), `GCP-PROV-5` (no preflight), `GCP-COST-1` (booked-price
 accuracy), `GCP-COST-2` (GPU disk default), `GCP-COST-4` (`worst_case_cost_usd: null`),
 `GCP-PREEMPT-2` (silent spot→on-demand), `GCP-DOC-1` (stale price table).
-**Basis:** `docs/proposals/2026-08-11-gcp-backend-gap-schema.md`, the code at `18dd24bb`, the
+**Basis:** `docs/proposals/2026-08-11-gcp-backend-gap-schema.md`, the code at `18d24bb`, the
 live GCP project `myproject-505213`, and SkyPilot 0.12.3 as installed.
 
 ---
@@ -303,6 +303,20 @@ guess — and it cost nothing to establish, because no VM ever started.
 Two smaller ones came from self-review: the hyperdisk family check matched on a prefix, so
 `n4a-*` would have been priced 20% low; and a memo entry that cost no region still collapsed the
 search space from 41 regions to 10.
+
+A fifth was found by checking an acceptance number rather than a test: `lab register --cloud gcp`
+quoted a worst case whose storage term was exactly $0. The disk invariant was enforced in
+`resolve_backend_profile`, which is on the CLI/MCP submit path — and **the scheduler launches
+registrations straight through `Lab.submit`**, so a deferred GCP job would still have inherited
+SkyPilot's 256 GB. The rule now lives in `lab.placement.effective_disk_gb` and is applied in
+`build_task`, which every launch goes through; `core` re-exports it so there is one definition.
+The registration now quotes $0.591439 for a 2-hour spot cpu job, which is
+`(0.29024 compute + 0.00548 disk) x 2` to the cent.
+
+The live reconcile assertion also had to change: `lab.wait` returns when the *job* is terminal,
+but `sky.down` and GCE's delete operation run after that, so reconcile legitimately saw a head
+node still `RUNNING` (gone ~40s later). The test now asserts convergence within a settle window
+rather than instant cleanliness — a flaky leak alarm is worse than none.
 
 **Deliberately not done.** `--instance-type` (the catalog resolves it from `--cpus`/`--memory`, and
 a third way to say the same thing invites conflicts); egress and sustained-use discounts in the

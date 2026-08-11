@@ -194,11 +194,24 @@ def test_hyperdisk_families_are_matched_on_whole_tokens(instance_type, hyperdisk
     assert rate == pytest.approx(expected)
 
 
-def test_skypilot_default_disk_can_outcost_a_spot_cpu_box():
-    """The number that reframed GCP-COST-2 from a leak footnote into a live distortion."""
-    disk_256 = P.storage_hourly_usd("gcp", 256, "n4-standard-4")
-    assert disk_256 == pytest.approx(0.02806, abs=1e-4)
-    assert disk_256 < 0.034  # the cheapest spot n4-standard-4 — but only just
+def test_skypilot_default_disk_roughly_doubles_a_spot_cpu_bill():
+    """The number that reframed GCP-COST-2 from a leak footnote into a live distortion.
+
+    A 256 GB boot disk is 82% of a $0.034/hr spot n4-standard-4 on hyperdisk (what n4 must use)
+    and 103% of it on pd-balanced. Either way the disk is the same order as the machine, which is
+    why leaving it to SkyPilot's default was never harmless.
+    """
+    spot_n4 = 0.034
+    hyperdisk_256 = P.storage_hourly_usd("gcp", 256, "n4-standard-4")
+    pd_256 = P.storage_hourly_usd("gcp", 256, "n1-highmem-4")
+    assert hyperdisk_256 == pytest.approx(0.02806, abs=1e-4)
+    assert pd_256 == pytest.approx(0.03507, abs=1e-4)
+    assert 0.8 < hyperdisk_256 / spot_n4 < 1.0
+    assert pd_256 > spot_n4
+
+    # What the lab actually provisions instead.
+    assert P.storage_hourly_usd("gcp", 50, "n4-standard-4") == pytest.approx(0.00548, abs=1e-4)
+    assert P.storage_hourly_usd("gcp", 100, "n1-highmem-4") == pytest.approx(0.0137, abs=1e-4)
 
 
 def test_vast_storage_is_zero_because_dph_total_already_includes_it():

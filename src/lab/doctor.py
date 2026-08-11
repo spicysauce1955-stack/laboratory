@@ -22,9 +22,12 @@ these rules it is a ``skip``.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal
 
@@ -68,6 +71,7 @@ _SHAPE_DEPENDENT = frozenset({"quota_cpu", "quota_gpu", "quota_disk"})
 
 def _shape_key(res: ResourceRequest) -> str:
     return f"{res.cpus}/{res.disk_size}/{res.accelerators}/{res.region}/{res.zone}/{res.use_spot}"
+
 
 # Project-level permissions SkyPilot needs on GCP. Verified against the live project: GCP's
 # projects.testIamPermissions accepts all of these and returns the subset the caller holds.
@@ -196,6 +200,24 @@ def _build(creds: Any, api: str, version: str) -> Any:
     return discovery.build(api, version, credentials=creds, cache_discovery=False)
 
 
+@contextmanager
+def _quiet_google_http() -> Iterator[None]:
+    """Silence googleapiclient's own WARNING for HTTP errors while checks run.
+
+    A check that gets a 403 reports it as a `skip` or a `fail` with a fix — in the user's terms,
+    on the right line of the table. The library's raw "Encountered 403 Forbidden with reason
+    PERMISSION_DENIED" adds nothing and reads as an alarm above output that is deliberately calm
+    about it. Scoped to this block, so nothing else in the process loses the warning.
+    """
+    logger = logging.getLogger("googleapiclient.http")
+    previous = logger.level
+    logger.setLevel(logging.ERROR)
+    try:
+        yield
+    finally:
+        logger.setLevel(previous)
+
+
 def _principal(creds: Any) -> str:
     """A human-readable identity for the ADC in use, without ever printing the credential."""
     for attr in ("service_account_email", "signer_email", "quota_project_id"):
@@ -290,7 +312,17 @@ def check_billing(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
         info = api.projects().getBillingInfo(name=f"projects/{project}").execute()
     except Exception as e:  # noqa: BLE001
         # Seen live: a 403 because the *Cloud Billing API itself* is disabled. That is not
-        # evidence about billing — the project was billing fine — so it must not block.
+        # evidence about billing — the project was billing fine — so it must not block. Say that
+        # in one line rather than pasting the library's URL-laden 403 into the table.
+        if "has not been used in project" in str(e) or "SERVICE_DISABLED" in str(e):
+            return CheckResult(
+                name="billing",
+                status="skip",
+                detail="not checked — the Cloud Billing API is off, which says nothing about "
+                "whether billing itself is enabled",
+                fix="gcloud services enable cloudbilling.googleapis.com (optional; only makes "
+                "this check possible)",
+            )
         return _skip("billing", f"could not read billing info: {str(e)[:160]}")
     if not info.get("billingEnabled"):
         return _fail(
@@ -508,9 +540,9 @@ def check_catalog(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
             "check --cpus/--memory/--accelerators name a shape this cloud offers",
         )
     ctx["estimate"] = est
-    instance_type = placement.resolve_instance_type(res)
-    if instance_type:
-        ctx["candidates"] = placement.candidates(res, instance_type=instance_type)
+    # Reuse the type the estimate already resolved rather than asking the catalog again: this
+    # runs on every remote submit, and a 32-shard sweep pays it 32 times.
+    ctx["candidates"] = placement.candidates(res, instance_type=est.instance_type)
     detail = (
         f"{est.instance_type}, {est.regions} region(s), "
         f"${est.best_hourly_usd:.4f}-${est.worst_hourly_usd:.4f}/hr incl. "
@@ -570,9 +602,6 @@ _REGISTRY: dict[str, tuple[tuple[str, Any], ...]] = {
     "local": (),
 }
 
-SUPPORTED = tuple(_REGISTRY)
-
-
 def run_checks(
     cloud: str | None,
     resources: ResourceRequest | None = None,
@@ -607,7 +636,8 @@ def run_checks(
             out.append(cached)
             continue
         try:
-            result = fn(res, ctx)
+            with _quiet_google_http():
+                result = fn(res, ctx)
         except Exception as e:  # noqa: BLE001 — a broken check must never block a launch
             result = _skip(name, f"check errored: {str(e)[:160]}")
         out.append(result)
@@ -629,6 +659,17 @@ def preflight(
     if (cloud or "vast") == "local":
         return []
     return blocking_failures(run_checks(cloud, resources, home=home, quick=True))
+
+
+def doctor_view(cloud: str | None, results: list[CheckResult]) -> dict[str, Any]:
+    """One structured shape for both shells (FR-F2), so `lab doctor --json` and the MCP tool
+    cannot drift apart. ``ok`` is the single field a caller needs to branch on."""
+    return {
+        "cloud": cloud or "vast",
+        "ok": not any(r.status == "fail" for r in results),
+        "checks": [r.model_dump() for r in results],
+        "blocking": [r.model_dump() for r in results if r.status == "fail"],
+    }
 
 
 def format_report(results: list[CheckResult]) -> str:

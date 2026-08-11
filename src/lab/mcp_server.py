@@ -247,7 +247,7 @@ def build_server(lab: Lab) -> FastMCP:
     ) -> dict[str, Any]:
         """Check whether a launch on this cloud would work, BEFORE it costs a provision — run this when a submit fails to provision, or before the first job on a new cloud/shape. Returns {cloud, ok, checks:[{name,status,detail,fix}], blocking:[...]} where status is ok|warn|fail|skip. Verifies credentials (including SkyPilot's API-server daemon, which does not inherit .env), project, billing, enabled APIs, IAM permissions, and quota for the requested shape, then reports the catalog's instance type and price band. GCP GPU quota is checked at both levels Google enforces: a project can hold regional NVIDIA_*_GPUS quota and still be blocked by a global GPUS_ALL_REGIONS of 0. status="skip" means the check could not answer and is never a blocker; only "fail" is a definitive negative."""
         from lab.core import default_disk_gb, validate_cloud
-        from lab.doctor import run_checks
+        from lab.doctor import doctor_view, run_checks
 
         try:
             validate_cloud(cloud)
@@ -258,13 +258,7 @@ def build_server(lab: Lab) -> FastMCP:
             cloud=cloud, region=region, zone=zone, use_spot=use_spot,
         )
         resources = resources.model_copy(update={"disk_size": default_disk_gb(resources)})
-        results = run_checks(cloud, resources, home=home)
-        return {
-            "cloud": cloud or "vast",
-            "ok": not any(r.status == "fail" for r in results),
-            "checks": [r.model_dump() for r in results],
-            "blocking": [r.model_dump() for r in results if r.status == "fail"],
-        }
+        return doctor_view(cloud, run_checks(cloud, resources, home=home))
 
     @mcp.tool
     def metrics(

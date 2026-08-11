@@ -18,6 +18,11 @@ uv run lab sweep --backend cpu --cloud gcp -c "..." --grid lr=0.1,0.01 --timeout
 uv run lab register --cloud gcp --gpu T4:1 --timeout 2h --expires +3d -c "..."
 ```
 
+Before any remote launch the cheap half of those checks runs automatically, so a missing
+permission or an exhausted quota costs about a second instead of a provisioning round trip. Only a
+check that positively establishes "this cannot work" blocks; one that merely fails to answer is
+skipped. `--no-preflight` opts out.
+
 `--cloud` selects the SkyPilot cloud (`vast` default | `do` | `gcp`) on `submit`, `sweep`,
 `register`, and `register-sweep` (and as `cloud=` on the MCP tools). `--backend cpu --cloud gcp`
 keeps the cpu profile's defaults (4 vCPU, 50 GB disk, no accelerators) but provisions on GCP —
@@ -49,9 +54,11 @@ Two things that table makes visible and the old one hid:
   `lab status` reports `spot_downgraded: true` when it actually happens.
 
 Storage is billed separately and is now on the manifest. It is not a rounding error: SkyPilot's
-default 256 GB boot disk costs **$0.028/hr**, which is *more than a $0.034/hr spot
-`n4-standard-4`*. The lab therefore never lets that default apply — every GCP job carries an
-explicit size (**50 GB** cpu profile, **100 GB** GPU).
+default 256 GB boot disk costs **$0.028/hr** on hyperdisk-balanced (what n4 must use) or
+**$0.035/hr** on pd-balanced (everything else) — that is 82-103% of a $0.034/hr spot
+`n4-standard-4`, so the untuned disk roughly *doubles* a cheap job's bill. The lab therefore never
+lets that default apply: every GCP job carries an explicit size (**50 GB** cpu profile,
+**100 GB** GPU), costing $0.0055 and $0.0137/hr respectively.
 
 ### Choosing where it lands
 
@@ -83,10 +90,19 @@ auto-resubmit applies to them like any spot job.
   Pick one of two paths — see *Credentials* below.
 - Select a project (`gcloud config set project <id>`, or `GOOGLE_CLOUD_PROJECT` in `.env`) with
   billing enabled, and enable the Compute Engine API.
-- Confirm `uv run sky check gcp` shows **GCP: enabled**.
-- **GPU quota:** a fresh project has 0 GPU quota. Request per-family regional quota
-  (e.g. `NVIDIA_T4_GPUS` / `NVIDIA_L4_GPUS` in your region) in the console before the first GPU
-  job, or provisioning fails with a quota error (`lab` surfaces a `sky check gcp`/quota hint).
+- **Check it with `uv run lab doctor --cloud gcp`** — one command in place of the chain of manual
+  checks below. It verifies credentials (including SkyPilot's API-server daemon, which does *not*
+  inherit `.env`), the project, billing, both required APIs, every IAM permission SkyPilot needs,
+  and quota for the shape you name; then prints what the catalog says it will cost. Exit 1 means
+  something would fail. Add `--gpu T4:1` before your first GPU job.
+- **GPU quota is enforced at two levels and you need both.** A fresh project has 0 GPU quota.
+  Request per-family *regional* quota (e.g. `NVIDIA_T4_GPUS` in your region) **and** the separate
+  *global* `GPUS_ALL_REGIONS`. These are independent: a project with `NVIDIA_T4_GPUS = 1` and
+  `GPUS_ALL_REGIONS = 0` looks fine on the quota page and fails every GPU launch with
+  `Quota 'GPUS_ALL_REGIONS' exceeded. Limit: 0.0 globally`. `lab doctor --cloud gcp --gpu T4:1`
+  checks both. First-time GPU quota requests can take up to 48 hours.
+- Ignore `PREEMPTIBLE_CPUS = 0` — it is the default and is not a blocker. Where preemptible quota
+  was never granted, GCP runs Spot VMs against the standard `CPUS` quota.
 
 ### Credentials
 
@@ -242,10 +258,14 @@ GCP has **two teardown channels**, mirroring the Vast design:
   message is `Failed to set up SkyPilot runtime on cluster` /
   `Could not find any head instance` — that is the *downstream* symptom. Grep the log for
   `ZONE_RESOURCE_POOL_EXHAUSTED` before chasing a runtime bug.
-- **`teardown_status` lags the terminal state.** `lab wait` can return with the job terminal but
-  `teardown_status: null` (reported as `teardown_unconfirmed`), which resolves to `"succeeded"` a
-  few seconds later. Re-read `lab status` before treating it as a leak — and confirm with
-  `lab reconcile`, which queries the live compute API and is ground truth.
+- **Teardown is asynchronous, and `lab reconcile` can catch it mid-flight.** `lab wait` returns
+  when the *job* is terminal; `sky.down` and GCE's own delete operation run after that. So a
+  `lab wait` that exits 0 can be followed by `teardown_status: null` (reported as
+  `teardown_unconfirmed`) and — measured 2026-08-11 — by a `lab reconcile` that lists the head node
+  as `RUNNING`. It was gone ~40s later. Reconcile *is* ground truth, but ground truth includes
+  "still shutting down": give it a minute and re-run before treating a fresh orphan as a leak. An
+  instance still listed several minutes after the job ended is real, and `lab reconcile --apply`
+  is the fix.
 
 ## Limitations (v1)
 

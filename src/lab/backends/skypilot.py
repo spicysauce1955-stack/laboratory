@@ -904,6 +904,10 @@ def build_task(manifest: JobManifest, workdir: Path, *, memo: Any | None = None)
         raise LabError("DigitalOcean has no spot instances; drop --spot")
     placement.validate_placement(res)  # a bad region name fails here, before anything bills
     _cloud = _cloud_for(cloud_name)
+    # Last line of defence for the disk invariant. `resolve_backend_profile` also applies it, but
+    # only on the CLI/MCP submit path — the scheduler launches registrations straight through
+    # `Lab.submit`, so without this a deferred GCP job still inherits SkyPilot's 256 GB default.
+    disk_gb = placement.effective_disk_gb(res)
 
     def _res(*, use_spot: bool | None = None, region: str | None = None) -> sky.Resources:
         return sky.Resources(
@@ -911,7 +915,7 @@ def build_task(manifest: JobManifest, workdir: Path, *, memo: Any | None = None)
             cpus=res.cpus,
             memory=res.memory,
             accelerators=res.accelerators or None,
-            disk_size=res.disk_size,
+            disk_size=disk_gb,
             use_spot=use_spot,
             region=region or res.region,
             zone=res.zone,

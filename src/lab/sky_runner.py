@@ -189,9 +189,10 @@ def resolve_cost(
     """The launched job's billed rate, storage included (FR-I2).
 
     ``hourly_usd`` is compute + storage. Storage was absent from this number until 2026-08-11 and
-    is not a rounding error: SkyPilot's default 256 GB disk costs $0.0351/hr against a $0.0340/hr
-    spot n4-standard-4. Everything downstream reads ``hourly_usd``, so folding the disk in there
-    fixes ``estimated_usd``, the dashboard, and the scheduler's spend accounting at once.
+    is not a rounding error: SkyPilot's default 256 GB disk runs $0.028-$0.035/hr depending on disk
+    type, against a $0.034/hr spot n4-standard-4. Everything downstream reads ``hourly_usd``, so
+    folding the disk in there fixes ``estimated_usd``, the dashboard, and the scheduler's spend
+    accounting at once.
     """
     from lab.placement import storage_hourly_usd
 

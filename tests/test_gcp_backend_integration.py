@@ -156,17 +156,40 @@ def test_gcp_job_ships_the_pinned_interpreter() -> None:
     assert reported.startswith(pin), f"remote ran {reported}, but .python-version pins {pin}"
 
 
-def test_reconcile_is_clean_after_the_live_jobs() -> None:
-    """Ground truth for the two tests above: the compute API itself must show nothing left.
+# Teardown is asynchronous: `lab.wait` returns when the *job* is terminal, and `sky.down` plus
+# GCE's own delete operation run after that. Observed 2026-08-11: reconcile immediately after a
+# wait saw the head node still RUNNING, and it was gone ~40s later. So the honest assertion is
+# "converges to clean", not "is instantly clean" — asserting the latter produces a flaky
+# leak-detection test, and a leak alarm people learn to ignore is worse than no alarm.
+_TEARDOWN_SETTLE_S = 240.0
+_TEARDOWN_POLL_S = 15.0
+
+
+def test_reconcile_converges_to_clean_after_the_live_jobs() -> None:
+    """Ground truth for the tests above: the compute API itself must end up showing nothing left.
 
     `teardown_status` is the lab's own bookkeeping; this asks GCP. It also exercises the passes
     that used to report clean while blind (GCP-LEAK-2/-3) — with real credentials present, a
     `gcp_pass` of anything but "ran" here means the pass silently skipped and proves nothing.
     """
-    report = default_lab(backend="skypilot").reconcile()
+    import time
+
+    lab = default_lab(backend="skypilot")
+    deadline = time.monotonic() + _TEARDOWN_SETTLE_S
+    report = lab.reconcile()
+    while time.monotonic() < deadline and (
+        report["gcp_orphans"] or report["gcp_disk_orphans"]
+    ):
+        time.sleep(_TEARDOWN_POLL_S)
+        report = lab.reconcile()
+
     assert report["gcp_pass"] == "ran", f"GCP pass did not run: {report['gcp_pass']}"
     assert report["gcp_disk_pass"] == "ran", f"disk pass did not run: {report['gcp_disk_pass']}"
-    assert report["gcp_orphans"] == [], f"leaked instances: {report['gcp_orphans']}"
+    # Anything still here after the settle window is billing, and is a real leak (FR-C2).
+    assert report["gcp_orphans"] == [], (
+        f"instances still up {_TEARDOWN_SETTLE_S:.0f}s after teardown — this is a leak, run "
+        f"`lab reconcile --apply`: {report['gcp_orphans']}"
+    )
     assert report["gcp_disk_orphans"] == [], f"leaked disks: {report['gcp_disk_orphans']}"
 
 

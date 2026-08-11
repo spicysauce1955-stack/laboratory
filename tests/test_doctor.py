@@ -253,6 +253,21 @@ def test_unknown_cloud_reports_a_skip_not_a_crash(tmp_path):
     assert [r.status for r in results] == ["skip"]
 
 
+def test_doctor_view_is_the_one_shape_both_shells_emit():
+    """CLI `--json` and the MCP tool must not drift: they share this view, the way status does.
+    They had already diverged once — the CLI omitted `ok`, the field a caller branches on."""
+    results = [D._ok("adc", "fine"), D._skip("billing", "no answer"), D._fail("iam", "x", "y")]
+    view = D.doctor_view("gcp", results)
+    assert view["cloud"] == "gcp"
+    assert view["ok"] is False
+    assert [c["name"] for c in view["checks"]] == ["adc", "billing", "iam"]
+    assert [b["name"] for b in view["blocking"]] == ["iam"]
+
+    # A skip is not a blocker, so a run with no `fail` is ok.
+    assert D.doctor_view(None, [D._skip("apis", "no answer")])["ok"] is True
+    assert D.doctor_view(None, [])["cloud"] == "vast"
+
+
 def test_format_report_shows_fixes_only_for_actionable_findings():
     out = D.format_report(
         [D._ok("adc", "fine"), D._fail("iam", "missing x", "grant it")]

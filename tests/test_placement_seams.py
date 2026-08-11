@@ -52,6 +52,36 @@ def test_no_gcp_skypilot_spec_can_inherit_skypilots_256gb_default():
     assert resolved.disk_size != 256
 
 
+def test_build_task_applies_the_disk_default_even_when_the_profile_never_ran(tmp_path):
+    """The invariant must hold on the DEFERRED path too.
+
+    `resolve_backend_profile` runs on the CLI/MCP submit path only — the scheduler launches a
+    registration straight through `Lab.submit`, so a registered GCP spec (which carries no
+    disk_size) reached SkyPilot with none and inherited its 256 GB default. Caught by noticing
+    that `lab register --cloud gcp` quoted a worst case with storage of exactly $0.
+    """
+    m = make_manifest("j1", "echo hi", resources=ResourceRequest(cloud="gcp", cpus=4))
+    assert m.resources.disk_size is None  # exactly what a registration looks like
+    got = _resources_of(S.build_task(m, workdir=tmp_path, memo=None))
+    assert got[0].disk_size == CPU_DEFAULT_DISK_GB
+
+    gpu = make_manifest("j2", "echo hi", resources=ResourceRequest(cloud="gcp", accelerators="T4:1"))
+    got = _resources_of(S.build_task(gpu, workdir=tmp_path, memo=None))
+    assert got[0].disk_size == GPU_DEFAULT_DISK_GB
+
+
+def test_registration_worst_case_prices_the_disk_it_will_actually_get(monkeypatch):
+    """A registration names no disk, but it will launch with one, so the exposure quoted to the
+    user must include it."""
+    from lab import placement
+
+    est = placement.estimate(ResourceRequest(cloud="gcp", cpus=4))
+    if est is None:
+        pytest.skip("catalog unavailable")
+    assert est.storage_usd > 0, "a GCP registration's worst case must price its disk"
+    assert f"{CPU_DEFAULT_DISK_GB}GiB" in est.basis
+
+
 def test_cpu_profile_disk_is_unchanged():
     _, resolved = resolve_backend_profile("cpu", ResourceRequest(cloud="gcp"))
     assert resolved.disk_size == CPU_DEFAULT_DISK_GB
