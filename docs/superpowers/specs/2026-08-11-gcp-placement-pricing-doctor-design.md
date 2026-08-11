@@ -272,7 +272,9 @@ regional quota passes, and `PREEMPTIBLE_CPUS = 0` must not fail.
 
 Built, tested, and verified live against project `myproject-505213`. 93 new unit tests across
 three new modules (634 in the suite); the full suite, `ruff`, and `mypy --strict` are clean, and
-the live integration harness now asserts every claim below so none of it is anecdotal.
+the live integration harness — **6/6 green on the final run** — asserts every claim below, so none
+of it is anecdotal. `lab reconcile` reports no orphans and the compute API directly confirms no
+`lab-*` instance or disk survives any of it.
 
 **What the live runs proved.** A real spot CPU job ran end to end and landed in **europe-west1-b**
 — the cheapest spot region — recording `compute $0.03401/hr` against a catalog price of $0.0340
