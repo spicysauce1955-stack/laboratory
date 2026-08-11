@@ -485,8 +485,18 @@ ZONE_RESOURCE_POOL_EXHAUSTED" note in the guide's gotchas.
 function, trivially testable.
 
 ---
-**`GCP-PROV-4` — the GPU path has never run**
-`area: provision` · `severity: high` · `confidence: suspected` · `precedent: none`
+**`GCP-PROV-4` — the GPU path has never run** ⚠️ **ATTEMPTED LIVE 2026-08-11 — blocked by project quota, not by the lab**
+`area: provision` · `severity: high` · `confidence: observed` · `precedent: none`
+
+> **Status.** A real `--accelerators T4:1` launch was attempted on 2026-08-11. It failed with
+> `Quota 'GPUS_ALL_REGIONS' exceeded. Limit: 0.0 globally` — a project-level authorisation the lab
+> cannot grant itself, not a defect in the GPU path. Everything upstream of provisioning is now
+> exercised: the catalog resolves `T4:1` to `n1-highmem-4` across 23 regions and prices it
+> ($0.60-$0.87/hr on demand incl. disk), the GPU disk default (100 GB) reaches `sky.Resources`,
+> and `lab doctor --cloud gcp --gpu T4:1` **predicts the failure in seconds** rather than
+> discovering it by burning a provision. What remains untested is strictly what happens *after* a
+> GPU VM boots. Reopen and finish this once `GPUS_ALL_REGIONS` is raised (request it in
+> IAM & Admin > Quotas; first-time GPU approvals take up to 48h).
 
 Zero GPU jobs have run on GCP. A fresh project has **0 GPU quota** and nothing pre-checks it.
 `--accelerators T4:1` additionally constrains the machine family (T4 needs n1) and the zone set,
