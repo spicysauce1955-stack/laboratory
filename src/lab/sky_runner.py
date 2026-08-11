@@ -376,6 +376,16 @@ _GCP_FAILURE_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
         "the project has no active billing — enable billing on it in the console, then retry",
     ),
     (
+        # The optimizer rejected the spec before touching the cloud — nothing provisioned, nothing
+        # billed. Observed live with `--price-cap 0.001`, where the generic setup checklist sent
+        # the reader looking at credentials and quota for a problem that was in their own flag.
+        ("does not contain any instances satisfying", "no resource satisfying"),
+        "no instance type matches this spec, so nothing was provisioned (you were not billed). "
+        "Most often a --price-cap below every available option, or a cpus/memory/accelerators "
+        "combination this cloud does not offer. `lab doctor --cloud gcp` prints the real price "
+        "band for the shape you are asking for",
+    ),
+    (
         ("could not find any head instance", "failed to set up skypilot runtime"),
         # What capacity exhaustion LOOKS like downstream; say so rather than let it read as a bug.
         "no VM came up. This is usually a *provisioning* failure surfacing as a runtime error — "

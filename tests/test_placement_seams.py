@@ -362,6 +362,20 @@ def test_global_gpu_quota_is_diagnosed_ahead_of_the_generic_quota_hint():
     assert "GPUS_ALL_REGIONS" in hint
 
 
+def test_an_unsatisfiable_spec_is_diagnosed_as_such_not_as_a_setup_problem():
+    """Observed live with `--price-cap 0.001`: nothing provisioned (correct), but the manifest
+    blamed credentials/API/quota. The optimizer had rejected the spec before touching the cloud,
+    and SkyPilot's own log said so — 'Max hourly cost limit may be too restrictive'."""
+    from lab.sky_runner import _gcp_failure_hint
+
+    hint = _gcp_failure_hint(
+        "launch error: Catalog does not contain any instances satisfying the request: 1"
+    )
+    assert "price-cap" in hint
+    assert "not billed" in hint
+    assert "sky check gcp" not in hint  # the generic checklist must not win here
+
+
 def test_capacity_exhaustion_still_diagnoses_as_capacity():
     from lab.sky_runner import _gcp_failure_hint
 
