@@ -18,11 +18,6 @@ uv run lab sweep --backend cpu --cloud gcp -c "..." --grid lr=0.1,0.01 --timeout
 uv run lab register --cloud gcp --gpu T4:1 --timeout 2h --expires +3d -c "..."
 ```
 
-Before any remote launch the cheap half of those checks runs automatically, so a missing
-permission or an exhausted quota costs about a second instead of a provisioning round trip. Only a
-check that positively establishes "this cannot work" blocks; one that merely fails to answer is
-skipped. `--no-preflight` opts out.
-
 `--cloud` selects the SkyPilot cloud (`vast` default | `do` | `gcp`) on `submit`, `sweep`,
 `register`, and `register-sweep` (and as `cloud=` on the MCP tools). `--backend cpu --cloud gcp`
 keeps the cpu profile's defaults (4 vCPU, 50 GB disk, no accelerators) but provisions on GCP —
@@ -95,6 +90,11 @@ auto-resubmit applies to them like any spot job.
   inherit `.env`), the project, billing, both required APIs, every IAM permission SkyPilot needs,
   and quota for the shape you name; then prints what the catalog says it will cost. Exit 1 means
   something would fail. Add `--gpu T4:1` before your first GPU job.
+  **The cheap half of these checks also runs automatically before every remote launch**, so a
+  missing permission or an exhausted quota costs about a second instead of a provisioning round
+  trip. Only a check that positively establishes "this cannot work" blocks; one that merely fails
+  to answer is skipped, because a preflight that refused a job because the *preflight* broke would
+  be worse than none. `--no-preflight` opts out.
 - **GPU quota is enforced at two levels and you need both.** A fresh project has 0 GPU quota.
   Request per-family *regional* quota (e.g. `NVIDIA_T4_GPUS` in your region) **and** the separate
   *global* `GPUS_ALL_REGIONS`. These are independent: a project with `NVIDIA_T4_GPUS = 1` and
