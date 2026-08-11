@@ -1,8 +1,8 @@
 # GCP backend — capability & gap schema
 
-**Status:** `GCP-LEAK-1`…`GCP-LEAK-6`, `VAST-LEAK-1`, `GCP-COST-3` and `GCP-PROV-3` are
-**fixed** (2026-08-11); `GCP-CREDS-1` is fixed in the runbook but **unverified on the live
-host**. Everything else is analysis, not a plan.
+**Status (2026-08-11).** **Fixed:** `GCP-LEAK-1`…`GCP-LEAK-6`, `VAST-LEAK-1`, `GCP-COST-3`,
+`GCP-PROV-3`, `GCP-PREEMPT-3`, `GCP-TEST-2`. **Partly:** `GCP-TEST-1` (harness written, never
+run), `GCP-CREDS-1` (runbook fixed, live host unverified). Everything else is analysis.
 **Scope:** everything `--cloud gcp` touches — provisioning, cost, teardown, leak detection,
 preemption, the scheduler, credentials, and test coverage.
 **Basis:** the code as of `96b02b3` + the first live GCP run (2026-08-11, job
@@ -54,8 +54,8 @@ The fastest way to see the shape of the gaps. Each column is a capability Vast h
 | Real booked price on the manifest | ✅ | ⚠️ | ⚠️ | GCP-COST-1 |
 | Failure diagnosed from the real cause | ✅ | ❌ | ✅ | ~~GCP-PROV-3~~ fixed |
 | Pre-launch budget estimate for the scheduler | ✅ | ✅ | ✅ | ~~GCP-COST-3~~ fixed |
-| Liveness-unknown fails safe (assume alive) | ✅ | ❌ | ❌ | GCP-PREEMPT-3 |
-| Live integration test | ⚠️ | ✅ | ❌ | GCP-TEST-1 |
+| Liveness-unknown fails safe (assume alive) | ✅ | ✅ | ✅ | ~~GCP-PREEMPT-3~~ fixed |
+| Live integration test | ⚠️ | ✅ | ✅ | ~~GCP-TEST-1~~ written |
 
 Two things fell out when this was written. **Vast was the only cloud whose leak story was
 complete**, because it was the only one that got a second, provider-direct opinion on every
@@ -440,7 +440,7 @@ silently land on-demand. `launched_spot` records what happened; nothing surfaces
 **fix:** surface the divergence in `lab status` when `use_spot and launched_spot is False`.
 
 ---
-**`GCP-PREEMPT-3` — unknown liveness reads as "gone" on GCP, and as "alive" on Vast**
+**`GCP-PREEMPT-3` — unknown liveness reads as "gone" on GCP, and as "alive" on Vast** ✅ **FIXED 2026-08-11**
 `area: preempt` · `severity: medium` · `confidence: confirmed` · `precedent: tick.py:67-87, explicitly`
 
 The scheduler watchdog's Vast branch documents its fail-safe: a listing error "must read as
@@ -528,7 +528,7 @@ for GCP, and good. Not covered: GCS signed-URL credentials (`X-Goog-Signature=`,
 ### Test coverage & hygiene
 
 ---
-**`GCP-TEST-1` — no live integration test**
+**`GCP-TEST-1` — no live integration test** ✅ **FIXED 2026-08-11 (written; not yet run)**
 `area: test` · `severity: medium` · `confidence: confirmed` · `precedent: tests/test_cpu_backend_integration.py`
 
 DO has one, with a double lock: `RUN_DO_INTEGRATION=1` **and** real creds present, so it can never
@@ -540,7 +540,7 @@ costs $0.0013.
 `reconcile` is clean.
 
 ---
-**`GCP-TEST-2` — `.python-version` is untracked**
+**`GCP-TEST-2` — `.python-version` is untracked** ✅ **FIXED 2026-08-11**
 `area: test` · `severity: high` · `confidence: observed` · `precedent: FR-B2`
 
 The pin reached the remote only via the dirty-tree diff bundle. On a clean tree it does not exist,

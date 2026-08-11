@@ -71,7 +71,8 @@ class Scheduler:
         rental with a missing/unparseable ``dph_total`` is still billing, and a listing error
         must read as "unknown, assume alive" (the alive branch respawns an adopt supervisor,
         which is harmless; the gone branch marks the job failed). Other clouds (DO/GCP) go
-        through ``sky.status``."""
+        through ``sky.status`` — with the same polarity: a status query that *failed* is not a
+        cluster that *vanished*, so it reads as alive too."""
         if cloud == "vast":
             from lab.backends.skypilot import confirm_no_rental
 
@@ -79,11 +80,12 @@ class Scheduler:
         try:
             import sky
 
-            from lab.sky_runner import _cluster_up
+            from lab.sky_runner import cluster_up_or_raise
 
-            return _cluster_up(sky, cluster)
-        except Exception:  # noqa: BLE001
-            return False
+            return cluster_up_or_raise(sky, cluster)
+        except Exception as e:  # noqa: BLE001 — unknown must read as alive, never as gone
+            print(f"[lab] {cluster}: status query failed, assuming ALIVE: {e}")
+            return True
 
     def _respawn_supervisor(self, job_id: str) -> None:
         """Re-attach a supervisor to a live cluster (sky_runner --adopt). Test seam."""

@@ -188,3 +188,71 @@ def test_cluster_alive_vast_api_error_reads_alive(tmp_path, monkeypatch):
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("api down")),
     )
     assert sched._cluster_alive("lab-x", cloud="vast") is True
+
+
+# --- GCP-PREEMPT-3: the non-Vast branch had the OPPOSITE polarity -----------------------------
+#
+# `except Exception: return False` — unknown read as "gone", two branches below a docstring
+# promising unknown reads as "alive". The gone branch marks the job failed, so a transient
+# sky.status error on a healthy GCP job threw the run away.
+
+
+def _fake_sky(monkeypatch, status_fn):
+    import sys
+    import types
+
+    fake = types.ModuleType("sky")
+    fake.get = lambda x: x  # type: ignore[attr-defined]
+    fake.status = status_fn  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sky", fake)
+    return fake
+
+
+def test_cluster_alive_gcp_api_error_reads_alive(tmp_path, monkeypatch):
+    """A status query that FAILED is not a cluster that is GONE. Same contract the Vast branch
+    documents two branches up: unknown must read as alive, because the gone branch marks the job
+    failed and the alive branch merely respawns a supervisor (harmless if wrong)."""
+    sched = _make_sched(tmp_path)
+
+    def _boom(cluster_names=None):
+        raise RuntimeError("sky api server unreachable")
+
+    _fake_sky(monkeypatch, _boom)
+    assert sched._cluster_alive("lab-x", cloud="gcp") is True
+
+
+def test_cluster_alive_gcp_empty_status_still_reads_gone(tmp_path, monkeypatch):
+    """An authoritative 'no such cluster' must keep reading as gone — the fix must not make the
+    watchdog blind to real disappearances."""
+    sched = _make_sched(tmp_path)
+    _fake_sky(monkeypatch, lambda cluster_names=None: [])
+    assert sched._cluster_alive("lab-x", cloud="gcp") is False
+
+
+def test_cluster_alive_gcp_up_reads_alive(tmp_path, monkeypatch):
+    import types
+
+    sched = _make_sched(tmp_path)
+    _fake_sky(
+        monkeypatch,
+        lambda cluster_names=None: [
+            {"name": "lab-x", "status": types.SimpleNamespace(name="UP")}
+        ],
+    )
+    assert sched._cluster_alive("lab-x", cloud="gcp") is True
+
+
+def test_cluster_up_still_treats_errors_as_gone_for_the_spot_classifier(monkeypatch):
+    """The classifier's own probe keeps its conservative contract — it is safe there because
+    every authoritative outcome wins before preemption is inferred. Only the scheduler watchdog,
+    where 'gone' means 'mark failed', needs the strict version."""
+    from lab.sky_runner import _cluster_up
+
+    class _Boom:
+        def get(self, x):
+            return x
+
+        def status(self, cluster_names=None):
+            raise RuntimeError("api down")
+
+    assert _cluster_up(_Boom(), "lab-x") is False

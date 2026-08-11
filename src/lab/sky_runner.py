@@ -104,21 +104,37 @@ def _wait_terminal(
     return map_job_status(name or "FAILED"), reached
 
 
+def cluster_up_or_raise(sky_mod: Any, cluster: str) -> bool:
+    """Is the SkyPilot cluster UP? **Propagates** API errors instead of reading them as "gone".
+
+    For callers where "gone" is a costly verdict — the scheduler watchdog marks the job failed —
+    a status query that *failed* is not a cluster that *vanished*, and conflating the two throws
+    away a healthy run. Callers that genuinely want the conservative reading use
+    :func:`_cluster_up`.
+    """
+    recs = sky_mod.get(sky_mod.status(cluster_names=[cluster]))  # 0.12: RequestId -> list
+    return _any_up(recs)
+
+
 def _cluster_up(sky_mod: Any, cluster: str) -> bool:
     """Best-effort: is the SkyPilot cluster still UP?
 
     Used by the spot classifier to detect a vanished box (an unmanaged spot preemption tears the
     instance away, so ``sky.status`` no longer reports it UP). Deliberately conservative on
     uncertainty: ANY exception or an empty/non-UP result reads as "gone" (returns False). That is
-    safe because the classifier only *infers* preemption when there was ALSO no terminal cloud
-    status AND the job was spot AND it wasn't a cancel/timeout — every authoritative outcome wins
-    first, so a false "gone" can never mislabel a real success/failure/cancel/timeout.
+    safe **here** because the classifier only *infers* preemption when there was ALSO no terminal
+    cloud status AND the job was spot AND it wasn't a cancel/timeout — every authoritative outcome
+    wins first, so a false "gone" can never mislabel a real success/failure/cancel/timeout. That
+    reasoning does not transfer: see :func:`cluster_up_or_raise`.
     """
     try:
-        recs = sky_mod.get(sky_mod.status(cluster_names=[cluster]))  # 0.12: RequestId -> list
+        return cluster_up_or_raise(sky_mod, cluster)
     except Exception as e:  # noqa: BLE001
         print(f"[lab] cluster status check failed (treating as gone): {e}")
         return False
+
+
+def _any_up(recs: Any) -> bool:
     for rec in recs or []:
         status = _rec_field(rec, "status")
         name = getattr(status, "name", str(status).split(".")[-1])
