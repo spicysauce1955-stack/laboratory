@@ -190,7 +190,7 @@ def test_robust_teardown_do_skips_vast_fallback(monkeypatch):
 
 
 def test_robust_teardown_vast_uses_fallback(monkeypatch):
-    monkeypatch.setattr("lab.backends.skypilot._vast_destroy_matching", lambda c: [123])
+    monkeypatch.setattr("lab.backends.skypilot._vast_destroy_matching", lambda c: ([123], []))
     out = robust_teardown(_SkyDownFails(), "lab-x", backoffs=(), cloud="vast")
     assert out["status"] == "succeeded" and out["vast_destroyed"] == [123]
 

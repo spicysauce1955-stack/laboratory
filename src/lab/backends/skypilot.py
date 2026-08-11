@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 from lab._util import infer_artifact_type, now, parse_duration
 from lab.manifest import sha256_file
 from lab.metrics import METRICS_FILE, read_points
-from lab.models import ArtifactRecord, JobManifest, JobState
+from lab.models import ArtifactRecord, JobManifest, JobState, ResourceRequest
 from lab.store import JobStore
 
 if TYPE_CHECKING:
@@ -498,6 +498,37 @@ def vast_hourly_for_cluster(cluster: str, client: Any | None = None) -> float | 
     return None
 
 
+def _catalog_resources(res: ResourceRequest) -> Any:
+    """A ``sky.Resources`` for a *requested* spec (no launch). Test seam."""
+    import sky
+
+    return sky.Resources(
+        cloud=_cloud_for(res.cloud),
+        cpus=res.cpus,
+        memory=res.memory,
+        accelerators=res.accelerators or None,
+        disk_size=res.disk_size,
+        use_spot=res.use_spot or None,
+    )
+
+
+def catalog_hourly(res: ResourceRequest) -> float | None:
+    """USD/hour for a spec from SkyPilot's catalog — a **local** lookup, no provisioning.
+
+    Vast has a live offer feed, so its registrations price themselves from real offers. Every
+    other cloud has none, which left the scheduler's cost guardrails with no number to check and
+    therefore silently unenforced (a `--max-cost` the user set and the CLI accepted). The catalog
+    is the pre-launch estimate for those clouds. Returns None if the catalog can't price the spec,
+    so a missing price never blocks a launch — the guardrail degrades to its old behaviour rather
+    than becoming a new failure mode.
+    """
+    try:
+        return float(_catalog_resources(res).get_cost(3600))
+    except Exception as e:  # noqa: BLE001 — best-effort estimate; caller falls back to None
+        print(f"[lab] catalog price unavailable for {res.cloud or 'vast'}: {e}")
+        return None
+
+
 def vast_balance(client: Any | None = None) -> float | None:
     """Current Vast.ai account balance/credit (USD), or None if unavailable (best-effort).
 
@@ -522,25 +553,36 @@ def vast_balance(client: Any | None = None) -> float | None:
     return None
 
 
-def _vast_destroy_matching(cluster: str, client: Any | None = None) -> list[int]:
-    """Destroy every Vast rental whose label contains ``cluster``; return their IDs."""
+def _vast_destroy_matching(
+    cluster: str, client: Any | None = None
+) -> tuple[list[int], list[str]]:
+    """Destroy every Vast rental whose label contains ``cluster``.
+
+    Returns ``(destroyed, failures)``. We keep going after a failure — the next rental might still
+    go — but the failures are **returned, not just printed**: a rental we found and could not
+    destroy is a live, billing box, and the caller must not report that as a clean teardown
+    (FR-C2). Vast bills the most per hour of any backend, so optimism is most expensive here.
+    """
     if client is None:
         client = _get_vast_client()
     needle = cluster.lower()
     destroyed: list[int] = []
+    failures: list[str] = []
     for inst in list_vast_instances(client=client):
         if needle not in _instance_label(inst):
             continue
         inst_id = inst.get("id")
         if inst_id is None:
+            failures.append(f"rental with no id (label={_instance_label(inst)!r})")
             continue
         try:
             client.destroy_instance(id=int(inst_id))
             destroyed.append(int(inst_id))
             print(f"[lab] vast-direct destroyed instance {inst_id} (cluster={cluster})")
         except Exception as e:  # noqa: BLE001 — best-effort; the next instance might still go
+            failures.append(f"{inst_id}: {type(e).__name__}: {e}")
             print(f"[lab] vast-direct destroy {inst_id} failed: {e}")
-    return destroyed
+    return destroyed, failures
 
 
 def robust_teardown(
@@ -635,13 +677,19 @@ def robust_teardown(
     # Talk to Vast directly — it's the source of truth.
     print(f"[lab] sky.down exhausted for {cluster}; falling back to vast-sdk direct destroy")
     try:
-        destroyed = _vast_destroy_matching(cluster)
+        destroyed, failures = _vast_destroy_matching(cluster)
         return {
-            "status": "succeeded",  # destroyed-or-none-found are both safe outcomes
+            # Destroyed-or-none-found are both safe. Found-and-failed-to-destroy is not: that is
+            # a live rental we know about and could not kill, so it must alarm (FR-C2).
+            "status": "failed" if failures else "succeeded",
             "attempts": len(delays),
             "vast_fallback_used": True,
-            "vast_destroyed": destroyed,
-            "error": last_err,
+            "vast_destroyed": destroyed,  # report what DID die even when we alarm
+            "error": (
+                f"sky.down: {last_err}; vast-direct: {'; '.join(failures)}"
+                if failures
+                else last_err
+            ),
         }
     except Exception as e:  # noqa: BLE001
         return {

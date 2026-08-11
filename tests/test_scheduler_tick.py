@@ -352,6 +352,91 @@ def test_daily_budget_skips_not_cancels(tmp_path: Path):
     assert q.get_entry(other).state is RegState.pending  # retried next tick
 
 
+# --- GCP-COST-3: the budget guardrails must bind on clouds with no Vast price feed ------------
+#
+# `_estimate_cost` was fed ONLY by the Vast price trigger's cache, and price triggers are rejected
+# for non-Vast clouds by design. So `est` was None for every GCP/DO registration and both cost
+# checks — which are guarded on `est is not None` — silently no-opped for an entire cloud, GPUs
+# included. The user sets --max-cost, the CLI accepts it, and nothing ever enforces it.
+
+
+def _cloud_reg(q, tmp_path, reg_id, *, cloud: str, timeout: str = "1h", **kw):
+    """A registration on a cloud with no price feed (no Vast triggers)."""
+    r = put_reg(q, tmp_path, reg_id, **kw)
+    q.put_entry(
+        r.model_copy(
+            update={"spec": r.spec.model_copy(update={
+                "resources": ResourceRequest(cloud=cloud, timeout=timeout)})}
+        )
+    )
+    return r
+
+
+def test_per_job_cost_cap_binds_on_gcp_without_a_price_trigger(tmp_path: Path, monkeypatch):
+    """A --max-cost the user set must be enforced on GCP, where no Vast offer feed exists."""
+    monkeypatch.setattr(Scheduler, "_catalog_hourly", lambda self, res: 0.50, raising=False)
+    sched, q = make_sched(tmp_path)
+    _cloud_reg(q, tmp_path, "reg-a", cloud="gcp", max_cost=0.25)  # 0.50/h x 1h = 0.50 > 0.25
+    rep = sched.tick()
+    assert rep.launched == []
+    assert "max_cost" in rep.skipped["reg-a"]
+
+
+def test_gcp_registration_within_its_cost_cap_still_launches(tmp_path: Path, monkeypatch):
+    """The guardrail must bind, not block: a job inside its cap goes."""
+    monkeypatch.setattr(Scheduler, "_catalog_hourly", lambda self, res: 0.50, raising=False)
+    sched, q = make_sched(tmp_path)
+    _cloud_reg(q, tmp_path, "reg-a", cloud="gcp", max_cost=5.0)
+    rep = sched.tick()
+    assert rep.launched == ["reg-a"]
+
+
+def test_daily_budget_binds_on_gcp(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(Scheduler, "_catalog_hourly", lambda self, res: 2.0, raising=False)
+    sched, q = make_sched(tmp_path)
+    q.write_control(ControlConfig(budget_usd_per_day=3.0))
+    _cloud_reg(q, tmp_path, "reg-a", cloud="gcp", max_cost=100.0)
+    _cloud_reg(q, tmp_path, "reg-b", cloud="gcp", max_cost=100.0)
+    rep = sched.tick()  # each estimated 2.0 -> only one fits the $3/day budget
+    assert len(rep.launched) == 1
+    other = ({"reg-a", "reg-b"} - set(rep.launched)).pop()
+    assert "budget" in rep.skipped[other]
+
+
+def test_vast_price_trigger_still_wins_over_the_catalog(tmp_path: Path, monkeypatch):
+    """The live Vast offer price is the better number when we have it — the catalog is the
+    fallback for clouds that have no offer feed, not a replacement."""
+    monkeypatch.setattr(Scheduler, "_catalog_hourly", lambda self, res: 99.0, raising=False)
+    sched, q = make_sched(tmp_path, price_feed=FakePrices(0.50))
+    _gpu_reg(q, tmp_path, "reg-a", max_hourly=1.0, max_cost=0.75)
+    rep = sched.tick()  # 0.50 (offer) x 1h < 0.75; the 99.0 catalog number must not bind
+    assert rep.launched == ["reg-a"]
+
+
+def test_catalog_hourly_prices_the_requested_resources(monkeypatch):
+    """The estimate comes from SkyPilot's catalog — a local lookup, no provisioning."""
+    import types
+
+    import lab.backends.skypilot as sky_mod
+
+    monkeypatch.setattr(
+        sky_mod, "_catalog_resources", lambda res: types.SimpleNamespace(get_cost=lambda s: 0.42)
+    )
+    assert sky_mod.catalog_hourly(ResourceRequest(cloud="gcp", cpus=4)) == 0.42
+
+
+def test_catalog_hourly_returns_none_when_the_catalog_cannot_price_it(monkeypatch):
+    """No catalog entry / no cloud extra installed -> None, and the caller falls back to the
+    existing behaviour rather than blocking a launch on a missing price."""
+    import lab.backends.skypilot as sky_mod
+
+    def _boom(res):
+        raise RuntimeError("no such instance type")
+
+    monkeypatch.setattr(sky_mod, "_catalog_resources", _boom)
+    assert sky_mod.catalog_hourly(ResourceRequest(cloud="gcp", cpus=4)) is None
+
+
 def test_max_concurrent(tmp_path: Path):
     sched, q = make_sched(tmp_path)
     q.write_control(ControlConfig(max_concurrent=1))

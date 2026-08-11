@@ -207,6 +207,75 @@ def test_robust_teardown_falls_back_to_vast_when_sky_exhausted(
     assert vast.destroyed == [7]  # only the matching instance was destroyed
 
 
+class _FakeVastFailingDestroy:
+    """Lists rentals fine, but destroying them fails — the rental stays alive and billing."""
+
+    def __init__(self, instances: list[dict], fail_ids: set[int]) -> None:
+        self.instances = instances
+        self.fail_ids = fail_ids
+        self.destroyed: list[int] = []
+
+    def show_instances(self) -> list[dict]:
+        return list(self.instances)
+
+    def destroy_instance(self, id: int) -> dict:  # noqa: A002 — mirrors the vastai-sdk arg name
+        if int(id) in self.fail_ids:
+            raise RuntimeError(f"vast destroy {id} rejected: 400 Bad Request")
+        self.destroyed.append(int(id))
+        return {"id": id, "destroyed": True}
+
+
+def test_robust_teardown_vast_reports_failed_when_a_destroy_fails(
+    _no_sleep, monkeypatch: pytest.MonkeyPatch
+):
+    """VAST-LEAK-1: a rental we found and could not destroy is a live, billing box. Reporting it
+    as a succeeded teardown writes teardown_status='succeeded' and exits `lab wait` 0 — the same
+    false-clean fixed for GCP in the leak-honesty pass. Vast bills the most per hour, so this is
+    the worst cloud to be optimistic on."""
+    sky = _FakeSky(fail_times=99)
+    vast = _FakeVastFailingDestroy(
+        instances=[{"id": 7, "label": "sky-lab-abc-xyz"}], fail_ids={7}
+    )
+    monkeypatch.setattr(skypilot_mod, "_get_vast_client", lambda: vast)
+    out = robust_teardown(sky, "lab-abc")
+    assert out["status"] == "failed"
+    assert "400 Bad Request" in (out["error"] or "")
+
+
+def test_robust_teardown_vast_partial_destroy_is_failed(
+    _no_sleep, monkeypatch: pytest.MonkeyPatch
+):
+    """One of two rentals destroyed is still a leak — and the survivor must be named."""
+    sky = _FakeSky(fail_times=99)
+    vast = _FakeVastFailingDestroy(
+        instances=[
+            {"id": 7, "label": "sky-lab-abc-head"},
+            {"id": 9, "label": "sky-lab-abc-worker"},
+        ],
+        fail_ids={9},
+    )
+    monkeypatch.setattr(skypilot_mod, "_get_vast_client", lambda: vast)
+    out = robust_teardown(sky, "lab-abc")
+    assert out["status"] == "failed"
+    assert out["vast_destroyed"] == [7]  # report what DID die, still alarm
+    assert "9" in (out["error"] or "")
+
+
+def test_robust_teardown_vast_matching_rental_without_an_id_is_failed(
+    _no_sleep, monkeypatch: pytest.MonkeyPatch
+):
+    """A rental labelled for our cluster but carrying no id can't be destroyed — that is a box we
+    know is billing and cannot kill, so it alarms rather than being skipped silently."""
+    sky = _FakeSky(fail_times=99)
+    vast = _FakeVastFailingDestroy(
+        instances=[{"label": "sky-lab-abc-xyz"}], fail_ids=set()  # no "id" key
+    )
+    monkeypatch.setattr(skypilot_mod, "_get_vast_client", lambda: vast)
+    out = robust_teardown(sky, "lab-abc")
+    assert out["status"] == "failed"
+    assert out["vast_destroyed"] == []
+
+
 def test_robust_teardown_failed_when_both_sky_and_vast_error(
     _no_sleep, monkeypatch: pytest.MonkeyPatch
 ):

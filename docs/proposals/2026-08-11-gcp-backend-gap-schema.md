@@ -1,7 +1,7 @@
 # GCP backend — capability & gap schema
 
-**Status:** `GCP-LEAK-1` … `GCP-LEAK-6` are **fixed** (the leak-honesty pass, 2026-08-11).
-Everything else is analysis, not a plan.
+**Status:** `GCP-LEAK-1`…`GCP-LEAK-6`, `VAST-LEAK-1` and `GCP-COST-3` are **fixed**
+(2026-08-11). Everything else is analysis, not a plan.
 **Scope:** everything `--cloud gcp` touches — provisioning, cost, teardown, leak detection,
 preemption, the scheduler, credentials, and test coverage.
 **Basis:** the code as of `96b02b3` + the first live GCP run (2026-08-11, job
@@ -43,7 +43,7 @@ The fastest way to see the shape of the gaps. Each column is a capability Vast h
 |---|:--:|:--:|:--:|---|
 | Provider-direct instance listing | ✅ | ❌ | ✅ | — |
 | Provider-direct destroy fallback in `robust_teardown` | ✅ | ❌ | ✅ | — |
-| Fallback reports partial failure honestly | ⚠️ | n/a | ✅ | ~~GCP-LEAK-4~~ fixed |
+| Fallback reports partial failure honestly | ✅ | n/a | ✅ | ~~GCP-LEAK-4~~, ~~VAST-LEAK-1~~ fixed |
 | Destroy is confirmed, not fire-and-forget | ✅ | n/a | ✅ | ~~GCP-LEAK-6~~ fixed |
 | Post-teardown "is it really gone" confirm | ✅ | ❌ | ✅ | ~~GCP-LEAK-5~~ fixed |
 | Detached-storage leak pass | n/a | ✅ | ✅ | — |
@@ -52,7 +52,7 @@ The fastest way to see the shape of the gaps. Each column is a capability Vast h
 | Orphans wired into `reconcile`'s exit code | ✅ | ✅ | ✅ | ~~GCP-LEAK-1~~ fixed |
 | Real booked price on the manifest | ✅ | ⚠️ | ⚠️ | GCP-COST-1 |
 | Pre-launch account diagnosis (`vast_balance`) | ✅ | ❌ | ❌ | GCP-PROV-3 |
-| Pre-launch budget estimate for the scheduler | ✅ | ❌ | ❌ | GCP-COST-3 |
+| Pre-launch budget estimate for the scheduler | ✅ | ✅ | ✅ | ~~GCP-COST-3~~ fixed |
 | Liveness-unknown fails safe (assume alive) | ✅ | ❌ | ❌ | GCP-PREEMPT-3 |
 | Live integration test | ⚠️ | ✅ | ❌ | GCP-TEST-1 |
 
@@ -64,14 +64,16 @@ GCP-COST-3 were DO bugs that were never GCP bugs specifically; GCP just doubled 
 
 After the leak-honesty pass the leak half of the matrix is closed, and one cell inverted:
 
-> **`VAST-LEAK-1` — `_vast_destroy_matching` still reports success when every destroy failed**
-> `area: leak` · `severity: medium` · `confidence: confirmed` · `precedent: GCP-LEAK-4, now fixed`
+> **`VAST-LEAK-1` — `_vast_destroy_matching` reported success when every destroy failed**
+> ✅ **FIXED 2026-08-11**
+> `area: leak` · `severity: medium` · `confidence: confirmed` · `precedent: GCP-LEAK-4`
 >
-> The Vast fallback keeps the shape GCP-LEAK-4 just lost: per-rental `destroy_instance` failures
-> are caught, printed, and dropped, and `robust_teardown` returns `succeeded` regardless. Vast is
-> partly covered downstream by `confirm_no_rental` (which GCP now also has), so this is `medium`
-> rather than `high` — but GCP is now strictly more honest than Vast here, which is backwards for
-> the cloud that bills the most per hour. Same fix, same tests, ~20 minutes.
+> The Vast fallback kept the shape GCP-LEAK-4 had just lost: per-rental `destroy_instance`
+> failures were caught, printed, and dropped, and `robust_teardown` returned `succeeded`
+> regardless. Vast is partly covered downstream by `confirm_no_rental`, so this was `medium`
+> rather than `high` — but it left GCP strictly more honest than Vast, which is backwards for the
+> cloud that bills the most per hour. Now returns `(destroyed, failures)` like its GCP twin. A
+> matching rental carrying **no id** also alarms now: we can see it and cannot kill it.
 
 ---
 
@@ -299,7 +301,7 @@ leaked cpu-profile disk, for no reason anyone chose.
 **fix:** default `disk_size` for the gcp GPU path the way the cpu profile does.
 
 ---
-**`GCP-COST-3` — the scheduler's daily budget and per-job cost cap silently no-op on GCP**
+**`GCP-COST-3` — the scheduler's daily budget and per-job cost cap silently no-op on GCP** ✅ **FIXED 2026-08-11**
 `area: cost` · `severity: high` · `confidence: confirmed`
 · `precedent: memory "cost-safety design philosophy" — admission control is the guardrail`
 
@@ -582,10 +584,13 @@ money alarm did not fire for the cloud we had just shipped. Neither was deep; bo
 from wiring, and they mirrored DO omissions that were never noticed because DO has no
 provider-direct pass to omit. Fixing LEAK-1 closed the DO volume hole for free.
 
-**The most expensive one is invisible.** GCP-COST-3 — a `--max-cost` and a daily budget that
-silently don't apply to an entire cloud, GPUs included — is the failure shape that produced this
-repo's two worst incidents (§4, §6). It reads as working. Nothing in `lab status`, the report, or
-the CLI help says the guardrail was skipped.
+**The most expensive one was invisible** — now fixed. GCP-COST-3, a `--max-cost` and a daily
+budget that silently didn't apply to an entire cloud, GPUs included, is the failure shape that
+produced this repo's two worst incidents (§4, §6). It read as working: nothing in `lab status`,
+the report, or the CLI help said the guardrail had been skipped. The estimate now falls back to
+SkyPilot's catalog when there is no Vast offer feed — a local lookup, no provisioning — and
+returns None only for specs with nothing to price (a plain local registration), preserving the
+old behaviour exactly where it was already correct.
 
 **The pattern across all of them:** Vast got a *second, provider-direct opinion* on every
 money-critical question — is it really gone, what is it really costing, why did it really fail.

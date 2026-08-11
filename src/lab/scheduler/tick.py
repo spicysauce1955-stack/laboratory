@@ -15,7 +15,7 @@ from pathlib import Path
 
 from lab._util import now, parse_duration
 from lab.core import Lab, build_backend
-from lab.models import JobManifest, JobState
+from lab.models import JobManifest, JobState, ResourceRequest
 from lab.scheduler.bundle import extract_bundle
 from lab.scheduler.models import ControlConfig, Registration, RegState, TickReport
 from lab.scheduler.price import PriceFeed
@@ -176,13 +176,31 @@ class Scheduler:
                 total += cost.estimated_usd
         return total
 
-    def _estimate_cost(self, reg: Registration) -> float | None:
-        """Worst-case launch cost: best offer $/h x wall-clock timeout (FR-I2 arithmetic).
+    def _catalog_hourly(self, resources: ResourceRequest) -> float | None:
+        """SkyPilot's catalog price for a spec, for clouds with no live offer feed. Test seam."""
+        try:
+            from lab.backends import skypilot
+        except ImportError:  # skypilot extra not installed on this host
+            return None
+        return skypilot.catalog_hourly(resources)
 
-        None when no price trigger ran (CPU/local jobs) — such launches bypass the budget
-        PRE-check and are only counted after launch via the manifest's estimated_usd.
+    def _estimate_cost(self, reg: Registration) -> float | None:
+        """Worst-case launch cost: $/h x wall-clock timeout (FR-I2 arithmetic).
+
+        The price comes from the Vast offer feed when a price trigger ran (a real, bookable
+        offer — the best number available), and otherwise from SkyPilot's catalog. Without that
+        fallback every non-Vast registration priced at None, and both cost guardrails — which are
+        guarded on a non-None estimate — silently did nothing for an entire cloud, GPUs included.
+
+        Still None for a spec with no cloud and no accelerators (a plain local/CPU registration):
+        there is nothing to price, and such launches are counted after the fact via the manifest's
+        estimated_usd, as before.
         """
         hourly = self._best_hourly_seen.get(reg.reg_id)
+        if hourly is None and (
+            reg.spec.resources.cloud is not None or reg.spec.resources.accelerators
+        ):
+            hourly = self._catalog_hourly(reg.spec.resources)
         secs = parse_duration(reg.spec.resources.timeout)
         if hourly is None or secs is None:
             return None
