@@ -149,7 +149,14 @@ syncs without the `cli` group).
 `lab register --cloud gcp` works like any registration — the cloud rides in the registered spec
 and the scheduler launches on GCP. **Exception:** `--max-hourly` / `--offer-query` price triggers
 query the **Vast offer feed only** and are rejected (fail-loud) for non-Vast clouds; use
-time-window/dependency triggers instead.
+time-window/dependency triggers instead. Cost guardrails still apply: `--max-cost` and the daily
+budget price non-Vast clouds from SkyPilot's catalog.
+
+> **The scheduler host needs its own GCP credentials.** It is a different machine, and nothing is
+> copied to it — a host provisioned before you started using GCP has neither the `gcp` extra nor
+> any ADC, so a deferred GCP job queues fine, passes its triggers, and fails at launch overnight.
+> Set it up (and run `sky check gcp` there) before relying on it: `deploy/scheduler/README.md`,
+> section *Google Cloud credentials*.
 
 ## Cost-safety
 

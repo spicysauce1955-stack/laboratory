@@ -811,6 +811,64 @@ def test_preempted_teardown_confirmed_vast_delegates(monkeypatch):
     assert preempted_teardown_confirmed("vast", "lab-x") is False
 
 
+# --- GCP-PROV-3: diagnose the actual failure, don't hand back a leaflet ------------------------
+#
+# Vast got a *dynamic* diagnosis out of LAB-BUGS §8 (consult the balance, say "top up"). GCP got a
+# fixed string listing three possible causes, returned regardless of what happened. Every real
+# cause is unambiguously identifiable from the error text we already hold — and the one we hit
+# live (capacity) surfaced as "Failed to set up SkyPilot runtime", which reads like a lab bug.
+
+
+@pytest.mark.parametrize(
+    ("launch_error", "remedy"),
+    [
+        # Assert on the REMEDY, never on a word that also appears in the error text — otherwise
+        # echoing the error back verbatim would pass the test without diagnosing anything.
+        (
+            "ZONE_RESOURCE_POOL_EXHAUSTED: The zone 'us-central1-a' does not have enough "
+            "resources available to fulfill the request",
+            "--spot",
+        ),
+        (
+            "Quota 'N4_CPUS' exceeded. Limit: 24.0 in region us-central1",
+            "quota increase",
+        ),
+        (
+            "Compute Engine API has not been used in project 12345 before or it is disabled",
+            "gcloud services enable",
+        ),
+        (
+            "The billing account for the owning project is disabled in state absent",
+            "enable billing",
+        ),
+    ],
+)
+def test_provision_failure_reason_gcp_names_the_actual_cause(launch_error, remedy):
+    import lab.sky_runner as sky_runner
+
+    msg = sky_runner.provision_failure_reason(f"launch error: {launch_error}", "gcp")
+    assert remedy in msg.lower()
+
+
+def test_provision_failure_reason_gcp_capacity_suggests_the_workaround():
+    """The lab exposes no region/zone override (GCP-PROV-1), so the only lever a user has when a
+    zone is exhausted is re-pricing the optimizer's search with --spot. Say so."""
+    import lab.sky_runner as sky_runner
+
+    msg = sky_runner.provision_failure_reason(
+        "launch error: ZONE_RESOURCE_POOL_EXHAUSTED", "gcp"
+    )
+    assert "--spot" in msg
+
+
+def test_provision_failure_reason_gcp_keeps_the_original_error():
+    """The diagnosis annotates; it never swallows the message it diagnosed."""
+    import lab.sky_runner as sky_runner
+
+    msg = sky_runner.provision_failure_reason("launch error: QUOTA_EXCEEDED for L4", "gcp")
+    assert "QUOTA_EXCEEDED for L4" in msg
+
+
 def test_provision_failure_reason_gcp_mentions_sky_check_not_vast(monkeypatch):
     import lab.sky_runner as sky_runner
 

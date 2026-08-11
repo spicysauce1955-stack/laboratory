@@ -235,6 +235,60 @@ def _launch_with_retry(
     ) from last
 
 
+# GCP failure signatures -> what to actually do about it. Ordered: the first match wins, so put
+# the specific causes ahead of the catch-all. Every marker here is text GCP itself emits and that
+# SkyPilot passes through, so matching it is diagnosing the real cause rather than guessing.
+_GCP_FAILURE_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        ("zone_resource_pool_exhausted", "does not have enough resources"),
+        # The lab has no region/zone override, so re-pricing the search is the only lever.
+        "the zone ran out of capacity for this machine type, not a setup problem. The lab can't "
+        "pin a region, so retry with --spot (it re-prices the optimizer's search and often "
+        "reaches a zone with capacity), or resubmit later",
+    ),
+    (
+        ("quota_exceeded", "quota '", "quota exceeded", "exceeded quota"),
+        "a GCP quota is exhausted — request a quota increase for that metric/region in the "
+        "console (a fresh project has 0 GPU quota, and GPUs are per-family: NVIDIA_T4_GPUS, "
+        "NVIDIA_L4_GPUS)",
+    ),
+    (
+        ("has not been used in project", "service_disabled", "api is disabled"),
+        "a required API is off for this project — `gcloud services enable compute.googleapis.com "
+        "cloudresourcemanager.googleapis.com` (needs roles/serviceusage.serviceUsageAdmin)",
+    ),
+    (
+        ("billing account", "billing_disabled", "billing is not enabled"),
+        "the project has no active billing — enable billing on it in the console, then retry",
+    ),
+    (
+        ("could not find any head instance", "failed to set up skypilot runtime"),
+        # What capacity exhaustion LOOKS like downstream; say so rather than let it read as a bug.
+        "no VM came up. This is usually a *provisioning* failure surfacing as a runtime error — "
+        "grep the launch log for ZONE_RESOURCE_POOL_EXHAUSTED or a quota message before "
+        "suspecting the lab",
+    ),
+)
+
+
+def _gcp_failure_hint(text: str) -> str:
+    """Diagnose a GCP provision failure from its error text (pure).
+
+    Vast gets a live diagnosis from its balance API (LAB-BUGS §8); GCP's causes are all named in
+    the error GCP already returned, so reading it beats handing back a list of things that might
+    be wrong. Falls back to the setup checklist when nothing matches.
+    """
+    low = text.lower()
+    for markers, hint in _GCP_FAILURE_HINTS:
+        if any(m in low for m in markers):
+            return hint
+    return (
+        "if this is a GCP setup issue, check `sky check gcp` passes "
+        "(`gcloud auth application-default login`), the Compute Engine API is enabled, and "
+        "your regional quota covers the accelerator family (per-family quota for L4/T4)"
+    )
+
+
 def provision_failure_reason(generic: str, cloud: str) -> str:
     """Enrich a generic provision-failure message per cloud (§8).
 
@@ -247,11 +301,7 @@ def provision_failure_reason(generic: str, cloud: str) -> str:
             "(doctl token at ~/.config/doctl/config.yaml) and your DO vCPU quota covers the size"
         )
     if cloud == "gcp":
-        return (
-            f"{generic} — if this is a GCP setup issue, check `sky check gcp` passes "
-            "(`gcloud auth application-default login`), the Compute Engine API is enabled, and "
-            "your regional quota covers the accelerator family (per-family quota for L4/T4)"
-        )
+        return f"{generic} — {_gcp_failure_hint(generic)}"
     if cloud == "vast":
         bal = vast_balance()
         if bal is not None and bal <= 0:

@@ -1,7 +1,8 @@
 # GCP backend — capability & gap schema
 
-**Status:** `GCP-LEAK-1`…`GCP-LEAK-6`, `VAST-LEAK-1` and `GCP-COST-3` are **fixed**
-(2026-08-11). Everything else is analysis, not a plan.
+**Status:** `GCP-LEAK-1`…`GCP-LEAK-6`, `VAST-LEAK-1`, `GCP-COST-3` and `GCP-PROV-3` are
+**fixed** (2026-08-11); `GCP-CREDS-1` is fixed in the runbook but **unverified on the live
+host**. Everything else is analysis, not a plan.
 **Scope:** everything `--cloud gcp` touches — provisioning, cost, teardown, leak detection,
 preemption, the scheduler, credentials, and test coverage.
 **Basis:** the code as of `96b02b3` + the first live GCP run (2026-08-11, job
@@ -51,7 +52,7 @@ The fastest way to see the shape of the gaps. Each column is a capability Vast h
 | Listing failure is loud, not silently "clean" | ✅ | ❌ | ✅ | ~~GCP-LEAK-2~~ fixed |
 | Orphans wired into `reconcile`'s exit code | ✅ | ✅ | ✅ | ~~GCP-LEAK-1~~ fixed |
 | Real booked price on the manifest | ✅ | ⚠️ | ⚠️ | GCP-COST-1 |
-| Pre-launch account diagnosis (`vast_balance`) | ✅ | ❌ | ❌ | GCP-PROV-3 |
+| Failure diagnosed from the real cause | ✅ | ❌ | ✅ | ~~GCP-PROV-3~~ fixed |
 | Pre-launch budget estimate for the scheduler | ✅ | ✅ | ✅ | ~~GCP-COST-3~~ fixed |
 | Liveness-unknown fails safe (assume alive) | ✅ | ❌ | ❌ | GCP-PREEMPT-3 |
 | Live integration test | ⚠️ | ✅ | ❌ | GCP-TEST-1 |
@@ -361,7 +362,7 @@ isn't set yet.
 **fix:** per-cloud defaults.
 
 ---
-**`GCP-PROV-3` — `provision_failure_reason` for GCP is a static leaflet, not a diagnosis**
+**`GCP-PROV-3` — `provision_failure_reason` for GCP is a static leaflet, not a diagnosis** ✅ **FIXED 2026-08-11**
 `area: provision` · `severity: medium-high` · `confidence: observed` · `precedent: LAB-BUGS §8`
 
 Vast got a *dynamic* diagnosis out of §8: on failure, query the balance and say
@@ -459,7 +460,7 @@ documented contract two branches up.
 ### Credentials (FR-J1)
 
 ---
-**`GCP-CREDS-1` — the scheduler droplet has no GCP credential path**
+**`GCP-CREDS-1` — the scheduler droplet has no GCP credential path** ⚠️ **RUNBOOK FIXED 2026-08-11; live host still unverified**
 `area: creds` · `severity: high` · `confidence: suspected` · `precedent: deploy/scheduler/, predates GCP`
 
 The guide states "`lab register --cloud gcp` works like any registration — the cloud rides in the
