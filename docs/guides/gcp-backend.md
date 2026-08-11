@@ -64,8 +64,11 @@ lets that default apply: every GCP job carries an explicit size (**50 GB** cpu p
 ```
 
 `--price-cap` is a **ceiling enforced by SkyPilot's optimizer**, not an estimate: it will not
-select an option above it. Note it is not `--max-hourly` on `lab register`, which is a Vast-only
-*wait-until* price trigger — a scheduling condition, not a limit.
+select an option above it. Set it below everything available and the job fails in about a minute
+with *"no instance type matches this spec, so nothing was provisioned (you were not billed)"* —
+the optimizer rejects the spec before touching the cloud, so an over-tight cap costs time, never
+money. Note it is not `--max-hourly` on `lab register`, which is a Vast-only *wait-until* price
+trigger — a scheduling condition, not a limit.
 
 With no pins the optimizer searches every region cheapest-first, as before. The one thing the lab
 adds is a **capacity memo**: when a launch fails with `ZONE_RESOURCE_POOL_EXHAUSTED`, the zones
