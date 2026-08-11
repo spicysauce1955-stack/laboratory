@@ -1,6 +1,7 @@
 # GCP backend — capability & gap schema
 
-**Status:** analysis, not a plan. Nothing here is implemented.
+**Status:** `GCP-LEAK-1` … `GCP-LEAK-6` are **fixed** (the leak-honesty pass, 2026-08-11).
+Everything else is analysis, not a plan.
 **Scope:** everything `--cloud gcp` touches — provisioning, cost, teardown, leak detection,
 preemption, the scheduler, credentials, and test coverage.
 **Basis:** the code as of `96b02b3` + the first live GCP run (2026-08-11, job
@@ -42,24 +43,35 @@ The fastest way to see the shape of the gaps. Each column is a capability Vast h
 |---|:--:|:--:|:--:|---|
 | Provider-direct instance listing | ✅ | ❌ | ✅ | — |
 | Provider-direct destroy fallback in `robust_teardown` | ✅ | ❌ | ✅ | — |
-| Fallback reports partial failure honestly | ⚠️ | n/a | ⚠️ | GCP-LEAK-4 |
-| Destroy is confirmed, not fire-and-forget | ✅ | n/a | ❌ | GCP-LEAK-6 |
-| Post-teardown "is it really gone" confirm | ✅ | ❌ | ❌ | GCP-LEAK-5 |
+| Fallback reports partial failure honestly | ⚠️ | n/a | ✅ | ~~GCP-LEAK-4~~ fixed |
+| Destroy is confirmed, not fire-and-forget | ✅ | n/a | ✅ | ~~GCP-LEAK-6~~ fixed |
+| Post-teardown "is it really gone" confirm | ✅ | ❌ | ✅ | ~~GCP-LEAK-5~~ fixed |
 | Detached-storage leak pass | n/a | ✅ | ✅ | — |
-| Storage pass survives an instance-API failure | n/a | ✅ | ❌ | GCP-LEAK-3 |
-| Listing failure is loud, not silently "clean" | ✅ | ❌ | ❌ | GCP-LEAK-2 |
-| Orphans wired into `reconcile`'s exit code | ✅ | ❌ | ❌ | GCP-LEAK-1 |
+| Storage pass survives an instance-API failure | n/a | ✅ | ✅ | ~~GCP-LEAK-3~~ fixed |
+| Listing failure is loud, not silently "clean" | ✅ | ❌ | ✅ | ~~GCP-LEAK-2~~ fixed |
+| Orphans wired into `reconcile`'s exit code | ✅ | ✅ | ✅ | ~~GCP-LEAK-1~~ fixed |
 | Real booked price on the manifest | ✅ | ⚠️ | ⚠️ | GCP-COST-1 |
 | Pre-launch account diagnosis (`vast_balance`) | ✅ | ❌ | ❌ | GCP-PROV-3 |
 | Pre-launch budget estimate for the scheduler | ✅ | ❌ | ❌ | GCP-COST-3 |
 | Liveness-unknown fails safe (assume alive) | ✅ | ❌ | ❌ | GCP-PREEMPT-3 |
 | Live integration test | ⚠️ | ✅ | ❌ | GCP-TEST-1 |
 
-Two things fall out. **Vast is the only cloud whose leak story is complete**, because it is the
-only one that got a second, provider-direct opinion on every question. GCP has all the machinery
-for that second opinion (`list_gcp_instances`) and uses it in exactly one place. And **the DO
-column's ❌s were inherited wholesale by GCP** — GCP-LEAK-1, -2 and GCP-COST-3 are DO bugs that
-were never GCP bugs specifically; GCP just doubled the blast radius.
+Two things fell out when this was written. **Vast was the only cloud whose leak story was
+complete**, because it was the only one that got a second, provider-direct opinion on every
+question — GCP had all the machinery for that second opinion (`list_gcp_instances`) and used it in
+exactly one place. And **the DO column's ❌s were inherited wholesale by GCP**: GCP-LEAK-1, -2 and
+GCP-COST-3 were DO bugs that were never GCP bugs specifically; GCP just doubled the blast radius.
+
+After the leak-honesty pass the leak half of the matrix is closed, and one cell inverted:
+
+> **`VAST-LEAK-1` — `_vast_destroy_matching` still reports success when every destroy failed**
+> `area: leak` · `severity: medium` · `confidence: confirmed` · `precedent: GCP-LEAK-4, now fixed`
+>
+> The Vast fallback keeps the shape GCP-LEAK-4 just lost: per-rental `destroy_instance` failures
+> are caught, printed, and dropped, and `robust_teardown` returns `succeeded` regardless. Vast is
+> partly covered downstream by `confirm_no_rental` (which GCP now also has), so this is `medium`
+> rather than `high` — but GCP is now strictly more honest than Vast here, which is backwards for
+> the cloud that bills the most per hour. Same fix, same tests, ~20 minutes.
 
 ---
 
@@ -68,7 +80,7 @@ were never GCP bugs specifically; GCP just doubled the blast radius.
 ### Leak detection (FR-C2)
 
 ---
-**`GCP-LEAK-1` — `lab reconcile` exits 0 on a GCP-only leak**
+**`GCP-LEAK-1` — `lab reconcile` exits 0 on a GCP-only leak** ✅ **FIXED 2026-08-11**
 `area: leak` · `severity: critical` · `confidence: confirmed`
 · `precedent: LAB-BUGS §4; tests/test_gcp_backend.py:335`
 
@@ -88,7 +100,7 @@ The skill and the guide both tell users exit 3 means action required.
 **fix:** exit 3 if any orphan list is non-empty. One line, and it retires the whole class.
 
 ---
-**`GCP-LEAK-2` — any GCP API failure reads as "GCP not configured → clean"**
+**`GCP-LEAK-2` — any GCP API failure reads as "GCP not configured → clean"** ✅ **FIXED 2026-08-11**
 `area: leak` · `severity: critical` · `confidence: confirmed` · `precedent: core.py:1011-1015`
 
 `except Exception: gcp_instances = None`, commented "GCP not configured/unavailable: skip the
@@ -110,7 +122,7 @@ any other error raises `LabError`.
 not-configured signals (`google.auth.exceptions.DefaultCredentialsError`, `ImportError`).
 
 ---
-**`GCP-LEAK-3` — the disk pass is nested inside the instance pass**
+**`GCP-LEAK-3` — the disk pass is nested inside the instance pass** ✅ **FIXED 2026-08-11**
 `area: leak` · `severity: high` · `confidence: confirmed` · `precedent: the DO volume pass, which is independent`
 
 Disk listing runs only `if gcp_instances is not None`, and its own failure yields `gcp_disks = []`
@@ -126,7 +138,7 @@ also exactly what a preempted spot VM can leave behind.
 **fix:** hoist the disk pass to its own try, keyed off its own configured-ness.
 
 ---
-**`GCP-LEAK-4` — `_gcp_destroy_matching` reports success when every delete failed**
+**`GCP-LEAK-4` — `_gcp_destroy_matching` reports success when every delete failed** ✅ **FIXED 2026-08-11**
 `area: leak` · `severity: high` · `confidence: confirmed`
 · `precedent: _vast_destroy_matching shares the shape — see note`
 
@@ -148,7 +160,7 @@ false-clean that FR-C2 exists to prevent.
 **fix:** count failures; any failure → `failed`.
 
 ---
-**`GCP-LEAK-5` — `preempted_teardown_confirmed` never checks GCP, though it can**
+**`GCP-LEAK-5` — `preempted_teardown_confirmed` never checks GCP, though it can** ✅ **FIXED 2026-08-11**
 `area: leak` · `severity: high` · `confidence: confirmed`
 · `precedent: tests/test_teardown_confirm.py (the Vast trio)`
 
@@ -171,7 +183,7 @@ unconditional `True`, so the gap is pinned in place by a passing test.
 contract. Rewrite the pinning test.
 
 ---
-**`GCP-LEAK-6` — deletes are fire-and-forget; the Operation is never polled**
+**`GCP-LEAK-6` — deletes are fire-and-forget; the Operation is never polled** ✅ **FIXED 2026-08-11**
 `area: leak` · `severity: high` · `confidence: confirmed` · `precedent: none — GCP-specific`
 
 `compute.instances().delete(...).execute()` returns a GCE **Operation**, not a completed delete.
@@ -564,11 +576,11 @@ Users budget from this number.
 
 ## 4. Reading of the whole
 
-**The critical two are both one-line fixes.** GCP-LEAK-1 (exit code reads two of six orphan
-lists) and GCP-LEAK-2 (every API error reads as "not configured") together mean the FR-C2 money
-alarm does not fire for the cloud we just shipped. Neither is deep; both are omissions from
-wiring, and they mirror DO omissions that were never noticed because DO has no provider-direct
-pass to omit.
+**The critical two were both one-line fixes** — now made. GCP-LEAK-1 (exit code read two of six
+orphan lists) and GCP-LEAK-2 (every API error read as "not configured") together meant the FR-C2
+money alarm did not fire for the cloud we had just shipped. Neither was deep; both were omissions
+from wiring, and they mirrored DO omissions that were never noticed because DO has no
+provider-direct pass to omit. Fixing LEAK-1 closed the DO volume hole for free.
 
 **The most expensive one is invisible.** GCP-COST-3 — a `--max-cost` and a daily budget that
 silently don't apply to an entire cloud, GPUs included — is the failure shape that produced this
@@ -582,8 +594,25 @@ DO could not have one. GCP can, and has the client for it, and uses it in exactl
 existing capability to the three other places that already have a Vast-shaped hole:
 `preempted_teardown_confirmed`, `_resolve_hourly`, and `provision_failure_reason`.
 
-**Sequencing, if this becomes a plan:** GCP-TEST-2 (`git add`) and GCP-LEAK-1 first — minutes,
-and they stop active bleeding of trust in the exit code. Then GCP-LEAK-2/-3/-4/-6 as one
-leak-honesty pass. Then GCP-COST-3. GCP-PROV-1 and GCP-PROV-4 are feature work and belong in their
-own cycle; GCP-CREDS-1 is a deployment errand that should be checked before anyone relies on
-deferred GCP jobs.
+**Sequencing.** ~~GCP-TEST-2 (`git add`) and GCP-LEAK-1 first — minutes, and they stop active
+bleeding of trust in the exit code. Then GCP-LEAK-2/-3/-4/-6 as one leak-honesty pass.~~ **Done
+2026-08-11** (GCP-LEAK-5 came along with it — the confirm function was the natural home for the
+listing the other fixes already needed). Next: **GCP-COST-3**, the budget that silently doesn't
+apply. GCP-PROV-1 and GCP-PROV-4 are feature work and belong in their own cycle; GCP-CREDS-1 is a
+deployment errand that should be checked before anyone relies on deferred GCP jobs.
+
+**What the leak-honesty pass changed**, for a reader diffing against the records above:
+
+| Change | Gap |
+|---|---|
+| `reconcile`'s exit 3 reads the union of all five orphan lists (`_ORPHAN_FIELDS`) | LEAK-1 |
+| `GcpNotConfigured` separates "GCP isn't set up here" from "the API failed"; the latter raises `LabError` | LEAK-2 |
+| `gcp_pass` / `gcp_disk_pass` breadcrumbs in the report, mirroring `vast_pass` | LEAK-2 |
+| instance and disk passes are independent, each with its own configured-ness | LEAK-3 |
+| `_gcp_destroy_matching` returns `(destroyed, failures)`; any failure → `teardown_status="failed"` | LEAK-4 |
+| `_await_zone_operation` waits for deletes to actually complete and raises on operation errors | LEAK-6 |
+| `confirm_no_instance` gives GCP the same post-teardown second opinion Vast has | LEAK-5 |
+
+19 new tests; 515 pass, ruff and mypy clean. Two tests that pinned the old behaviour were
+rewritten (GCP-TEST-3), and one pre-existing test was made hermetic — it had begun reaching the
+real GCP project once `preempted_teardown_confirmed` started consulting the compute API.

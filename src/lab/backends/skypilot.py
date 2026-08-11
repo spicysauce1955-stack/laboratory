@@ -238,15 +238,44 @@ def do_volume_orphans(
     return orphans
 
 
+class GcpNotConfigured(RuntimeError):
+    """GCP isn't set up on this machine: the provider extra isn't installed, there are no
+    application-default credentials, or no project is selected.
+
+    Deliberately distinct from a GCP API *failure* (a revoked role, an expired key, a disabled
+    API, a 5xx). "Not configured" is safe to skip — not every account uses GCP. A failure is not:
+    a leak-detection pass that swallows one reports **clean while blind**, which is worse than
+    having no pass at all, because the report claims coverage it doesn't have (FR-C2). Callers
+    catch this narrowly and let everything else propagate.
+    """
+
+
+def _gcp_default_credentials() -> tuple[Any, str | None]:
+    """ADC credentials + the ambient project. Test seam; raises :class:`GcpNotConfigured` when
+    GCP isn't set up here."""
+    try:
+        import google.auth
+        from google.auth.exceptions import DefaultCredentialsError
+    except ImportError as e:  # the `gcp` extra isn't installed
+        raise GcpNotConfigured(f"GCP client libraries not installed: {e}") from e
+    try:
+        creds, project = google.auth.default()
+    except DefaultCredentialsError as e:
+        raise GcpNotConfigured(f"no application-default credentials: {e}") from e
+    return creds, project
+
+
 def _get_gcp_compute() -> tuple[Any, str]:
     """GCP compute client + project via application-default credentials (the same creds
     SkyPilot's GCP provisioner uses). Test seam: monkeypatch to inject a fake."""
-    import google.auth
     from googleapiclient import discovery  # type: ignore[import-untyped]
 
-    creds, project = google.auth.default()
+    creds, project = _gcp_default_credentials()
     if not project:
-        raise RuntimeError("no GCP project configured (run `gcloud config set project <id>`)")
+        raise GcpNotConfigured(
+            "no GCP project configured (run `gcloud config set project <id>`, or set "
+            "GOOGLE_CLOUD_PROJECT in .env)"
+        )
     compute = discovery.build("compute", "v1", credentials=creds, cache_discovery=False)
     return compute, str(project)
 
@@ -336,29 +365,62 @@ def gcp_disk_orphans(
     return orphans
 
 
+def _await_zone_operation(compute: Any, project: str, zone: str, operation: dict[str, Any]) -> None:
+    """Block until a zonal operation finishes and raise if it failed.
+
+    ``instances().delete()`` returns an **Operation**, not a completed delete: GCE deletes take
+    30-60s and can fail *after* acceptance (``RESOURCE_IN_USE_BY_ANOTHER_RESOURCE``, a quota error
+    on the disk detach, a stuck zonal op). Treating the accepted request as a destroyed VM writes
+    ``teardown_status="succeeded"`` while the instance still bills — so we wait for the real
+    outcome (FR-C2). ``zoneOperations.wait`` blocks server-side (~2 min max) and returns the
+    operation whether or not it is DONE.
+    """
+    name = operation.get("name")
+    if not name:  # nothing to poll (a fake, or an API that already returned a completed op)
+        return
+    done = compute.zoneOperations().wait(project=project, zone=zone, operation=name).execute()
+    error = (done or {}).get("error")
+    if error:
+        errors = "; ".join(str(e.get("message", e)) for e in error.get("errors", [error]))
+        raise RuntimeError(f"operation {name} failed: {errors}")
+    if (done or {}).get("status") != "DONE":
+        raise RuntimeError(f"operation {name} did not complete (status={done.get('status')})")
+
+
 def delete_gcp_instance(
     name: str, zone: str, compute: Any | None = None, project: str | None = None
 ) -> None:
-    """Provider-direct instance delete (bypasses SkyPilot's registry)."""
+    """Provider-direct instance delete (bypasses SkyPilot's registry). Waits for the delete to
+    actually complete — see :func:`_await_zone_operation`."""
     if compute is None or project is None:
         compute, project = _get_gcp_compute()
-    compute.instances().delete(project=project, zone=zone, instance=name).execute()
+    op = compute.instances().delete(project=project, zone=zone, instance=name).execute()
+    _await_zone_operation(compute, project, zone, op or {})
 
 
 def delete_gcp_disk(
     name: str, zone: str, compute: Any | None = None, project: str | None = None
 ) -> None:
-    """Provider-direct disk delete (unattached leftovers only — attached deletes 400)."""
+    """Provider-direct disk delete (unattached leftovers only — attached deletes 400). Waits for
+    completion, same reasoning as :func:`delete_gcp_instance`."""
     if compute is None or project is None:
         compute, project = _get_gcp_compute()
-    compute.disks().delete(project=project, zone=zone, disk=name).execute()
+    op = compute.disks().delete(project=project, zone=zone, disk=name).execute()
+    _await_zone_operation(compute, project, zone, op or {})
 
 
-def _gcp_destroy_matching(cluster: str) -> list[str]:
-    """Destroy every GCE instance whose name contains ``cluster``; return their names."""
+def _gcp_destroy_matching(cluster: str) -> tuple[list[str], list[str]]:
+    """Destroy every GCE instance whose name contains ``cluster``.
+
+    Returns ``(destroyed, failures)``. We keep going after a failure — the next instance might
+    still die — but the failures are **returned, not just printed**: a destroy we attempted and
+    could not complete is a live, billing box, and the caller must not report that as a clean
+    teardown (FR-C2).
+    """
     compute, project = _get_gcp_compute()
     needle = cluster.lower()
     destroyed: list[str] = []
+    failures: list[str] = []
     for inst in list_gcp_instances(compute, project):
         if needle not in inst["name"].lower():
             continue
@@ -367,8 +429,9 @@ def _gcp_destroy_matching(cluster: str) -> list[str]:
             destroyed.append(inst["name"])
             print(f"[lab] gcp-direct destroyed instance {inst['name']} (cluster={cluster})")
         except Exception as e:  # noqa: BLE001 — best-effort; the next instance might still go
+            failures.append(f"{inst['name']}: {type(e).__name__}: {e}")
             print(f"[lab] gcp-direct destroy {inst['name']} failed: {e}")
-    return destroyed
+    return destroyed, failures
 
 
 def confirm_no_rental(cluster: str) -> bool:
@@ -382,13 +445,35 @@ def confirm_no_rental(cluster: str) -> bool:
     return not any(needle in _instance_label(inst) for inst in instances)  # _instance_label is lower
 
 
+def confirm_no_instance(cluster: str) -> bool:
+    """True iff no GCE instance named for this cluster remains — the GCP twin of
+    :func:`confirm_no_rental`, with the same fail-toward-alarm contract: any match OR a failed
+    listing returns False, because we never claim "gone" under uncertainty (FR-C2).
+
+    Status is deliberately ignored. This runs *after* teardown, so a surviving instance record in
+    any state (a TERMINATED preemptible still holds its boot disk) means the teardown didn't take.
+    """
+    try:
+        instances = list_gcp_instances()
+    except Exception:  # noqa: BLE001 — uncertainty must read as "still maybe billing"
+        return False
+    needle = cluster.lower()
+    return not any(needle in str(inst.get("name", "")).lower() for inst in instances)
+
+
 def preempted_teardown_confirmed(cloud: str, cluster: str) -> bool:
-    """Whether a preempted job's instance is confirmably gone. Vast has a provider-direct listing
-    to double-check against (:func:`confirm_no_rental`); other clouds have none, so the
-    :func:`tear_down_and_record` outcome is already the authoritative answer."""
-    if cloud != "vast":
-        return True
-    return confirm_no_rental(cluster)
+    """Whether a preempted job's instance is confirmably gone.
+
+    Vast and GCP both expose a provider-direct listing to double-check against, and an unmanaged
+    spot preemption is the likeliest way a box outlives its job — so both get a second opinion
+    rather than trusting the teardown call's own return. DigitalOcean has no such channel, so
+    there the :func:`tear_down_and_record` outcome is already the authoritative answer.
+    """
+    if cloud == "vast":
+        return confirm_no_rental(cluster)
+    if cloud == "gcp":
+        return confirm_no_instance(cluster)
+    return True
 
 
 def vast_hourly_for_cluster(cluster: str, client: Any | None = None) -> float | None:
@@ -511,15 +596,21 @@ def robust_teardown(
         # Talk to the GCP compute API directly — bypasses SkyPilot's registry.
         print(f"[lab] sky.down exhausted for {cluster}; falling back to gcp-direct destroy")
         try:
-            gcp_destroyed = _gcp_destroy_matching(cluster)
+            gcp_destroyed, gcp_failures = _gcp_destroy_matching(cluster)
             return {
-                "status": "succeeded",  # destroyed-or-none-found are both safe outcomes
+                # Destroyed-or-none-found are both safe. Found-and-failed-to-destroy is not: that
+                # is a live box we know about and could not kill, so it must alarm (FR-C2).
+                "status": "failed" if gcp_failures else "succeeded",
                 "attempts": len(delays),
                 "vast_fallback_used": False,
                 "vast_destroyed": [],
                 "gcp_fallback_used": True,
-                "gcp_destroyed": gcp_destroyed,
-                "error": last_err,
+                "gcp_destroyed": gcp_destroyed,  # report what DID die even when we alarm
+                "error": (
+                    f"sky.down: {last_err}; gcp-direct: {'; '.join(gcp_failures)}"
+                    if gcp_failures
+                    else last_err
+                ),
             }
         except Exception as e:  # noqa: BLE001
             return {

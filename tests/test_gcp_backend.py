@@ -154,22 +154,143 @@ def test_list_gcp_instances_parses_aggregated_list():
     assert out == [{"name": "lab-x-1a2b-head", "zone": "us-central1-a", "status": "RUNNING"}]
 
 
+class _SkyDownFails:
+    def down(self, cluster):
+        raise RuntimeError("sky.down boom")
+
+    def get(self, x):
+        return x
+
+
 def test_robust_teardown_gcp_uses_gcp_fallback(monkeypatch):
+    monkeypatch.setattr(
+        "lab.backends.skypilot._gcp_destroy_matching", lambda c: (["lab-x-1a2b-head"], [])
+    )
     from lab.backends.skypilot import robust_teardown
 
-    class _SkyDownFails:
-        def down(self, cluster):
-            raise RuntimeError("sky.down boom")
-
-        def get(self, x):
-            return x
-
-    monkeypatch.setattr(
-        "lab.backends.skypilot._gcp_destroy_matching", lambda c: ["lab-x-1a2b-head"]
-    )
     out = robust_teardown(_SkyDownFails(), "lab-x", backoffs=(), cloud="gcp")
     assert out["status"] == "succeeded"
     assert out["gcp_destroyed"] == ["lab-x-1a2b-head"]
+
+
+def test_robust_teardown_gcp_reports_failed_when_a_destroy_fails(monkeypatch):
+    """GCP-LEAK-4: 'destroyed-or-none-found are both safe outcomes' has a third case —
+    found-and-failed-to-destroy — which is NOT safe. Reporting it as succeeded writes
+    teardown_status='succeeded' onto the manifest and exits `lab wait` 0 while the VM bills on:
+    the exact false-clean FR-C2 exists to prevent."""
+    from lab.backends.skypilot import robust_teardown
+
+    monkeypatch.setattr(
+        "lab.backends.skypilot._gcp_destroy_matching",
+        lambda c: ([], ["lab-x-1a2b-head: 403 Forbidden"]),
+    )
+    out = robust_teardown(_SkyDownFails(), "lab-x", backoffs=(), cloud="gcp")
+    assert out["status"] == "failed"
+    assert "403 Forbidden" in (out["error"] or "")
+
+
+def test_robust_teardown_gcp_partial_destroy_is_failed(monkeypatch):
+    """One of two instances destroyed is still a leak."""
+    from lab.backends.skypilot import robust_teardown
+
+    monkeypatch.setattr(
+        "lab.backends.skypilot._gcp_destroy_matching",
+        lambda c: (["lab-x-1a2b-head"], ["lab-x-1a2b-worker: still running"]),
+    )
+    out = robust_teardown(_SkyDownFails(), "lab-x", backoffs=(), cloud="gcp")
+    assert out["status"] == "failed"
+    assert out["gcp_destroyed"] == ["lab-x-1a2b-head"]  # report what DID die, still alarm
+
+
+def test_gcp_destroy_matching_collects_failures(monkeypatch):
+    """A delete that raises must surface as a failure, not vanish into a print()."""
+    from lab.backends.skypilot import _gcp_destroy_matching
+
+    monkeypatch.setattr(
+        "lab.backends.skypilot._get_gcp_compute", lambda: (object(), "proj")
+    )
+    monkeypatch.setattr(
+        "lab.backends.skypilot.list_gcp_instances",
+        lambda *a, **k: [{"name": "lab-x-1a2b-head", "zone": "us-central1-a", "status": "RUNNING"}],
+    )
+    monkeypatch.setattr(
+        "lab.backends.skypilot.delete_gcp_instance", _raise(RuntimeError("403 Forbidden"))
+    )
+    destroyed, failures = _gcp_destroy_matching("lab-x")
+    assert destroyed == []
+    assert len(failures) == 1 and "403 Forbidden" in failures[0]
+
+
+# --- GCP-LEAK-6: a delete request is not a completed delete ----------------------------------
+
+
+class _FakeOps:
+    """GCE zonal operations. `wait` blocks server-side until the op is DONE, then returns it."""
+
+    def __init__(self, result):
+        self._result = result
+        self.waited = []
+
+    def wait(self, project, zone, operation):
+        self.waited.append(operation)
+        return _Executable(self._result)
+
+
+class _Executable:
+    def __init__(self, result):
+        self._result = result
+
+    def execute(self):
+        return self._result
+
+
+class _FakeCompute:
+    def __init__(self, op_result):
+        self.ops = _FakeOps(op_result)
+        self.deleted = []
+
+    def instances(self):
+        return self
+
+    def disks(self):
+        return self
+
+    def delete(self, project, zone, **kw):
+        self.deleted.append(kw)
+        return _Executable({"name": "operation-1", "status": "PENDING"})
+
+    def zoneOperations(self):  # noqa: N802 — mirrors googleapiclient
+        return self.ops
+
+
+def test_delete_gcp_instance_raises_when_the_operation_fails(monkeypatch):
+    """GCP-LEAK-6: `instances().delete().execute()` returns an Operation, not a completed delete.
+    GCE deletes take 30-60s and can fail AFTER acceptance (RESOURCE_IN_USE, a stuck zonal op).
+    Treating the 202 as success reports a destroyed VM that is still RUNNING — and every
+    downstream signal (teardown_status, `lab wait`'s exit code, the dashboard) inherits the lie."""
+    from lab.backends.skypilot import delete_gcp_instance
+
+    compute = _FakeCompute(
+        {"status": "DONE", "error": {"errors": [{"message": "RESOURCE_IN_USE_BY_ANOTHER_RESOURCE"}]}}
+    )
+    with pytest.raises(RuntimeError, match="RESOURCE_IN_USE"):
+        delete_gcp_instance("lab-x-1a2b-head", "us-central1-a", compute, "proj")
+
+
+def test_delete_gcp_instance_succeeds_when_the_operation_completes(monkeypatch):
+    from lab.backends.skypilot import delete_gcp_instance
+
+    compute = _FakeCompute({"status": "DONE"})
+    delete_gcp_instance("lab-x-1a2b-head", "us-central1-a", compute, "proj")
+    assert compute.ops.waited == ["operation-1"]  # it actually waited for completion
+
+
+def test_delete_gcp_disk_raises_when_the_operation_fails():
+    from lab.backends.skypilot import delete_gcp_disk
+
+    compute = _FakeCompute({"status": "DONE", "error": {"errors": [{"message": "diskInUse"}]}})
+    with pytest.raises(RuntimeError, match="diskInUse"):
+        delete_gcp_disk("lab-x-1a2b-head", "us-central1-a", compute, "proj")
 
 
 def test_robust_teardown_gcp_fallback_failure_is_failed(monkeypatch):
@@ -224,18 +345,88 @@ def test_reconcile_gcp_pass_flags_and_destroys_orphans(tmp_path, monkeypatch):
     assert ("disk", "lab-leak-1a2b-head", "us-central1-a") in deleted
 
 
-def test_reconcile_gcp_pass_skips_when_unconfigured(tmp_path, monkeypatch):
-    """No ADC / GCP not set up: the GCP pass skips silently (best-effort), like the DO pass."""
+def _lab_with_other_passes_clean(tmp_path, monkeypatch):
+    """A Lab whose Vast/sky/DO passes are all clean, so only the GCP passes are under test."""
     lab = Lab(backend=LocalBackend(home=tmp_path, repo=tmp_path), repo=tmp_path, home=tmp_path)
     monkeypatch.setattr("lab.backends.skypilot.list_vast_instances", lambda *a, **k: [])
     monkeypatch.setattr(Lab, "_sky_status_orphans", lambda self, running_clusters: [])
     monkeypatch.setattr("lab.backends.skypilot.list_do_volumes", lambda *a, **k: [])
+    return lab
+
+
+def _raise(exc):
+    def _boom(*a, **k):
+        raise exc
+
+    return _boom
+
+
+def test_reconcile_gcp_pass_skips_when_unconfigured(tmp_path, monkeypatch):
+    """GCP genuinely not set up on this machine: skip the pass, but SAY SO in the report."""
+    from lab.backends.skypilot import GcpNotConfigured
+
+    lab = _lab_with_other_passes_clean(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        "lab.backends.skypilot.list_gcp_instances",
-        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no application default creds")),
+        "lab.backends.skypilot.list_gcp_instances", _raise(GcpNotConfigured("no ADC"))
     )
     report = lab.reconcile()
     assert report["gcp_orphans"] == [] and report["gcp_destroyed"] == []
+    assert "skipped" in report["gcp_pass"]
+
+
+def test_reconcile_gcp_api_failure_raises_instead_of_reporting_clean(tmp_path, monkeypatch):
+    """GCP-LEAK-2: a revoked role / expired key / disabled API is NOT 'GCP not configured'.
+    Swallowing it makes a leak-detection command report clean while blind — worse than having no
+    pass at all, because the report claims coverage. Mirrors the Vast pass, which raises on
+    anything that isn't a missing SDK."""
+    lab = _lab_with_other_passes_clean(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "lab.backends.skypilot.list_gcp_instances",
+        _raise(RuntimeError("403 Forbidden: compute.instances.list denied")),
+    )
+    with pytest.raises(LabError, match="GCP"):
+        lab.reconcile()
+
+
+def test_reconcile_gcp_disk_pass_runs_even_when_the_instance_pass_is_skipped(
+    tmp_path, monkeypatch
+):
+    """GCP-LEAK-3: the disk pass must not be nested inside the instance pass. An unattached disk
+    is the slow, quiet leak — it survives every instance-level cleanup and bills forever."""
+    from lab.backends.skypilot import GcpNotConfigured
+
+    lab = _lab_with_other_passes_clean(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "lab.backends.skypilot.list_gcp_instances", _raise(GcpNotConfigured("no compute scope"))
+    )
+    monkeypatch.setattr(
+        "lab.backends.skypilot.list_gcp_disks",
+        lambda *a, **k: [{"name": "lab-leak-1a2b-head", "zone": "us-central1-a", "users": []}],
+    )
+    report = lab.reconcile()
+    assert [d["name"] for d in report["gcp_disk_orphans"]] == ["lab-leak-1a2b-head"]
+
+
+def test_reconcile_gcp_disk_api_failure_raises(tmp_path, monkeypatch):
+    """A disk-listing failure must not read as 'no leaked disks'."""
+    lab = _lab_with_other_passes_clean(tmp_path, monkeypatch)
+    monkeypatch.setattr("lab.backends.skypilot.list_gcp_instances", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "lab.backends.skypilot.list_gcp_disks", _raise(RuntimeError("500 backendError"))
+    )
+    with pytest.raises(LabError, match="GCP"):
+        lab.reconcile()
+
+
+def test_get_gcp_compute_raises_not_configured_without_a_project(monkeypatch):
+    """The missing-project case is a configuration gap, not an API failure — it must be
+    distinguishable, or the reconcile pass cannot tell 'skip me' from 'I am blind'."""
+    import lab.backends.skypilot as sky_mod
+    from lab.backends.skypilot import GcpNotConfigured
+
+    monkeypatch.setattr(sky_mod, "_gcp_default_credentials", lambda: (object(), None))
+    with pytest.raises(GcpNotConfigured, match="project"):
+        sky_mod._get_gcp_compute()
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +543,53 @@ def test_cli_reconcile_exits_3_on_sky_orphans_even_without_vast_pass():
     with patch.object(cli_mod, "_lab", return_value=fake):
         result = CliRunner().invoke(app, ["reconcile"])
     assert result.exit_code == 3
+
+
+def _clean_reconcile_report(**overrides: object) -> dict:
+    """A reconcile report with every pass clean — overridden one list at a time below."""
+    report: dict = {
+        "vast_pass": "ran", "gcp_pass": "ran", "gcp_disk_pass": "ran",
+        "instances_total": 0, "unsupervised": [],
+        "orphans": [], "destroyed": [], "ghosts": [],
+        "sky_orphans": [], "sky_destroyed": [],
+        "do_volume_orphans": [], "do_volumes_destroyed": [],
+        "gcp_orphans": [], "gcp_destroyed": [],
+        "gcp_disk_orphans": [], "gcp_disks_destroyed": [],
+        "applied": False,
+    }
+    report.update(overrides)
+    return report
+
+
+def _reconcile_exit_code(report: dict) -> int:
+    from unittest.mock import MagicMock, patch
+
+    from typer.testing import CliRunner
+
+    import lab.cli as cli_mod
+    from lab.cli import app
+
+    fake = MagicMock()
+    fake.reconcile.return_value = report
+    with patch.object(cli_mod, "_lab", return_value=fake):
+        return CliRunner().invoke(app, ["reconcile"]).exit_code
+
+
+@pytest.mark.parametrize(
+    "leak_field",
+    ["orphans", "sky_orphans", "gcp_orphans", "gcp_disk_orphans", "do_volume_orphans"],
+)
+def test_cli_reconcile_exits_3_for_every_orphan_list(leak_field):
+    """GCP-LEAK-1: the dry-run leak alarm must read EVERY orphan pass, not just the two it was
+    born with. The GCP compute pass exists for the case where SkyPilot's registry lost the
+    cluster — exactly when `sky_orphans` is empty and `gcp_orphans` is the only non-empty list,
+    so wiring only the first two silences the alarm in the one scenario the pass was written for.
+    """
+    assert _reconcile_exit_code(_clean_reconcile_report(**{leak_field: ["lab-leaked"]})) == 3
+
+
+def test_cli_reconcile_exits_0_when_every_pass_is_clean():
+    assert _reconcile_exit_code(_clean_reconcile_report()) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -510,14 +748,57 @@ def test_build_task_gcp_spot_allowed_with_fallback(tmp_path):
     assert [r.use_spot for r in res_list] == [True, False]
 
 
-def test_preempted_teardown_confirmed_gcp_never_touches_vast(monkeypatch):
-    from lab.backends.skypilot import preempted_teardown_confirmed
-
+def _no_vast(monkeypatch):
+    """Any touch of the Vast listing while handling a GCP job is the :367 bug."""
     monkeypatch.setattr(
         "lab.backends.skypilot.list_vast_instances",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("vast listing used for gcp")),
+        _raise(AssertionError("vast listing used for gcp")),
     )
+
+
+def test_preempted_teardown_confirmed_gcp_true_when_instance_is_gone(monkeypatch):
+    """GCP-LEAK-5: teardown runs BEFORE this check, so a surviving instance record means the
+    teardown didn't take. GCP has a provider-direct listing — the same one `reconcile` and the
+    teardown fallback already use — so unlike DO it can give the second opinion Vast gets."""
+    from lab.backends.skypilot import preempted_teardown_confirmed
+
+    _no_vast(monkeypatch)
+    monkeypatch.setattr("lab.backends.skypilot.list_gcp_instances", lambda *a, **k: [])
     assert preempted_teardown_confirmed("gcp", "lab-x") is True
+
+
+def test_preempted_teardown_confirmed_gcp_false_when_instance_survives(monkeypatch):
+    """The likeliest way a GCP box outlives its job is an unmanaged spot preemption — which is
+    exactly the path that used to skip confirmation entirely and return True."""
+    from lab.backends.skypilot import preempted_teardown_confirmed
+
+    _no_vast(monkeypatch)
+    monkeypatch.setattr(
+        "lab.backends.skypilot.list_gcp_instances",
+        lambda *a, **k: [
+            {"name": "lab-x-1a2b-head", "zone": "us-central1-a", "status": "RUNNING"}
+        ],
+    )
+    assert preempted_teardown_confirmed("gcp", "lab-x") is False
+
+
+def test_preempted_teardown_confirmed_gcp_false_when_listing_fails(monkeypatch):
+    """Uncertainty must read as 'still maybe billing' — the contract confirm_no_rental holds."""
+    from lab.backends.skypilot import preempted_teardown_confirmed
+
+    _no_vast(monkeypatch)
+    monkeypatch.setattr(
+        "lab.backends.skypilot.list_gcp_instances", _raise(RuntimeError("api down"))
+    )
+    assert preempted_teardown_confirmed("gcp", "lab-x") is False
+
+
+def test_preempted_teardown_confirmed_do_stays_optimistic(monkeypatch):
+    """DO has no provider-direct listing, so tear_down_and_record's outcome is the only answer."""
+    from lab.backends.skypilot import preempted_teardown_confirmed
+
+    _no_vast(monkeypatch)
+    assert preempted_teardown_confirmed("do", "lab-x") is True
 
 
 def test_preempted_teardown_confirmed_vast_delegates(monkeypatch):
@@ -577,10 +858,10 @@ def test_run_job_gcp_preemption_does_not_flag_teardown_failed(tmp_path, monkeypa
     monkeypatch.setattr(runner_mod, "_rsync_down", lambda *a, **k: None)
     monkeypatch.setattr(runner_mod, "tear_down_and_record", lambda *a, **k: True)
     # Any touch of the Vast listing for a gcp job is the bug.
-    monkeypatch.setattr(
-        "lab.backends.skypilot.list_vast_instances",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("vast listing used for gcp")),
-    )
+    _no_vast(monkeypatch)
+    # The GCP confirm consults the compute API; stub it so the test stays hermetic (an unstubbed
+    # listing would reach the real project, and its answer would depend on the dev's ADC).
+    monkeypatch.setattr("lab.backends.skypilot.list_gcp_instances", lambda *a, **k: [])
 
     rc = runner_mod.run_job(home / "g4", adopt=True)
 

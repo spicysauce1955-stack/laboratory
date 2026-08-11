@@ -501,6 +501,19 @@ def dashboard(
     run_dashboard(lab, ids, interval=interval)
 
 
+# Every orphan list `reconcile` can report. The dry-run leak alarm reads the UNION: each pass
+# covers a blind spot of the others (the GCP compute pass exists precisely for clusters SkyPilot's
+# registry has lost, where `sky_orphans` is empty by definition), so reading a subset silences the
+# alarm exactly where the missing pass was needed. Add a pass -> add it here (FR-C2).
+_ORPHAN_FIELDS = (
+    "orphans",  # Vast-direct rentals
+    "sky_orphans",  # SkyPilot-tracked clusters (DO/GCP/Vast)
+    "gcp_orphans",  # GCE instances via the compute API
+    "gcp_disk_orphans",  # unattached GCE persistent disks
+    "do_volume_orphans",  # detached DO block volumes
+)
+
+
 @app.command()
 def reconcile(
     apply: bool = typer.Option(
@@ -521,7 +534,7 @@ def reconcile(
         _emit({"error": str(e)})
         raise typer.Exit(code=2) from e
     _emit(report)
-    if (report["orphans"] or report["sky_orphans"]) and not apply:
+    if any(report.get(k) for k in _ORPHAN_FIELDS) and not apply:
         raise typer.Exit(code=3)  # action required: re-run with --apply
 
 

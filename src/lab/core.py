@@ -1102,19 +1102,31 @@ class Lab:
         # API — `sky.status` only sees clusters SkyPilot still tracks, and a GCP persistent disk
         # that outlives its VM keeps billing (same failure mode as the DO volume leak). Skipped
         # silently when GCP isn't configured (no ADC), since not every account uses GCP.
-        from lab.backends.skypilot import delete_gcp_disk, delete_gcp_instance
+        from lab.backends.skypilot import GcpNotConfigured, delete_gcp_disk, delete_gcp_instance
         from lab.backends.skypilot import gcp_disk_orphans as _find_gcp_disk_orphans
         from lab.backends.skypilot import gcp_instance_orphans as _find_gcp_instance_orphans
         from lab.backends.skypilot import list_gcp_disks, list_gcp_instances
+
+        def _gcp_list(what: str, lister: Callable[[], list[dict[str, Any]]]) -> tuple[
+            list[dict[str, Any]] | None, str
+        ]:
+            """Run one GCP listing, distinguishing "GCP isn't set up here" (skip, and say so in
+            the report) from "the API failed" (raise — a leak pass that swallows an API error
+            reports clean while blind). The two passes are independent: an instance-API hiccup
+            must not also hide leaked disks, which are the slow, quiet leak."""
+            try:
+                return lister(), "ran"
+            except GcpNotConfigured as e:
+                return None, f"skipped ({e})"
+            except Exception as e:  # noqa: BLE001
+                raise LabError(f"could not list GCP {what}: {e}") from e
 
         gcp_orphans: list[dict[str, Any]] = []
         gcp_destroyed: list[str] = []
         gcp_disk_orphans: list[dict[str, Any]] = []
         gcp_disks_destroyed: list[str] = []
-        try:
-            gcp_instances = list_gcp_instances()
-        except Exception:  # noqa: BLE001 — GCP not configured/unavailable: skip the pass
-            gcp_instances = None
+
+        gcp_instances, gcp_pass = _gcp_list("instances", list_gcp_instances)
         if gcp_instances is not None:
             gcp_orphans = _find_gcp_instance_orphans(gcp_instances, set(running_clusters))
             if apply and gcp_orphans:
@@ -1124,10 +1136,9 @@ class Lab:
                         gcp_destroyed.append(str(inst["name"]))
                     except Exception as e:  # noqa: BLE001
                         print(f"[lab] reconcile delete gcp instance {inst['name']} failed: {e}")
-            try:
-                gcp_disks = list_gcp_disks()
-            except Exception:  # noqa: BLE001 — instances listed but disks failed: report what we have
-                gcp_disks = []
+
+        gcp_disks, gcp_disk_pass = _gcp_list("disks", list_gcp_disks)
+        if gcp_disks is not None:
             gcp_disk_orphans = _find_gcp_disk_orphans(gcp_disks, set(running_clusters))
             if apply and gcp_disk_orphans:
                 for disk in gcp_disk_orphans:
@@ -1139,6 +1150,8 @@ class Lab:
 
         return {
             "vast_pass": vast_pass,
+            "gcp_pass": gcp_pass,
+            "gcp_disk_pass": gcp_disk_pass,
             "instances_total": len(instances),
             "unsupervised": unsupervised,  # running manifests with a dead supervisor (FR-C2)
             "orphans": orphans,
