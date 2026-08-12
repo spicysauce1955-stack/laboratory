@@ -444,3 +444,45 @@ is absent from the response `skip`s rather than fails; `GPUS_ALL_REGIONS=0` does
 Honourable mention, correct behaviour on the same run: `catalog WARN — SkyPilot's catalog cannot
 price this spec, so cost guardrails will not apply to it`. That is exactly the right shape — it
 says what it cannot do and does not pretend otherwise.
+
+### F13 — `lab reconcile` cannot see a leaked TPU
+
+`severity: **high**` · `confirmed by direct measurement` · leak blind spot
+
+The lab can now launch TPUs: a `tpu-v5litepod-1:1` spot job provisioned, ran and completed on GCP
+for $0.063. While its node was still being torn down:
+
+```
+GCE instances visible to reconcile: none
+TPU NODE: lab-20260812-145139-58f6aa-3dd12990-head-3id3mqtx-tpu  DELETING  v5litepod-1
+```
+
+TPU VMs are **not GCE instances**. They live under `tpu.projects.locations.nodes` (TPU API v2),
+while `list_gcp_instances()` reads `compute.instances().aggregatedList()`. The two never
+intersect, so a TPU node is invisible to every GCP pass in `reconcile` — instances *and* disks.
+
+The consequence is the failure mode the whole cost-safety design exists to prevent: if a TPU
+teardown fails, the node bills (up to **$1.20/hr** on demand for the smallest v5e podslice, more
+for larger pods) and `lab reconcile` reports **clean, exit 0**, forever. There is no second
+channel — `robust_teardown`'s gcp-direct fallback also goes through the compute API, so it cannot
+destroy a TPU either.
+
+This is strictly worse than the GCP-LEAK-7 situation it resembles. That was an over-broad matcher
+that could delete the wrong thing loudly; this is a resource class the sweep cannot observe at all.
+
+The good news is that the hard part is already done. The node name
+`lab-<job_id>-<userhash>-head-<uuid8>-**tpu**` matches `_GCP_NODE_RE` unchanged — `tpu` is one of
+the three `GCPNodeType` values the predicate already accepts. Only the *listing* is missing.
+
+**Proposed fix:**
+1. A `list_gcp_tpu_nodes()` pass over `tpu.projects.locations.nodes.list` for the regions/zones
+   the lab launches into, shaped like `list_gcp_instances` (`{name, zone, status}`), feeding the
+   existing `gcp_instance_orphans` predicate.
+2. Wire it into `_ORPHAN_FIELDS` as `gcp_tpu_orphans` so it trips exit 3 like every other pass.
+3. A `delete_gcp_tpu_node` for `--apply`, and a TPU branch in `robust_teardown`'s gcp-direct
+   fallback.
+4. Until that exists, the GCP guide should say plainly that **TPU jobs have no leak net** and must
+   be verified by hand (`gcloud compute tpus tpu-vm list --zone …`).
+
+**Test:** a fake TPU listing returning a `…-tpu` node not tied to a running job yields a
+`gcp_tpu_orphans` entry and exit 3; a node tied to a running cluster does not.
