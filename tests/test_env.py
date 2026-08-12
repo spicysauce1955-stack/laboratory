@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 import pytest
 
@@ -132,3 +133,69 @@ def test_dotenv_is_excluded_from_the_workdir_sync():
     excluded = {e.strip("/") for e in get_excluded_files(str(repo))}
 
     assert ".env" in excluded
+
+
+# --- LAB_REPO_DIR: one resolution, honoured everywhere ----------------------------------------
+
+
+def test_repo_root_honours_lab_repo_dir(tmp_path, monkeypatch):
+    """The override belongs in `repo_root` itself. It used to live in `cli._repo()`, which library
+    code cannot reach — so `default_lab`, `default_queue` and the MCP entrypoint all silently fell
+    back to cwd while a handful of CLI commands honoured the variable."""
+    from lab.manifest import repo_root
+
+    monkeypatch.setenv("LAB_REPO_DIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path.parent)
+
+    assert repo_root() == tmp_path
+
+
+def test_an_explicit_start_is_never_overridden_by_the_env(tmp_path, monkeypatch):
+    """`repo_root(start)` asks about a *specific* directory — provenance capture uses it to find
+    the work tree containing a known path. An ambient override must not hijack that answer, or the
+    commit recorded on a manifest stops describing the code that ran."""
+    from lab.manifest import repo_root
+
+    monkeypatch.setenv("LAB_REPO_DIR", str(tmp_path / "elsewhere"))
+    repo = Path(__file__).resolve().parents[1]
+
+    assert repo_root(repo) == repo
+
+
+def test_blank_lab_repo_dir_falls_through_to_cwd(tmp_path, monkeypatch):
+    """An unfilled `.env.example` placeholder must behave as unset, like every other setting."""
+    from lab.manifest import repo_root
+
+    monkeypatch.setenv("LAB_REPO_DIR", "  ")
+    monkeypatch.chdir(tmp_path)
+
+    assert repo_root() == tmp_path
+
+
+def test_default_lab_is_rooted_at_lab_repo_dir(tmp_path, monkeypatch):
+    """The split-brain this closes. `default_lab` is the shared constructor for both the CLI and
+    the MCP server, and it decides *both* the repo used for provenance and where `runs/` lives —
+    so on a host with `LAB_REPO_DIR` set it read a different `runs/` than the scheduler wrote."""
+    from lab.core import default_lab
+
+    monkeypatch.setenv("LAB_REPO_DIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path.parent)
+
+    lab = default_lab()
+
+    assert lab.repo == tmp_path
+    assert lab.home == tmp_path / "runs"
+
+
+def test_default_queue_is_rooted_at_lab_repo_dir(tmp_path, monkeypatch):
+    """The repo-local queue is what `lab register` writes and `lab scheduler tick` reads. If they
+    disagree about the repo root, jobs queue into a directory the scheduler never looks at."""
+    from lab.scheduler.queue import default_queue
+
+    monkeypatch.delenv("LAB_QUEUE_DIR", raising=False)
+    monkeypatch.delenv("LAB_R2_ENDPOINT", raising=False)
+    monkeypatch.delenv("LAB_R2_BUCKET", raising=False)
+    monkeypatch.setenv("LAB_REPO_DIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path.parent)
+
+    assert default_queue().root == tmp_path / "queue"

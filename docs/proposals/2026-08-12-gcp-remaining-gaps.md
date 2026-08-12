@@ -238,11 +238,35 @@ Suite: 649 unit tests pass, `ruff` clean, `mypy --strict` clean. No cloud calls,
 `uv run lab doctor --cloud gcp`, and it should happen before anyone schedules an overnight GCP
 job. `GCP-PROV-4` waits on Google.
 
-**Noticed while fixing `GCP-CREDS-2`, not fixed:** that record says "every other repo-rooted path
-in the CLI goes through `_repo()`". It doesn't — `_lab_for`, `status`, and the `JobStore`
-construction in `wait` still call `repo_root()` directly, so on a scheduler host with
-`LAB_REPO_DIR` set they read a different `runs/` than the one the scheduler writes. Same class of
-bug, wider blast radius, out of scope here. Worth its own record.
+## Follow-up: `LAB_REPO_DIR` was honoured in four places and ignored in six
+
+Found while fixing `GCP-CREDS-2`, fixed straight after. That record says "every other repo-rooted
+path in the CLI goes through `_repo()`". It didn't, and the split was wider than the CLI:
+
+| Honoured `LAB_REPO_DIR` | Ignored it (cwd-derived) |
+|---|---|
+| `doctor`, `register`, `register_sweep`, `scheduler tick` | `default_lab` (**the shared CLI+MCP constructor** — sets both the provenance repo and `runs/`) |
+| | `default_queue` (the repo-local queue `register` writes and `tick` reads) |
+| | `_lab_for`, `status`, `wait`'s `JobStore` |
+| | the MCP server's own `load_lab_env` |
+
+The cause was structural: the resolution lived in `cli._repo()`, which library code cannot
+import, so every library-level path quietly fell back to cwd. Setting the variable — which
+`.env.example` invites, and which is the documented remedy when `WorkingDirectory` isn't the repo
+— would have split the two halves: `lab register` queueing into one directory while
+`lab scheduler tick` read another, and `lab status` reading a `runs/` nobody wrote.
+
+**fix:** moved the override into `repo_root()` itself and deleted the `cli._repo()` shim, so
+there is one resolution and every caller gets it. An explicit `repo_root(start)` is deliberately
+*not* overridden — that call asks about a specific directory for provenance capture, and an
+ambient variable must not change which commit gets recorded on a manifest.
+
+**tests:** `repo_root` honours it; an explicit `start` is never overridden; blank falls through
+to cwd; `default_lab` roots both repo and `runs/` at it; `default_queue` roots the queue at it.
+
+**Not currently sprung in production:** the shipped `lab-scheduler.service` sets
+`WorkingDirectory=/opt/laboratory` and never sets `LAB_REPO_DIR`, so today's droplet resolves
+correctly by cwd. The trap was armed, not triggered.
 
 ## What is explicitly *not* on this list
 

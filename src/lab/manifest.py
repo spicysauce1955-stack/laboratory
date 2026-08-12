@@ -7,6 +7,7 @@ them into a full :class:`lab.models.JobManifest`.
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import subprocess
 import tarfile
@@ -15,7 +16,26 @@ from pathlib import Path
 
 
 def repo_root(start: Path | None = None) -> Path:
-    """The git work-tree root containing ``start`` (defaults to cwd)."""
+    """The git work-tree root containing ``start`` (defaults to cwd).
+
+    With no ``start``, the machine-local ``LAB_REPO_DIR`` override wins (blank = unset, as
+    everywhere else). The scheduler host is its documented user: a systemd unit's
+    ``WorkingDirectory`` need not be the repo, and a cwd-derived answer there silently picks a
+    different ``runs/``, ``queue/`` and ``.env`` than the one the scheduler uses.
+
+    This resolution deliberately lives *here* rather than in the CLI. It used to sit in
+    ``cli._repo()``, which library code cannot reach — so ``default_lab``, ``default_queue`` and
+    the MCP entrypoint all fell back to cwd while a handful of CLI commands honoured the
+    variable, and the two halves could disagree about which repo they were operating on.
+
+    An explicit ``start`` is never overridden: that call asks about a *specific* directory (the
+    work tree containing a known path, for provenance capture), and an ambient variable must not
+    change the answer.
+    """
+    if start is None:
+        override = (os.environ.get("LAB_REPO_DIR") or "").strip()
+        if override:
+            return Path(override)
     start = start or Path.cwd()
     try:
         out = subprocess.check_output(

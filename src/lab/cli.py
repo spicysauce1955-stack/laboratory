@@ -45,12 +45,12 @@ app = typer.Typer(
 def _load_env() -> None:
     """Apply the git-ignored ``.env`` before any command (cloud creds/project; real env wins).
 
-    Resolved through :func:`_repo`, not bare ``repo_root()``: the scheduler host runs from a
-    systemd unit whose ``WorkingDirectory`` need not be the repo, and it is the host that most
-    needs a service-account key. A cwd-derived lookup found no ``.env`` there and the failure
-    surfaced one layer down as an opaque auth error (GCP-CREDS-2).
+    ``repo_root()`` honours ``LAB_REPO_DIR``, which matters most on the scheduler host: its
+    systemd unit's ``WorkingDirectory`` need not be the repo, and it is the host that most needs a
+    service-account key. A cwd-derived lookup found no ``.env`` there and the failure surfaced one
+    layer down as an opaque auth error (GCP-CREDS-2).
     """
-    load_lab_env(_repo())
+    load_lab_env(repo_root())
 
 
 def _lab(backend: str = "local") -> Lab:
@@ -572,13 +572,6 @@ def reconcile(
         raise typer.Exit(code=3)  # action required: re-run with --apply
 
 
-def _repo() -> Path:
-    import os
-
-    env = os.environ.get("LAB_REPO_DIR")
-    return Path(env) if env else repo_root()
-
-
 @app.command()
 def doctor(
     cloud: str | None = typer.Option(None, "--cloud", help="vast | do | gcp (default vast)"),
@@ -616,7 +609,7 @@ def doctor(
     # Apply the same disk defaults a real submit would, so the quota check asks about the size
     # that would actually be provisioned rather than the one the user happened to type.
     resources = resources.model_copy(update={"disk_size": default_disk_gb(resources)})
-    results = run_checks(cloud, resources, home=_repo() / "runs", use_cache=not no_cache)
+    results = run_checks(cloud, resources, home=repo_root() / "runs", use_cache=not no_cache)
     if as_json:
         _emit(doctor_view(cloud, results))
     else:
@@ -713,7 +706,7 @@ def register(
         submitted_by="human",
     )
     try:
-        reg = sched_register(_repo(), queue, spec, triggers, guardrails)
+        reg = sched_register(repo_root(), queue, spec, triggers, guardrails)
     except LabError as e:  # fail-loud, actionable (FR-F3)
         _emit({"error": str(e)})
         raise typer.Exit(code=1) from e
@@ -814,7 +807,7 @@ def register_sweep(
     )
     try:
         sweep_id, regs = sched_register_sweep(
-            _repo(), queue, wrap_with_extras(command, with_pkg), _parse_grid(grid),
+            repo_root(), queue, wrap_with_extras(command, with_pkg), _parse_grid(grid),
             resources=resources, triggers=triggers, guardrails=guardrails, seed=seed,
             sweep_max_cost=sweep_max_cost,
             daily_budget=queue.read_control().budget_usd_per_day,
@@ -986,7 +979,7 @@ def scheduler_tick(
 
         price_feed = VastPriceFeed()
     sched = Scheduler(
-        default_queue(), home=_repo() / "runs", backend=backend, price_feed=price_feed
+        default_queue(), home=repo_root() / "runs", backend=backend, price_feed=price_feed
     )
     _emit(json.loads(sched.tick().model_dump_json()))
 
