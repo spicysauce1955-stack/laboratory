@@ -414,3 +414,29 @@ def test_worst_case_cost_is_still_none_when_there_is_nothing_to_price():
 
     assert R.worst_case_cost(Triggers(), ResourceRequest(timeout="2h")) is None
     assert R.worst_case_cost(Triggers(), ResourceRequest(cloud="gcp")) is None
+
+
+def test_catalog_chatter_never_reaches_stdout(monkeypatch, capsys):
+    """SkyPilot prints "Updating <cloud> catalog: ..." on STDOUT the first time a machine needs a
+    catalog CSV. Our stdout is a JSON payload, so on a cold catalog — a fresh laptop, a new
+    scheduler droplet — that corrupts what callers parse: `json.loads(lab register ...)` failed on
+    CI's first-ever run and would have worked on every run after."""
+    import lab.placement as placement_mod
+
+    class _NoisyCatalog:
+        def list_accelerators(self, *a, **k):
+            print("Updating Vast catalog: vast/vms.csv")
+            return {}
+
+        def get_instance_type_for_accelerator(self, *a, **k):
+            print("Updating Vast catalog: vast/vms.csv")
+            return (["x1.large"], None)
+
+    monkeypatch.setattr(placement_mod, "_catalog", lambda: _NoisyCatalog())
+    placement_mod.resolve_instance_type(
+        ResourceRequest(cloud="vast", accelerators="RTX_4090:1")
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == "", f"catalog chatter leaked onto stdout: {captured.out!r}"
+    assert "Updating Vast catalog" in captured.err

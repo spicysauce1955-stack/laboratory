@@ -27,12 +27,16 @@ import os
 import re
 import sys
 import time
+from contextlib import redirect_stdout
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, TypeVar, cast
 
 from lab._util import atomic_write_text
 from lab.models import ResourceRequest
+
+_F = TypeVar("_F", bound=Callable[..., Any])
 
 
 def _note(message: str) -> None:
@@ -280,6 +284,28 @@ def _catalog() -> Any:
     return catalog
 
 
+def _quiet(fn: _F) -> _F:
+    """Keep SkyPilot's own chatter off stdout for the duration of a catalog call.
+
+    The first time a machine needs a catalog CSV, SkyPilot downloads it and announces itself on
+    **stdout** ("Updating Vast catalog: vast/vms.csv"). Our stdout is a JSON payload, so on any
+    host with a cold catalog — a fresh laptop, a newly provisioned scheduler droplet — that
+    chatter corrupts what callers parse: `json.loads` of `lab register`'s output fails on the very
+    first run of a machine's life and works ever after, which is the worst shape a bug can have.
+
+    ``_note`` already holds this line for our own diagnostics; this extends it to the vendor's.
+    Decorating the whole function (rather than the one call) also covers anything a future edit
+    adds to the body.
+    """
+
+    @wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        with redirect_stdout(sys.stderr):
+            return fn(*args, **kwargs)
+
+    return cast(_F, wrapper)
+
+
 def _catalog_cpus(res: ResourceRequest) -> str | None:
     return str(res.cpus) if res.cpus else None
 
@@ -302,6 +328,7 @@ def _split_accelerators(spec: str | None) -> tuple[str, int] | None:
         return name, 1
 
 
+@_quiet
 def resolve_instance_type(res: ResourceRequest) -> str | None:
     """The instance type this spec will actually land on, or None if the catalog can't say.
 
@@ -338,6 +365,7 @@ def resolve_instance_type(res: ResourceRequest) -> str | None:
         return None
 
 
+@_quiet
 def validate_placement(res: ResourceRequest) -> None:
     """Reject a region/zone the cloud does not have, before anything provisions.
 
@@ -389,6 +417,7 @@ def _price(cat: Any, instance_type: str, res: ResourceRequest, region: str, spot
     return total
 
 
+@_quiet
 def candidates(
     res: ResourceRequest,
     *,

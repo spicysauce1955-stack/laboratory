@@ -151,3 +151,31 @@ def test_sweep_no_stagger_for_local_backend(tmp_path, monkeypatch):
     monkeypatch.setenv("LAB_SUBMIT_STAGGER_S", "1.5")
     lab.sweep("true", {"a": ["1", "2"]})
     assert sleeps == []  # local backend never staggers
+
+
+def test_vast_balance_degrades_when_no_api_key(monkeypatch, capsys):
+    """The balance lookup is a best-effort *diagnostic* on the provision-failure path. Building the
+    client was outside its own try, so on a box with no Vast key — a GCP-only user, or CI — it
+    raised and replaced the real failure cause with "No API key found"."""
+    import lab.backends.skypilot as sky_mod
+
+    def _no_key():
+        raise RuntimeError("No API key found. Pass api_key=, set VAST_API_KEY, ...")
+
+    monkeypatch.setattr(sky_mod, "_get_vast_client", _no_key)
+
+    assert sky_mod.vast_balance() is None
+    captured = capsys.readouterr()
+    assert captured.out == ""  # diagnostics never touch the JSON channel
+    assert "vast balance lookup failed" in captured.err
+
+
+def test_provision_failure_reason_survives_a_missing_vast_key(monkeypatch):
+    """The real cause must reach the manifest even when the enrichment cannot run."""
+    import lab.backends.skypilot as sky_mod
+
+    monkeypatch.setattr(
+        sky_mod, "_get_vast_client", lambda: (_ for _ in ()).throw(RuntimeError("No API key found"))
+    )
+    generic = "Failed to provision resources"
+    assert runner_mod.provision_failure_reason(generic, "vast") == generic
