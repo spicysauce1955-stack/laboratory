@@ -1379,7 +1379,7 @@ git commit -m "ci: verify every push and publish a release on each tag"
 - [ ] **Step 1: Write `docs/guides/getting-started.md`**
 
 Cover, in this order, with runnable commands:
-1. **Create the project** — `uv init`, `git init`, `uv add "laboratory[...] @ git+…@v0.5.0"`, `uv run lab init`, commit the scaffold.
+1. **Create the project** — `uv init --python 3.12`, `git init`, `uv add "laboratory[...] @ git+…@v0.5.0"`, `uv run lab init`, commit the scaffold.
 2. **Credentials** — copy `.env.example` to `.env`, what each key is for, that `.env` is git-ignored and listed in `.skyignore`, and that secrets never enter manifests.
 3. **First run** — `uv run lab submit -c "python experiments/example.py" --seed 0 -- steps=5`, then `lab wait`, `lab status`, `runs/<job_id>/`.
 4. **Going remote** — `--backend cpu --cloud gcp`, and `lab doctor` before spending money.

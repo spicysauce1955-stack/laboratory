@@ -23,7 +23,7 @@
 | `tests/test_skypilot.py` | Update run-script tests; add watchdog + `vast_balance` tests | Modify |
 | `tests/test_runner.py` | Heartbeat `_wait_terminal` test | Modify |
 | `tests/test_cli_wait.py` | §1 exit-code regression test | **Create** |
-| `LAB-BUGS.md` | Mark §1 verified; note §6/§7/§8 addressed | Modify |
+| `LAB-BUGS.md` (now `docs/archive/2026-06-LAB-BUGS.md`) | Mark §1 verified; note §6/§7/§8 addressed | Modify |
 
 ---
 
@@ -720,11 +720,11 @@ git commit -m "test(cli): lab wait exits 1 on timeout-without-completion (LAB-BU
 ## Task 7: Update LAB-BUGS.md and run the full quality gate
 
 **Files:**
-- Modify: `LAB-BUGS.md`
+- Modify: `LAB-BUGS.md` (now `docs/archive/2026-06-LAB-BUGS.md`)
 
 - [ ] **Step 1: Mark §1 verified**
 
-In `LAB-BUGS.md` §1, append under the existing Update line:
+In `LAB-BUGS.md` (now `docs/archive/2026-06-LAB-BUGS.md`) §1, append under the existing Update line:
 
 ```markdown
 **Update (2026-06-07): VERIFIED — not a lab bug.** `cli.py::wait` does

@@ -325,9 +325,12 @@ ambient variable must not change which commit gets recorded on a manifest.
 **tests:** `repo_root` honours it; an explicit `start` is never overridden; blank falls through
 to cwd; `default_lab` roots both repo and `runs/` at it; `default_queue` roots the queue at it.
 
-**Not currently sprung in production:** the shipped `lab-scheduler.service` sets
-`WorkingDirectory=/opt/laboratory` and never sets `LAB_REPO_DIR`, so today's droplet resolves
-correctly by cwd. The trap was armed, not triggered.
+**Was not sprung in production:** at the time of writing the shipped `lab-scheduler.service` set
+`WorkingDirectory=/opt/laboratory` and never set `LAB_REPO_DIR`, so that droplet resolved
+correctly by cwd. The trap was armed, not triggered. *Superseded by the v0.5.0 deployment:* the
+unit now sets **both** `WorkingDirectory=/opt/tempotron-capacity` and
+`Environment=LAB_REPO_DIR=/opt/tempotron-capacity` (see `deploy/scheduler/lab-scheduler.service`),
+which is exactly the configuration the fix above makes safe.
 
 ## What is explicitly *not* on this list
 

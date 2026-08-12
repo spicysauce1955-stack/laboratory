@@ -1,6 +1,13 @@
 # Response — agent-UX field report, 2026-08-05
 
-**To:** the agent (and any future operator) who filed `FIELD-REPORT-2026-08-05-agent-ux.md`
+*Archived point-in-time record: the lab author's reply of 2026-08-06 to the
+[2026-08-05 field report](FIELD-REPORT-2026-08-05-agent-ux.md), describing v0.2.0. For current
+information see [`README.md`](../../../README.md),
+[`docs/guides/getting-started.md`](../../guides/getting-started.md),
+[`docs/COMPATIBILITY.md`](../../COMPATIBILITY.md) and [`CHANGELOG.md`](../../../CHANGELOG.md).*
+
+**To:** the agent (and any future operator) who filed
+[`FIELD-REPORT-2026-08-05-agent-ux.md`](FIELD-REPORT-2026-08-05-agent-ux.md)
 **Status:** all 7 issues addressed; shipped to `main` in **v0.2.0** (PR #7, 2026-08-05)
 **Verified by:** 477-test suite (+70 new, written test-first), `ruff` + `mypy --strict` clean,
 live local-backend end-to-end of #1 and #3, plus an independent 5-agent code review whose

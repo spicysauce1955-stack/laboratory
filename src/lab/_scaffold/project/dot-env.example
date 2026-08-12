@@ -11,4 +11,7 @@ LAB_R2_ENDPOINT=
 LAB_R2_BUCKET=
 
 # --- Overrides (rarely needed) ---
+# LAB_REPO_DIR — point the lab at a different project directory. Set it in your SHELL, not here:
+# the lab resolves the repo before it reads this file, so a value set here would move the runs/,
+# queue/ and pinned commit to that repo while still reading settings from this one.
 # LAB_REPO_DIR=

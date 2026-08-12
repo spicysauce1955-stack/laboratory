@@ -19,10 +19,14 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   everything `lab` needs to work when installed must be a real dependency or an extra, never a
   dependency group.
 - **Env is fixed:** Python via **uv** (`uv.lock` committed; **NumPy `<2`** pin), config via
-  **Hydra+Pydantic**, metrics via **MLflow**, outputs to git-ignored `runs/`.
-- **First workload:** tempotron-capacity — CPU-bound, embarrassingly parallel (seeds/α/K). GPU is P1.
-- **Chosen stack (to confirm):** provisioner = **SkyPilot** + a **`local`** subprocess backend
-  (NFR-4); tracker = **MLflow** self-hosted (`get_metric_history` = live series); interface =
+  **Hydra+Pydantic**, metrics to `$LAB_RUN_DIR/metrics.jsonl`, outputs to git-ignored `runs/`.
+- **Reference workload:** tempotron-capacity — CPU-bound, embarrassingly parallel (seeds/α/K).
+  It now lives in **its own repo** that installs the lab as a dependency; this repo keeps only
+  `experiments/example_capacity.py` as the contract fixture its tests run against.
+- **Stack (shipped):** provisioner = **SkyPilot** + a **`local`** subprocess backend (NFR-4);
+  metrics = a **`metrics.jsonl` file convention** read incrementally by `lab metrics` — there is
+  **no tracker server**, and no MLflow anywhere in `src/lab` (`mlflow` is an unused opt-in
+  `tracking` extra; `lab.metrics`' read interface is where one could slot in later); interface =
   **FastMCP**; artifacts = object store (Cloudflare R2/S3) → `runs/<job_id>/`.
 - **Experiment Contract (§7):** any committed `uv run` entrypoint, determined by config+seed,
   writes to `$LAB_RUN_DIR`, logs metrics via `log_metric(name, value, step)`, exits non-zero on fail.
@@ -53,7 +57,8 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   profile on GCP (spot allowed there — only DO forces spot off). `lab reconcile` runs a
   cloud-agnostic `sky.status` orphan pass (Vast-direct pass skipped without vastai-sdk), a GCP
   compute-API pass (`lab-*` instances + unattached `lab-*` disks), and flags `unsupervised`
-  running jobs whose supervisor pid is dead; DO volumes remain uncovered. `robust_teardown` has a
+  running jobs whose supervisor pid is dead, and a DO detached-volume pass (`do_volume_orphans`).
+  `robust_teardown` has a
   gcp-direct fallback mirroring the vastai one. Price/offer triggers
   (`--max-hourly`/`--offer-query`) are Vast-only and rejected for other clouds. Guides:
   `docs/guides/cpu-backend.md`, `docs/guides/gcp-backend.md`.

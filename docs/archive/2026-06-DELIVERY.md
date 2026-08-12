@@ -1,5 +1,12 @@
 # Laboratory — Delivery Document
 
+*Archived point-in-time record: the delivery letter as written on 2026-06-07 (with a 2026-08-12
+v0.3.0 addendum), kept for the record of what was promised. Its setup instructions, test counts,
+backend list and FR status table describe the repo as it was then and are no longer accurate — for
+current information see [`README.md`](../../README.md),
+[`docs/guides/getting-started.md`](../guides/getting-started.md),
+[`docs/COMPATIBILITY.md`](../COMPATIBILITY.md) and [`CHANGELOG.md`](../../CHANGELOG.md).*
+
 **To:** the researcher who authored `LAB-REQUIREMENTS.md`
 **Re:** the Remote Experiment Runner is built and ready to use for the tempotron-capacity work (and anything else).
 **Status:** P0 (MVP) + the P1 roadmap (§12) **complete and validated** — including a real end-to-end run on a Vast.ai GPU. Two individually-P1-tagged FRs and the P2 items are not built yet (see §8 below — stated honestly).

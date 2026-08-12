@@ -102,3 +102,22 @@ def infer_artifact_type(name: str) -> str:
     """Map a filename to an ArtifactType (FR-E3); defaults to ``"other"``."""
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
     return _ARTIFACT_EXT.get(ext, "other")
+
+
+def pid_alive(pid: int | None) -> bool:
+    """Is this pid still running? ``None``/0 is never alive.
+
+    One implementation for the local runner, the skypilot runner and the scheduler tick, which
+    each carried a byte-identical private copy — the same reason ``timeout_reason`` lives here.
+    ``PermissionError`` means the process exists but belongs to another user, which is still
+    alive for our purposes (supervisor liveness, leak detection).
+    """
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True

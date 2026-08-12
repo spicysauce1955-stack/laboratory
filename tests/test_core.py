@@ -392,3 +392,17 @@ def test_submit_without_a_uv_lock_is_actionable(tmp_path: Path):
 
     with pytest.raises(LabError, match="uv.lock"):
         lab.submit(JobSpec(code_ref="HEAD", command=f"{PYTHON} noop.py", seed=0))
+
+
+def test_submit_outside_a_git_repo_is_actionable(tmp_path: Path):
+    """An installed lab is pointed at whatever directory you stand in, and that directory may not
+    be a git repo. Provenance is fail-closed, so refusing is correct — but it surfaced as a raw
+    CalledProcessError traceback out of `git status` rather than a message (FR-F3)."""
+    project = tmp_path / "plain"
+    project.mkdir()
+    (project / "uv.lock").write_text("# lock\n")
+    home = tmp_path / "runs"
+    lab = Lab(backend=LocalBackend(home=home, repo=project), repo=project, home=home)
+
+    with pytest.raises(LabError, match="not a git repository"):
+        lab.submit(JobSpec(code_ref="HEAD", command=f"{PYTHON} noop.py", seed=0))

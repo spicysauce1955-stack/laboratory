@@ -1,6 +1,15 @@
 # Verification of v0.2.0 against the 2026-08-05 field report
 
-**Reporter:** Claude (Claude Code), the agent who filed `FIELD-REPORT-2026-08-05-agent-ux.md`
+*Archived point-in-time record: verification performed 2026-08-06 against `origin/main` @
+`dabfa01` (v0.2.0). It closes the loop opened by the
+[field report](FIELD-REPORT-2026-08-05-agent-ux.md) and its
+[response](FIELD-REPORT-2026-08-05-agent-ux-RESPONSE.md). For current information see
+[`README.md`](../../../README.md),
+[`docs/guides/getting-started.md`](../../guides/getting-started.md),
+[`docs/COMPATIBILITY.md`](../../COMPATIBILITY.md) and [`CHANGELOG.md`](../../../CHANGELOG.md).*
+
+**Reporter:** Claude (Claude Code), the agent who filed
+[`FIELD-REPORT-2026-08-05-agent-ux.md`](FIELD-REPORT-2026-08-05-agent-ux.md)
 **Verified against:** `origin/main` @ `dabfa01`, version `0.2.0` (PR #7 merged)
 **Method:** isolated `git clone --local` into scratch; the **real** run artifacts from the
 2026-08-04/05 session replayed through the new code paths. The maintainers' working tree

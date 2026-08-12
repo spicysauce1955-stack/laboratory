@@ -13,7 +13,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from lab._util import now, parse_duration
+from lab._util import now, parse_duration, pid_alive
 from lab.core import Lab, build_backend
 from lab.models import JobManifest, JobState, ResourceRequest
 from lab.scheduler.bundle import extract_bundle
@@ -23,14 +23,6 @@ from lab.scheduler.queue import QueueStore
 from lab.store import JobStore
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
 
 
 class Scheduler:
@@ -248,7 +240,7 @@ class Scheduler:
                 # max_concurrent after a host crash/reboot.
                 rt = self.store.read_runtime(reg.job_id)
                 pid = rt.get("runner_pid")
-                if pid and not _pid_alive(int(pid)):
+                if pid and not pid_alive(int(pid)):
                     pgid = rt.get("command_pgid")
                     if pgid:  # orphaned experiment process: nothing enforces its timeout now
                         try:
@@ -265,7 +257,7 @@ class Scheduler:
             ):
                 rt = self.store.read_runtime(reg.job_id)
                 pid = rt.get("runner_pid")
-                if pid and not _pid_alive(int(pid)):
+                if pid and not pid_alive(int(pid)):
                     from lab.backends.skypilot import cluster_name_for
 
                     cluster = str(rt.get("cluster") or cluster_name_for(reg.job_id))

@@ -1,6 +1,7 @@
 # Feature Proposal: Spot instances with resubmit-on-preemption
 
-**Status:** proposed (2026-06-14, rev. 2 — incorporates user cost-safety feedback) ·
+**Status:** **implemented** — `--spot` / `--no-fallback` (`--spot-only`) and the `preempted` job
+state shipped. Written 2026-06-14, rev. 2 — incorporates user cost-safety feedback ·
 **Audience:** lab users (people running experiments)
 
 This describes a proposed feature from your point of view as someone who uses the lab to run

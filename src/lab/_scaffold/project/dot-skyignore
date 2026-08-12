@@ -1,7 +1,14 @@
-# SkyPilot's exclusion is if/else: when a .skyignore exists it is used INSTEAD of .gitignore,
-# so anything you want kept off remote boxes must be listed here too.
+# What NOT to rsync to a remote box with the workdir.
+#
+# SkyPilot uses THIS file *instead of* .gitignore when it exists (sky.data.storage_utils.
+# get_excluded_files is an if/else, not a union) — so being git-ignored is not enough to keep a
+# file off the remote. Anything secret must be listed here explicitly (FR-J1).
 .env
-.git
-runs/
 .venv
-__pycache__/
+runs
+.git
+.mypy_cache
+.ruff_cache
+.pytest_cache
+__pycache__
+mlruns

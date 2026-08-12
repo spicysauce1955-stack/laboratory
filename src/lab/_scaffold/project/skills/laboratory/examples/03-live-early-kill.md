@@ -20,7 +20,7 @@ divergence criterion fires — saving GPU-hours on a run that's already lost.
 
 ```python
 res = mcp__lab__submit(
-    command="python experiments/tempotron_capacity.py",
+    command="python experiments/example.py",
     backend="skypilot",
     accelerators="RTX4090:1",
     timeout="2h",

@@ -1,5 +1,11 @@
 # Laboratory — bugs & feedback (for the lab author)
 
+*Archived point-in-time record: user-filed bug reports from 2026-06-07. Every entry here is
+closed; the document is kept because later designs and tests cite its sections (§1, §4–§8) as
+precedent. For current information see [`README.md`](../../README.md),
+[`docs/guides/getting-started.md`](../guides/getting-started.md),
+[`docs/COMPATIBILITY.md`](../COMPATIBILITY.md) and [`CHANGELOG.md`](../../CHANGELOG.md).*
+
 Observations found while *using* the lab (I don't edit the lab project; logging here per request).
 Each entry: what I saw, how to reproduce, severity, and a suggested fix.
 

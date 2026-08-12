@@ -82,7 +82,12 @@ auto-resubmit applies to them like any spot job.
 
 ## One-time setup
 
-- `uv sync --extra skypilot --extra gcp`
+- Install the lab into your project with the `gcp` extra:
+  ```bash
+  uv add "laboratory[gcp] @ git+https://github.com/spicysauce1955-stack/laboratory@v0.5.0"
+  ```
+  (Working on the lab itself, in a clone of *this* repo, the contributor equivalent is
+  `uv sync --extra gcp`.)
 - **Authenticate.** There is no GCP "API key" for provisioning: SkyPilot and the lab's own
   compute-API passes both go through **Application Default Credentials** (`google.auth.default()`).
   Pick one of two paths — see *Credentials* below.
@@ -127,8 +132,12 @@ chmod 600 ~/.config/gcloud/lab-sa.json
 # then in .env:
 #   GOOGLE_APPLICATION_CREDENTIALS=/home/you/.config/gcloud/lab-sa.json
 #   GOOGLE_CLOUD_PROJECT=my-project-id
-gcloud auth activate-service-account --key-file=$GOOGLE_APPLICATION_CREDENTIALS
+gcloud auth activate-service-account --key-file=/home/you/.config/gcloud/lab-sa.json
 ```
+
+Spell the path out on that last line. `GOOGLE_APPLICATION_CREDENTIALS` lives in `.env`, which the
+lab reads *inside its own process* and never exports to your shell — `--key-file=$GOOGLE_...`
+expands to empty in an interactive terminal.
 
 The last line matters: SkyPilot shells out to `gcloud` for some GCP operations, so activating the
 service account there too avoids a half-authenticated state where `sky check gcp` passes but
@@ -207,8 +216,10 @@ exported in your shell **win** over the file, so `GOOGLE_CLOUD_PROJECT=other uv 
 overrides for a single command. Blank entries are treated as unset — an unfilled
 `GOOGLE_APPLICATION_CREDENTIALS` simply falls through to path (a). A path that doesn't exist fails
 loudly at startup instead of surfacing as an opaque auth error mid-provision. The file holds the
-key's **path**, never the key itself, and never reaches a manifest or a remote box (the remote
-syncs without the `cli` group).
+key's **path**, never the key itself, and never reaches a manifest or a remote box — `.env` is
+listed in **`.skyignore`**, which is what actually keeps it out of the workdir rsync. Being
+git-ignored is *not* enough: SkyPilot uses `.skyignore` **instead of** `.gitignore` when it
+exists, so anything secret must be named there explicitly (`lab init` writes it).
 
 ## Deferred jobs (scheduler)
 

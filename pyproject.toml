@@ -87,6 +87,11 @@ include = [
     "CHANGELOG.md",
     "LAB-REQUIREMENTS.md",
 ]
+# Archived point-in-time records (a delivery letter, a closed bug ledger, closed field reports).
+# They live under docs/ so their history and inbound links survive, but they describe states of
+# the world that no longer hold — shipping them to someone installing from source would put stale
+# setup instructions in the same tree as current ones.
+exclude = ["docs/archive"]
 
 [tool.ruff]
 line-length = 100
@@ -96,12 +101,8 @@ line-length = 100
 # aren't lab source. Keep correctness checks (undefined names, syntax) but waive the import- and
 # statement-style rules `src/lab` is held to.
 "experiments/*" = ["E4", "E7", "F401", "F541", "F841"]
-"collect_v10.py" = ["E4", "E7", "F401", "F541", "F841"]
-# Same waiver, same reason: researcher analysis scratch, not lab source. These leave with the
-# rest of the workspace when `tempotron-capacity` is extracted (packaged-release spec §9.1);
-# until then they must not fail the release gates.
-"analyze_clean.py" = ["E4", "E7", "F401", "F541", "F841"]
-"analyze_formtest.py" = ["E4", "E7", "F401", "F541", "F841"]
+# `experiments/` now holds a single file — example_capacity.py, the lab's own contract fixture.
+# The analysis scratch that needed the wider waiver left with tempotron-capacity.
 ".claude/**" = ["E4", "E7", "F401", "F541", "F841"]
 
 [tool.mypy]

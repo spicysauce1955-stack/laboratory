@@ -32,7 +32,7 @@ When you submit, the lab resolves `HEAD` and checks whether your working tree is
 
 ```bash
 # Dirty tree → the diff is captured automatically; the manifest is reproducible.
-uv run lab submit -c "python experiments/example_capacity.py" --seed 42
+uv run lab submit -c "python experiments/example.py" --seed 42
 ```
 
 Inspect the result:
@@ -76,7 +76,7 @@ files:
 ```bash
 git checkout <git_commit>                 # the pinned SHA from the manifest
 # then apply the captured snapshot onto that checkout:
-python -c "from pathlib import Path; from lab.manifest import apply_diff; \
+uv run python -c "from pathlib import Path; from lab.manifest import apply_diff; \
            apply_diff(Path('runs/<job_id>/code_diff.tar.gz'), Path('.'))"
 ```
 
@@ -115,7 +115,7 @@ Every job carries a wall-clock cap (`--timeout`). When a job hits it:
   ```
 
 ```bash
-uv run lab submit -c "python experiments/example_capacity.py" \
+uv run lab submit -c "python experiments/example.py" \
   --backend skypilot --accelerators RTX4090:1 --timeout 20m
 ```
 
