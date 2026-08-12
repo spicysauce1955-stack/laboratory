@@ -4,6 +4,25 @@
 **Re:** the Remote Experiment Runner is built and ready to use for the tempotron-capacity work (and anything else).
 **Status:** P0 (MVP) + the P1 roadmap (§12) **complete and validated** — including a real end-to-end run on a Vast.ai GPU. Two individually-P1-tagged FRs and the P2 items are not built yet (see §8 below — stated honestly).
 
+> ### Addendum — this letter is dated; see below for what changed (2026-08-12, v0.3.0)
+>
+> The body of this document is kept as written at delivery. Three of its statements have since
+> been overtaken and should not be read as current:
+>
+> - **§8's "FR-B1 (partial)"** — the dirty-tree **diff snapshot is now implemented** and
+>   fail-closed: `JobStore.create` rejects a manifest whose code can't reproduce the run, and a
+>   dirty submit auto-snapshots the diff into `code_diff.tar.gz`. See
+>   `docs/guides/provenance-and-timeouts.md`.
+> - **§9's "43 tests"** — the suite is now **634**.
+> - **§8's "FR-I3 (not yet): spot/preemptible"** — spot is supported on Vast and GCP
+>   (`--spot`, with on-demand fallback and `preempted` classification).
+>
+> Since delivery the lab has also gained: DigitalOcean and **Google Cloud** backends, sharded
+> sweeps, a deferred scheduler, `lab confirm`, `lab export`, and — in this release —
+> region/zone placement, storage-inclusive costing, and `lab doctor`. Current state lives in
+> `CLAUDE.md` (key facts) and `docs/guides/`; open work is in
+> `docs/proposals/2026-08-12-gcp-remaining-gaps.md`.
+
 ---
 
 ## 1. What you got, in one paragraph
