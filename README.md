@@ -6,6 +6,7 @@ jobs and keep working, watch metrics live and kill early if off-track, and get r
 unchanged.
 
 - **Getting started:** [`docs/guides/getting-started.md`](docs/guides/getting-started.md)
+- **Used to work inside this repo?** [`docs/guides/moving-off-the-lab-repo.md`](docs/guides/moving-off-the-lab-repo.md)
 - **What a release freezes:** [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) ·
   **what changed:** [`CHANGELOG.md`](CHANGELOG.md)
 - **Spec:** [`LAB-REQUIREMENTS.md`](LAB-REQUIREMENTS.md) (RFC-2119, phased P0/P1/P2)
