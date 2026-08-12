@@ -12,8 +12,22 @@ attempted, what the system did, what was expected, and what the gap cost.
 
 ## Running cost
 
-| Stage | Where | Recorded | Notes |
+| Stage | Where | Recorded | Outcome |
 |---|---|---|---|
+| 0 | local | $0.00 | **PASS** — q0 deterministic, lint clean |
+| 1a | GCP T4 | $0.00 | capacity: T4 exhausted in 7 zones, never provisioned |
+| 1b | GCP L4 | $0.0334 | **F9** — GPU billed, unusable (cu130 vs driver 12020) |
+| 1c | GCP L4 ×2 | $0.1003 | root cause **and** remedy proven (`torch==2.5.1+cu121` → `cuda_available: true`) |
+| 2a | GCP CPU ×5 | $0.00 rec / ~$0.43 real | cancelled after re-sizing — **F10** |
+| 2b | GCP CPU ×8 | $2.3329 | **the science**: 200 rows, K_eff 8/16/32, 8 seeds |
+| 3 | GCP CPU | $0.0112 | figure rendered; live reconcile clean; config handshake verified |
+| 4 | GCP TPU | $0.0626 | TPU ran on GCP for the first time — **F12**, **F13** |
+| **total** | | **$2.54 recorded** | ~$2.97 real; ceiling $15 |
+
+Cost recording note: `timed_out` shards recorded cost correctly ($0.29 each). Only **cancelled**
+jobs lose it, which narrows F10 to the cancel path specifically.
+
+---|---|---|---|
 | 0 | local | $0.00 | |
 | 1a | GCP T4 | $0.00 | never provisioned — capacity exhausted in 7 zones |
 | 1b | GCP L4 | $0.0334 | provisioned, GPU unusable (F9) |
@@ -493,3 +507,34 @@ the three `GCPNodeType` values the predicate already accepts. Only the *listing*
 
 **Test:** a fake TPU listing returning a `…-tpu` node not tied to a running job yields a
 `gcp_tpu_orphans` entry and exit 3; a node tied to a running cluster does not.
+
+---
+
+## Verdict
+
+**The science.** q0 measured for `gauss` at K_eff ∈ {8, 16, 32}, 8 seeds, α = 1.8–3.0. Two clean
+monotonic trends: q0 roughly **halves per doubling of K_eff** (0.214 → 0.133 → 0.060 at α=1.8) and
+**rises with load** within every cell (K=8: 0.214 → 0.335). Solution clusters are more diverse for
+richer kernels and are forced together as load approaches capacity. Every point sits below its
+published findable α_c, as it must — above α_c nothing solves and q0 is undefined.
+
+K_eff=64 is missing: cell cost is superlinear in K_eff and the shards hit their wall-clock cap
+after ~27 of 36 rows. Data, figure and provenance are committed
+(`experiments/kernel_universality_capacity/results/q0_2026-08-12.csv`).
+
+**The lab.** Thirteen findings, two of them serious enough to act on before the next GPU or TPU
+run: **F9** (a GCP GPU job bills an accelerator it cannot use, silently, unless the workload
+happens to check) and **F13** (the GCP second-channel leak sweep has no TPU equivalent, so a TPU
+leak is invisible exactly when the primary channel has failed). **F12** blocks TPU launches
+outright on a metric name GCP does not have.
+
+What worked, verified live rather than assumed: the node predicate rewritten earlier that day
+matched five real GCE nodes with `gcp_unmatched` empty; fail-closed provenance snapshotted a dirty
+tree unasked; provision failover survived seven exhausted zones; eight shards ran concurrently;
+partial-row aggregation recovered 200 rows from eight timed-out shards; and the async-teardown
+gotcha behaved exactly as the guide documents it.
+
+**Two claims I checked and withdrew** rather than file: a provision-watchdog overrun (I had
+misread local log timestamps as UTC) and a running job appearing in `gcp_orphans` (it had
+succeeded seconds earlier). Both were caught by looking before filing, which is the same
+discipline that produced F9's proven root cause instead of a plausible guess.
