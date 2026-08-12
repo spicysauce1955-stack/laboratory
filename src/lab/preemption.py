@@ -23,6 +23,14 @@ def gcp_terminal_state(instances: list[dict[str, Any]]) -> JobState | None:
     Abstains (``None``) rather than guessing when there is nothing terminal to read — no instance
     left, or one still running — so the caller keeps today's inference. Pure; the listing that
     feeds it is :func:`lab.backends.skypilot.gcp_preemption_state`.
+
+    **Known limit — on GCP *spot* this abstains in practice.** SkyPilot's spot config sets
+    ``instanceTerminationAction: DELETE``, so GCE deletes a preempted VM rather than leaving it
+    ``TERMINATED``: the evidence is destroyed by the event we are confirming. And whenever a spot
+    instance *is* readable, ``preemptible`` is true, so the ``failed`` branch cannot fire for a
+    spot job. Net effect today: safe (never worse than the inference) but not yet an improvement
+    on it. The record that survives the delete is the zone operations log
+    (``operationType = compute.instances.preempted``) — the open follow-up.
     """
     stopped = [i for i in instances if str(i.get("status") or "").upper() == "TERMINATED"]
     if not stopped:

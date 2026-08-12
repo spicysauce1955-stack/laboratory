@@ -153,6 +153,33 @@ same shape as `confirm_no_instance`, which already does provider-direct verifica
 **test:** a fake compute reporting `TERMINATED` + `preemptible=true` → preempted; reporting a
 non-preemptible stop → failed; a listing error → fall back to today's inference, never worse.
 
+> **Shipped, and currently inert — this record's premise is half true.** GCE does state
+> preemption, but SkyPilot's GCP spot config sets `instanceTerminationAction: DELETE`
+> (`templates/gcp-ray.yml.j2`), so GCE **deletes** a preempted VM rather than leaving it
+> `TERMINATED`. The evidence the probe reads is destroyed by the event it is confirming.
+>
+> Worked through case by case on GCP spot:
+>
+> | Case | Instance readable? | Probe | Old inference | Net |
+> |---|---|---|---|---|
+> | genuine preemption | no (deleted) | abstains | `preempted` | unchanged, and right |
+> | non-preemption stop of a spot VM | yes, `preemptible=true` | `preempted` | `preempted` | unchanged |
+> | on-demand VM stopped | yes, `preemptible=false` | `failed` | `failed` (`use_spot` false) | unchanged |
+>
+> The `failed` branch cannot fire for a spot job at all, because a readable spot instance always
+> has `preemptible=true`. So the probe is **safe but delivers no improvement yet**. It is left in
+> place: it is correct, tested, costs one listing, and is the seam the real fix plugs into.
+>
+> **The actual fix, still open.** The authoritative record survives the delete — it lives in the
+> zone operations log, not on the instance: `compute.zoneOperations.list` filtered to
+> `operationType = compute.instances.preempted` with `targetLink` matching the cluster's nodes.
+> That distinguishes a real preemption from any other disappearance, which is exactly what this
+> record asked for. Implementation note: it needs the *zone*, which the probe does not currently
+> carry once the instance is gone — either walk all zones the manifest could have landed in, or
+> record the launched zone on the manifest at provision time (cheaper, and useful elsewhere).
+> `test_a_real_gcp_preemption_leaves_nothing_for_the_probe_to_read` pins today's behaviour so the
+> gap stays visible.
+
 ## 4. `GCP-LEAK-8` — uncovered billable GCP resources — **CLOSED, not a gap**
 
 `area: leak` · `severity: medium` · `confidence: suspected → **refuted**`
@@ -243,7 +270,7 @@ which SkyPilot's bucket staging can emit into logs.
 |---|---|---|
 | `GCP-LEAK-7` | orphan passes match SkyPilot's real node shape `lab-…-<head\|worker>-<uuid8>-<compute\|tpu\|mig>`; report carries `gcp_project` and an advisory `gcp_unmatched` | `lab-notebook` and five near-miss names are not orphans; unmatched names reported but never destroyed; swept project recorded; predicate round-trips names built by **SkyPilot's own** naming functions, plus the verbatim names from the 2026-08-11 live run |
 | `GCP-CREDS-2` | `_load_env` resolves through `_repo()` | `.env` is read from `LAB_REPO_DIR` |
-| `GCP-PREEMPT-1` | `gcp_preemption_state` probe feeds the classifier's inputs; classifier itself untouched | non-preemptible stop → `failed` (end to end); real preemption → `preempted`; probe error → today's inference |
+| `GCP-PREEMPT-1` | `gcp_preemption_state` probe feeds the classifier's inputs; classifier itself untouched. **Safe but inert on GCP spot** — see the note in its section; the real fix (zone operations log) is still open | non-preemptible stop → `failed` (end to end); real preemption → `preempted`; probe error → today's inference; a deleted-on-preemption VM leaves nothing to read |
 | `GCP-LEAK-8` | **refuted** — no code | launch path creates no object storage |
 | `GCP-CREDS-4` | `.env` added to `.skyignore` — it was really syncing | asserted against SkyPilot's `get_excluded_files` |
 | `GCP-LEAK-9` | `build_run_script` docstring + guide state the per-cloud effect | docs only |

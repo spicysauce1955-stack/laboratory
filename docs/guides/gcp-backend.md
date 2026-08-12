@@ -298,18 +298,27 @@ GCP has **two teardown channels**, mirroring the Vast design:
   instance still listed several minutes after the job ended is real, and `lab reconcile --apply`
   is the fix.
 
-## Spot preemption is read, not guessed
+## Spot preemption: still inferred, and here is why
 
-On the unmanaged spot path the lab normally *infers* preemption: spot, plus the box vanished,
-plus no authoritative terminal status. GCE does not require that guess — a preempted Spot VM goes
-`TERMINATED` with `scheduling.preemptible = true` — so on GCP the lab asks the compute API before
-falling back to the inference.
+On the unmanaged spot path the lab *infers* preemption: spot, plus the box vanished, plus no
+authoritative terminal status. That inference is wrong in the expensive direction — a job that
+genuinely *failed* on a box that happened to disappear looks identical to a preemption, and the
+scheduler auto-resubmits preempted jobs, so the same failure gets paid for twice.
 
-This matters because the inference is wrong in the expensive direction: a job that genuinely
-*failed* on a box that happened to disappear looked identical to a preemption, and the scheduler
-auto-resubmits preempted jobs — so the same failure got paid for twice. GCE's answer wins over
-the inference in both directions, and if the probe can't answer (no ADC, revoked role, a 5xx, or
-the instance already deleted) the old inference stands unchanged.
+The lab now asks GCE before falling back to that inference (`gcp_preemption_state`), reading
+`status = TERMINATED` + `scheduling.preemptible`. **But on GCP spot that probe currently cannot
+answer**, and it is worth knowing why rather than assuming you are covered:
+
+SkyPilot's GCP spot config sets `instanceTerminationAction: DELETE`, so GCE **deletes** a
+preempted VM instead of leaving it `TERMINATED`. The evidence is destroyed by the event we are
+trying to confirm. The probe correctly abstains, and the old inference carries the
+classification — landing on `preempted`, which for a genuine preemption is right.
+
+So the probe is currently **safe but inert** on GCP spot: it never makes the answer worse, and it
+does not yet make it better. The record that *does* survive the delete is the zone operations log
+(`operationType = compute.instances.preempted`); wiring that in is the open follow-up in
+`docs/proposals/2026-08-12-gcp-remaining-gaps.md`. Until then, treat a `preempted` GCP spot
+result as "the box went away and it was spot", not as GCE's confirmation.
 
 ## Limitations (v1)
 

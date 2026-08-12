@@ -1117,6 +1117,26 @@ def test_gce_terminal_state_calls_a_non_preemptible_stop_a_failure():
     assert gcp_terminal_state(stopped) is JobState.failed
 
 
+def test_a_real_gcp_preemption_leaves_nothing_for_the_probe_to_read():
+    """The limit of the probe, pinned so nobody over-trusts it.
+
+    SkyPilot's GCP spot config sets `instanceTerminationAction: DELETE` (templates/gcp-ray.yml.j2),
+    so GCE **deletes** a preempted VM rather than leaving it TERMINATED — the evidence the probe
+    was meant to read is destroyed by the very event it is trying to confirm. The probe therefore
+    abstains and today's inference carries the classification, which lands on `preempted` anyway.
+
+    The consequence: on GCP spot, `preemptible` is always true whenever an instance *is* readable,
+    so the `failed` branch cannot fire for a spot job, and the probe cannot yet distinguish a real
+    preemption from a non-preemption stop. It is safe (never worse than the inference) but it does
+    not yet deliver GCP-PREEMPT-1's benefit. The authoritative record that survives the delete is
+    the zone operations log (`operationType = compute.instances.preempted`) — see the follow-up in
+    docs/proposals/2026-08-12-gcp-remaining-gaps.md.
+    """
+    from lab.preemption import gcp_terminal_state
+
+    assert gcp_terminal_state([]) is None
+
+
 def test_gce_terminal_state_says_nothing_when_there_is_nothing_to_read():
     """No instance left (already deleted) or still running: GCE has no authoritative answer, so
     the probe must abstain rather than invent one — the caller keeps today's inference."""
