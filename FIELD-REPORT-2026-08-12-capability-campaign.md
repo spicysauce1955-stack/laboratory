@@ -358,3 +358,37 @@ the natural place for a "cost is derivable, so derive it" rule covering cancelle
 alike.
 **Test:** a cancelled manifest with `started_at`, `ended_at` and `hourly_usd` reports a non-null
 `actual_usd` matching `hourly × elapsed`.
+
+### F11 — `sweep-aggregate` crashes on multi-row-per-seed output, after the compute is paid for
+
+`severity: medium` · `confirmed`
+
+The sweep finished and `lab sweep-aggregate` died:
+
+```
+ValueError: duplicate row key ('0',) within one shard result
+```
+
+Each shard was one seed; v14 emits **36 rows per seed** (one per K_eff×α cell). The default row
+key is the seed column alone, so every row in a shard collides. The composite-key feature added in
+v0.2.1 is exactly the fix — `--row-key "seed,Keff_target,alpha"` aggregated all 200 rows cleanly —
+but nothing pointed there, and the traceback is a raw `ValueError` from `merge_seed_rows` rather
+than a diagnosis.
+
+The cost is the ordering. `lab sweep` accepted the submission, provisioned eight boxes and ran
+them to their wall-clock cap; only *then* did the tooling reveal that the results could not be
+aggregated with the configured key. The compute was already spent. `lab sweep` takes `--row-key`
+at submit time, so the mismatch is knowable up front.
+
+Two cheap improvements, in order of value:
+
+1. **Diagnose instead of raising.** `duplicate row key ('0',)` should say: "shard results have
+   multiple rows per seed; pass `--row-key` naming the columns that make a row unique (e.g.
+   `seed,<param>`), see …". The error already knows the key and that it was the bare seed column.
+2. **Check at submit.** A sweep whose entrypoint is known to emit multiple rows per seed cannot be
+   aggregated by seed alone. A local dry-run of one cell, or simply warning when `--row-key` is
+   left at its default for a grid with internal parameter lists, would move the failure before the
+   spend.
+
+**Test:** a shard CSV with two rows sharing a seed produces an error naming `--row-key`, not a
+bare `ValueError`; and with a composite key those rows aggregate.
