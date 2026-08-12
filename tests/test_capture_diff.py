@@ -43,3 +43,27 @@ def test_roundtrip_restores_dirty_state(tmp_path: Path):
 
     assert (fresh / "tracked.txt").read_text() == "CHANGED\n"
     assert (fresh / "new_script.py").read_text() == "print('hi')\n"
+
+
+def test_untracked_symlink_to_a_directory_does_not_break_capture(tmp_path: Path):
+    """git lists an untracked symlink as one entry. Copying *through* one that points at a
+    directory raised IsADirectoryError and took the whole dirty-tree snapshot with it — so a
+    project with, say, a linked data/ dir could not submit at all (FR-B1)."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    commit = current_commit(repo)
+    (repo / "real_dir").mkdir()
+    (repo / "real_dir" / "inner.txt").write_text("payload\n")
+    (repo / "linked").symlink_to("real_dir", target_is_directory=True)
+
+    blob = capture_diff(repo, tmp_path / "dest")
+    assert blob is not None and Path(blob).exists()
+
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    _git(repo, "worktree", "add", "-q", "--detach", str(fresh), commit)
+    apply_diff(Path(blob), fresh)
+
+    # The link is restored as a link, not as a copy of its target.
+    assert (fresh / "linked").is_symlink()
+    assert (fresh / "real_dir" / "inner.txt").read_text() == "payload\n"
