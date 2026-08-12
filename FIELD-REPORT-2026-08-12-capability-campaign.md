@@ -30,6 +30,17 @@ Gate: q0 computed and deterministic; `lab lint` clean.
 
 ---
 
+## Verified working, on live infrastructure
+
+| Claim | Evidence | Result |
+|---|---|---|
+| `is_lab_cluster_node` matches real GCE nodes | 5 live instances from the stage-2 sweep, e.g. `lab-20260812-123332-ce9b5f-3dd12990-head-t2zlfn9c-compute` | **PASS** — all 5 `ours=True`, `gcp_unmatched: []`. The predicate rewritten on 2026-08-12 had only ever been checked against *recorded* names; this is the first time it has met live nodes. |
+| `gcp_project` names the swept project | `myproject-505213` in every reconcile | **PASS** |
+| Fail-closed provenance on a dirty tree | stage-1 submit auto-snapshotted `code_diff.tar.gz` to R2 and recorded `diff_ref` | **PASS** — happened without being asked for |
+| GCP provision failover | T4 exhausted in 6 zones (`us-central1-b/c/f`, `us-east1-b/c/d`); SkyPilot failed over across all of them | **PASS** — the 20-minute GCP provision budget (raised from 8 precisely for this) is what makes the failover survivable |
+| Shard concurrency on GCP | 5 shards provisioned and ran concurrently in `us-east1-b` | **PASS** |
+| `lab lint` on a legacy entrypoint | 13 keys checked, `missing_keys: []` | **PASS** |
+
 ## Findings
 
 ### F1 — `lab lint` is load-bearing for v14, because the runtime handshake does not cover it
