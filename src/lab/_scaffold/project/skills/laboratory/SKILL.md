@@ -1,22 +1,23 @@
 ---
 name: laboratory
-description: "Run/execute a reproducible ML or compute experiment via the lab runner (MCP tools / `lab` CLI) — in this repo this is the right way to actually launch a training/experiment job, not running the script directly. Use when the user wants the work done, not just discussed: run, submit, or kick off an experiment; sweep a grid over hyperparameters/seeds and report which config won; shard a large-seed sweep into independently-bounded per-seed sub-jobs and aggregate one per-cell result (sweep-aggregate / sweep-retry); put a job on a remote GPU (RTX 4090 on Vast.ai via SkyPilot; T4/L4 on GCP) or a cheap remote CPU box (DigitalOcean/GCP, --backend cpu), cap its cost or runtime; REGISTER/schedule an experiment for later — run tonight/off-hours, run when a GPU price drops, run after another job, queue/hold/cancel deferred runs while the laptop is closed; stream live metrics and kill a diverging run early; fetch results/artifacts; reproduce a prior run or verify a result still reproduces (lab confirm); export a committable provenance bundle for the paper (lab export); or diagnose a billing/teardown leak ('am I still being charged?', stuck Vast rental, `lab wait` exit 3). Triggers: lab submit, lab sweep, lab sweep-aggregate, lab sweep-retry, lab wait, lab confirm, lab export, lab lint, lab register, lab queue, lab scheduler, lab reconcile. Skip for merely writing an experiment script or reading saved results."
+description: "Run/execute a reproducible ML or compute experiment via the lab runner (MCP tools / `lab` CLI) — in this project this is the right way to actually launch a training/experiment job, not running the script directly. Use when the user wants the work done, not just discussed: run, submit, or kick off an experiment; sweep a grid over hyperparameters/seeds and report which config won; shard a large-seed sweep into independently-bounded per-seed sub-jobs and aggregate one per-cell result (sweep-aggregate / sweep-retry); put a job on a remote GPU (RTX 4090 on Vast.ai via SkyPilot; T4/L4 on GCP) or a cheap remote CPU box (DigitalOcean/GCP, --backend cpu), cap its cost or runtime; REGISTER/schedule an experiment for later — run tonight/off-hours, run when a GPU price drops, run after another job, queue/hold/cancel deferred runs while the laptop is closed; stream live metrics and kill a diverging run early; fetch results/artifacts; reproduce a prior run or verify a result still reproduces (lab confirm); export a committable provenance bundle for the paper (lab export); or diagnose a billing/teardown leak ('am I still being charged?', stuck Vast rental, `lab wait` exit 3). Triggers: lab submit, lab sweep, lab sweep-aggregate, lab sweep-retry, lab wait, lab confirm, lab export, lab lint, lab register, lab queue, lab scheduler, lab reconcile. Skip for merely writing an experiment script or reading saved results."
 metadata:
-  version: "0.7.0"
-  last_updated: "2026-08-06"
+  version: "0.8.0"
+  last_updated: "2026-08-12"
   status: active
 ---
 
 # Laboratory — Remote Experiment Runner
 
 This skill teaches you to drive the **lab** — an experiment-agnostic remote job
-runner — from inside the `laboratory` repo. The lab handles: submitting a job
-without blocking, watching its metrics live, sweeping a grid, fetching durable
-artifacts, and pinning everything to a reproducible manifest (commit + uv.lock
-+ config + seed).
+runner installed into this project as a dependency. The lab handles: submitting
+a job without blocking, watching its metrics live, sweeping a grid, fetching
+durable artifacts, and pinning everything to a reproducible manifest (commit +
+uv.lock + config + seed). Provenance is pinned against **this project's** git
+history, not the lab's.
 
-You will normally use the **MCP tools** (`mcp__lab__*`) registered by the repo's
-`.mcp.json`. For push-notify (block-until-done as a background task), use the
+You will normally use the **MCP tools** (`mcp__lab__*`) registered by this
+project's `.mcp.json` (written by `lab init`). For push-notify (block-until-done as a background task), use the
 **CLI** `uv run lab wait` — the MCP `wait` tool is deliberately bounded (default
 600s) and is only for short waits.
 
@@ -42,23 +43,30 @@ tracking — just running `uv run python experiments/foo.py` is fine.
 
 ## 2. Prerequisites (verify before first use)
 
-Run from the lab repo root.
+Run from **this project's** root — the git repo whose commits the lab pins as
+provenance and under whose `runs/` results land.
 
-- **Sync deps.**
-  - `uv sync` — local backend + CLI + MCP server (lean default).
-  - `uv sync --extra skypilot --extra r2` — also enables remote (Vast.ai via
-    SkyPilot) and durable artifacts on Cloudflare R2. Add `--extra gcp` for
-    `--cloud gcp`.
-- **Remote creds (only for remote backends).**
+- **Sync deps.** `uv sync` installs what this project's `pyproject.toml` pins,
+  including the `laboratory` version it depends on. Remote backends need the
+  matching extras on that dependency; if a backend is missing, re-add it with
+  the extras you need, e.g.
+  `uv add "laboratory[skypilot,gcp,r2] @ git+https://github.com/spicysauce1955-stack/laboratory@vX.Y.Z"`
+  (`skypilot` = Vast.ai, `do` = DigitalOcean, `gcp` = Google Cloud, `r2` =
+  durable artifacts).
+- **Remote creds (only for remote backends).** Machine-local, never committed —
+  see `.env.example` in this project.
   - Vast API key in `~/.config/vastai/vast_api_key` (`--cloud vast`, the default).
-  - GCP: gcloud ADC auth + project + GPU quota — see §7 / `docs/guides/gcp-backend.md`.
+  - GCP: gcloud ADC auth + project + GPU quota — see §7. Run `uv run lab doctor
+    --cloud gcp` before spending money; it checks creds, project, billing, APIs,
+    IAM and quota.
   - R2 (optional, for durable artifacts):
     - Creds in `~/.cloudflare/r2.credentials` (S3-compat: Access Key + Secret).
     - Env: `LAB_R2_ENDPOINT="https://<account>.r2.cloudflarestorage.com"` and
       `LAB_R2_BUCKET="lab-artifacts"`.
-- **MCP server.** Registered by `.mcp.json` at the repo root. Opening the repo
-  in Claude Code should offer the `lab` server; once enabled, the tools below
-  appear as `mcp__lab__submit`, etc.
+- **MCP server.** Registered by `.mcp.json` at this project's root, written by
+  `uv run lab init`. Opening the project in Claude Code should offer the `lab`
+  server; once enabled, the tools below appear as `mcp__lab__submit`, etc. If
+  they are missing, run `uv run lab init --check`.
 - **Dirty trees are captured, not lost (fail-closed provenance, FR-B1).**
   Manifests pin `HEAD`; if the tree is dirty the lab **auto-snapshots the
   uncommitted changes** (tracked diff + untracked files) and records a
@@ -67,7 +75,7 @@ Run from the lab repo root.
   (CLI) / `allow_dirty=false` (MCP) to refuse a dirty submit instead. Note the
   cache (`cache=true`) still only hits on a **clean** tree, and `lab confirm`
   still refuses a dirty producer — commit when you want cache reuse or
-  confirmability. See `docs/guides/provenance-and-timeouts.md`.
+  confirmability. See the [provenance & timeouts guide](https://github.com/spicysauce1955-stack/laboratory/blob/main/docs/guides/provenance-and-timeouts.md).
 
 ## 3. The Experiment Contract (spec §7)
 
@@ -94,7 +102,7 @@ A metric line is `{"name": "...", "value": <float>, "step": <int>, "wall_time": 
 The lab tolerates a half-written trailing line, so you can write line-by-line
 and the metrics tool will still read cleanly.
 
-**Reference template:** `experiments/example_capacity.py` (50 lines, contract-compliant).
+**Reference template:** `experiments/example.py` (50 lines, contract-compliant).
 
 **For sharded sweeps (§4 `sweep` with `seeds`/`shard_size`)** the entrypoint additionally must:
 read its assigned seed subset from a config key (default `seeds`, a comma list like `seeds=0,1,2,3`)
@@ -104,11 +112,11 @@ per-cell aggregate and uses the seed column to report present-vs-expected and na
 the file and the column are overridable (`--results-file` / `--seed-column`). **Multiple rows per
 seed** (an axis swept inside the job, e.g. one row per (seed, α)) are supported by declaring the
 row identity at sweep time: `--row-key seed,alpha` — duplicates are then judged on the full key.
-Guide: `docs/guides/sharded-sweeps.md`.
+Guide: the [sharded sweeps guide](https://github.com/spicysauce1955-stack/laboratory/blob/main/docs/guides/sharded-sweeps.md).
 
 ## 4. The MCP tool surface
 
-All registered by `build_server` in `src/lab/mcp_server.py`. Each returns a
+All registered by the lab's MCP server (`lab mcp`). Each returns a
 JSON-serializable dict.
 
 ### `mcp__lab__submit`
@@ -116,7 +124,7 @@ Submit one job. Non-blocking — returns immediately with the `job_id`.
 
 | Input            | Type           | Notes |
 |------------------|----------------|-------|
-| `command`        | str (required) | e.g. `"python experiments/example_capacity.py"` |
+| `command`        | str (required) | e.g. `"python experiments/example.py"` |
 | `backend`        | str            | `"local"` (default), `"skypilot"`, or `"cpu"` (cheap CPU box: 4 vCPU + 50 GB volume, DO by default) |
 | `cloud`          | str            | SkyPilot cloud: `"vast"` (default) \| `"do"` \| `"gcp"`. `--backend cpu --cloud gcp` runs the cpu profile on GCP (spot allowed there; DO has none). GCP GPUs: `accelerators="T4:1"`/`"L4:1"`. |
 | `disk_size`      | int            | Boot/attached volume GB (skypilot; sizes the DO volume) |
@@ -327,7 +335,7 @@ column that flags `LEAK` rows loudly. Ctrl-C to exit.
 For "run this **tonight** / when a GPU is **cheap** / **after** that job — and let me close
 the laptop." A *registration* = a normal job spec + triggers + guardrails, written to an R2
 queue; an always-on droplet evaluates triggers every 60s and launches via skypilot. Spec:
-`docs/superpowers/specs/2026-06-10-deferred-scheduling-design.md`; host runbook:
+the [deferred-scheduling design](https://github.com/spicysauce1955-stack/laboratory/blob/main/docs/superpowers/specs/2026-06-10-deferred-scheduling-design.md); host runbook:
 `deploy/scheduler/README.md`.
 
 **Prereq:** export `LAB_R2_ENDPOINT` (+ `LAB_R2_BUCKET=lab-artifacts`) — register/queue talk
@@ -407,7 +415,7 @@ chunking by hand. Pattern: `mcp__lab__sweep(grid=…, seeds="0-31", shard_size=8
 per cell → if a cell is `incomplete`, `mcp__lab__sweep_retry(<sweep_id>)` reruns
 only the missing seeds, then aggregate again. Each shard is a normal job (own
 timeout + teardown + manifest); the experiment must honor the sharded results
-contract in §3. Guide: `docs/guides/sharded-sweeps.md`.
+contract in §3. Guide: the [sharded sweeps guide](https://github.com/spicysauce1955-stack/laboratory/blob/main/docs/guides/sharded-sweeps.md).
 
 ### C. Live early-kill (watch and stop if off-track)
 See **`examples/03-live-early-kill.md`**. Pattern: submit → poll
@@ -457,9 +465,9 @@ that fails.
 
 The **cloud** is orthogonal: `--cloud vast|do|gcp` (default `vast`) on
 submit/sweep/register. `--backend cpu --cloud gcp` runs the cpu profile on GCP
-— unlike DO, GCP allows spot there. GCP needs `uv sync --extra gcp`, gcloud ADC
+— unlike DO, GCP allows spot there. GCP needs `the `gcp` extra on the `laboratory` dependency`, gcloud ADC
 auth, and (for GPUs) per-family regional quota; guide:
-`docs/guides/gcp-backend.md`.
+the [GCP backend guide](https://github.com/spicysauce1955-stack/laboratory/blob/main/docs/guides/gcp-backend.md).
 
 The cpu-profile defaults are deliberately inside a **fresh DO account's tier**:
 8-vCPU sizes and SkyPilot's default 256 GB volume both `422` on an untouched
@@ -472,7 +480,7 @@ and marked `timed_out` if it overruns, and the machine is torn down.
 
 ## 8. Reproducibility & manifests
 
-Every job writes `runs/<job_id>/manifest.json` (model in `src/lab/models.py`)
+Every job writes `runs/<job_id>/manifest.json` (schema: `lab.models.JobManifest`)
 recording: created_at, git commit (+ dirty flag + `diff_ref`), uv.lock sha256,
 command, resolved config, seed, backend + machine type + region, status
 timeline, exit code + end reason, cost (estimated + actual), artifact URIs, and
@@ -535,13 +543,21 @@ record artifact **URIs**, never credentials (spec FR-J1).
 
 ## 10. Pointers
 
-- **Full reference (human-facing):** `DELIVERY.md` at the repo root.
-- **Provenance & timeouts guide (human-facing):** `docs/guides/provenance-and-timeouts.md`.
-- **CPU backend guide:** `docs/guides/cpu-backend.md`.
-- **GCP backend guide:** `docs/guides/gcp-backend.md`.
-- **Sharded sweeps guide:** `docs/guides/sharded-sweeps.md`.
-- **Spec:** `LAB-REQUIREMENTS.md` (RFC-2119, FR/AC/NFR).
-- **Design decisions:** `research/16-decisions.md`.
-- **MCP tool source:** `src/lab/mcp_server.py`.
-- **CLI source:** `src/lab/cli.py`.
-- **Example experiment:** `experiments/example_capacity.py`.
+In **this project**:
+
+- **Example experiment:** `experiments/example.py` — the Experiment Contract, worked.
+- **Machine-local settings:** `.env.example` → copy to `.env` (git-ignored).
+- **Results:** `runs/<job_id>/` — manifest, logs, metrics, output.
+- **Installed version:** `uv run lab --version`; refresh this skill and `.mcp.json`
+  after upgrading with `uv run lab init`.
+
+In the [laboratory repo](https://github.com/spicysauce1955-stack/laboratory)
+(the lab's own source and docs):
+
+- **Getting started:** [getting-started guide](https://github.com/spicysauce1955-stack/laboratory/blob/main/docs/guides/getting-started.md).
+- **What a release freezes:** [COMPATIBILITY.md](https://github.com/spicysauce1955-stack/laboratory/blob/main/docs/COMPATIBILITY.md).
+- **Provenance & timeouts:** [guide](https://github.com/spicysauce1955-stack/laboratory/blob/main/docs/guides/provenance-and-timeouts.md).
+- **CPU backend:** [guide](https://github.com/spicysauce1955-stack/laboratory/blob/main/docs/guides/cpu-backend.md).
+- **GCP backend:** [guide](https://github.com/spicysauce1955-stack/laboratory/blob/main/docs/guides/gcp-backend.md).
+- **Sharded sweeps:** [guide](https://github.com/spicysauce1955-stack/laboratory/blob/main/docs/guides/sharded-sweeps.md).
+- **Spec:** [LAB-REQUIREMENTS.md](https://github.com/spicysauce1955-stack/laboratory/blob/main/LAB-REQUIREMENTS.md) (RFC-2119, FR/AC/NFR).

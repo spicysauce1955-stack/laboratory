@@ -119,7 +119,7 @@ seconds, destroy it by hand: `vastai destroy_instance <id>`.
 - Rentals tied to a job whose manifest is in `running` state — those show
   up as `matched`, not `orphans`.
 
-If you have multiple lab repos sharing one Vast account, run `lab reconcile`
+If you have multiple projects sharing one Vast account, run `lab reconcile`
 from each repo before `--apply` (a rental tied to a job in repo B looks like
 an orphan from repo A's perspective).
 

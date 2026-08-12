@@ -1,0 +1,14 @@
+# Machine-local settings for the lab. Copy to .env (git-ignored) and fill in.
+# Real environment variables win over this file; blank means unset.
+# Secrets live here and nowhere else — never in the repo, a manifest, or a log.
+
+# --- Google Cloud (--cloud gcp) ---
+GOOGLE_CLOUD_PROJECT=
+GOOGLE_APPLICATION_CREDENTIALS=
+
+# --- Cloudflare R2 durable artifacts (optional) ---
+LAB_R2_ENDPOINT=
+LAB_R2_BUCKET=
+
+# --- Overrides (rarely needed) ---
+# LAB_REPO_DIR=
