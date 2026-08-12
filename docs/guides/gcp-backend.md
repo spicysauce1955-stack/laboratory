@@ -177,7 +177,14 @@ Compute Admin + Service Account User is **not** enough for SkyPilot: `sky check 
 | `roles/iam.serviceAccountAdmin` | creating the VM service account at launch |
 | `roles/serviceusage.serviceUsageAdmin` | `serviceusage.services.use` / `.enable` |
 | `roles/iam.securityReviewer` | `resourcemanager.projects.getIamPolicy`, `iam.roles.get` |
-| `roles/storage.admin` | SkyPilot's staging bucket (`storage.buckets.create/delete`) |
+| `roles/storage.admin` | `sky check gcp`'s `storage.buckets.create/delete` probe |
+
+`roles/storage.admin` is needed to make `sky check gcp` pass, **not** because this lab stages
+anything into object storage. SkyPilot only creates a `skypilot-filemounts-*` bucket from
+`maybe_translate_local_file_mounts_and_sync_up`, which runs for controller-backed launches
+(`sky jobs launch` / `sky serve up`) and translates `file_mounts` / `storage_mounts`. The lab
+calls plain `sky.launch` with a `workdir`, rsynced over SSH — so no bucket is ever created and
+none needs reaping. `test_the_launch_path_creates_no_object_storage` fails if that changes.
 
 Grant them **as a project owner** — a service account cannot grant itself roles (it can't even
 `getIamPolicy`, so `add-iam-policy-binding` fails at the read):
@@ -228,14 +235,36 @@ GCP has **two teardown channels**, mirroring the Vast design:
 - Out-of-band: `lab reconcile` runs (a) the cloud-agnostic `sky.status` orphan pass and (b) a
   **GCP compute-API pass** listing `lab-*` instances and **unattached `lab-*` persistent disks**
   (a disk that outlives its VM keeps billing — the GCP analogue of the DO volume leak).
-  `--apply` deletes both, waiting for each delete operation to actually complete rather than
-  trusting the accepted request. The instance and disk passes are independent, and each reports
+  `--apply` deletes both — listing what it is about to destroy and asking first (`--yes` skips
+  the prompt for unattended use; declining exits 4 and destroys nothing) — and waits for each
+  delete operation to actually complete rather than trusting the accepted request. The instance and disk passes are independent, and each reports
   its own outcome in the report (`gcp_pass`, `gcp_disk_pass`).
   **Any orphan from any pass exits 3** in dry-run mode — the alarm reads the union, not a subset.
 - **"Skipped" vs "failed" matters.** The GCP passes skip only when GCP genuinely isn't set up on
   this machine (no ADC, no project, extra not installed) — the report says so. An actual API
   failure (revoked role, expired key, disabled API, 5xx) **raises** instead of reporting clean:
   a leak-detection pass that swallows an error claims coverage it doesn't have.
+- **The on-box `poweroff` backstop is compute-only on GCP.** It fires at `wall + 600s` and is
+  described elsewhere as "a hard backstop"; on GCP that is only half true. `poweroff` puts the VM
+  in `TERMINATED`, which stops **compute** billing — but the persistent disk survives a
+  TERMINATED instance and **keeps billing indefinitely**. So on GCP the backstop converts a
+  compute leak into a storage leak. That is a real improvement (compute is the expensive part),
+  but it is not a release of resources, and nothing on the box will ever release the disk. The
+  actual teardown path is `down=True` + autostop; `lab reconcile`'s unattached-disk pass is the
+  net behind it. (For contrast: on Vast `poweroff` ends the rental outright and nothing survives;
+  on DO it powers the droplet off and you keep paying full price for the whole droplet.)
+- **The GCP passes only claim what SkyPilot actually created.** A resource is ours only if it
+  matches the real node shape `lab-…-<head|worker>-<uuid8>-<compute|tpu|mig>` — e.g.
+  `lab-20260811-144501-c5b340-3dd12990-head-c0h9pkx0-compute`, where `3dd12990` is the SkyPilot
+  user hash and the job id is *not* reliably recoverable (`make_cluster_name_on_cloud` truncates
+  past GCP's 35-char limit, and our names fit by exactly zero characters); a bare
+  `lab-` prefix is not enough, because a shared project's
+  `lab-notebook` would have matched. Anything else named `lab-*` is listed under `gcp_unmatched`
+  and never destroyed — check that list if you expected a leak and saw none.
+- **Check `gcp_project` in the report.** The passes resolve the project ambiently from ADC, while
+  SkyPilot can be pinned to a *different* project in `~/.sky/config.yaml`. If those disagree,
+  reconcile sweeps a project the lab never launches into and truthfully reports it clean. The
+  report names the project it swept so you can tell that apart from a real all-clear.
 - Manual double-check if you suspect a leak:
   `gcloud compute instances list --filter="name~'^lab-'"` and
   `gcloud compute disks list --filter="name~'^lab-' AND -users:*"`.
@@ -269,6 +298,28 @@ GCP has **two teardown channels**, mirroring the Vast design:
   "still shutting down": give it a minute and re-run before treating a fresh orphan as a leak. An
   instance still listed several minutes after the job ended is real, and `lab reconcile --apply`
   is the fix.
+
+## Spot preemption: still inferred, and here is why
+
+On the unmanaged spot path the lab *infers* preemption: spot, plus the box vanished, plus no
+authoritative terminal status. That inference is wrong in the expensive direction — a job that
+genuinely *failed* on a box that happened to disappear looks identical to a preemption, and the
+scheduler auto-resubmits preempted jobs, so the same failure gets paid for twice.
+
+The lab now asks GCE before falling back to that inference (`gcp_preemption_state`), reading
+`status = TERMINATED` + `scheduling.preemptible`. **But on GCP spot that probe currently cannot
+answer**, and it is worth knowing why rather than assuming you are covered:
+
+SkyPilot's GCP spot config sets `instanceTerminationAction: DELETE`, so GCE **deletes** a
+preempted VM instead of leaving it `TERMINATED`. The evidence is destroyed by the event we are
+trying to confirm. The probe correctly abstains, and the old inference carries the
+classification — landing on `preempted`, which for a genuine preemption is right.
+
+So the probe is currently **safe but inert** on GCP spot: it never makes the answer worse, and it
+does not yet make it better. The record that *does* survive the delete is the zone operations log
+(`operationType = compute.instances.preempted`); wiring that in is the open follow-up in
+`docs/proposals/2026-08-12-gcp-remaining-gaps.md`. Until then, treat a `preempted` GCP spot
+result as "the box went away and it was spot", not as GCE's confirmation.
 
 ## Limitations (v1)
 

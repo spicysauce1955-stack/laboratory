@@ -2,7 +2,9 @@
 
 SkyPilot/Vast log the Vast API key inside request URLs (``…?api_key=<key>``); gcloud/SkyPilot
 on GCP can log OAuth material (``"access_token": "ya29.…"``, refresh tokens, service-account
-``private_key`` JSON fields). That output is streamed into ``logs.txt`` (and would go to R2).
+``private_key`` JSON fields) and GCS **signed-URL** credentials (``X-Goog-Signature=…``), where
+the signature itself grants read access until it expires. That output is streamed into
+``logs.txt`` (and would go to R2).
 :func:`redact` masks the value at capture time so the secret never lands on disk;
 :func:`install_log_redaction` wires it onto fds 1/2 in the supervisor so even subprocess output
 is filtered.
@@ -33,6 +35,11 @@ _PATTERNS = (
     ),
     # Bare OAuth2 access tokens (gcloud logs them outside JSON too, e.g. in curl commands).
     re.compile(r"(ya29\.)[0-9A-Za-z_\-.]+"),
+    # GCS V4 signed-URL credentials, which SkyPilot's bucket staging can emit into logs. The
+    # signature *is* the credential — it grants whoever holds the URL read access to the object
+    # until it expires — and X-Goog-Credential names the signing service account. The bucket and
+    # object path are deliberately left intact so the line stays diagnosable (GCP-CREDS-5).
+    re.compile(r"(X-Goog-(?:Signature|Credential)=)[^&\s\"']+", re.IGNORECASE),
 )
 
 

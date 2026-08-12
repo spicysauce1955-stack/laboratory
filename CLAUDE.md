@@ -20,7 +20,11 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
 - **Teardown is cost-critical (FR-C2):** every skypilot job runs through `robust_teardown`
   (sky.down retries → vastai-sdk fallback). A persistent failure flips `teardown_status="failed"`
   on the manifest and makes `lab wait` exit 3. **Recovery: `uv run lab reconcile [--apply]`**
-  finds orphaned `lab-*` Vast rentals not tied to a running job and destroys them.
+  finds orphaned rentals/instances not tied to a running job and destroys them. `--apply` lists
+  what it will destroy and **asks**; add `--yes` for unattended use (with no tty it refuses and
+  exits 4 rather than prompting). Only the approved set is destroyed. The GCP passes claim only
+  SkyPilot's real node shape `lab-…-<head|worker>-<uuid8>-<compute|tpu|mig>` — anything else
+  named `lab-*` is listed under `gcp_unmatched`, warned about on stderr, and never destroyed.
 - **Deferred scheduling:** `lab register` + `lab queue …` queue jobs (night window / price /
   dependency triggers); an always-on host runs `lab scheduler tick` every 60s (systemd timer,
   `deploy/scheduler/`). Spec: `docs/superpowers/specs/2026-06-10-deferred-scheduling-design.md`.

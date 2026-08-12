@@ -28,6 +28,7 @@ from lab._util import infer_artifact_type, now, parse_duration
 from lab.manifest import sha256_file
 from lab.metrics import METRICS_FILE, read_points
 from lab.models import ArtifactRecord, JobManifest, JobState, ResourceRequest
+from lab.preemption import gcp_terminal_state
 from lab.store import JobStore
 
 if TYPE_CHECKING:
@@ -139,6 +140,22 @@ def build_run_script(manifest: JobManifest) -> str:
     * **Backstop:** a detached ``poweroff`` watchdog at ``wall + SELF_DESTRUCT_MARGIN_S``. This is
       best-effort only — it is a no-op inside an unprivileged container — so it is defence in depth
       behind ``timeout``, not the mechanism we rely on.
+
+    **What ``poweroff`` actually stops is per-cloud** (GCP-LEAK-9) — it is not the hard backstop
+    the word suggests:
+
+    ===== ================================= ==========================================
+    Cloud ``poweroff`` does                 Still billing afterwards
+    ===== ================================= ==========================================
+    Vast  ends the rental                   nothing
+    GCP   TERMINATEs the VM; compute stops  **the persistent disk, indefinitely**
+    DO    powers the droplet off            **the whole droplet, at full price**
+    ===== ================================= ==========================================
+
+    So on GCP this converts a compute leak into a storage leak — a real improvement, but not a
+    release of resources. The actual teardown path is ``down=True`` + autostop, with
+    ``lab reconcile``'s unattached-disk pass as the net behind it; on DO the backstop stops
+    nothing at all and teardown is the only mechanism.
     """
     timeout = parse_duration(manifest.resources.timeout)
     lines = [
@@ -297,9 +314,13 @@ def _zone_name(url: str) -> str:
 
 
 def list_gcp_instances(compute: Any | None = None, project: str | None = None) -> list[dict[str, Any]]:
-    """Every GCE instance on the project as ``{name, zone, status}`` dicts, via
+    """Every GCE instance on the project as ``{name, zone, status, preemptible}`` dicts, via
     ``instances.aggregatedList`` (all zones, paginated). Raises if GCP isn't configured —
-    best-effort callers (the reconcile pass) swallow that."""
+    best-effort callers (the reconcile pass) swallow that.
+
+    ``preemptible`` mirrors ``scheduling.preemptible``, which is how GCE states a Spot VM
+    outright — see :func:`lab.preemption.gcp_terminal_state` (GCP-PREEMPT-1).
+    """
     if compute is None or project is None:
         compute, project = _get_gcp_compute()
     out: list[dict[str, Any]] = []
@@ -313,6 +334,7 @@ def list_gcp_instances(compute: Any | None = None, project: str | None = None) -
                         "name": str(inst.get("name", "")),
                         "zone": _zone_name(str(inst.get("zone", ""))),
                         "status": inst.get("status"),
+                        "preemptible": bool((inst.get("scheduling") or {}).get("preemptible")),
                     }
                 )
         req = compute.instances().aggregatedList_next(previous_request=req, previous_response=resp)
@@ -341,16 +363,78 @@ def list_gcp_disks(compute: Any | None = None, project: str | None = None) -> li
     return out
 
 
+def gcp_project() -> str | None:
+    """The project the GCP reconcile passes actually sweep — ambient, from ADC — or ``None`` when
+    GCP isn't configured here.
+
+    Reported so a sweep of the *wrong* project is visible (GCP-LEAK-7): SkyPilot can be pinned to
+    a different project in ``~/.sky/config.yaml``, in which case reconcile scans a project the lab
+    never launches into and truthfully reports it clean. Without the project in the report the
+    reader cannot tell that all-clear from a real one.
+
+    Swallows *every* failure, not just :class:`GcpNotConfigured`. This is read into the reconcile
+    report after the destroy passes have already run, and it is a label rather than a leak signal
+    — letting a transport hiccup here propagate would discard the report of what was just
+    destroyed, on the one command whose purpose is an auditable account of what it did.
+    """
+    try:
+        _creds, project = _gcp_default_credentials()
+    except Exception:  # noqa: BLE001 — a missing label must never cost us the destroy report
+        return None
+    return str(project) if project else None
+
+
+# A GCE node SkyPilot built for one of our clusters, e.g. (real, from the live run 2026-08-11):
+#
+#   lab-20260811-144501-c5b340-3dd12990-head-c0h9pkx0-compute
+#   \_/ \___________________/ \______/ \__/ \______/ \_____/
+#    |    cluster_name_for()   user     node  uuid8   node type
+#    |                         hash                   (compute|tpu|mig)
+#    `-- our prefix
+#
+# Two parts, and only two are safe to rely on: our `lab-` prefix, and the suffix
+# `sky.provision.gcp.instance_utils._generate_node_name` appends to every instance it creates.
+#
+# The middle is deliberately unconstrained. It is tempting to anchor on `lab-<job_id>`, but
+# `make_cluster_name_on_cloud` appends an 8-char user hash *and* truncates past GCP's 35-char
+# limit — and `lab-<job_id>` is 26 chars against a budget of 35-9=26, i.e. it fits by exactly
+# zero characters. One more character in a job id and the name becomes
+# `lab-<trunc>-<2ch>-<userhash>-head-…`, with no recoverable job id in it. An anchored pattern
+# would then match nothing and the leak pass would report clean forever, which is strictly worse
+# than the over-broad matching this replaced.
+#
+# Matching the node suffix rather than a bare `lab-` prefix is what keeps `reconcile --apply` off
+# a shared project's `lab-notebook` (GCP-LEAK-7); the CLI's confirmation prompt is the second
+# layer, for when this predicate is wrong anyway. A GCE boot disk
+# inherits its instance's name (the boot disk's `initializeParams` sets no `diskName`), so the
+# same shape identifies both. Pinned by `test_the_predicate_accepts_names_skypilot_itself_
+# generates`, which builds its input with SkyPilot's own naming functions rather than ours.
+# The uuid is exactly INSTANCE_NAME_UUID_LEN=8 base36 chars and the node type is one of
+# GCPNodeType's three values. Both are pinned rather than left loose so a hand-named
+# `lab-ml-worker-2-gpu` in a shared project cannot match; the round-trip test enumerates the real
+# enum, so a new SkyPilot node type fails there instead of silently going unmatched here.
+_GCP_NODE_RE = re.compile(
+    r"^lab-.+-(?:head|worker)-[0-9a-z]{8}-(?:compute|tpu|mig)$", re.IGNORECASE
+)
+
+
+def is_lab_cluster_node(name: str) -> bool:
+    """True iff ``name`` is a GCE instance (or its boot disk) that SkyPilot created for a lab
+    cluster. Deliberately narrow: everything this returns True for is something
+    ``reconcile --apply`` may destroy unprompted."""
+    return bool(_GCP_NODE_RE.match(name))
+
+
 def gcp_instance_orphans(
     instances: list[dict[str, Any]], running_clusters: set[str]
 ) -> list[dict[str, Any]]:
-    """``lab-*`` GCE instances not tied to any running cluster — the out-of-band GCP analogue of
+    """Lab-cluster GCE instances not tied to any running cluster — the out-of-band GCP analogue of
     the Vast rental pass (SkyPilot names instances after their cluster, so a running cluster name
     is a substring of its instance names). Pure."""
     orphans: list[dict[str, Any]] = []
     for inst in instances:
         name = str(inst.get("name", ""))
-        if not name.startswith("lab-"):
+        if not is_lab_cluster_node(name):
             continue  # not ours — leave it alone
         if any(c.lower() in name.lower() for c in running_clusters):
             continue  # backs a live job
@@ -361,12 +445,13 @@ def gcp_instance_orphans(
 def gcp_disk_orphans(
     disks: list[dict[str, Any]], running_clusters: set[str]
 ) -> list[dict[str, Any]]:
-    """Unattached ``lab-*`` persistent disks — a disk that outlived its VM keeps billing (the GCP
-    analogue of the DO volume-leak pass). Attached disks are skipped: they die with the VM. Pure."""
+    """Unattached lab-cluster persistent disks — a disk that outlived its VM keeps billing (the
+    GCP analogue of the DO volume-leak pass). Attached disks are skipped: they die with the VM.
+    Pure."""
     orphans: list[dict[str, Any]] = []
     for disk in disks:
         name = str(disk.get("name", ""))
-        if not name.startswith("lab-"):
+        if not is_lab_cluster_node(name):
             continue
         if disk.get("users"):
             continue  # attached — deleted together with its instance
@@ -374,6 +459,24 @@ def gcp_disk_orphans(
             continue
         orphans.append(disk)
     return orphans
+
+
+def gcp_unmatched_lab_names(*resource_lists: list[dict[str, Any]]) -> list[str]:
+    """``lab-*`` GCE resources that do **not** match our node shape — the narrowing's safety net.
+
+    Reported, never destroyed. Narrowing the delete predicate trades a destructive false positive
+    for the chance of a silent false negative; surfacing what we chose not to claim keeps a leak
+    in an unexpected shape visible instead of dropping it on the floor. Advisory only, so it does
+    not trip `lab wait`'s exit 3. Pure.
+    """
+    return sorted(
+        {
+            name
+            for resources in resource_lists
+            for r in resources
+            if (name := str(r.get("name", ""))).startswith("lab-") and not is_lab_cluster_node(name)
+        }
+    )
 
 
 def _await_zone_operation(compute: Any, project: str, zone: str, operation: dict[str, Any]) -> None:
@@ -470,6 +573,25 @@ def confirm_no_instance(cluster: str) -> bool:
         return False
     needle = cluster.lower()
     return not any(needle in str(inst.get("name", "")).lower() for inst in instances)
+
+
+def gcp_preemption_state(cluster: str) -> JobState | None:
+    """Ask GCE directly why ``cluster``'s VM stopped — ``preempted``, ``failed``, or no answer.
+
+    The provider-direct second opinion for *classification*, mirroring what
+    :func:`confirm_no_instance` already does for teardown. ``None`` means GCE could not answer
+    (GCP not configured, the listing failed, nothing terminal to read) and the caller keeps its
+    inference: this probe only ever *refines* the classifier's inputs, never removes them, so a
+    revoked role leaves today's behaviour exactly as it was (GCP-PREEMPT-1).
+    """
+    try:
+        instances = list_gcp_instances()
+    except Exception:  # noqa: BLE001 — no answer is a valid answer here; inference still applies
+        return None
+    needle = cluster.lower()
+    return gcp_terminal_state(
+        [i for i in instances if needle in str(i.get("name", "")).lower()]
+    )
 
 
 def preempted_teardown_confirmed(cloud: str, cluster: str) -> bool:

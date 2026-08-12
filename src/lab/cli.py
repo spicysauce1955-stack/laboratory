@@ -6,6 +6,8 @@ Wired to the local backend by default; structured JSON output mirrors the MCP §
 from __future__ import annotations
 
 import json
+import os
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -19,11 +21,12 @@ from lab.core import (
     default_lab,
     default_disk_gb,
     job_status_view,
+    orphan_key,
     resolve_backend_profile,
     validate_cloud,
 )
 from lab.env import load_lab_env
-from lab.manifest import repo_root
+from lab.manifest import git_work_tree, repo_root
 from lab.models import JobSpec, ResourceRequest
 from lab.scheduler.models import Guardrails, RegState, Triggers
 from lab.scheduler.price import PriceFeed
@@ -43,8 +46,39 @@ app = typer.Typer(
 
 @app.callback()
 def _load_env() -> None:
-    """Apply the git-ignored ``.env`` before any command (cloud creds/project; real env wins)."""
+    """Apply the git-ignored ``.env`` before any command (cloud creds/project; real env wins).
+
+    ``repo_root()`` honours ``LAB_REPO_DIR``, which matters most on the scheduler host: its
+    systemd unit's ``WorkingDirectory`` need not be the repo, and it is the host that most needs a
+    service-account key. A cwd-derived lookup found no ``.env`` there and the failure surfaced one
+    layer down as an opaque auth error (GCP-CREDS-2).
+    """
     load_lab_env(repo_root())
+    _warn_if_repo_override_shadows_cwd()
+
+
+def _warn_if_repo_override_shadows_cwd() -> None:
+    """Warn when ``LAB_REPO_DIR`` points somewhere other than the work tree you are standing in.
+
+    The override governs ``Lab.repo`` — the tree whose commit is pinned into the manifest and
+    whose contents are rsynced as the SkyPilot workdir. That is right on the scheduler host, whose
+    cwd is not a repo at all. But a laptop that has it set in ``.env`` and then runs `lab submit`
+    from a second checkout or a git worktree would silently launch the *other* tree's code and
+    record a commit that never contained the change — FR-B1 provenance wrong with no error
+    anywhere. Only fires when cwd really is inside a different work tree, so the scheduler's
+    intended use stays quiet.
+    """
+    override = (os.environ.get("LAB_REPO_DIR") or "").strip()
+    if not override:
+        return
+    here = git_work_tree(Path.cwd())
+    if here is not None and here != repo_root():  # cwd IS a work tree, and not the one we'd use
+        typer.echo(
+            f"warning: LAB_REPO_DIR={override} overrides the repo used for provenance and the "
+            f"workdir upload, but you are inside {here}. Jobs will pin and upload "
+            f"{repo_root()}, not the tree you are standing in.",
+            err=True,
+        )
 
 
 def _lab(backend: str = "local") -> Lab:
@@ -532,12 +566,48 @@ _ORPHAN_FIELDS = (
     "gcp_disk_orphans",  # unattached GCE persistent disks
     "do_volume_orphans",  # detached DO block volumes
 )
+# Deliberately NOT here: `gcp_unmatched` — `lab-*` GCE names that do not match our cluster-node
+# shape. It is advisory (something in this project is named like us but is not ours to destroy),
+# so it must not exit 3 and send the reader to `--apply` (GCP-LEAK-7).
+
+
+def _describe_orphan(item: Any) -> str:
+    """One line naming a single doomed resource, however each pass shapes its entries.
+
+    Vast emits ``{id, label}`` — the label is the only human-readable thing it has, and it is what
+    lets an operator recognise which job a rental belonged to, so it must not be dropped.
+    """
+    if not isinstance(item, dict):
+        return str(item)
+    name = item.get("name") or item.get("label") or item.get("id")
+    extra = [str(v) for v in (item.get("zone") or item.get("region"), item.get("status")) if v]
+    if item.get("label") and item.get("id") is not None:
+        extra.insert(0, f"id={item['id']}")
+    return f"{name}{f'  ({", ".join(extra)})' if extra else ''}"
+
+
+def _doomed(report: dict[str, Any]) -> list[tuple[str, Any]]:
+    """Every ``(pass, resource)`` `--apply` would destroy. Empty = nothing to confirm."""
+    return [(field, item) for field in _ORPHAN_FIELDS for item in report.get(field) or []]
+
+
+def _lines(doomed: list[tuple[str, Any]]) -> list[str]:
+    return [f"{field}: {_describe_orphan(item)}" for field, item in doomed]
+
+
+def _stdin_is_a_tty() -> bool:
+    """Whether there is a human to prompt. Test seam — a CliRunner swaps ``sys.stdin`` during
+    invoke, so patching the stream's own ``isatty`` from a test cannot reach it."""
+    return sys.stdin.isatty()
 
 
 @app.command()
 def reconcile(
     apply: bool = typer.Option(
         False, "--apply", help="destroy orphaned rentals (default: dry-run report only)"
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="skip the confirmation prompt (for unattended use)"
     ),
 ) -> None:
     """Cross-check cloud instances against local jobs to find leaks (FR-C2).
@@ -547,22 +617,70 @@ def reconcile(
     after a teardown failure (look for ``teardown_status: "failed"`` in ``lab status``). The
     Vast-direct pass is skipped when vastai-sdk isn't installed. Exits 3 if orphans are found in
     dry-run mode — re-run with --apply, or destroy by hand via ``vastai destroy_instance <id>``.
+
+    ``--apply`` lists what it is about to destroy and asks first; ``--yes`` skips the prompt for
+    unattended use. The narrowed GCP predicate makes a destructive false positive unlikely, not
+    *recoverable* — the prompt is what keeps a bug in it from costing someone a VM they cared
+    about. Declining exits 4 and destroys nothing.
+
+    The GCP passes only claim resources matching SkyPilot's real node shape
+    (``lab-…-<head|worker>-<uuid8>-<compute|tpu|mig>``), and report the project they swept as
+    ``gcp_project`` — check it matches the project SkyPilot launches into. Anything else named
+    ``lab-*`` is listed under ``gcp_unmatched`` and never destroyed.
     """
+    lab = _lab(backend="skypilot")
+    approved: set[str] | None = None
     try:
-        report = _lab(backend="skypilot").reconcile(apply=apply)
+        if apply and not yes:
+            # Price the blast radius, then make the approval *binding*: the confirmed pass is a
+            # second, independent sweep, so a resource that becomes an orphan in between (a job
+            # whose supervisor dies, dropping its live cluster out of running_clusters) would
+            # otherwise be destroyed without ever having been shown. Diagnostics go to stderr —
+            # stdout carries only JSON, which callers parse (§9).
+            dry = lab.reconcile(apply=False)
+            doomed = _doomed(dry)
+            if doomed:
+                if not _stdin_is_a_tty():
+                    # Nobody to ask. Fail closed and say exactly how to proceed — a bare
+                    # click.Abort here would exit 1 with no JSON at all.
+                    typer.echo(
+                        f"refusing to destroy {len(doomed)} resource(s) with no terminal to "
+                        "confirm at — re-run with --yes to proceed unattended.",
+                        err=True,
+                    )
+                    _emit({"aborted": True, "reason": "no tty", "would_destroy": _lines(doomed)})
+                    raise typer.Exit(code=4)
+                project = dry.get("gcp_project")
+                typer.echo(
+                    f"about to destroy {len(doomed)} resource(s)"
+                    f"{f' in project {project}' if project else ''}:",
+                    err=True,
+                )
+                for line in _lines(doomed):
+                    typer.echo(f"  {line}", err=True)
+                if not typer.confirm("proceed?", err=True):
+                    _emit({"aborted": True, "would_destroy": _lines(doomed)})
+                    raise typer.Exit(code=4)
+                approved = {orphan_key(field, item) for field, item in doomed}
+        report = lab.reconcile(apply=apply, only=approved)
     except LabError as e:
         _emit({"error": str(e)})
         raise typer.Exit(code=2) from e
     _emit(report)
+    if unmatched := report.get("gcp_unmatched"):
+        # Not an orphan field (see above) — it is not `--apply`-able, so exit 3's "re-run with
+        # --apply" would be wrong advice. But it must not be silent either: if these are in fact
+        # our own nodes under a name shape we stopped recognising, the leak passes have gone
+        # blind and would report clean while the VMs bill (GCP-LEAK-7).
+        typer.echo(
+            f"warning: {len(unmatched)} `lab-*` GCP resource(s) did not match our node shape and "
+            "were NOT considered for cleanup — check whether they are ours:",
+            err=True,
+        )
+        for name in unmatched:
+            typer.echo(f"  {name}", err=True)
     if any(report.get(k) for k in _ORPHAN_FIELDS) and not apply:
         raise typer.Exit(code=3)  # action required: re-run with --apply
-
-
-def _repo() -> Path:
-    import os
-
-    env = os.environ.get("LAB_REPO_DIR")
-    return Path(env) if env else repo_root()
 
 
 @app.command()
@@ -602,7 +720,7 @@ def doctor(
     # Apply the same disk defaults a real submit would, so the quota check asks about the size
     # that would actually be provisioned rather than the one the user happened to type.
     resources = resources.model_copy(update={"disk_size": default_disk_gb(resources)})
-    results = run_checks(cloud, resources, home=_repo() / "runs", use_cache=not no_cache)
+    results = run_checks(cloud, resources, home=repo_root() / "runs", use_cache=not no_cache)
     if as_json:
         _emit(doctor_view(cloud, results))
     else:
@@ -699,7 +817,7 @@ def register(
         submitted_by="human",
     )
     try:
-        reg = sched_register(_repo(), queue, spec, triggers, guardrails)
+        reg = sched_register(repo_root(), queue, spec, triggers, guardrails)
     except LabError as e:  # fail-loud, actionable (FR-F3)
         _emit({"error": str(e)})
         raise typer.Exit(code=1) from e
@@ -800,7 +918,7 @@ def register_sweep(
     )
     try:
         sweep_id, regs = sched_register_sweep(
-            _repo(), queue, wrap_with_extras(command, with_pkg), _parse_grid(grid),
+            repo_root(), queue, wrap_with_extras(command, with_pkg), _parse_grid(grid),
             resources=resources, triggers=triggers, guardrails=guardrails, seed=seed,
             sweep_max_cost=sweep_max_cost,
             daily_budget=queue.read_control().budget_usd_per_day,
@@ -972,7 +1090,7 @@ def scheduler_tick(
 
         price_feed = VastPriceFeed()
     sched = Scheduler(
-        default_queue(), home=_repo() / "runs", backend=backend, price_feed=price_feed
+        default_queue(), home=repo_root() / "runs", backend=backend, price_feed=price_feed
     )
     _emit(json.loads(sched.tick().model_dump_json()))
 

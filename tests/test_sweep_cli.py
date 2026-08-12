@@ -30,7 +30,7 @@ def test_sweep_sharded_emits_cells(tmp_path: Path) -> None:
             ["sweep", "-c", "true", "-g", "N=1000", "--seeds", "0-3", "--shard-size", "2"],
         )
     assert res.exit_code == 0, res.output
-    out = json.loads(res.output)
+    out = json.loads(res.stdout)
     assert out["sweep_id"]
     assert len(out["cells"]) == 1
     assert out["cells"][0]["seeds_expected"] == 4
@@ -41,7 +41,7 @@ def test_sweep_unsharded_unchanged(tmp_path: Path) -> None:
     with patch.object(cli_mod, "_lab", return_value=_real_lab(tmp_path)):
         res = runner.invoke(app, ["sweep", "-c", "true", "-g", "N=1000,1500"])
     assert res.exit_code == 0, res.output
-    out = json.loads(res.output)
+    out = json.loads(res.stdout)
     assert out["count"] == 2
     assert "cells" not in out
 
@@ -64,7 +64,7 @@ def test_sweep_aggregate_emits_cells(tmp_path: Path) -> None:
             ["sweep", "-c", "true", "-g", "N=1000", "--seeds", "0-3", "--shard-size", "2"],
         )
     assert res.exit_code == 0, res.output
-    sweep_id = json.loads(res.output)["sweep_id"]
+    sweep_id = json.loads(res.stdout)["sweep_id"]
 
     # Mark both shards succeeded with results.
     plan = lab.sweep_plan(sweep_id)
@@ -76,7 +76,7 @@ def test_sweep_aggregate_emits_cells(tmp_path: Path) -> None:
     with patch.object(cli_mod, "_lab", return_value=lab):
         res = runner.invoke(app, ["sweep-aggregate", sweep_id])
     assert res.exit_code == 0, res.output
-    out = json.loads(res.output)
+    out = json.loads(res.stdout)
     assert out["sweep_id"] == sweep_id
     assert len(out["cells"]) == 1
     c = out["cells"][0]
@@ -92,7 +92,7 @@ def test_sweep_bad_seeds_comma_exits_nonzero(tmp_path: Path) -> None:
             ["sweep", "-c", "true", "-g", "N=1000", "--seeds", "0,foo", "--shard-size", "2"],
         )
     assert res.exit_code != 0
-    out = json.loads(res.output)
+    out = json.loads(res.stdout)
     assert "error" in out
 
 
@@ -104,7 +104,7 @@ def test_sweep_bad_seeds_range_exits_nonzero(tmp_path: Path) -> None:
             ["sweep", "-c", "true", "-g", "N=1000", "--seeds", "5-2", "--shard-size", "2"],
         )
     assert res.exit_code != 0
-    out = json.loads(res.output)
+    out = json.loads(res.stdout)
     assert "error" in out
 
 
@@ -117,7 +117,7 @@ def test_sweep_retry_emits_cells(tmp_path: Path) -> None:
             ["sweep", "-c", "true", "-g", "N=1000", "--seeds", "0-3", "--shard-size", "2"],
         )
     assert res.exit_code == 0, res.output
-    sweep_id = json.loads(res.output)["sweep_id"]
+    sweep_id = json.loads(res.stdout)["sweep_id"]
 
     # Succeed one shard, fail the other.
     plan = lab.sweep_plan(sweep_id)
@@ -132,7 +132,7 @@ def test_sweep_retry_emits_cells(tmp_path: Path) -> None:
     with patch.object(cli_mod, "_lab", return_value=lab):
         res = runner.invoke(app, ["sweep-retry", sweep_id])
     assert res.exit_code == 0, res.output
-    out = json.loads(res.output)
+    out = json.loads(res.stdout)
     assert out["sweep_id"] == sweep_id
     assert "cells" in out
     assert len(out["cells"]) == 1

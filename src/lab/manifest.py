@@ -7,6 +7,7 @@ them into a full :class:`lab.models.JobManifest`.
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import subprocess
 import tarfile
@@ -15,15 +16,51 @@ from pathlib import Path
 
 
 def repo_root(start: Path | None = None) -> Path:
-    """The git work-tree root containing ``start`` (defaults to cwd)."""
+    """The git work-tree root containing ``start`` (defaults to cwd).
+
+    With no ``start``, the machine-local ``LAB_REPO_DIR`` override wins (blank = unset, as
+    everywhere else). The scheduler host is its documented user: a systemd unit's
+    ``WorkingDirectory`` need not be the repo, and a cwd-derived answer there silently picks a
+    different ``runs/``, ``queue/`` and ``.env`` than the one the scheduler uses.
+
+    This resolution deliberately lives *here* rather than in the CLI. It used to sit in
+    ``cli._repo()``, which library code cannot reach — so ``default_lab``, ``default_queue`` and
+    the MCP entrypoint all fell back to cwd while a handful of CLI commands honoured the
+    variable, and the two halves could disagree about which repo they were operating on.
+
+    An explicit ``start`` is never overridden: that call asks about a *specific* directory (the
+    work tree containing a known path, for provenance capture), and an ambient variable must not
+    change the answer.
+    """
+    if start is None:
+        override = (os.environ.get("LAB_REPO_DIR") or "").strip()
+        if override:
+            # Resolve it like any other path (``~``, relative, symlinks) and then fall through to
+            # the git lookup below, so a value pointing *inside* a work tree still yields the
+            # tree's root. Callers assume a root: `current_commit`, `is_dirty` and `capture_diff`
+            # all pin provenance from it. A non-repo path still works — the scheduler host is
+            # allowed to point at a plain directory — it just returns itself.
+            start = Path(override).expanduser().resolve()
     start = start or Path.cwd()
+    return git_work_tree(start) or Path(start)
+
+
+def git_work_tree(start: Path) -> Path | None:
+    """The git work-tree root containing ``start``, or ``None`` when it is not inside one.
+
+    Distinct from :func:`repo_root`, which falls back to ``start`` itself: callers that need to
+    know *whether* a path is in a work tree cannot tell that apart from "it is the root" by
+    comparing paths.
+    """
     try:
         out = subprocess.check_output(
-            ["git", "-C", str(start), "rev-parse", "--show-toplevel"], text=True
+            ["git", "-C", str(start), "rev-parse", "--show-toplevel"],
+            text=True,
+            stderr=subprocess.DEVNULL,
         ).strip()
-        return Path(out)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return Path(start)
+    except (subprocess.CalledProcessError, FileNotFoundError, NotADirectoryError):
+        return None
+    return Path(out) if out else None
 
 
 def current_commit(repo: Path) -> str:

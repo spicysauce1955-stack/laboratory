@@ -601,6 +601,28 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         else manifest.resources.use_spot
     )
     cluster_gone = not _cluster_up(sky, cluster)
+
+    # GCP-PREEMPT-1: on GCP we don't have to *infer* preemption — GCE states it, so ask. Only
+    # consulted when we hold no authoritative terminal of our own, since replacing the inference
+    # is the entire point; the probe abstains (None) on any doubt and the inference stands.
+    # This adjusts the classifier's inputs; the classifier itself stays pure and unchanged.
+    if cloud == "gcp" and not reached_terminal:
+        from lab.backends.skypilot import gcp_preemption_state
+
+        probed = gcp_preemption_state(cluster)
+        if probed is JobState.failed:
+            # GCE: the box stopped and was not preemptible. Feeding this as an authoritative
+            # terminal is what stops the scheduler resubmitting — and re-paying for — a job that
+            # genuinely failed.
+            final, reached_terminal = JobState.failed, True
+        elif probed is JobState.preempted:
+            # `classify_terminal` never trusts sky_state=preempted directly — it reaches
+            # `preempted` only via `use_spot and cluster_gone`. GCE reporting a *preemptible*
+            # instance is itself authoritative about spot-ness (better evidence than the
+            # manifest's `launched_spot`, which the adopt path never records), so set both or the
+            # probe's answer is silently discarded and the job comes out `failed`.
+            final, cluster_gone, use_spot = JobState.preempted, True, True
+
     final = classify_terminal(
         sky_state=final,
         timed_out=timed_out,

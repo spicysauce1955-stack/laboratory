@@ -10,6 +10,19 @@ to be already-resolved bookkeeping (`GCP-CREDS-3`, `GCP-TEST-3`).
 approval rather than on code.** This file is the actionable backlog — the parent document stays
 the record of *why* each gap exists, this one is *what to do next*.
 
+> **Update 2026-08-12 — all seven code-side records are closed.** Two changed shape once
+> investigated, and both changes are worth reading before trusting the entries below:
+>
+> - **`GCP-LEAK-8` is not a gap.** *Both* halves were false on our launch path — see its section.
+>   No sweep was written; a tripwire test was, so the reasoning fails loudly if it stops holding.
+> - **`GCP-CREDS-4` was a live bug, not an unasserted belief.** Its stated premise — "`.env` is
+>   git-ignored and SkyPilot honours `.gitignore`/`.skyignore`" — was wrong: SkyPilot uses
+>   `.skyignore` *instead of* `.gitignore` when one exists, and this repo commits a `.skyignore`
+>   that never listed `.env`. `.env` was being rsynced to every remote box.
+>
+> Still open, both non-code: `GCP-PROV-4` (Google quota approval) and `GCP-CREDS-1` (a droplet
+> errand). Neither moved.
+
 ---
 
 ## Reading order
@@ -87,6 +100,40 @@ prefix; put `project` in the reconcile report so a mismatched sweep is visible.
 **test:** a `lab-notebook`-style name is not an orphan; a name matching the real cluster shape is;
 the report records the swept project. All pure — no cloud calls needed.
 
+> **The "`lab-<job_id>` plus SkyPilot's suffix" in this fix line is wrong, and the first
+> implementation followed it into a bug.** The real name carries an 8-char SkyPilot *user hash*
+> between the two — `lab-20260811-144501-c5b340-3dd12990-head-c0h9pkx0-compute` — so a job-id
+> anchored pattern matched **neither** of the two instances the 2026-08-11 live run actually
+> produced. That is worse than the over-broad matching it replaced: an over-broad leak detector
+> deletes the wrong thing loudly, a blind one reports clean forever.
+>
+> Worse, the guard test written alongside it constructed its expected name from the same wrong
+> belief, so it passed. Self-confirming tests do not guard anything.
+>
+> It cannot be anchored on the job id even in principle: `make_cluster_name_on_cloud` truncates
+> past GCP's 35-char limit to `lab-<trunc>-<2ch>-<userhash>`, and `lab-<job_id>` is 26 chars
+> against a budget of 35−9 = **26** — it fits by exactly zero characters. One more character in a
+> job id and the job id stops appearing in the name at all. The shipped predicate therefore
+> anchors on our `lab-` prefix plus `_generate_node_name`'s suffix, the two parts that are
+> actually stable, and its test builds inputs with SkyPilot's own functions.
+
+### The second half: `--apply` now asks
+
+This record was two complaints — the match was too broad, *and* `--apply` does not prompt. The
+narrowing addresses only the first; it makes a destructive false positive unlikely, not
+*recoverable*.
+
+`lab reconcile --apply` now lists every resource it is about to destroy (naming the swept project)
+and asks. `--yes` skips it for unattended use; declining exits 4 and destroys nothing.
+
+Deliberately **CLI-only**. The scheduler's unattended sweep calls `Lab.reconcile(apply=…)` through
+the library, which is untouched — so `auto_reconcile` (default **off**) keeps working with no
+prompt to hang on, and the MCP tool stays hard-wired to `apply=False`.
+
+Known limit, taken knowingly: the confirmed pass re-lists rather than destroying the exact set it
+displayed. The window is seconds, and the alternative is threading a captured resource list
+through five independent destroy passes in the most cost-critical code in the repo.
+
 ## 2. `GCP-CREDS-2` — `.env` discovery ignores `LAB_REPO_DIR`
 
 `area: creds` · `severity: medium` · `confidence: confirmed`
@@ -123,39 +170,83 @@ same shape as `confirm_no_instance`, which already does provider-direct verifica
 **test:** a fake compute reporting `TERMINATED` + `preemptible=true` → preempted; reporting a
 non-preemptible stop → failed; a listing error → fall back to today's inference, never worse.
 
-## 4. `GCP-LEAK-8` — uncovered billable GCP resources
+> **Shipped, and currently inert — this record's premise is half true.** GCE does state
+> preemption, but SkyPilot's GCP spot config sets `instanceTerminationAction: DELETE`
+> (`templates/gcp-ray.yml.j2`), so GCE **deletes** a preempted VM rather than leaving it
+> `TERMINATED`. The evidence the probe reads is destroyed by the event it is confirming.
+>
+> Worked through case by case on GCP spot:
+>
+> | Case | Instance readable? | Probe | Old inference | Net |
+> |---|---|---|---|---|
+> | genuine preemption | no (deleted) | abstains | `preempted` | unchanged, and right |
+> | non-preemption stop of a spot VM | yes, `preemptible=true` | `preempted` | `preempted` | unchanged |
+> | on-demand VM stopped | yes, `preemptible=false` | `failed` | `failed` (`use_spot` false) | unchanged |
+>
+> The `failed` branch cannot fire for a spot job at all, because a readable spot instance always
+> has `preemptible=true`. So the probe is **safe but delivers no improvement yet**. It is left in
+> place: it is correct, tested, costs one listing, and is the seam the real fix plugs into.
+>
+> **The actual fix, still open.** The authoritative record survives the delete — it lives in the
+> zone operations log, not on the instance: `compute.zoneOperations.list` filtered to
+> `operationType = compute.instances.preempted` with `targetLink` matching the cluster's nodes.
+> That distinguishes a real preemption from any other disappearance, which is exactly what this
+> record asked for. Implementation note: it needs the *zone*, which the probe does not currently
+> carry once the instance is gone — either walk all zones the manifest could have landed in, or
+> record the launched zone on the manifest at provision time (cheaper, and useful elsewhere).
+> `test_a_real_gcp_preemption_leaves_nothing_for_the_probe_to_read` pins today's behaviour so the
+> gap stays visible.
 
-`area: leak` · `severity: medium` · `confidence: **suspected**`
+## 4. `GCP-LEAK-8` — uncovered billable GCP resources — **CLOSED, not a gap**
 
-Covered today: instances, unattached disks. Not covered, and each bills:
+`area: leak` · `severity: medium` · `confidence: suspected → **refuted**`
 
-- **Reserved-but-unattached static external IPs** — GCP charges *more* for an idle reserved IP
-  than an attached one, by design.
-- **SkyPilot's staging bucket** — `roles/storage.admin` is in the required-roles table precisely
-  because SkyPilot creates one. Nothing ever reaps it.
-- Snapshots and custom images, if a future path creates them.
+The confirmation step was done first, as this record insisted. It refuted **both** halves, so no
+sweep was written:
 
-**Do the confirmation step first.** Check whether SkyPilot's GCP provisioner actually *reserves*
-static IPs on our path — it may use ephemeral ones, which are released with the instance and would
-delete the first bullet entirely. Writing an addresses pass before checking that risks building a
-sweep for a resource we never create.
+- **Static external IPs — never reserved.** SkyPilot exposes static-IP reservation on **Nebius
+  only** (`use_static_ip_address`, `provision/nebius/utils.py`). The GCP provisioner never calls
+  `compute.addresses` at all, so our instances get ephemeral IPs, which are released with the
+  instance. This bullet was self-deleting, exactly as suspected.
+- **The staging bucket — never created on our path.** The bucket comes from
+  `controller_utils.maybe_translate_local_file_mounts_and_sync_up`, whose only callers are
+  `jobs/server/core.py` and `serve/server/impl.py` — i.e. `sky jobs launch` and `sky serve up`,
+  both controller-backed. It translates `file_mounts` / `storage_mounts` into
+  `skypilot-filemounts-*`. The lab calls plain `sky.launch` with a `workdir`, which is rsynced
+  over SSH. This record inferred the bucket's existence from `roles/storage.admin` being in the
+  required-roles table; that role is there to satisfy `sky check gcp`'s probe, which is a
+  different thing. The guide now says so, so the inference isn't made again.
+- **Snapshots and custom images** — no path creates either.
 
-**fix (after confirming):** an addresses pass and a bucket pass, both cheap `aggregatedList` calls,
-wired into `_ORPHAN_FIELDS` so they trip exit 3 like every other pass.
+That leaves instances and disks, which are covered — coverage of billable GCP resources on this
+launch path is complete.
 
-## 5. `GCP-CREDS-4` — `.env` exclusion from the workdir sync is believed, not asserted
+**shipped instead of a sweep:** `test_the_launch_path_creates_no_object_storage` pins the
+reasoning — a `file_mounts` / `storage_mounts` entry added later reintroduces a billable resource
+no pass covers, and the test fails first. (Mutation-checked: adding a file mount fails it.)
 
-`area: creds` · `severity: low-medium` · `confidence: suspected`
+## 5. `GCP-CREDS-4` — `.env` **was** being synced to every remote box
 
-`build_task(..., workdir=Path.cwd())` rsyncs the repo root to the remote. `.env` is git-ignored and
-SkyPilot honours `.gitignore`/`.skyignore`, so it is *believed* excluded — never asserted.
+`area: creds` · `severity: low-medium → **the belief was false**` · `confidence: suspected →
+**confirmed**`
 
-Today `.env` holds only paths, so the blast radius is a disclosed filesystem layout rather than a
-key. But it is precisely the file a user will paste an R2 secret into, and LAB-BUGS §7 is this
-repo's history of a secret reaching a persisted artifact.
+`build_task(..., workdir=Path.cwd())` rsyncs the repo root to the remote. This record assumed
+`.env` was *probably* excluded because it is git-ignored and "SkyPilot honours
+`.gitignore`/`.skyignore`" — and asked only that the belief be asserted.
 
-**fix:** an explicit `.skyignore` entry — belt and braces, one line.
-**test:** assert `.env` is not in the synced file set.
+**The belief was wrong.** `sky.data.storage_utils.get_excluded_files` is an **if/else**: when a
+`.skyignore` exists it is used *instead of* `.gitignore`, which is never consulted. This repo
+commits a `.skyignore`, and it did not list `.env`. Measured against SkyPilot's own exclusion
+logic before the fix, `.env` was **not** in the excluded set — it shipped to every box, on every
+cloud, for as long as that file has existed.
+
+Blast radius is as the record judged it: today `.env` holds paths, not keys. But that is a
+property of what the user happens to have pasted into it, not of the mechanism.
+
+**fixed:** `.env` added to `.skyignore`, with a comment stating the if/else so the next person
+doesn't re-derive "git-ignored is enough".
+**test:** `test_dotenv_is_excluded_from_the_workdir_sync` asserts against SkyPilot's real
+`get_excluded_files`, so it tracks what actually syncs rather than what we intended.
 
 ## 6. `GCP-LEAK-9` — the `poweroff` backstop is compute-only on GCP
 
@@ -190,14 +281,53 @@ which SkyPilot's bucket staging can emit into logs.
 
 ---
 
-## Suggested next slice
+## What shipped (2026-08-12)
 
-**`GCP-LEAK-7` + `GCP-CREDS-2`.** One destructive-safety fix, one deployment-correctness fix. Both
-are small, both are testable with no cloud calls and no spend, and together they close the two
-records where the current behaviour can do real harm rather than merely report imprecisely.
+| Gap | Change | Test |
+|---|---|---|
+| `GCP-LEAK-7` | orphan passes match SkyPilot's real node shape `lab-…-<head\|worker>-<uuid8>-<compute\|tpu\|mig>`; report carries `gcp_project` and an advisory `gcp_unmatched`; **`--apply` now lists what it will destroy and asks** (`--yes` to skip, decline exits 4), CLI-only so the scheduler is unaffected | declining destroys nothing; `--yes` never prompts; a clean sweep doesn't prompt; the preview goes to stderr so stdout stays parseable JSON; `lab-notebook` and five near-miss names are not orphans; unmatched names reported but never destroyed; swept project recorded; predicate round-trips names built by **SkyPilot's own** naming functions, plus the verbatim names from the 2026-08-11 live run |
+| `GCP-CREDS-2` | `_load_env` resolves through `_repo()` | `.env` is read from `LAB_REPO_DIR` |
+| `GCP-PREEMPT-1` | `gcp_preemption_state` probe feeds the classifier's inputs; classifier itself untouched. **Safe but inert on GCP spot** — see the note in its section; the real fix (zone operations log) is still open | non-preemptible stop → `failed` (end to end); real preemption → `preempted`; probe error → today's inference; a deleted-on-preemption VM leaves nothing to read |
+| `GCP-LEAK-8` | **refuted** — no code | launch path creates no object storage |
+| `GCP-CREDS-4` | `.env` added to `.skyignore` — it was really syncing | asserted against SkyPilot's `get_excluded_files` |
+| `GCP-LEAK-9` | `build_run_script` docstring + guide state the per-cloud effect | docs only |
+| `GCP-CREDS-5` | `X-Goog-Signature=` / `X-Goog-Credential=` patterns | real-shaped V4 signed URL; bucket/object left readable; idempotent |
 
-`GCP-CREDS-1` is not code — it is twenty minutes on the droplet with `lab doctor --cloud gcp`, and
-it should happen before anyone schedules an overnight GCP job.
+Suite: 649 unit tests pass, `ruff` clean, `mypy --strict` clean. No cloud calls, no spend.
+
+**Still not code, still worth doing:** `GCP-CREDS-1` is twenty minutes on the droplet with
+`uv run lab doctor --cloud gcp`, and it should happen before anyone schedules an overnight GCP
+job. `GCP-PROV-4` waits on Google.
+
+## Follow-up: `LAB_REPO_DIR` was honoured in four places and ignored in six
+
+Found while fixing `GCP-CREDS-2`, fixed straight after. That record says "every other repo-rooted
+path in the CLI goes through `_repo()`". It didn't, and the split was wider than the CLI:
+
+| Honoured `LAB_REPO_DIR` | Ignored it (cwd-derived) |
+|---|---|
+| `doctor`, `register`, `register_sweep`, `scheduler tick` | `default_lab` (**the shared CLI+MCP constructor** — sets both the provenance repo and `runs/`) |
+| | `default_queue` (the repo-local queue `register` writes and `tick` reads) |
+| | `_lab_for`, `status`, `wait`'s `JobStore` |
+| | the MCP server's own `load_lab_env` |
+
+The cause was structural: the resolution lived in `cli._repo()`, which library code cannot
+import, so every library-level path quietly fell back to cwd. Setting the variable — which
+`.env.example` invites, and which is the documented remedy when `WorkingDirectory` isn't the repo
+— would have split the two halves: `lab register` queueing into one directory while
+`lab scheduler tick` read another, and `lab status` reading a `runs/` nobody wrote.
+
+**fix:** moved the override into `repo_root()` itself and deleted the `cli._repo()` shim, so
+there is one resolution and every caller gets it. An explicit `repo_root(start)` is deliberately
+*not* overridden — that call asks about a specific directory for provenance capture, and an
+ambient variable must not change which commit gets recorded on a manifest.
+
+**tests:** `repo_root` honours it; an explicit `start` is never overridden; blank falls through
+to cwd; `default_lab` roots both repo and `runs/` at it; `default_queue` roots the queue at it.
+
+**Not currently sprung in production:** the shipped `lab-scheduler.service` sets
+`WorkingDirectory=/opt/laboratory` and never sets `LAB_REPO_DIR`, so today's droplet resolves
+correctly by cwd. The trap was armed, not triggered.
 
 ## What is explicitly *not* on this list
 
