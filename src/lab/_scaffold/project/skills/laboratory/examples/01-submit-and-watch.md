@@ -22,7 +22,7 @@ without polling in a tight loop.
 ```python
 # Tool call
 mcp__lab__submit(
-    command="python experiments/example_capacity.py",
+    command="python experiments/example.py",
     backend="local",       # or "skypilot" for Vast.ai
     seed=42,
     timeout="10m",         # wall-clock cap

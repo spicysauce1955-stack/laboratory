@@ -1,0 +1,7 @@
+# SkyPilot's exclusion is if/else: when a .skyignore exists it is used INSTEAD of .gitignore,
+# so anything you want kept off remote boxes must be listed here too.
+.env
+.git
+runs/
+.venv
+__pycache__/

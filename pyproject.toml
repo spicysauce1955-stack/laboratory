@@ -75,6 +75,11 @@ line-length = 100
 # statement-style rules `src/lab` is held to.
 "experiments/*" = ["E4", "E7", "F401", "F541", "F841"]
 "collect_v10.py" = ["E4", "E7", "F401", "F541", "F841"]
+# Same waiver, same reason: researcher analysis scratch, not lab source. These leave with the
+# rest of the workspace when `tempotron-capacity` is extracted (packaged-release spec §9.1);
+# until then they must not fail the release gates.
+"analyze_clean.py" = ["E4", "E7", "F401", "F541", "F841"]
+"analyze_formtest.py" = ["E4", "E7", "F401", "F541", "F841"]
 ".claude/**" = ["E4", "E7", "F401", "F541", "F841"]
 
 [tool.mypy]
