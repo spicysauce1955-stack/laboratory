@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # The cloud extras are not optional: several tests import `sky` at module scope, so a lean
+      # sync fails at collection rather than skipping. No credentials are involved — the live
+      # integration tests gate themselves on RUN_*_INTEGRATION and stay skipped here.
+      - run: uv sync --frozen --extra skypilot --extra do --extra gcp --extra r2
+
+      - run: uv run ruff check
+      - run: uv run mypy --strict
+      - run: uv run pytest -q
+      - run: uv run pytest -m packaging -q

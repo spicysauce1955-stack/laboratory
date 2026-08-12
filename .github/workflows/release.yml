@@ -1,0 +1,52 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen --extra skypilot --extra do --extra gcp --extra r2
+
+      - name: Tag must match the packaged version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(uv version --short)"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag $GITHUB_REF_NAME does not match pyproject version $pkg" >&2
+            exit 1
+          fi
+
+      - run: uv run ruff check
+      - run: uv run mypy --strict
+      - run: uv run pytest -q
+      - run: uv run pytest -m packaging -q
+
+      - run: uv build
+
+      - name: Extract the changelog section
+        run: |
+          awk -v v="## ${GITHUB_REF_NAME} " '
+            index($0, v) == 1 {inside=1; next}
+            inside && /^## / {exit}
+            inside {print}
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME"
+          --title "$GITHUB_REF_NAME"
+          --notes-file release-notes.md
+          dist/*
