@@ -46,9 +46,56 @@ The service account needs the six roles listed in that guide, and the project ne
 
 - `systemctl list-timers lab-scheduler.timer` — next tick scheduled.
 - From the laptop: `lab queue list` — `heartbeat_age_s` under ~120.
-- If you configured GCP: on the host, `sudo -u lab uv run sky check gcp` must show **GCP:
-  enabled**. Do this *before* registering a deferred GCP job — a credential problem discovered at
-  launch time wastes the whole night the job was scheduled for.
+- If you configured GCP: see the section below. Do it *before* registering a deferred GCP job —
+  a credential problem discovered at launch time wastes the whole night the job was scheduled for.
+
+## GCP host check (`GCP-CREDS-1`) — ~20 minutes, do it once
+
+The runbook above has never been confirmed on the live droplet. The failure mode it guards
+against is a deferred GCP job that queues fine, passes its triggers, and dies at launch at 3am
+unattended — which is the entire point of the feature.
+
+`lab doctor --cloud gcp` did not exist when this gap was written; it now answers the whole
+question in one shot, including whether SkyPilot's daemon agrees (the thing the symlink above
+exists for). **On the host, as the `lab` user:**
+
+```bash
+cd /opt/laboratory
+sudo -u lab env $(grep -v '^#' /etc/lab/scheduler.env | xargs) \
+  uv run lab doctor --cloud gcp        # credentials, project, billing, APIs, IAM, quota
+```
+
+Every check should be `ok` or `skip`; **only a definitive negative blocks**, so a `skip` is not a
+failure. If it reports a credential problem, re-check the ADC symlink — that is the usual cause,
+because the SkyPilot daemon does not inherit `EnvironmentFile`.
+
+### Then prove the leak path, for about a nickel
+
+Worth doing in the same session: the GCP orphan passes match SkyPilot's real node shape, and that
+narrowing has been validated against *recorded* names but never against a live instance. One
+cheap job closes it:
+
+```bash
+# laptop. The cpu profile resolves to n4-standard-4 on GCP: $0.18-0.29/hr on demand plus
+# $0.0055/hr disk, so a 10-minute cap plus a few minutes of provisioning is roughly $0.05.
+uv run lab submit -c "uv run experiments/<cheap-exp>.py" --backend cpu --cloud gcp --timeout 10m
+uv run lab reconcile          # WHILE it runs
+uv run lab wait <job_id>
+uv run lab reconcile          # after teardown settles — give it a minute, teardown is async
+```
+
+What to check in the two `reconcile` reports:
+
+| Field | While running | After teardown |
+|---|---|---|
+| `gcp_project` | matches the project SkyPilot launched into | same |
+| `gcp_orphans` / `gcp_disk_orphans` | `[]` — the live instance is suppressed by its running cluster | `[]` |
+| `gcp_unmatched` | `[]` — a non-empty list here means the node-shape predicate has drifted and is **no longer matching our own instances** | `[]` |
+| exit code | 0 | 0 |
+
+A name appearing under `gcp_unmatched` that is obviously ours is the signal that matters: it means
+the leak passes would go blind and report clean. See `is_lab_cluster_node` and the
+`test_the_predicate_accepts_*` tests.
 
 ## Live smoke (run once, at night, before trusting it)
 
