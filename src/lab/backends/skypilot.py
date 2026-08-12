@@ -398,8 +398,9 @@ def gcp_project() -> str | None:
 # would then match nothing and the leak pass would report clean forever, which is strictly worse
 # than the over-broad matching this replaced.
 #
-# Matching the node suffix rather than a bare `lab-` prefix is what keeps `reconcile --apply`,
-# which does not prompt, off a shared project's `lab-notebook` (GCP-LEAK-7). A GCE boot disk
+# Matching the node suffix rather than a bare `lab-` prefix is what keeps `reconcile --apply` off
+# a shared project's `lab-notebook` (GCP-LEAK-7); the CLI's confirmation prompt is the second
+# layer, for when this predicate is wrong anyway. A GCE boot disk
 # inherits its instance's name (the boot disk's `initializeParams` sets no `diskName`), so the
 # same shape identifies both. Pinned by `test_the_predicate_accepts_names_skypilot_itself_
 # generates`, which builds its input with SkyPilot's own naming functions rather than ours.

@@ -543,10 +543,31 @@ _ORPHAN_FIELDS = (
 # so it must not exit 3 and send the reader to `--apply` (GCP-LEAK-7).
 
 
+def _describe_orphan(item: Any) -> str:
+    """One line naming a single doomed resource, however each pass shapes its entries."""
+    if isinstance(item, dict):
+        name = item.get("name") or item.get("id") or item.get("volume_id")
+        where = item.get("zone") or item.get("region")
+        return f"{name}{f'  ({where})' if where else ''}"
+    return str(item)
+
+
+def _preview_destruction(report: dict[str, Any]) -> list[str]:
+    """Every resource `--apply` would destroy, as ``pass: description`` lines. Empty = nothing."""
+    return [
+        f"{field}: {_describe_orphan(item)}"
+        for field in _ORPHAN_FIELDS
+        for item in report.get(field) or []
+    ]
+
+
 @app.command()
 def reconcile(
     apply: bool = typer.Option(
         False, "--apply", help="destroy orphaned rentals (default: dry-run report only)"
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="skip the confirmation prompt (for unattended use)"
     ),
 ) -> None:
     """Cross-check cloud instances against local jobs to find leaks (FR-C2).
@@ -557,13 +578,38 @@ def reconcile(
     Vast-direct pass is skipped when vastai-sdk isn't installed. Exits 3 if orphans are found in
     dry-run mode — re-run with --apply, or destroy by hand via ``vastai destroy_instance <id>``.
 
+    ``--apply`` lists what it is about to destroy and asks first; ``--yes`` skips the prompt for
+    unattended use. The narrowed GCP predicate makes a destructive false positive unlikely, not
+    *recoverable* — the prompt is what keeps a bug in it from costing someone a VM they cared
+    about. Declining exits 4 and destroys nothing.
+
     The GCP passes only claim resources matching SkyPilot's real node shape
     (``lab-…-<head|worker>-<uuid8>-<compute|tpu|mig>``), and report the project they swept as
     ``gcp_project`` — check it matches the project SkyPilot launches into. Anything else named
     ``lab-*`` is listed under ``gcp_unmatched`` and never destroyed.
     """
+    lab = _lab(backend="skypilot")
     try:
-        report = _lab(backend="skypilot").reconcile(apply=apply)
+        if apply and not yes:
+            # Price the blast radius before taking it. This re-lists on the confirmed pass rather
+            # than destroying a captured set: the window is seconds, and the alternative is
+            # threading a resource list through five independent destroy passes in the most
+            # cost-critical code in the repo. Diagnostics go to stderr — stdout is JSON (§9).
+            dry = lab.reconcile(apply=False)
+            preview = _preview_destruction(dry)
+            if preview:
+                project = dry.get("gcp_project")
+                typer.echo(
+                    f"about to destroy {len(preview)} resource(s)"
+                    f"{f' in project {project}' if project else ''}:",
+                    err=True,
+                )
+                for line in preview:
+                    typer.echo(f"  {line}", err=True)
+                if not typer.confirm("proceed?", err=True):
+                    _emit({"aborted": True, "would_destroy": preview})
+                    raise typer.Exit(code=4)
+        report = lab.reconcile(apply=apply)
     except LabError as e:
         _emit({"error": str(e)})
         raise typer.Exit(code=2) from e

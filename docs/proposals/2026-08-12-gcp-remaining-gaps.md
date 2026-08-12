@@ -117,6 +117,23 @@ the report records the swept project. All pure — no cloud calls needed.
 > anchors on our `lab-` prefix plus `_generate_node_name`'s suffix, the two parts that are
 > actually stable, and its test builds inputs with SkyPilot's own functions.
 
+### The second half: `--apply` now asks
+
+This record was two complaints — the match was too broad, *and* `--apply` does not prompt. The
+narrowing addresses only the first; it makes a destructive false positive unlikely, not
+*recoverable*.
+
+`lab reconcile --apply` now lists every resource it is about to destroy (naming the swept project)
+and asks. `--yes` skips it for unattended use; declining exits 4 and destroys nothing.
+
+Deliberately **CLI-only**. The scheduler's unattended sweep calls `Lab.reconcile(apply=…)` through
+the library, which is untouched — so `auto_reconcile` (default **off**) keeps working with no
+prompt to hang on, and the MCP tool stays hard-wired to `apply=False`.
+
+Known limit, taken knowingly: the confirmed pass re-lists rather than destroying the exact set it
+displayed. The window is seconds, and the alternative is threading a captured resource list
+through five independent destroy passes in the most cost-critical code in the repo.
+
 ## 2. `GCP-CREDS-2` — `.env` discovery ignores `LAB_REPO_DIR`
 
 `area: creds` · `severity: medium` · `confidence: confirmed`
@@ -268,7 +285,7 @@ which SkyPilot's bucket staging can emit into logs.
 
 | Gap | Change | Test |
 |---|---|---|
-| `GCP-LEAK-7` | orphan passes match SkyPilot's real node shape `lab-…-<head\|worker>-<uuid8>-<compute\|tpu\|mig>`; report carries `gcp_project` and an advisory `gcp_unmatched` | `lab-notebook` and five near-miss names are not orphans; unmatched names reported but never destroyed; swept project recorded; predicate round-trips names built by **SkyPilot's own** naming functions, plus the verbatim names from the 2026-08-11 live run |
+| `GCP-LEAK-7` | orphan passes match SkyPilot's real node shape `lab-…-<head\|worker>-<uuid8>-<compute\|tpu\|mig>`; report carries `gcp_project` and an advisory `gcp_unmatched`; **`--apply` now lists what it will destroy and asks** (`--yes` to skip, decline exits 4), CLI-only so the scheduler is unaffected | declining destroys nothing; `--yes` never prompts; a clean sweep doesn't prompt; the preview goes to stderr so stdout stays parseable JSON; `lab-notebook` and five near-miss names are not orphans; unmatched names reported but never destroyed; swept project recorded; predicate round-trips names built by **SkyPilot's own** naming functions, plus the verbatim names from the 2026-08-11 live run |
 | `GCP-CREDS-2` | `_load_env` resolves through `_repo()` | `.env` is read from `LAB_REPO_DIR` |
 | `GCP-PREEMPT-1` | `gcp_preemption_state` probe feeds the classifier's inputs; classifier itself untouched. **Safe but inert on GCP spot** — see the note in its section; the real fix (zone operations log) is still open | non-preemptible stop → `failed` (end to end); real preemption → `preempted`; probe error → today's inference; a deleted-on-preemption VM leaves nothing to read |
 | `GCP-LEAK-8` | **refuted** — no code | launch path creates no object storage |

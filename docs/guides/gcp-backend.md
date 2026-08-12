@@ -235,8 +235,9 @@ GCP has **two teardown channels**, mirroring the Vast design:
 - Out-of-band: `lab reconcile` runs (a) the cloud-agnostic `sky.status` orphan pass and (b) a
   **GCP compute-API pass** listing `lab-*` instances and **unattached `lab-*` persistent disks**
   (a disk that outlives its VM keeps billing — the GCP analogue of the DO volume leak).
-  `--apply` deletes both, waiting for each delete operation to actually complete rather than
-  trusting the accepted request. The instance and disk passes are independent, and each reports
+  `--apply` deletes both — listing what it is about to destroy and asking first (`--yes` skips
+  the prompt for unattended use; declining exits 4 and destroys nothing) — and waits for each
+  delete operation to actually complete rather than trusting the accepted request. The instance and disk passes are independent, and each reports
   its own outcome in the report (`gcp_pass`, `gcp_disk_pass`).
   **Any orphan from any pass exits 3** in dry-run mode — the alarm reads the union, not a subset.
 - **"Skipped" vs "failed" matters.** The GCP passes skip only when GCP genuinely isn't set up on
@@ -257,7 +258,7 @@ GCP has **two teardown channels**, mirroring the Vast design:
   `lab-20260811-144501-c5b340-3dd12990-head-c0h9pkx0-compute`, where `3dd12990` is the SkyPilot
   user hash and the job id is *not* reliably recoverable (`make_cluster_name_on_cloud` truncates
   past GCP's 35-char limit, and our names fit by exactly zero characters); a bare
-  `lab-` prefix is not enough, because `--apply` deletes without prompting and a shared project's
+  `lab-` prefix is not enough, because a shared project's
   `lab-notebook` would have matched. Anything else named `lab-*` is listed under `gcp_unmatched`
   and never destroyed — check that list if you expected a leak and saw none.
 - **Check `gcp_project` in the report.** The passes resolve the project ambiently from ADC, while
