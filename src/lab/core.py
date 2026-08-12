@@ -1443,6 +1443,7 @@ def _status_fields(
     return {
         "job_id": m.job_id,
         "state": state,
+        "lab_version": m.lab_version,  # which lab produced the run (None on pre-0.5.0 manifests)
         "started_at": m.started_at,
         "ended_at": m.ended_at,
         "exit_code": m.exit_code,
