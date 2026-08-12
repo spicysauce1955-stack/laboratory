@@ -14,6 +14,7 @@ from typing import Any
 
 import typer
 
+from lab import __version__
 from lab._util import atomic_write_text, now, parse_duration, wrap_with_extras
 from lab.core import (
     Lab,
@@ -44,8 +45,22 @@ app = typer.Typer(
 )
 
 
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(__version__)
+        raise typer.Exit()
+
+
 @app.callback()
-def _load_env() -> None:
+def _load_env(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=_version_callback,
+        is_eager=True,
+        help="Print the installed lab version and exit.",
+    ),
+) -> None:
     """Apply the git-ignored ``.env`` before any command (cloud creds/project; real env wins).
 
     ``repo_root()`` honours ``LAB_REPO_DIR``, which matters most on the scheduler host: its
@@ -369,6 +384,35 @@ def lint(
     missing = unreferenced_keys(Path(script).read_text(), keys)
     _emit({"script": script, "checked_keys": sorted(keys), "missing_keys": missing})
     if missing:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def mcp() -> None:
+    """Run the MCP server on stdio (the command scaffolded into ``.mcp.json``)."""
+    from lab.mcp_server import build_server
+
+    build_server(default_lab()).run()
+
+
+@app.command()
+def init(
+    check: bool = typer.Option(
+        False, "--check", help="Report what init would do and exit non-zero if anything is stale."
+    ),
+) -> None:
+    """Scaffold this project to drive the lab: MCP server, skill, example entrypoint, ignores."""
+    from lab.init import scaffold
+
+    report = scaffold(Path.cwd(), check=check)
+    for dest in report["conflicts"]:
+        print(
+            f"warning: {dest} differs from the version lab ships and was left as-is; "
+            f"the current version is beside it as {dest}.new",
+            file=sys.stderr,
+        )
+    _emit(report)
+    if check and not report["ok"]:
         raise typer.Exit(code=1)
 
 
