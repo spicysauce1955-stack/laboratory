@@ -379,15 +379,36 @@ def gcp_project() -> str | None:
     return str(project) if project else None
 
 
-# SkyPilot's GCE node names are `<cluster>-<head|worker>-<uuid>-<node type>`, where cluster is
-# `lab-<job_id>` and node type is compute/tpu/mig — see
-# `sky.provision.gcp.instance_utils._generate_node_name`. A GCE boot disk inherits its instance's
-# name, so the same shape identifies both. Matching the full shape rather than a bare `lab-`
-# prefix is what keeps `reconcile --apply`, which does not prompt, off a shared project's
-# `lab-notebook` (GCP-LEAK-7). `test_the_node_shape_matches_a_freshly_generated_job_id` fails
-# loudly if `_new_job_id`'s format ever drifts away from this.
+# A GCE node SkyPilot built for one of our clusters, e.g. (real, from the live run 2026-08-11):
+#
+#   lab-20260811-144501-c5b340-3dd12990-head-c0h9pkx0-compute
+#   \_/ \___________________/ \______/ \__/ \______/ \_____/
+#    |    cluster_name_for()   user     node  uuid8   node type
+#    |                         hash                   (compute|tpu|mig)
+#    `-- our prefix
+#
+# Two parts, and only two are safe to rely on: our `lab-` prefix, and the suffix
+# `sky.provision.gcp.instance_utils._generate_node_name` appends to every instance it creates.
+#
+# The middle is deliberately unconstrained. It is tempting to anchor on `lab-<job_id>`, but
+# `make_cluster_name_on_cloud` appends an 8-char user hash *and* truncates past GCP's 35-char
+# limit — and `lab-<job_id>` is 26 chars against a budget of 35-9=26, i.e. it fits by exactly
+# zero characters. One more character in a job id and the name becomes
+# `lab-<trunc>-<2ch>-<userhash>-head-…`, with no recoverable job id in it. An anchored pattern
+# would then match nothing and the leak pass would report clean forever, which is strictly worse
+# than the over-broad matching this replaced.
+#
+# Matching the node suffix rather than a bare `lab-` prefix is what keeps `reconcile --apply`,
+# which does not prompt, off a shared project's `lab-notebook` (GCP-LEAK-7). A GCE boot disk
+# inherits its instance's name (the boot disk's `initializeParams` sets no `diskName`), so the
+# same shape identifies both. Pinned by `test_the_predicate_accepts_names_skypilot_itself_
+# generates`, which builds its input with SkyPilot's own naming functions rather than ours.
+# The uuid is exactly INSTANCE_NAME_UUID_LEN=8 base36 chars and the node type is one of
+# GCPNodeType's three values. Both are pinned rather than left loose so a hand-named
+# `lab-ml-worker-2-gpu` in a shared project cannot match; the round-trip test enumerates the real
+# enum, so a new SkyPilot node type fails there instead of silently going unmatched here.
 _GCP_NODE_RE = re.compile(
-    r"^lab-\d{8}-\d{6}-[0-9a-f]{6}-(?:head|worker)-[0-9a-z]+-[a-z]+$", re.IGNORECASE
+    r"^lab-.+-(?:head|worker)-[0-9a-z]{8}-(?:compute|tpu|mig)$", re.IGNORECASE
 )
 
 

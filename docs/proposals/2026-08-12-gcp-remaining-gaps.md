@@ -100,6 +100,23 @@ prefix; put `project` in the reconcile report so a mismatched sweep is visible.
 **test:** a `lab-notebook`-style name is not an orphan; a name matching the real cluster shape is;
 the report records the swept project. All pure — no cloud calls needed.
 
+> **The "`lab-<job_id>` plus SkyPilot's suffix" in this fix line is wrong, and the first
+> implementation followed it into a bug.** The real name carries an 8-char SkyPilot *user hash*
+> between the two — `lab-20260811-144501-c5b340-3dd12990-head-c0h9pkx0-compute` — so a job-id
+> anchored pattern matched **neither** of the two instances the 2026-08-11 live run actually
+> produced. That is worse than the over-broad matching it replaced: an over-broad leak detector
+> deletes the wrong thing loudly, a blind one reports clean forever.
+>
+> Worse, the guard test written alongside it constructed its expected name from the same wrong
+> belief, so it passed. Self-confirming tests do not guard anything.
+>
+> It cannot be anchored on the job id even in principle: `make_cluster_name_on_cloud` truncates
+> past GCP's 35-char limit to `lab-<trunc>-<2ch>-<userhash>`, and `lab-<job_id>` is 26 chars
+> against a budget of 35−9 = **26** — it fits by exactly zero characters. One more character in a
+> job id and the job id stops appearing in the name at all. The shipped predicate therefore
+> anchors on our `lab-` prefix plus `_generate_node_name`'s suffix, the two parts that are
+> actually stable, and its test builds inputs with SkyPilot's own functions.
+
 ## 2. `GCP-CREDS-2` — `.env` discovery ignores `LAB_REPO_DIR`
 
 `area: creds` · `severity: medium` · `confidence: confirmed`
@@ -224,7 +241,7 @@ which SkyPilot's bucket staging can emit into logs.
 
 | Gap | Change | Test |
 |---|---|---|
-| `GCP-LEAK-7` | orphan passes match SkyPilot's real node shape `lab-<job_id>-<head\|worker>-<uuid>-<type>`; report carries `gcp_project` and an advisory `gcp_unmatched` | `lab-notebook` is not an orphan; unmatched names reported but never destroyed; swept project recorded; node shape round-trips a fresh `_new_job_id` |
+| `GCP-LEAK-7` | orphan passes match SkyPilot's real node shape `lab-…-<head\|worker>-<uuid8>-<compute\|tpu\|mig>`; report carries `gcp_project` and an advisory `gcp_unmatched` | `lab-notebook` and five near-miss names are not orphans; unmatched names reported but never destroyed; swept project recorded; predicate round-trips names built by **SkyPilot's own** naming functions, plus the verbatim names from the 2026-08-11 live run |
 | `GCP-CREDS-2` | `_load_env` resolves through `_repo()` | `.env` is read from `LAB_REPO_DIR` |
 | `GCP-PREEMPT-1` | `gcp_preemption_state` probe feeds the classifier's inputs; classifier itself untouched | non-preemptible stop → `failed` (end to end); real preemption → `preempted`; probe error → today's inference |
 | `GCP-LEAK-8` | **refuted** — no code | launch path creates no object storage |

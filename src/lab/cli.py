@@ -558,7 +558,7 @@ def reconcile(
     dry-run mode — re-run with --apply, or destroy by hand via ``vastai destroy_instance <id>``.
 
     The GCP passes only claim resources matching SkyPilot's real node shape
-    (``lab-<job_id>-head|worker-<uuid>-<node type>``), and report the project they swept as
+    (``lab-…-<head|worker>-<uuid8>-<compute|tpu|mig>``), and report the project they swept as
     ``gcp_project`` — check it matches the project SkyPilot launches into. Anything else named
     ``lab-*`` is listed under ``gcp_unmatched`` and never destroyed.
     """

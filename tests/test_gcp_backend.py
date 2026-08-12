@@ -94,12 +94,25 @@ def test_reconcile_still_raises_on_non_import_listing_failure(tmp_path, monkeypa
 # GCP second teardown channel: compute-API orphan passes + robust_teardown branch
 # ---------------------------------------------------------------------------
 
-# SkyPilot's real GCE node name for a lab cluster: `lab-<job_id>-<head|worker>-<uuid>-<node type>`
-# (sky.provision.gcp.instance_utils._generate_node_name). Names that skip this shape deliberately
-# no longer match the orphan passes — see GCP-LEAK-7 below.
-REAL_NODE = "lab-20260812-143000-a1b2c3-head-8n2k4p1q-compute"
-REAL_WORKER = "lab-20260812-143000-a1b2c3-worker-3z8x1v0w-compute"
-LEAKED_NODE = "lab-20260621-153202-dcf60d-head-1a2b3c4d-compute"
+# Real GCE node names, copied verbatim from the live GCP run of 2026-08-11. Do not "tidy" these:
+# every segment is load-bearing, and a hand-written approximation is what made the first attempt
+# at GCP-LEAK-7 match nothing at all.
+#
+#   lab-20260811-144501-c5b340-3dd12990-head-c0h9pkx0-compute
+#   \_/ \___________________/ \______/ \__/ \______/ \_____/
+#    |    cluster_name_for()   user     node  uuid8   node type
+#    |    = lab-<job_id>       hash                   (compute|tpu|mig)
+#    `-- our prefix
+#
+# The user hash comes from `make_cluster_name_on_cloud`, which *also* truncates: GCP's limit is 35
+# chars and `lab-<job_id>` is 26 against a budget of 35-9=26 — it fits by exactly zero characters.
+# One more character in a job id and the name becomes `lab-<trunc>-<2ch>-<userhash>-head-…`, with
+# the job id mangled. That is why the predicate anchors on SkyPilot's node suffix rather than on
+# the job id: the job id is not reliably present in the name at all.
+REAL_NODE = "lab-20260811-144501-c5b340-3dd12990-head-c0h9pkx0-compute"
+LEAKED_NODE = "lab-20260811-182037-cde576-3dd12990-head-4oq7tgke-compute"
+REAL_WORKER = "lab-20260811-144501-c5b340-3dd12990-worker-3z8x1v0w-compute"
+REAL_TRUNCATED_NODE = "lab-85-3dd12990-head-c0h9pkx0-compute"  # the over-length fallback shape
 
 
 def test_gcp_instance_orphans_flags_untracked_lab_instances():
@@ -468,16 +481,60 @@ def test_worker_nodes_match_too():
     assert [o["name"] for o in gcp_instance_orphans(instances, set())] == [REAL_WORKER]
 
 
-def test_the_node_shape_matches_a_freshly_generated_job_id():
-    """The narrowing is only safe while it still recognises our own clusters. This asserts the
-    round trip end to end — if `_new_job_id`'s format ever drifts, the leak pass would go blind
-    and report clean forever; this test fails first instead."""
+def test_the_predicate_accepts_names_skypilot_itself_generates():
+    """The narrowing is only safe while it still recognises our own clusters, and a leak pass that
+    silently matches nothing reports clean forever.
+
+    So this builds the name the way SkyPilot really builds it — `make_cluster_name_on_cloud` at
+    GCP's own length limit, then `_generate_node_name` — from a freshly generated job id, rather
+    than from our belief about the shape. The first attempt at GCP-LEAK-7 hand-wrote the expected
+    name, omitted the user hash, and matched none of the two real instances the live run produced;
+    a self-confirming test did not catch it. This one would have.
+    """
+    from sky.clouds.gcp import GCP
+    from sky.provision.gcp.instance_utils import GCPNodeType, _generate_node_name
+    from sky.utils.common_utils import make_cluster_name_on_cloud
+
     from lab.backends.skypilot import cluster_name_for, is_lab_cluster_node
     from lab.core import _new_job_id
 
-    cluster = cluster_name_for(_new_job_id())
-    assert is_lab_cluster_node(f"{cluster}-head-8n2k4p1q-compute")
-    assert is_lab_cluster_node(f"{cluster}-worker-8n2k4p1q-tpu")
+    on_cloud = make_cluster_name_on_cloud(
+        cluster_name_for(_new_job_id()), max_length=GCP.max_cluster_name_length()
+    )
+    # Enumerate the real enum, not a hand-copied list: a node type SkyPilot adds later fails here
+    # rather than silently going unmatched by the predicate.
+    for node_type in GCPNodeType:
+        for is_head in (True, False):
+            name = _generate_node_name(on_cloud, node_type.value, is_head=is_head)
+            assert is_lab_cluster_node(name), name
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "lab-notebook",  # the shared-project VM that started GCP-LEAK-7
+        "lab-shared-jupyter",
+        "lab-ml-worker-2-gpu",  # human-named and *shaped* like a node: uuid too short, bad type
+        "lab-run-head-c0h9pkx0-gpu",  # `gpu` is not a GCPNodeType
+        "lab-run-head-short-compute",  # uuid is not 8 chars
+        "notlab-20260811-144501-c5b340-3dd12990-head-c0h9pkx0-compute",  # not our prefix
+    ],
+)
+def test_the_predicate_rejects_things_that_are_not_ours(name):
+    """Everything the predicate accepts is something `reconcile --apply` deletes without asking,
+    so the near misses matter as much as the hits."""
+    from lab.backends.skypilot import is_lab_cluster_node
+
+    assert not is_lab_cluster_node(name), name
+
+
+def test_the_predicate_accepts_the_real_names_from_the_live_run():
+    """Belt and braces on the generator above: the exact strings GCE reported on 2026-08-11,
+    including the over-length truncated shape, which drops the job id from the name entirely."""
+    from lab.backends.skypilot import is_lab_cluster_node
+
+    for name in (REAL_NODE, LEAKED_NODE, REAL_WORKER, REAL_TRUNCATED_NODE):
+        assert is_lab_cluster_node(name), name
 
 
 def test_unmatched_lab_names_are_reported_but_never_destroyed(tmp_path, monkeypatch):

@@ -253,7 +253,10 @@ GCP has **two teardown channels**, mirroring the Vast design:
   net behind it. (For contrast: on Vast `poweroff` ends the rental outright and nothing survives;
   on DO it powers the droplet off and you keep paying full price for the whole droplet.)
 - **The GCP passes only claim what SkyPilot actually created.** A resource is ours only if it
-  matches the real node shape `lab-<job_id>-<head|worker>-<uuid>-<compute|tpu|mig>`; a bare
+  matches the real node shape `lab-…-<head|worker>-<uuid8>-<compute|tpu|mig>` — e.g.
+  `lab-20260811-144501-c5b340-3dd12990-head-c0h9pkx0-compute`, where `3dd12990` is the SkyPilot
+  user hash and the job id is *not* reliably recoverable (`make_cluster_name_on_cloud` truncates
+  past GCP's 35-char limit, and our names fit by exactly zero characters); a bare
   `lab-` prefix is not enough, because `--apply` deletes without prompting and a shared project's
   `lab-notebook` would have matched. Anything else named `lab-*` is listed under `gcp_unmatched`
   and never destroyed — check that list if you expected a leak and saw none.
