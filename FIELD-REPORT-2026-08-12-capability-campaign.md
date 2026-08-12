@@ -5,7 +5,33 @@
 **Design:** `docs/superpowers/specs/2026-08-12-capability-campaign-design.md`
 **Science:** the q0 restart-overlap witness (v14 addition #2), extending the 2026-06-25 α_c curve
 
-Written as friction happens, not reconstructed afterwards. Each finding records what was
+Written as friction happens, not reconstructed afterwards.
+
+**Status: complete.** Handing over to the developers — nothing here is in progress and no
+resources remain provisioned.
+
+## Triage summary
+
+| # | Finding | Sev | Area |
+|---|---|---|---|
+| **F9** | a GCP GPU job provisions, bills, and cannot use the GPU (image driver 12020 vs `cu130` wheels) | **high** | cost-safety |
+| **F13** | `reconcile` has no TPU pass, so a lost-registry TPU leak is invisible | **high** | leak net |
+| **F12** | `doctor` blocks legitimate TPU launches on a metric GCP does not have | med-high | preflight |
+| **F6** | a config key can be *consumed but inert*; 37× cost cliff and the opposite answer | medium | correctness |
+| **F5** | every running non-Vast job is reported as a `ghost` | medium | reconcile |
+| **F8** | a GCP provision timeout blames "a dead Vast offer" | medium | diagnostics |
+| **F10** | a cancelled job records no cost, though the inputs are on hand | medium | cost ledger |
+| **F11** | `sweep-aggregate` crashes on multi-row-per-seed output, after the spend | medium | sweeps |
+| **F3** | `estimated_usd` is a budget, not a prediction, and nothing says so | medium | cost model |
+| **F7** | nothing preflights the concurrency a sweep will actually hit | low-med | admission |
+| **F14** | `submit` says `status`, everything else says `state` | low | API surface |
+| F1, F2, F4 | informational / experiment-side | info | — |
+
+Suggested order: **F9** and **F13** before the next accelerator run — they are the two that cost
+money silently. **F12** unblocks TPUs. **F5**, **F8**, **F10**, **F14** are small, well-bounded
+fixes with obvious tests.
+
+ Each finding records what was
 attempted, what the system did, what was expected, and what the gap cost.
 
 ---
@@ -538,3 +564,24 @@ gotcha behaved exactly as the guide documents it.
 misread local log timestamps as UTC) and a running job appearing in `gcp_orphans` (it had
 succeeded seconds earlier). Both were caught by looking before filing, which is the same
 discipline that produced F9's proven root cause instead of a plausible guess.
+
+### F14 — `submit` calls it `status`, everything else calls it `state`
+
+`severity: low` · `confirmed` · found by writing the bug it invites
+
+`lab submit` emits `{"job_id", "cached", "status"}` (cli.py:205, 212). Every other command emits
+the same concept as `state`: `lab cancel` (cli.py:413), `lab status`, `lab list` and the sweep
+views (core.py:946, 1001, 1296, 1445).
+
+The natural agent/script pattern is to submit, read a key off the response, then poll for it. That
+pattern silently never matches: the poller greps for `"status"` — the key `submit` just handed it
+— against a `lab status` payload that only contains `"state"`.
+
+I know it is silent because I wrote exactly that loop during this campaign, and it polled a
+finished job every 20 seconds for about three hours without ever matching or erroring. Nothing
+failed; the loop simply never terminated. A human notices an idle terminal, but an agent driving
+the lab in the background does not.
+
+**Proposed fix:** emit `state` from `submit` too. Keep `status` alongside it for one release if
+anything depends on it, then drop it. One key, one name.
+**Test:** every command's JSON uses `state` for the job's lifecycle value.
