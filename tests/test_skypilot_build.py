@@ -27,3 +27,21 @@ def test_spot_only_when_fallback_disabled(tmp_path):
     m.resources.use_spot = True
     m.resources.spot_fallback = False
     assert _spot_flags(m) == [True]
+
+
+def test_the_launch_path_creates_no_object_storage(tmp_path):
+    """GCP-LEAK-8's second half, pinned. SkyPilot only stages files into a
+    `skypilot-filemounts-*` bucket from `maybe_translate_local_file_mounts_and_sync_up`, which
+    runs for controller-backed launches (`sky jobs launch` / `sky serve up`) and translates
+    `file_mounts` / `storage_mounts`. The lab calls plain `sky.launch` with a `workdir`, which is
+    rsynced over SSH — so nothing is ever created that would need reaping.
+
+    This is the tripwire on that reasoning: adding a file mount silently reintroduces a billable
+    resource no `reconcile` pass covers, and this test fails first.
+    """
+    m = make_manifest("j4", "echo hi", accelerators="RTX_4090:1")
+    task = build_task(m, workdir=Path("."))
+
+    assert not task.file_mounts
+    assert not task.storage_mounts
+    assert task.workdir is not None  # the workdir rsync is how files actually get there

@@ -177,7 +177,14 @@ Compute Admin + Service Account User is **not** enough for SkyPilot: `sky check 
 | `roles/iam.serviceAccountAdmin` | creating the VM service account at launch |
 | `roles/serviceusage.serviceUsageAdmin` | `serviceusage.services.use` / `.enable` |
 | `roles/iam.securityReviewer` | `resourcemanager.projects.getIamPolicy`, `iam.roles.get` |
-| `roles/storage.admin` | SkyPilot's staging bucket (`storage.buckets.create/delete`) |
+| `roles/storage.admin` | `sky check gcp`'s `storage.buckets.create/delete` probe |
+
+`roles/storage.admin` is needed to make `sky check gcp` pass, **not** because this lab stages
+anything into object storage. SkyPilot only creates a `skypilot-filemounts-*` bucket from
+`maybe_translate_local_file_mounts_and_sync_up`, which runs for controller-backed launches
+(`sky jobs launch` / `sky serve up`) and translates `file_mounts` / `storage_mounts`. The lab
+calls plain `sky.launch` with a `workdir`, rsynced over SSH — so no bucket is ever created and
+none needs reaping. `test_the_launch_path_creates_no_object_storage` fails if that changes.
 
 Grant them **as a project owner** — a service account cannot grant itself roles (it can't even
 `getIamPolicy`, so `add-iam-policy-binding` fails at the read):
@@ -236,6 +243,24 @@ GCP has **two teardown channels**, mirroring the Vast design:
   this machine (no ADC, no project, extra not installed) — the report says so. An actual API
   failure (revoked role, expired key, disabled API, 5xx) **raises** instead of reporting clean:
   a leak-detection pass that swallows an error claims coverage it doesn't have.
+- **The on-box `poweroff` backstop is compute-only on GCP.** It fires at `wall + 600s` and is
+  described elsewhere as "a hard backstop"; on GCP that is only half true. `poweroff` puts the VM
+  in `TERMINATED`, which stops **compute** billing — but the persistent disk survives a
+  TERMINATED instance and **keeps billing indefinitely**. So on GCP the backstop converts a
+  compute leak into a storage leak. That is a real improvement (compute is the expensive part),
+  but it is not a release of resources, and nothing on the box will ever release the disk. The
+  actual teardown path is `down=True` + autostop; `lab reconcile`'s unattached-disk pass is the
+  net behind it. (For contrast: on Vast `poweroff` ends the rental outright and nothing survives;
+  on DO it powers the droplet off and you keep paying full price for the whole droplet.)
+- **The GCP passes only claim what SkyPilot actually created.** A resource is ours only if it
+  matches the real node shape `lab-<job_id>-<head|worker>-<uuid>-<compute|tpu|mig>`; a bare
+  `lab-` prefix is not enough, because `--apply` deletes without prompting and a shared project's
+  `lab-notebook` would have matched. Anything else named `lab-*` is listed under `gcp_unmatched`
+  and never destroyed — check that list if you expected a leak and saw none.
+- **Check `gcp_project` in the report.** The passes resolve the project ambiently from ADC, while
+  SkyPilot can be pinned to a *different* project in `~/.sky/config.yaml`. If those disagree,
+  reconcile sweeps a project the lab never launches into and truthfully reports it clean. The
+  report names the project it swept so you can tell that apart from a real all-clear.
 - Manual double-check if you suspect a leak:
   `gcloud compute instances list --filter="name~'^lab-'"` and
   `gcloud compute disks list --filter="name~'^lab-' AND -users:*"`.
@@ -269,6 +294,19 @@ GCP has **two teardown channels**, mirroring the Vast design:
   "still shutting down": give it a minute and re-run before treating a fresh orphan as a leak. An
   instance still listed several minutes after the job ended is real, and `lab reconcile --apply`
   is the fix.
+
+## Spot preemption is read, not guessed
+
+On the unmanaged spot path the lab normally *infers* preemption: spot, plus the box vanished,
+plus no authoritative terminal status. GCE does not require that guess — a preempted Spot VM goes
+`TERMINATED` with `scheduling.preemptible = true` — so on GCP the lab asks the compute API before
+falling back to the inference.
+
+This matters because the inference is wrong in the expensive direction: a job that genuinely
+*failed* on a box that happened to disappear looked identical to a preemption, and the scheduler
+auto-resubmits preempted jobs — so the same failure got paid for twice. GCE's answer wins over
+the inference in both directions, and if the probe can't answer (no ADC, revoked role, a 5xx, or
+the instance already deleted) the old inference stands unchanged.
 
 ## Limitations (v1)
 

@@ -43,8 +43,14 @@ app = typer.Typer(
 
 @app.callback()
 def _load_env() -> None:
-    """Apply the git-ignored ``.env`` before any command (cloud creds/project; real env wins)."""
-    load_lab_env(repo_root())
+    """Apply the git-ignored ``.env`` before any command (cloud creds/project; real env wins).
+
+    Resolved through :func:`_repo`, not bare ``repo_root()``: the scheduler host runs from a
+    systemd unit whose ``WorkingDirectory`` need not be the repo, and it is the host that most
+    needs a service-account key. A cwd-derived lookup found no ``.env`` there and the failure
+    surfaced one layer down as an opaque auth error (GCP-CREDS-2).
+    """
+    load_lab_env(_repo())
 
 
 def _lab(backend: str = "local") -> Lab:
@@ -532,6 +538,9 @@ _ORPHAN_FIELDS = (
     "gcp_disk_orphans",  # unattached GCE persistent disks
     "do_volume_orphans",  # detached DO block volumes
 )
+# Deliberately NOT here: `gcp_unmatched` — `lab-*` GCE names that do not match our cluster-node
+# shape. It is advisory (something in this project is named like us but is not ours to destroy),
+# so it must not exit 3 and send the reader to `--apply` (GCP-LEAK-7).
 
 
 @app.command()
@@ -547,6 +556,11 @@ def reconcile(
     after a teardown failure (look for ``teardown_status: "failed"`` in ``lab status``). The
     Vast-direct pass is skipped when vastai-sdk isn't installed. Exits 3 if orphans are found in
     dry-run mode — re-run with --apply, or destroy by hand via ``vastai destroy_instance <id>``.
+
+    The GCP passes only claim resources matching SkyPilot's real node shape
+    (``lab-<job_id>-head|worker-<uuid>-<node type>``), and report the project they swept as
+    ``gcp_project`` — check it matches the project SkyPilot launches into. Anything else named
+    ``lab-*`` is listed under ``gcp_unmatched`` and never destroyed.
     """
     try:
         report = _lab(backend="skypilot").reconcile(apply=apply)

@@ -1141,7 +1141,8 @@ class Lab:
         from lab.backends.skypilot import GcpNotConfigured, delete_gcp_disk, delete_gcp_instance
         from lab.backends.skypilot import gcp_disk_orphans as _find_gcp_disk_orphans
         from lab.backends.skypilot import gcp_instance_orphans as _find_gcp_instance_orphans
-        from lab.backends.skypilot import list_gcp_disks, list_gcp_instances
+        from lab.backends.skypilot import gcp_project, gcp_unmatched_lab_names, list_gcp_disks
+        from lab.backends.skypilot import list_gcp_instances
 
         def _gcp_list(what: str, lister: Callable[[], list[dict[str, Any]]]) -> tuple[
             list[dict[str, Any]] | None, str
@@ -1188,6 +1189,10 @@ class Lab:
             "vast_pass": vast_pass,
             "gcp_pass": gcp_pass,
             "gcp_disk_pass": gcp_disk_pass,
+            # Which project the two passes above actually swept — ambient from ADC, and possibly
+            # not the one SkyPilot launches into (GCP-LEAK-7).
+            "gcp_project": gcp_project(),
+            "gcp_unmatched": gcp_unmatched_lab_names(gcp_instances or [], gcp_disks or []),
             "instances_total": len(instances),
             "unsupervised": unsupervised,  # running manifests with a dead supervisor (FR-C2)
             "orphans": orphans,

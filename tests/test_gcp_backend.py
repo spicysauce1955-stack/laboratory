@@ -5,7 +5,7 @@ import pytest
 
 from lab.backends.local import LocalBackend
 from lab.core import Lab, LabError, resolve_backend_profile, validate_cloud
-from lab.models import ResourceRequest
+from lab.models import JobState, ResourceRequest
 
 
 # ---------------------------------------------------------------------------
@@ -94,17 +94,26 @@ def test_reconcile_still_raises_on_non_import_listing_failure(tmp_path, monkeypa
 # GCP second teardown channel: compute-API orphan passes + robust_teardown branch
 # ---------------------------------------------------------------------------
 
+# SkyPilot's real GCE node name for a lab cluster: `lab-<job_id>-<head|worker>-<uuid>-<node type>`
+# (sky.provision.gcp.instance_utils._generate_node_name). Names that skip this shape deliberately
+# no longer match the orphan passes — see GCP-LEAK-7 below.
+REAL_NODE = "lab-20260812-143000-a1b2c3-head-8n2k4p1q-compute"
+REAL_WORKER = "lab-20260812-143000-a1b2c3-worker-3z8x1v0w-compute"
+LEAKED_NODE = "lab-20260621-153202-dcf60d-head-1a2b3c4d-compute"
+
 
 def test_gcp_instance_orphans_flags_untracked_lab_instances():
     from lab.backends.skypilot import gcp_instance_orphans
 
+    dead = "lab-20260812-090000-dead01-head-3dd1aaaa-compute"
+    alive = "lab-20260812-100000-a11ced-head-3dd1bbbb-compute"
     instances = [
-        {"name": "lab-job-dead-3dd1-head", "zone": "us-central1-a", "status": "RUNNING"},
-        {"name": "lab-job-alive-3dd1-head", "zone": "us-central1-a", "status": "RUNNING"},
+        {"name": dead, "zone": "us-central1-a", "status": "RUNNING"},
+        {"name": alive, "zone": "us-central1-a", "status": "RUNNING"},
         {"name": "someone-else-vm", "zone": "us-central1-a", "status": "RUNNING"},
     ]
-    orphans = gcp_instance_orphans(instances, running_clusters={"lab-job-alive"})
-    assert [o["name"] for o in orphans] == ["lab-job-dead-3dd1-head"]
+    orphans = gcp_instance_orphans(instances, running_clusters={"lab-20260812-100000-a11ced"})
+    assert [o["name"] for o in orphans] == [dead]
 
 
 def test_gcp_disk_orphans_flags_unattached_lab_disks():
@@ -112,14 +121,16 @@ def test_gcp_disk_orphans_flags_unattached_lab_disks():
     volume-leak pass. Attached disks die with their instance teardown; only unattached ones leak."""
     from lab.backends.skypilot import gcp_disk_orphans
 
+    dead = "lab-20260812-090000-dead01-head-3dd1aaaa-compute"
+    attached = "lab-20260812-100000-a11ced-head-3dd1bbbb-compute"
     disks = [
-        {"name": "lab-job-dead-3dd1-head", "zone": "us-central1-a", "users": []},
-        {"name": "lab-job-alive-3dd1-head", "zone": "us-central1-a",
-         "users": ["projects/p/zones/z/instances/lab-job-alive-3dd1-head"]},
+        {"name": dead, "zone": "us-central1-a", "users": []},
+        {"name": attached, "zone": "us-central1-a",
+         "users": [f"projects/p/zones/z/instances/{attached}"]},
         {"name": "someone-else-disk", "zone": "us-central1-a", "users": []},
     ]
     orphans = gcp_disk_orphans(disks, running_clusters=set())
-    assert [o["name"] for o in orphans] == ["lab-job-dead-3dd1-head"]
+    assert [o["name"] for o in orphans] == [dead]
 
 
 def test_list_gcp_instances_parses_aggregated_list():
@@ -151,7 +162,10 @@ def test_list_gcp_instances_parses_aggregated_list():
             return _Instances()
 
     out = list_gcp_instances(_Compute(), "proj")
-    assert out == [{"name": "lab-x-1a2b-head", "zone": "us-central1-a", "status": "RUNNING"}]
+    assert out == [
+        {"name": "lab-x-1a2b-head", "zone": "us-central1-a", "status": "RUNNING",
+         "preemptible": False}
+    ]
 
 
 class _SkyDownFails:
@@ -319,12 +333,12 @@ def test_reconcile_gcp_pass_flags_and_destroys_orphans(tmp_path, monkeypatch):
     monkeypatch.setattr("lab.backends.skypilot.list_do_volumes", lambda *a, **k: [])
     monkeypatch.setattr(
         "lab.backends.skypilot.list_gcp_instances",
-        lambda *a, **k: [{"name": "lab-leak-1a2b-head", "zone": "us-central1-a",
+        lambda *a, **k: [{"name": LEAKED_NODE, "zone": "us-central1-a",
                           "status": "RUNNING"}],
     )
     monkeypatch.setattr(
         "lab.backends.skypilot.list_gcp_disks",
-        lambda *a, **k: [{"name": "lab-leak-1a2b-head", "zone": "us-central1-a", "users": []}],
+        lambda *a, **k: [{"name": LEAKED_NODE, "zone": "us-central1-a", "users": []}],
     )
     deleted: list[tuple] = []
     monkeypatch.setattr(
@@ -337,12 +351,12 @@ def test_reconcile_gcp_pass_flags_and_destroys_orphans(tmp_path, monkeypatch):
     )
 
     report = lab.reconcile(apply=True)
-    assert [o["name"] for o in report["gcp_orphans"]] == ["lab-leak-1a2b-head"]
-    assert report["gcp_destroyed"] == ["lab-leak-1a2b-head"]
-    assert [o["name"] for o in report["gcp_disk_orphans"]] == ["lab-leak-1a2b-head"]
-    assert report["gcp_disks_destroyed"] == ["lab-leak-1a2b-head"]
-    assert ("inst", "lab-leak-1a2b-head", "us-central1-a") in deleted
-    assert ("disk", "lab-leak-1a2b-head", "us-central1-a") in deleted
+    assert [o["name"] for o in report["gcp_orphans"]] == [LEAKED_NODE]
+    assert report["gcp_destroyed"] == [LEAKED_NODE]
+    assert [o["name"] for o in report["gcp_disk_orphans"]] == [LEAKED_NODE]
+    assert report["gcp_disks_destroyed"] == [LEAKED_NODE]
+    assert ("inst", LEAKED_NODE, "us-central1-a") in deleted
+    assert ("disk", LEAKED_NODE, "us-central1-a") in deleted
 
 
 def _lab_with_other_passes_clean(tmp_path, monkeypatch):
@@ -401,10 +415,10 @@ def test_reconcile_gcp_disk_pass_runs_even_when_the_instance_pass_is_skipped(
     )
     monkeypatch.setattr(
         "lab.backends.skypilot.list_gcp_disks",
-        lambda *a, **k: [{"name": "lab-leak-1a2b-head", "zone": "us-central1-a", "users": []}],
+        lambda *a, **k: [{"name": LEAKED_NODE, "zone": "us-central1-a", "users": []}],
     )
     report = lab.reconcile()
-    assert [d["name"] for d in report["gcp_disk_orphans"]] == ["lab-leak-1a2b-head"]
+    assert [d["name"] for d in report["gcp_disk_orphans"]] == [LEAKED_NODE]
 
 
 def test_reconcile_gcp_disk_api_failure_raises(tmp_path, monkeypatch):
@@ -416,6 +430,104 @@ def test_reconcile_gcp_disk_api_failure_raises(tmp_path, monkeypatch):
     )
     with pytest.raises(LabError, match="GCP"):
         lab.reconcile()
+
+
+# --- GCP-LEAK-7: `lab-` matching is too broad, and unanchored to a project -------------------
+
+
+def test_a_bare_lab_prefixed_vm_is_not_an_orphan():
+    """The destructive false positive. `reconcile --apply` deletes without prompting, so in a
+    shared project someone's `lab-notebook` was a VM we would silently destroy. Only SkyPilot's
+    real node shape — cluster + `-head|worker-<uuid>-<node type>` — is ours to delete."""
+    from lab.backends.skypilot import gcp_instance_orphans
+
+    instances = [
+        {"name": "lab-notebook", "zone": "us-central1-a", "status": "RUNNING"},
+        {"name": "lab-shared-jupyter", "zone": "us-central1-a", "status": "RUNNING"},
+        {"name": REAL_NODE, "zone": "us-central1-a", "status": "RUNNING"},
+    ]
+    assert [o["name"] for o in gcp_instance_orphans(instances, set())] == [REAL_NODE]
+
+
+def test_a_bare_lab_prefixed_disk_is_not_an_orphan():
+    """Same narrowing for disks: a GCE boot disk inherits its instance's name, so an unattached
+    disk we may delete carries the same node shape. `lab-notebook`'s data disk does not."""
+    from lab.backends.skypilot import gcp_disk_orphans
+
+    disks = [
+        {"name": "lab-notebook", "zone": "us-central1-a", "users": []},
+        {"name": REAL_NODE, "zone": "us-central1-a", "users": []},
+    ]
+    assert [o["name"] for o in gcp_disk_orphans(disks, set())] == [REAL_NODE]
+
+
+def test_worker_nodes_match_too():
+    from lab.backends.skypilot import gcp_instance_orphans
+
+    instances = [{"name": REAL_WORKER, "zone": "us-central1-a", "status": "RUNNING"}]
+    assert [o["name"] for o in gcp_instance_orphans(instances, set())] == [REAL_WORKER]
+
+
+def test_the_node_shape_matches_a_freshly_generated_job_id():
+    """The narrowing is only safe while it still recognises our own clusters. This asserts the
+    round trip end to end — if `_new_job_id`'s format ever drifts, the leak pass would go blind
+    and report clean forever; this test fails first instead."""
+    from lab.backends.skypilot import cluster_name_for, is_lab_cluster_node
+    from lab.core import _new_job_id
+
+    cluster = cluster_name_for(_new_job_id())
+    assert is_lab_cluster_node(f"{cluster}-head-8n2k4p1q-compute")
+    assert is_lab_cluster_node(f"{cluster}-worker-8n2k4p1q-tpu")
+
+
+def test_unmatched_lab_names_are_reported_but_never_destroyed(tmp_path, monkeypatch):
+    """The narrowing's own safety net: a `lab-*` resource we no longer claim is still surfaced,
+    so a real leak in an unexpected shape is visible rather than silently dropped. It is
+    advisory — it must not land in the orphan lists that `--apply` destroys."""
+    lab = _lab_with_other_passes_clean(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "lab.backends.skypilot.list_gcp_instances",
+        lambda *a, **k: [{"name": "lab-notebook", "zone": "us-central1-a", "status": "RUNNING"}],
+    )
+    monkeypatch.setattr(
+        "lab.backends.skypilot.list_gcp_disks",
+        lambda *a, **k: [{"name": "lab-notebook-data", "zone": "us-central1-a", "users": []}],
+    )
+    monkeypatch.setattr(
+        "lab.backends.skypilot.delete_gcp_instance", _raise(AssertionError("must not destroy"))
+    )
+    monkeypatch.setattr(
+        "lab.backends.skypilot.delete_gcp_disk", _raise(AssertionError("must not destroy"))
+    )
+
+    report = lab.reconcile(apply=True)
+    assert report["gcp_orphans"] == [] and report["gcp_disk_orphans"] == []
+    assert sorted(report["gcp_unmatched"]) == ["lab-notebook", "lab-notebook-data"]
+
+
+def test_reconcile_reports_the_project_it_swept(tmp_path, monkeypatch):
+    """Unanchored: the project comes from ambient ADC, while SkyPilot can be pinned to a
+    different one in ~/.sky/config.yaml. A reconcile of the wrong project reports clean and is
+    indistinguishable from a real all-clear — unless the report says which project it swept."""
+    lab = _lab_with_other_passes_clean(tmp_path, monkeypatch)
+    monkeypatch.setattr("lab.backends.skypilot.list_gcp_instances", lambda *a, **k: [])
+    monkeypatch.setattr("lab.backends.skypilot.list_gcp_disks", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "lab.backends.skypilot._gcp_default_credentials", lambda: (object(), "swept-project")
+    )
+    assert lab.reconcile()["gcp_project"] == "swept-project"
+
+
+def test_reconcile_reports_a_null_project_when_gcp_is_unconfigured(tmp_path, monkeypatch):
+    from lab.backends.skypilot import GcpNotConfigured
+
+    lab = _lab_with_other_passes_clean(tmp_path, monkeypatch)
+    monkeypatch.setattr("lab.backends.skypilot.list_gcp_instances", lambda *a, **k: [])
+    monkeypatch.setattr("lab.backends.skypilot.list_gcp_disks", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "lab.backends.skypilot._gcp_default_credentials", _raise(GcpNotConfigured("no ADC"))
+    )
+    assert lab.reconcile()["gcp_project"] is None
 
 
 def test_get_gcp_compute_raises_not_configured_without_a_project(monkeypatch):
@@ -927,6 +1039,157 @@ def test_run_job_gcp_preemption_does_not_flag_teardown_failed(tmp_path, monkeypa
     assert final.status is JobState.preempted
     assert rc == 0  # teardown succeeded and stays succeeded
     assert final.end_reason != "preempted but teardown unconfirmed — see `lab reconcile`"
+
+
+# --- GCP-PREEMPT-1: GCE reports preemption; stop inferring it --------------------------------
+
+
+def test_gce_terminal_state_reads_preemption_off_a_terminated_spot_vm():
+    from lab.preemption import gcp_terminal_state
+
+    stopped_spot = [{"name": REAL_NODE, "status": "TERMINATED", "preemptible": True}]
+    assert gcp_terminal_state(stopped_spot) is JobState.preempted
+
+
+def test_gce_terminal_state_calls_a_non_preemptible_stop_a_failure():
+    """The direction that costs money: a genuinely failed job whose box happened to stop is not
+    a preemption, and must not be auto-resubmitted."""
+    from lab.preemption import gcp_terminal_state
+
+    stopped = [{"name": REAL_NODE, "status": "TERMINATED", "preemptible": False}]
+    assert gcp_terminal_state(stopped) is JobState.failed
+
+
+def test_gce_terminal_state_says_nothing_when_there_is_nothing_to_read():
+    """No instance left (already deleted) or still running: GCE has no authoritative answer, so
+    the probe must abstain rather than invent one — the caller keeps today's inference."""
+    from lab.preemption import gcp_terminal_state
+
+    assert gcp_terminal_state([]) is None
+    assert gcp_terminal_state([{"name": REAL_NODE, "status": "RUNNING"}]) is None
+
+
+def test_list_gcp_instances_carries_the_preemptible_flag():
+    from lab.backends.skypilot import list_gcp_instances
+
+    class _Req:
+        def execute(self):
+            return {
+                "items": {
+                    "zones/us-central1-a": {
+                        "instances": [
+                            {
+                                "name": REAL_NODE,
+                                "zone": "https://.../zones/us-central1-a",
+                                "status": "TERMINATED",
+                                "scheduling": {"preemptible": True},
+                            }
+                        ]
+                    }
+                }
+            }
+
+    class _Instances:
+        def aggregatedList(self, project):  # noqa: N802 — mirrors googleapiclient
+            return _Req()
+
+        def aggregatedList_next(self, previous_request, previous_response):  # noqa: N802
+            return None
+
+    class _Compute:
+        def instances(self):
+            return _Instances()
+
+    assert list_gcp_instances(_Compute(), "proj")[0]["preemptible"] is True
+
+
+def _gcp_spot_job_whose_box_vanished(tmp_path, monkeypatch, job_id):
+    """A gcp spot job that reached no terminal state and whose cluster is gone — the exact input
+    the classifier could previously only *infer* about. Returns its JobStore."""
+    import sys
+    import types
+
+    import lab.sky_runner as runner_mod
+    from helpers import make_manifest
+    from lab._util import now
+    from lab.models import BackendInfo, CostInfo
+    from lab.store import JobStore
+
+    store = JobStore(tmp_path / "runs")
+    m = make_manifest(job_id, "python x.py", timeout="1h").model_copy(
+        update={
+            "status": JobState.running,
+            "started_at": now(),
+            "cost": CostInfo(hourly_usd=0.2, estimated_usd=0.2),
+            "backend": BackendInfo(provisioner="skypilot", launched_spot=True),
+        }
+    )
+    m.resources.cloud = "gcp"
+    m.resources.use_spot = True
+    store.create(m)
+    store.write_runtime(job_id, runner_pid=1, cluster=f"lab-{job_id}")
+
+    fake_sky = types.ModuleType("sky")
+    monkeypatch.setitem(sys.modules, "sky", fake_sky)
+    monkeypatch.setattr(fake_sky, "tail_logs", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(runner_mod, "_wait_terminal", lambda *a, **k: (JobState.failed, False))
+    monkeypatch.setattr(runner_mod, "_cluster_up", lambda *a, **k: False)
+    monkeypatch.setattr(runner_mod, "_rsync_down", lambda *a, **k: None)
+    monkeypatch.setattr(runner_mod, "tear_down_and_record", lambda *a, **k: True)
+    _no_vast(monkeypatch)
+    return store
+
+
+def test_a_non_preempted_spot_failure_is_not_resubmitted(tmp_path, monkeypatch):
+    """GCP-PREEMPT-1's failure mode, end to end. Spot + box gone + no terminal used to infer
+    `preempted`, which the scheduler auto-resubmits — so a job that genuinely failed got paid for
+    twice. GCE says outright that this VM was not preemptible, and that answer wins."""
+    import lab.sky_runner as runner_mod
+
+    store = _gcp_spot_job_whose_box_vanished(tmp_path, monkeypatch, "gp1")
+    monkeypatch.setattr(
+        "lab.backends.skypilot.list_gcp_instances",
+        lambda *a, **k: [
+            {"name": "lab-gp1-head-1a2b3c4d-compute", "zone": "us-central1-a",
+             "status": "TERMINATED", "preemptible": False}
+        ],
+    )
+
+    runner_mod.run_job(tmp_path / "runs" / "gp1", adopt=True)
+
+    assert store.read_manifest("gp1").status is JobState.failed
+
+
+def test_a_real_preemption_is_confirmed_by_gce_rather_than_inferred(tmp_path, monkeypatch):
+    import lab.sky_runner as runner_mod
+
+    store = _gcp_spot_job_whose_box_vanished(tmp_path, monkeypatch, "gp2")
+    monkeypatch.setattr(
+        "lab.backends.skypilot.list_gcp_instances",
+        lambda *a, **k: [
+            {"name": "lab-gp2-head-1a2b3c4d-compute", "zone": "us-central1-a",
+             "status": "TERMINATED", "preemptible": True}
+        ],
+    )
+
+    runner_mod.run_job(tmp_path / "runs" / "gp2", adopt=True)
+
+    assert store.read_manifest("gp2").status is JobState.preempted
+
+
+def test_a_failed_probe_falls_back_to_inference_never_worse(tmp_path, monkeypatch):
+    """The probe refines an inference; it must never remove one. A revoked role or a 500 leaves
+    the old behaviour exactly as it was."""
+    import lab.sky_runner as runner_mod
+
+    store = _gcp_spot_job_whose_box_vanished(tmp_path, monkeypatch, "gp3")
+    monkeypatch.setattr(
+        "lab.backends.skypilot.list_gcp_instances", _raise(RuntimeError("403 Forbidden"))
+    )
+
+    runner_mod.run_job(tmp_path / "runs" / "gp3", adopt=True)
+
+    assert store.read_manifest("gp3").status is JobState.preempted
 
 
 def test_tear_down_and_record_gcp_annotation_names_cloud(tmp_path, monkeypatch):

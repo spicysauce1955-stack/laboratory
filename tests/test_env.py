@@ -93,3 +93,42 @@ def test_blank_credentials_is_ignored(tmp_path, monkeypatch):
 
     assert not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     assert os.environ["GOOGLE_CLOUD_PROJECT"] == "p"
+
+
+def test_cli_env_discovery_honours_lab_repo_dir(tmp_path, monkeypatch):
+    """GCP-CREDS-2: the Typer callback resolved `.env` from cwd, while every other repo-rooted
+    path in the CLI goes through `_repo()` and honours `LAB_REPO_DIR`. The scheduler host is the
+    documented user of that override *and* the host that most needs a service-account key: a
+    systemd unit whose WorkingDirectory isn't the repo silently loaded no `.env` at all, and the
+    failure surfaced one layer down as an opaque auth error at 3am."""
+    from lab.cli import _load_env
+
+    _write_env(tmp_path, "GOOGLE_CLOUD_PROJECT=from-lab-repo-dir\n")
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.setenv("LAB_REPO_DIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path.parent)  # a cwd that is not the repo
+
+    _load_env()
+
+    assert os.environ["GOOGLE_CLOUD_PROJECT"] == "from-lab-repo-dir"
+
+
+def test_dotenv_is_excluded_from_the_workdir_sync():
+    """GCP-CREDS-4. `build_task(..., workdir=Path.cwd())` rsyncs the repo root to the remote.
+    `.env` was *believed* excluded because it is git-ignored — but SkyPilot's `get_excluded_files`
+    uses `.skyignore` **instead of** `.gitignore` when one exists, and this repo commits a
+    `.skyignore`. So the git-ignore was never consulted and `.env` shipped to every box.
+
+    Today `.env` holds only paths, so the blast radius is a disclosed filesystem layout rather
+    than a key — but it is precisely the file a user pastes an R2 secret into, and LAB-BUGS §7 is
+    this repo's history of a secret reaching a persisted artifact. Asserted against SkyPilot's own
+    exclusion logic, so it tracks what really syncs rather than what we intended.
+    """
+    from pathlib import Path
+
+    from sky.data.storage_utils import get_excluded_files
+
+    repo = Path(__file__).resolve().parents[1]
+    excluded = {e.strip("/") for e in get_excluded_files(str(repo))}
+
+    assert ".env" in excluded
