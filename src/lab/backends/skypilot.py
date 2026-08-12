@@ -93,8 +93,10 @@ def build_setup_script() -> str:
         "set -e\n"
         "curl -LsSf https://astral.sh/uv/install.sh | sh\n"
         'export PATH="$HOME/.local/bin:$PATH"\n'
-        # --no-default-groups: skip the cli/dev groups (typer/fastmcp/pytest) — the remote only
-        # needs experiment-runtime deps, not the lab control plane.
+        # --no-default-groups: skip dev/test tooling (pytest, ruff, mypy) — a provisioned box
+        # runs the experiment, it does not lint or test the project. Note this no longer keeps
+        # the lab's control plane off the remote: the project depends on `laboratory`, so its
+        # runtime deps install here as a matter of course.
         "uv sync --frozen --no-default-groups\n"
     )
 

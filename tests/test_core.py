@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import time
 import types
@@ -371,3 +372,23 @@ def test_build_sweep_point_spec_matches_sweep_semantics():
 def test_build_sweep_point_spec_rejects_non_int_seed():
     with pytest.raises(LabError, match="seed"):
         build_sweep_point_spec("python x.py", {"seed": "x"}, seed=None, resources=ResourceRequest())
+
+
+def test_submit_without_a_uv_lock_is_actionable(tmp_path: Path):
+    """An installed lab is pointed at whatever project you stand in, and that project may not be
+    uv-managed yet. FR-B2 has nothing to hash then — say so instead of raising FileNotFoundError
+    from the hash helper (FR-F3)."""
+    project = tmp_path / "project"
+    project.mkdir()
+    for cmd in (
+        ["git", "init", "-q", "."],
+        ["git", "config", "user.email", "t@example.com"],
+        ["git", "config", "user.name", "t"],
+        ["git", "commit", "-q", "--allow-empty", "-m", "root"],
+    ):
+        subprocess.run(cmd, cwd=project, check=True, capture_output=True)
+    home = tmp_path / "runs"
+    lab = Lab(backend=LocalBackend(home=home, repo=project), repo=project, home=home)
+
+    with pytest.raises(LabError, match="uv.lock"):
+        lab.submit(JobSpec(code_ref="HEAD", command=f"{PYTHON} noop.py", seed=0))

@@ -396,6 +396,20 @@ class Lab:
         elif code.git_dirty and not allow_dirty:
             raise LabError("bundle captured a dirty tree but allow_dirty=False (FR-B1)")
         seed = spec.seed if spec.seed is not None else 0  # explicit + recorded (FR-B4)
+        lock = self.repo / "uv.lock"
+        try:
+            lock_sha = uv_lock_sha256(lock)
+        except FileNotFoundError as e:
+            # The lab pins the environment by hashing the lockfile (FR-B2), so there is nothing
+            # to record without one. This became a reachable state when the lab stopped being the
+            # repo you run from: an installed lab is pointed at whatever project you stand in,
+            # and that project may not be uv-managed yet. Say so, rather than letting the hash
+            # helper's FileNotFoundError reach the user as a traceback (FR-F3).
+            raise LabError(
+                f"no uv.lock at {lock} — the lab records its sha256 so the remote environment "
+                "provably matches yours (FR-B2). Run `uv lock` in this project first "
+                "(`uv init` first if it is not uv-managed yet)."
+            ) from e
         manifest = JobManifest(
             job_id=job_id,
             sweep_id=sweep_id,
@@ -406,7 +420,7 @@ class Lab:
             submitted_by=spec.submitted_by,
             code=code,
             env=EnvInfo(
-                uv_lock_sha256=uv_lock_sha256(self.repo / "uv.lock"),
+                uv_lock_sha256=lock_sha,
                 python_version=platform.python_version(),
             ),
             run=RunSpec(
