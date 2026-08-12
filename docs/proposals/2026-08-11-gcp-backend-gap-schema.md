@@ -596,7 +596,7 @@ and the failure appears one layer down as an opaque auth error.
 **fix:** use the same resolution as `_repo()`.
 
 ---
-**`GCP-CREDS-3` — `.env` is not actually the source of truth it reads as**
+**`GCP-CREDS-3` — `.env` is not actually the source of truth it reads as** ✅ **FIXED 2026-08-11**
 `area: creds` · `severity: low` · `confidence: observed` · `precedent: documented in the guide's gotcha`
 
 `load_lab_env` mutates the lab process only. SkyPilot's long-lived API-server daemon does not
@@ -606,6 +606,11 @@ mental model `.env` invites ("this file configures the lab") is not quite true.
 
 **fix:** none needed beyond the existing docs; consider having `lab doctor` (GCP-PROV-5) report
 the *daemon's* view of credentials rather than the process's.
+
+**done 2026-08-11:** that is exactly what `lab doctor`'s `sky_daemon` check now does — it shells
+out to `sky check gcp` and reports a **fail** when the daemon says GCP is disabled while ADC
+resolves fine here, naming `sky api stop` and the well-known-ADC symlink as the fixes. The
+divergence is no longer something you have to know to look for.
 
 ---
 **`GCP-CREDS-4` — `.env` exclusion from the workdir sync is believed, not asserted**
@@ -664,7 +669,7 @@ enough image yet.
 it can't be dropped again.
 
 ---
-**`GCP-TEST-3` — two tests pin current behaviour that the fixes must change**
+**`GCP-TEST-3` — two tests pin current behaviour that the fixes must change** ✅ **RESOLVED 2026-08-11**
 
 - `test_gcp_backend.py:227` `test_reconcile_gcp_pass_skips_when_unconfigured` — asserts the
   over-broad swallow of GCP-LEAK-2.
@@ -674,6 +679,14 @@ it can't be dropped again.
 
 Neither is a bug. Both are load-bearing for the current design and will fail loudly when it
 changes — which is what they're for.
+
+**Resolved in the leak-honesty pass.** They did exactly their job: both failed, and both were
+rewritten rather than deleted. `test_reconcile_gcp_pass_skips_when_unconfigured` now asserts the
+narrow behaviour (skip **only** on `GcpNotConfigured`, and say so in the report), with a sibling
+asserting that any other API failure raises. The unconditional-`True` test became the trio
+`test_preempted_teardown_confirmed_gcp_{true_when_instance_is_gone,false_when_instance_survives,
+false_when_listing_fails}` — keeping the original intent (never consult Vast for a GCP job) while
+asserting the GCP listing is consulted and that uncertainty reads as "still there".
 
 ---
 **`GCP-DOC-1` — the guide's price table is stale** ✅ **FIXED 2026-08-11**
