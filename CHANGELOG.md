@@ -6,6 +6,12 @@ with a **BREAKING** entry and an upgrade note.
 
 ## Unreleased
 
+### Fixed
+- Getting-started and README now say `uv init --python 3.12`. Bare `uv init` writes
+  `requires-python = ">=3.11"` — uv's default floor regardless of the interpreter present — so
+  the very next `uv add "laboratory @ ..."` failed as unsatisfiable. Found by installing v0.5.0
+  from its published tag exactly as the guide instructs.
+
 ## v0.5.0 — 2026-08-12
 
 ### Added

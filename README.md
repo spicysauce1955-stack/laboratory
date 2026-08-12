@@ -19,7 +19,8 @@ experiment code, its git history is the provenance every manifest pins, and resu
 your `runs/`.
 
 ```bash
-uv init my-experiments && cd my-experiments && git init
+# --python 3.12 matters: bare `uv init` writes requires-python = ">=3.11" and the add then fails.
+uv init --python 3.12 my-experiments && cd my-experiments && git init
 uv add "laboratory[skypilot,gcp,r2] @ git+https://github.com/spicysauce1955-stack/laboratory@v0.5.0"
 uv run lab init          # .mcp.json, the laboratory skill, .env.example, ignores, an example entrypoint
 

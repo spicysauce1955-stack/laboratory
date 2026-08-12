@@ -7,13 +7,18 @@ you upgrade on your own schedule.
 ## 1. Create the project
 
 ```bash
-uv init tempotron-capacity && cd tempotron-capacity
+uv init --python 3.12 tempotron-capacity && cd tempotron-capacity
 git init
 
 uv add "laboratory[skypilot,gcp,r2] @ git+https://github.com/spicysauce1955-stack/laboratory@v0.5.0"
 uv run lab init
 git add -A && git commit -m "scaffold the lab"
 ```
+
+**`--python 3.12` is not optional.** Bare `uv init` writes `requires-python = ">=3.11"` — uv's
+own default floor, regardless of which interpreter you actually have — and the lab requires 3.12,
+so `uv add` then fails with "your project's requirements are unsatisfiable". If you hit that in an
+existing project, raise its `requires-python` to `>=3.12` and re-run.
 
 Pick the extras you need — omitting one just means that backend is unavailable:
 
