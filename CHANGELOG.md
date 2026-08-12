@@ -6,6 +6,8 @@ with a **BREAKING** entry and an upgrade note.
 
 ## Unreleased
 
+## v0.5.1 — 2026-08-12
+
 ### Changed
 - **`tempotron-capacity` extracted.** The experiment code, analysis scripts, sweep drivers and the
   `runs/` archive moved to their own repo, which installs the lab as a pinned dependency. This
