@@ -257,3 +257,69 @@ reproduced exactly as the guide describes it.
 
 Retrying once on **L4** (quota held in five regions, typically better availability) before
 recording GPU as capacity-blocked.
+
+### F9 — a GCP GPU job provisions, bills, and cannot use the GPU
+
+`severity: **high**` · `confirmed by direct measurement` · the headline finding
+
+The L4 retry provisioned fine (`g2-standard-4`, `L4:1`, us-east4-a, $0.70/hr), `uv sync` installed
+the whole CUDA wheel stack, and the run died on the experiment's own guard:
+
+> `FATAL: require_cuda=1 but no CUDA device. Exiting non-zero (no CPU-smoke at GPU price).`
+
+A dedicated probe (`experiments/gpu_probe.py`, $0.03) gives the exact mechanism:
+
+```json
+{"nvidia_smi": "535.216.01, NVIDIA L4, 23034 MiB",
+ "torch_version": "2.13.0+cu130", "torch_cuda_runtime": "13.0",
+ "cuda_available": false, "device_count": 0,
+ "cuda_init_error": "RuntimeError: The NVIDIA driver on your system is too old (found version 12020)."}
+```
+
+The GPU is attached and the driver is healthy. SkyPilot's default GCP GPU image
+(`skypilot:custom-gpu-ubuntu-2204`, documented in `clouds/gcp.py:608` as "CUDA driver version
+535.86.10, CUDA Library 12.2") ships driver **535.216.01 = CUDA 12.2 = 12020**. Plain
+`uv run --with torch` today resolves **torch 2.13.0+cu130**, whose CUDA 13.0 runtime requires a
+newer driver. The two are one major version apart and the mismatch is silent.
+
+**This is not specific to this experiment.** Any GPU job on GCP that installs torch the obvious
+way gets a billed accelerator it cannot address. v14 happened to carry its own `require_cuda`
+guard and so failed loudly for $0.03; a workload without one runs to completion on CPU at GPU
+price and returns numbers that look fine. That is the precise failure mode the lab's cost-safety
+design exists to prevent, and the lab currently has no guard for it.
+
+It is also the same shape as the already-documented `.python-version` gotcha: the lockfile pins
+packages, but what the *remote* resolves at runtime is unpinned and can be incompatible with the
+image.
+
+**Proposed fix — two parts.**
+
+1. *Framework guard (the important one).* When a job requests accelerators, the lab should verify
+   the accelerator is actually usable before running the workload, and fail fast if not. It
+   already knows accelerators were requested; a one-line probe in the setup script
+   (`python -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)"`, skipped when
+   torch isn't present) converts a silent full-price CPU run into an immediate, diagnosable
+   failure. This generalises v14's `require_cuda` from one experiment to every job.
+2. *Documentation.* The GCP guide should state the image's driver version and that a CUDA-matched
+   torch must be pinned, e.g.
+   `--with "torch==2.5.1+cu121" --extra-index-url https://download.pytorch.org/whl/cu121`
+   (verified to resolve; `cu124` gives `torch==2.6.0+cu124`).
+
+**Test:** a fake `nvidia-smi`/torch reporting driver 12020 with a cu130 runtime fails the
+accelerator preflight; a matching pair passes.
+
+**Remedy verified on real hardware** (same L4 box, $0.03):
+
+```
+-c "uv run --extra-index-url https://download.pytorch.org/whl/cu121 \
+        --with torch==2.5.1+cu121 python experiments/gpu_probe.py"
+```
+```json
+{"nvidia_smi": "535.216.01, NVIDIA L4, 23034 MiB",
+ "torch_version": "2.5.1+cu121", "torch_cuda_runtime": "12.1",
+ "cuda_available": true, "device_count": 1}
+```
+
+So GCP's post-boot GPU path is **sound** — CUDA image, `uv sync` on a GPU host, accelerator
+visible, teardown — and GCP-PROV-4's untested strip is now exercised. The only defect is the
+unpinned CUDA runtime, and it is one flag wide.
