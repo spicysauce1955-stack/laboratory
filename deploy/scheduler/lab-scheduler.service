@@ -6,9 +6,14 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 User=lab
-WorkingDirectory=/opt/laboratory
+# The EXPERIMENT PROJECT, not the lab: it supplies the git history the scheduler pins as
+# provenance, the runs/ it writes, and the .env it reads. The lab itself is an installed tool
+# (`uv tool install "laboratory[...] @ git+...@vX.Y.Z"`). Set both — WorkingDirectory alone is
+# not enough, because SkyPilot may chdir and LAB_REPO_DIR is what the lab actually resolves.
+WorkingDirectory=/opt/tempotron-capacity
+Environment=LAB_REPO_DIR=/opt/tempotron-capacity
 EnvironmentFile=/etc/lab/scheduler.env
-ExecStart=/usr/local/bin/uv run lab scheduler tick --backend skypilot
+ExecStart=/root/.local/bin/lab scheduler tick --backend skypilot
 TimeoutStartSec=300
 # The tick spawns detached sky_runner supervisors that must OUTLIVE this
 # oneshot. Default KillMode=control-group SIGKILLs the whole cgroup the

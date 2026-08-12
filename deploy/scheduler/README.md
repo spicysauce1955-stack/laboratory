@@ -7,15 +7,51 @@ live in R2, so this host can be destroyed and recreated at any time.
 
 Use the playground project's `cloud-digitalocean` backend to create the smallest droplet
 (the tick is tiny and I/O-bound), then run the steps below (manually or via an Ansible role in
-that repo):
+that repo).
 
-1. Install uv + git; `git clone <laboratory remote> /opt/laboratory && cd /opt/laboratory && uv sync --extra skypilot --extra r2`.
-   **Add `--extra gcp` if you will register `--cloud gcp` jobs** — without it the host cannot
-   provision on GCP at all, and the failure only shows up at launch time, unattended, at 3am.
-2. Create user `lab`; `cp deploy/scheduler/scheduler.env.example /etc/lab/scheduler.env` and fill
+The host runs a **pinned release of the lab** against a clone of your **experiment project** —
+the same split as on your laptop. The lab is a tool; the project supplies the git history the
+scheduler pins as provenance, the `runs/` it writes, and the `.env` it reads.
+
+1. Install uv + git.
+2. Install the lab at the version you want the host to run:
+   ```bash
+   uv tool install "laboratory[skypilot,r2] @ git+https://github.com/spicysauce1955-stack/laboratory@v0.5.0"
+   ```
+   **Add `gcp` to the extras if you will register `--cloud gcp` jobs** — without it the host
+   cannot provision on GCP at all, and the failure only shows up at launch time, unattended, at
+   3am.
+3. Clone the experiment project: `git clone <project remote> /opt/tempotron-capacity`.
+4. Create user `lab`; `cp deploy/scheduler/scheduler.env.example /etc/lab/scheduler.env` and fill
    in real credentials (mode 0600, owner `lab`).
-3. `cp deploy/scheduler/lab-scheduler.{service,timer} /etc/systemd/system/`
-4. `systemctl daemon-reload && systemctl enable --now lab-scheduler.timer`
+5. `cp deploy/scheduler/lab-scheduler.{service,timer} /etc/systemd/system/`, then point the unit
+   at the project — two lines:
+   ```ini
+   WorkingDirectory=/opt/tempotron-capacity
+   Environment=LAB_REPO_DIR=/opt/tempotron-capacity
+   ExecStart=/root/.local/bin/lab scheduler tick --backend skypilot
+   ```
+   (`uv tool install` puts `lab` on `~/.local/bin`; use the path for the user the unit runs as.)
+6. `systemctl daemon-reload && systemctl enable --now lab-scheduler.timer`
+
+### Upgrading the host
+
+```bash
+uv tool upgrade laboratory     # or re-run `uv tool install` pinned to the new tag
+```
+
+Nothing else moves — the project clone and `/etc/lab/scheduler.env` are untouched.
+
+### Cutting over from a `/opt/laboratory` clone
+
+Hosts provisioned before v0.5.0 ran `uv run lab scheduler tick` inside a clone of the *lab* repo.
+To move to the layout above:
+
+1. **Drain the queue first** — `lab queue list` must be empty, and no job in flight. The queue
+   dir and `runs/` are resolved relative to the repo, so pending registrations under
+   `/opt/laboratory` are stranded the moment `LAB_REPO_DIR` moves.
+2. `systemctl stop lab-scheduler.timer`, then follow steps 2–6 above.
+3. Verify with one cheap registered job end to end before trusting it with a night's work.
 
 ## Google Cloud credentials (only for `--cloud gcp` registrations)
 
@@ -60,9 +96,9 @@ question in one shot, including whether SkyPilot's daemon agrees (the thing the 
 exists for). **On the host, as the `lab` user:**
 
 ```bash
-cd /opt/laboratory
+cd /opt/tempotron-capacity
 sudo -u lab env $(grep -v '^#' /etc/lab/scheduler.env | xargs) \
-  uv run lab doctor --cloud gcp        # credentials, project, billing, APIs, IAM, quota
+  lab doctor --cloud gcp               # credentials, project, billing, APIs, IAM, quota
 ```
 
 Every check should be `ok` or `skip`; **only a definitive negative blocks**, so a `skip` is not a

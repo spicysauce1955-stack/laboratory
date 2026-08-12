@@ -9,6 +9,15 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
 - `research/10-architecture.md` — architecture + FR→component traceability.
 
 ## Key facts
+- **Released as a package (v0.5.0+):** researchers install a pinned tag into their **own** project
+  (`uv add "laboratory[...] @ git+https://github.com/spicysauce1955-stack/laboratory@vX.Y.Z"`) and
+  run `lab init`, which scaffolds `.mcp.json`, the skill, `.env.example`, ignores and an example
+  entrypoint from `src/lab/_scaffold/`. **This repo is the tool's source, not a workspace.** What
+  a release freezes: `docs/COMPATIBILITY.md`. How to cut one: `scripts/release.sh vX.Y.Z` (CI
+  publishes on the tag). The guard against re-coupling is `uv run pytest -m packaging`, which
+  installs the built wheel into a clean venv and runs a job with no checkout on `sys.path` —
+  everything `lab` needs to work when installed must be a real dependency or an extra, never a
+  dependency group.
 - **Env is fixed:** Python via **uv** (`uv.lock` committed; **NumPy `<2`** pin), config via
   **Hydra+Pydantic**, metrics via **MLflow**, outputs to git-ignored `runs/`.
 - **First workload:** tempotron-capacity — CPU-bound, embarrassingly parallel (seeds/α/K). GPU is P1.
