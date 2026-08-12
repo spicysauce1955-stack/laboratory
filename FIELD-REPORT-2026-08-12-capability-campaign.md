@@ -12,10 +12,15 @@ attempted, what the system did, what was expected, and what the gap cost.
 
 ## Running cost
 
-| Stage | Where | Spent | Notes |
+| Stage | Where | Recorded | Notes |
 |---|---|---|---|
 | 0 | local | $0.00 | |
-| **total** | | **$0.00** | ceiling $15; stop-for-decision at $10 |
+| 1a | GCP T4 | $0.00 | never provisioned — capacity exhausted in 7 zones |
+| 1b | GCP L4 | $0.0334 | provisioned, GPU unusable (F9) |
+| 1c | GCP L4 probe | $0.03 | root cause + remedy proven |
+| 2a | GCP CPU ×5 | **$0.00 recorded / ~$0.43 real** | cancelled after re-sizing — see F10 |
+| 2b | GCP CPU ×8 | in flight | resized sweep |
+| **total** | | **$0.07 recorded** | ceiling $15; real spend ~$0.50 including F10's gap |
 
 ---
 
@@ -323,3 +328,33 @@ accelerator preflight; a matching pair passes.
 So GCP's post-boot GPU path is **sound** — CUDA image, `uv sync` on a GPU host, accelerator
 visible, teardown — and GCP-PROV-4's untested strip is now exercised. The only defect is the
 unpinned CUDA runtime, and it is one flag wide.
+
+### F10 — a cancelled job records no cost, though everything needed is on hand
+
+`severity: medium` · `confirmed`
+
+The five over-sized shards were cancelled after 27.7 minutes each. Their manifests:
+
+```json
+{"duration_seconds": null, "actual_usd": null,
+ "hourly_usd": 0.18687945, "estimated_usd": 0.186879,
+ "started_at": "2026-08-12T12:33:33Z", "ended_at": "2026-08-12T13:01:16Z"}
+```
+
+`actual_usd` and `duration_seconds` are **null**, so `lab list`/`lab status` report the campaign
+as having spent $0.07 when it actually spent about $0.50. Yet the manifest holds both timestamps
+*and* the resolved `hourly_usd` — the arithmetic that the succeeded path performs
+(`actual_cost(hourly, duration)`) is available and simply never runs, because `lab cancel` kills
+the supervisor rather than going through the finalize block that computes it.
+
+For a tool whose stated purpose is cost-bounded execution, the ledger under-reports precisely when
+the user intervened to control cost. A user who cancels ten runaway jobs sees a $0 bill from the
+lab and a real one from the cloud.
+
+**Proposed fix:** compute `actual_usd`/`duration_seconds` on the cancel path too — either in
+`lab cancel` before it kills the supervisor, or in the terminal-transition handler in
+`JobStore.update_manifest`, which already back-fills `final_metrics` on the succeeded path and is
+the natural place for a "cost is derivable, so derive it" rule covering cancelled/failed/timed_out
+alike.
+**Test:** a cancelled manifest with `started_at`, `ended_at` and `hourly_usd` reports a non-null
+`actual_usd` matching `hourly × elapsed`.
