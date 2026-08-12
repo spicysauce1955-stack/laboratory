@@ -125,14 +125,29 @@ def test_dotenv_is_excluded_from_the_workdir_sync():
     this repo's history of a secret reaching a persisted artifact. Asserted against SkyPilot's own
     exclusion logic, so it tracks what really syncs rather than what we intended.
     """
+    import shutil
+    import tempfile
     from pathlib import Path
 
     from sky.data.storage_utils import get_excluded_files
 
     repo = Path(__file__).resolve().parents[1]
-    excluded = {e.strip("/") for e in get_excluded_files(str(repo))}
+
+    # `get_excluded_files` returns files that EXIST and match, not the patterns themselves — and
+    # `.env` is git-ignored, so it exists on a developer's box and never on a fresh checkout.
+    # Asserting against the repo directly therefore passed locally and failed on CI, testing the
+    # machine rather than the code. Copy the real `.skyignore` next to a real `.env` instead: same
+    # question, same vendor function, no dependency on who is running it.
+    with tempfile.TemporaryDirectory() as td:
+        fixture = Path(td)
+        shutil.copy2(repo / ".skyignore", fixture / ".skyignore")
+        (fixture / ".env").write_text("LAB_R2_BUCKET=secret-looking-value\n")
+        (fixture / "keep_me.py").write_text("# a file that must still sync\n")
+
+        excluded = {e.strip("/") for e in get_excluded_files(str(fixture))}
 
     assert ".env" in excluded
+    assert "keep_me.py" not in excluded  # the pattern excludes .env, not everything
 
 
 # --- LAB_REPO_DIR: one resolution, honoured everywhere ----------------------------------------

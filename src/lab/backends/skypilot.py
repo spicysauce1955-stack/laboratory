@@ -666,12 +666,18 @@ def vast_balance(client: Any | None = None) -> float | None:
     SkyPilot surfaces as a generic "Failed to provision … resources" — indistinguishable from
     "no GPUs". We consult this on a provision failure to give an actionable message (§8).
     """
-    if client is None:
-        client = _get_vast_client()
     try:
+        # Constructing the client must be inside the guard, not before it: vastai-sdk raises when
+        # no API key exists, so on a GCP-only box (or CI) this best-effort *diagnostic* threw and
+        # replaced the real provision failure with "No API key found" — the enrichment destroying
+        # the thing it was enriching.
+        if client is None:
+            client = _get_vast_client()
         info = client.show_user()
     except Exception as e:  # noqa: BLE001 — best-effort; caller falls back to the generic message
-        print(f"[lab] vast balance lookup failed: {e}")
+        # stderr: this runs on the CLI's JSON path, where a stray stdout line is a corrupted
+        # payload rather than a log line.
+        print(f"[lab] vast balance lookup failed: {e}", file=sys.stderr)
         return None
     for key in ("credit", "balance"):
         val = info.get(key) if isinstance(info, dict) else getattr(info, key, None)
