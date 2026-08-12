@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -55,3 +56,35 @@ def test_update_manifest_tolerates_legacy_gapb(tmp_path: Path):
     (tmp_path / "g3" / "manifest.json").write_text(m.model_dump_json(indent=2))
     updated = store.update_manifest("g3", status=JobState.failed)  # must not raise
     assert updated.status is JobState.failed and updated.code.diff_ref is None
+
+
+def test_create_stamps_the_running_lab_version(tmp_path: Path):
+    """A manifest records which lab produced it — the tool now versions independently of the
+    project, so 'which lab wrote this run' is provenance, not trivia."""
+    from lab import __version__
+
+    store = JobStore(tmp_path)
+    m = make_manifest("j-ver-1", "true")
+    assert m.lab_version is None
+    store.create(m)
+    assert store.read_manifest("j-ver-1").lab_version == __version__
+
+
+def test_create_does_not_overwrite_an_explicit_lab_version(tmp_path: Path):
+    """Adoption/import paths may replay a manifest produced elsewhere; their stamp wins."""
+    store = JobStore(tmp_path)
+    m = make_manifest("j-ver-2", "true")
+    m.lab_version = "0.4.0"
+    store.create(m)
+    assert store.read_manifest("j-ver-2").lab_version == "0.4.0"
+
+
+def test_legacy_manifest_without_lab_version_still_reads(tmp_path: Path):
+    """Read-compatibility is part of the public surface: a v0.4.0 manifest has no such key."""
+    store = JobStore(tmp_path)
+    m = make_manifest("j-ver-3", "true")
+    store.create(m)
+    raw = json.loads(store.manifest_path("j-ver-3").read_text())
+    del raw["lab_version"]
+    store.manifest_path("j-ver-3").write_text(json.dumps(raw))
+    assert store.read_manifest("j-ver-3").lab_version is None

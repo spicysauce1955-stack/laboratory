@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from lab import __version__
 from lab._util import atomic_write_text
 from lab.metrics import snapshot_final_metrics
 from lab.models import JobManifest, JobState, SweepPlan
@@ -60,6 +61,8 @@ class JobStore:
         (including on legacy Gap-B manifests already on disk) never re-validate and so never
         crash (FR-B1)."""
         manifest.code.assert_fail_closed()
+        if manifest.lab_version is None:
+            manifest.lab_version = __version__
         self.output_dir(manifest.job_id).mkdir(parents=True, exist_ok=True)
         self.logs_path(manifest.job_id).touch()
         self.write_manifest(manifest)

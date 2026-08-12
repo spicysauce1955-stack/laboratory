@@ -144,6 +144,10 @@ class JobManifest(BaseModel):
     cell_id: str | None = None  # sharded-sweep cell grouping (P1-2); None for non-sharded jobs
     registration_id: str | None = None  # set when launched by the scheduler (spec §4.5 repair)
     confirms: str | None = None  # the run-id this job was launched to re-derive (lab confirm)
+    # Which lab produced this run. Stamped at JobStore.create (the single creation chokepoint),
+    # never defaulted on read: a manifest written by v0.4.0 has no such key and must stay None
+    # rather than claim the version that happens to be reading it.
+    lab_version: str | None = None
     created_at: datetime
     submitted_by: Submitter
     code: CodeRef
