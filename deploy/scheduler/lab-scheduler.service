@@ -13,7 +13,10 @@ User=lab
 WorkingDirectory=/opt/tempotron-capacity
 Environment=LAB_REPO_DIR=/opt/tempotron-capacity
 EnvironmentFile=/etc/lab/scheduler.env
-ExecStart=/root/.local/bin/lab scheduler tick --backend skypilot
+# Absolute path, in the `lab` user's own home: `uv tool install` puts the binary under the
+# installing user's ~/.local/bin, and /root is mode 0700 — a /root/... path here fails as
+# systemd status=203/EXEC even though the file exists. Install the tool AS this user.
+ExecStart=/home/lab/.local/bin/lab scheduler tick --backend skypilot
 TimeoutStartSec=300
 # The tick spawns detached sky_runner supervisors that must OUTLIVE this
 # oneshot. Default KillMode=control-group SIGKILLs the whole cgroup the

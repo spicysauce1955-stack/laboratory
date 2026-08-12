@@ -1,6 +1,8 @@
 # Follow-up Spec: Deferred-sweep registration path
 
-**Status:** proposed (2026-06-14) · **Size:** small follow-up to the spot-instances feature
+**Status:** **implemented** — the `lab register-sweep` CLI command and the `register_sweep` MCP
+tool both shipped (both call `lab.scheduler.register.register_sweep`). Written 2026-06-14 ·
+**Size:** small follow-up to the spot-instances feature
 **Depends on:** spot-instances (merged) — `Registration.sweep_id` / `sweep_max_cost`, the scheduler
 sweep-ceiling guard (`_evaluate_and_launch`), `JobStore.sweep_spend`, and `Lab.sweep_summary`
 already exist and are honored.
@@ -8,9 +10,9 @@ already exist and are honored.
 ## Why
 
 The spot-instances feature added the scheduler-side machinery to run a sweep *deferred* and stop
-launching its points once finished-spend hits a ceiling (never killing a running point). But **no
-user-facing command populates `Registration.sweep_id` / `sweep_max_cost`**, so that machinery is
-currently unreachable:
+launching its points once finished-spend hits a ceiling (never killing a running point). But at
+the time of writing **no user-facing command populated `Registration.sweep_id` /
+`sweep_max_cost`**, so that machinery was unreachable:
 
 - `Lab.sweep` submits all points *immediately* (gets the up-front worst-case admission check, but
   not the during-sweep ceiling, and ignores triggers/windows).

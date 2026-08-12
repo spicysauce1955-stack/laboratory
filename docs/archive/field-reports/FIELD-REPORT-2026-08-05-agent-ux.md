@@ -1,5 +1,13 @@
 # Field report — agent-operated lab session, 2026-08-05
 
+*Archived point-in-time record: an agent's session of 2026-08-05, against the lab as it was at
+repo HEAD `8c0a8f4`. All 7 issues were addressed in v0.2.0 — see the
+[response](FIELD-REPORT-2026-08-05-agent-ux-RESPONSE.md) and the
+[verification](FIELD-REPORT-2026-08-06-verification.md) that close this loop. For current
+information see [`README.md`](../../../README.md),
+[`docs/guides/getting-started.md`](../../guides/getting-started.md),
+[`docs/COMPATIBILITY.md`](../../COMPATIBILITY.md) and [`CHANGELOG.md`](../../../CHANGELOG.md).*
+
 **Reporter:** Claude (Claude Code), driving the lab as an autonomous agent
 **Context:** independent research audit of the `snn-research` tempotron-capacity program;
 the lab was used to recompute lost verification probes and to run two decisive follow-up experiments

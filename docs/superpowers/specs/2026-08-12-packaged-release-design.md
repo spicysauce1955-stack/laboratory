@@ -1,7 +1,8 @@
 # Packaged releases: the lab as an installable tool + scaffold
 
 **Date:** 2026-08-12
-**Status:** approved design, not yet implemented
+**Status:** implemented — released as **v0.5.0** on 2026-08-12. §9.1 (`tempotron-capacity`
+extraction) is **done**; §9.3 (scheduler droplet cutover) is **still outstanding**.
 **Supersedes in practice:** the "work inside the laboratory repo" model assumed by `README.md`,
 `.claude/skills/laboratory/SKILL.md`, and `deploy/scheduler/`.
 
@@ -52,7 +53,7 @@ as a record of what was built.
 ## 5. The researcher's project
 
 ```bash
-uv init tempotron-capacity && cd tempotron-capacity && git init
+uv init --python 3.12 tempotron-capacity && cd tempotron-capacity && git init
 uv add "laboratory[skypilot,gcp,r2] @ git+https://github.com/spicysauce1955-stack/laboratory@v0.5.0"
 uv run lab init
 ```
@@ -177,8 +178,10 @@ internal function signatures, `lab.core.Lab`'s Python API), the test suite, `res
 ### 9.1 Extract `tempotron-capacity`
 
 Created *with* v0.5.0 (`uv add …@v0.5.0` + `lab init`), then these move out of this repo:
-`experiments/`, `analyze_clean.py`, `analyze_formtest.py`, `collect_v10.py`, `run_*.sh`,
-`*_done.json`, `resubmit_jobs.txt`, and the `runs/` tree (copied, since it is git-ignored).
+`experiments/` **except `experiments/example_capacity.py`** — that one is the lab's own
+Experiment-Contract fixture, exercised by the test suite and the packaging smoke, and it stays
+(as the paragraph below already says) — `analyze_clean.py`, `analyze_formtest.py`,
+`collect_v10.py`, `run_*.sh`, `*_done.json`, `resubmit_jobs.txt`, and the `runs/` tree (copied, since it is git-ignored).
 
 **Fresh `git init`; no history rewrite.** Pre-split manifests pin commits in *this* repo, which
 stays public with its history intact, so `lab confirm` on an old run still works from a laboratory

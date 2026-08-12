@@ -46,12 +46,14 @@ status = mcp__lab__status(job_id="20260529-141233-a1b2c3")
 
 ### 2. Dry-run reconcile
 
-This is a **CLI-only command** (`lab reconcile` is not exposed via MCP — it
-talks to the vastai-sdk directly and is operational/destructive):
+The dry run is available on **both** surfaces — `mcp__lab__reconcile()` returns
+the same read-only report, so you can detect from MCP without shelling out:
 
 ```bash
 uv run lab reconcile
 ```
+
+Only the destructive half (`--apply`) is CLI-only.
 
 Returns JSON like:
 
@@ -76,15 +78,25 @@ Returns JSON like:
   prints.
 
 **Exit code is `3`** when orphans are found in dry-run — that's the
-"action required, run with --apply" signal.
+"action required, run with --apply" signal. The full set: `0` nothing to do ·
+`2` error · `3` orphans found in dry-run · `4` the confirmation was declined or
+there was no tty to ask at (**nothing was destroyed**).
 
 ### 3. Apply
 
 Once the orphan list looks right:
 
 ```bash
-uv run lab reconcile --apply
+uv run lab reconcile --apply --yes
 ```
+
+**`--yes` is not optional for you.** Bare `--apply` re-lists the doomed
+resources and *prompts* — and with no tty (every agent invocation) it refuses
+instead of prompting: exit `4`, `{"aborted": true, "reason": "no tty",
+"would_destroy": [...]}`, and **the leak keeps billing**. Use bare `--apply`
+only when a human is sitting at the terminal; pass `--apply --yes` when you are
+the one running it. (With the prompt, only the resources shown and approved are
+destroyed — a resource that becomes an orphan between the two sweeps is not.)
 
 Returns the same shape with `destroyed` filled in:
 
@@ -132,6 +144,7 @@ an orphan from repo A's perspective).
   the vastai-sdk directly. `teardown_status: "failed"` means even that
   fallback errored — usually a Vast.ai API outage. Re-running `lab reconcile`
   a few minutes later is the recovery.
-- **Tests cover this path** — see `tests/test_skypilot.py::test_robust_teardown_*`
-  and `tests/test_core.py::test_reconcile_*` for the exact retry/fallback/
-  detection semantics.
+- **Tests cover this path** — in the lab's own repo (not installed here):
+  `tests/test_skypilot.py::test_robust_teardown_*` and
+  `tests/test_core.py::test_reconcile_*` pin the exact retry/fallback/detection
+  semantics.

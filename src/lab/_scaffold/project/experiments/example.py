@@ -2,7 +2,10 @@
 
 Run it through the lab, not directly:
 
-    uv run lab submit -c "python experiments/example.py" --seed 0 -- steps=5
+    uv run lab submit -c "python experiments/example.py steps=5" --seed 0
+
+Config overrides are `key=value` tokens INSIDE the -c command string; `lab submit` takes no
+positional arguments, so a trailing `-- steps=5` is rejected.
 
 The contract, in four lines of code below:
   - read the seed and output dir the lab injects (`$LAB_SEED`, `$LAB_RUN_DIR`),

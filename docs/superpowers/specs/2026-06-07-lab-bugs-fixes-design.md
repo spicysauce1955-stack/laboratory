@@ -1,7 +1,7 @@
 # Design — LAB-BUGS fixes (§6, §7, §8, §1)
 
 **Date:** 2026-06-07
-**Source:** `LAB-BUGS.md` (observations from a lab *user*; this work is the lab-author response)
+**Source:** `LAB-BUGS.md`, now archived at `docs/archive/2026-06-LAB-BUGS.md` (observations from a lab *user*; this work is the lab-author response)
 **Scope:** all currently-open items — §6 (critical), §7 (security), §8 (usability), §1 (verify).
 §2/§4/§5 are already resolved; §3 is not a bug.
 
@@ -201,7 +201,7 @@ explanation — not a lab bug.
 - Add a regression test: a job whose status stays non-terminal, `wait([id], timeout=<short>)`
   returns non-terminal manifests and the CLI `wait` path exits 1 (assert via the
   `all_terminal=False → Exit(1)` logic; exercise the CLI command with a fake Lab).
-- Update `LAB-BUGS.md` §1 to "verified — works as designed; regression test added".
+- Update `LAB-BUGS.md` (now `docs/archive/2026-06-LAB-BUGS.md`) §1 to "verified — works as designed; regression test added".
 
 ---
 
@@ -213,7 +213,7 @@ explanation — not a lab bug.
 | `src/lab/sky_runner.py` | heartbeat rsync (A3); `install_log_redaction` call; balance in failure handlers |
 | `src/lab/redact.py` (new) | `redact` + `install_log_redaction` |
 | `tests/…` | unit tests for run-script, redact/capture, vast_balance, wait exit code |
-| `LAB-BUGS.md` | mark §1 verified (and note §6/§7/§8 addressed) |
+| `LAB-BUGS.md` (now `docs/archive/2026-06-LAB-BUGS.md`) | mark §1 verified (and note §6/§7/§8 addressed) |
 
 All changes keep `ruff` (line length 100) and `mypy --strict` on `src/lab` green, and preserve
 the CLI/MCP-as-thin-shell convention (logic stays in the backend/runner).

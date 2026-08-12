@@ -27,7 +27,7 @@ running the thing.**
 **Scope:** everything `--cloud gcp` touches — provisioning, cost, teardown, leak detection,
 preemption, the scheduler, credentials, and test coverage.
 **Basis:** the code as of `96b02b3` + the first live GCP run (2026-08-11, job
-`20260811-145235-d5a46c`) + the vendor precedents in `LAB-BUGS.md` and the Vast/DO test suites.
+`20260811-145235-d5a46c`) + the vendor precedents in `docs/archive/2026-06-LAB-BUGS.md` and the Vast/DO test suites.
 
 The GCP backend was built by mirroring the DO CPU backend, which was itself built by mirroring
 Vast. Each mirroring step dropped something. This document names what.
@@ -52,7 +52,7 @@ Every gap below is a record with these fields.
 
 **Severity is money-weighted.** `critical` is reserved for two shapes: a resource that can bill
 unnoticed, and a cost guardrail the user believes is on when it is off. Both have precedent in
-this repo (`LAB-BUGS.md` §4 → ~$50 leaked; §6 → $146 overrun).
+this repo (`docs/archive/2026-06-LAB-BUGS.md` §4 → ~$50 leaked; §6 → $146 overrun).
 
 ---
 

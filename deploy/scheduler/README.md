@@ -13,34 +13,70 @@ The host runs a **pinned release of the lab** against a clone of your **experime
 the same split as on your laptop. The lab is a tool; the project supplies the git history the
 scheduler pins as provenance, the `runs/` it writes, and the `.env` it reads.
 
-1. Install uv + git.
-2. Install the lab at the version you want the host to run:
+There is no clone of the *lab* repo on this host, so there is no `deploy/` directory to copy from:
+the unit files are fetched from the same tag the tool is pinned to. `$TAG` below is that tag —
+set it once and the whole runbook is consistent.
+
+```bash
+TAG=v0.5.0
+RAW=https://raw.githubusercontent.com/spicysauce1955-stack/laboratory/$TAG/deploy/scheduler
+```
+
+1. Install git, and uv **somewhere every user can run it** — the tick runs as `lab`, not root:
    ```bash
-   uv tool install "laboratory[skypilot,r2] @ git+https://github.com/spicysauce1955-stack/laboratory@v0.5.0"
+   curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
    ```
+2. Create the service user **before** installing anything: `useradd --create-home --system lab`.
+3. Install the lab **as that user**, at the version you want the host to run:
+   ```bash
+   sudo -u lab -H uv tool install \
+     "laboratory[skypilot,r2] @ git+https://github.com/spicysauce1955-stack/laboratory@$TAG"
+   ```
+   This puts the entrypoint at **`/home/lab/.local/bin/lab`** — the path the unit must use.
+   Installing as root instead puts it under `/root/.local/bin`, which is mode 0700: `User=lab`
+   then cannot execute it and systemd fails the unit with **203/EXEC**.
    **Add `gcp` to the extras if you will register `--cloud gcp` jobs** — without it the host
    cannot provision on GCP at all, and the failure only shows up at launch time, unattended, at
    3am.
-3. Clone the experiment project: `git clone <project remote> /opt/tempotron-capacity`.
-4. Create user `lab`; `cp deploy/scheduler/scheduler.env.example /etc/lab/scheduler.env` and fill
-   in real credentials (mode 0600, owner `lab`).
-5. `cp deploy/scheduler/lab-scheduler.{service,timer} /etc/systemd/system/`, then point the unit
-   at the project — two lines:
+4. Clone the experiment project as `lab`:
+   ```bash
+   install -d -o lab -g lab /opt/tempotron-capacity
+   sudo -u lab -H git clone <project remote> /opt/tempotron-capacity
+   ```
+5. Fetch the env template, fill in real credentials (mode 0600, owner `lab`):
+   ```bash
+   install -d -m 0755 /etc/lab
+   curl -fsSL $RAW/scheduler.env.example -o /etc/lab/scheduler.env
+   chown lab:lab /etc/lab/scheduler.env && chmod 600 /etc/lab/scheduler.env
+   ```
+6. Fetch the unit + timer, then point the unit at the project and the right binary — three lines:
+   ```bash
+   curl -fsSL $RAW/lab-scheduler.service -o /etc/systemd/system/lab-scheduler.service
+   curl -fsSL $RAW/lab-scheduler.timer   -o /etc/systemd/system/lab-scheduler.timer
+   ```
    ```ini
    WorkingDirectory=/opt/tempotron-capacity
    Environment=LAB_REPO_DIR=/opt/tempotron-capacity
-   ExecStart=/root/.local/bin/lab scheduler tick --backend skypilot
+   ExecStart=/home/lab/.local/bin/lab scheduler tick --backend skypilot
    ```
-   (`uv tool install` puts `lab` on `~/.local/bin`; use the path for the user the unit runs as.)
-6. `systemctl daemon-reload && systemctl enable --now lab-scheduler.timer`
+   The shipped `ExecStart` is a placeholder pointing at `/root/.local/bin/lab`; with the unit's
+   `User=lab` that is the 203/EXEC failure above. Replace it.
+7. `systemctl daemon-reload && systemctl enable --now lab-scheduler.timer`
 
 ### Upgrading the host
 
+Re-install pinned to the new tag. `uv tool upgrade laboratory` is effectively a no-op here — the
+requirement is a git tag, so there is nothing newer for it to resolve to:
+
 ```bash
-uv tool upgrade laboratory     # or re-run `uv tool install` pinned to the new tag
+sudo -u lab -H uv tool install --force \
+  "laboratory[skypilot,r2] @ git+https://github.com/spicysauce1955-stack/laboratory@v0.6.0"
+sudo -u lab -H /home/lab/.local/bin/lab --version   # confirm the new version is live
 ```
 
-Nothing else moves — the project clone and `/etc/lab/scheduler.env` are untouched.
+Keep the extras identical to the install line — `--force` replaces the environment wholesale, so
+an extra dropped here is a backend silently gone at 3am. Nothing else moves: the project clone and
+`/etc/lab/scheduler.env` are untouched.
 
 ### Cutting over from a `/opt/laboratory` clone
 
@@ -50,7 +86,7 @@ To move to the layout above:
 1. **Drain the queue first** — `lab queue list` must be empty, and no job in flight. The queue
    dir and `runs/` are resolved relative to the repo, so pending registrations under
    `/opt/laboratory` are stranded the moment `LAB_REPO_DIR` moves.
-2. `systemctl stop lab-scheduler.timer`, then follow steps 2–6 above.
+2. `systemctl stop lab-scheduler.timer`, then follow steps 2–7 above.
 3. Verify with one cheap registered job end to end before trusting it with a night's work.
 
 ## Google Cloud credentials (only for `--cloud gcp` registrations)
@@ -80,6 +116,9 @@ The service account needs the six roles listed in that guide, and the project ne
 
 ## Verify
 
+- `sudo -u lab -H /home/lab/.local/bin/lab --version` — the tool is installed, executable **by the
+  user the unit runs as**, and at the tag you meant to pin. This is the check that catches
+  203/EXEC before systemd does.
 - `systemctl list-timers lab-scheduler.timer` — next tick scheduled.
 - From the laptop: `lab queue list` — `heartbeat_age_s` under ~120.
 - If you configured GCP: see the section below. Do it *before* registering a deferred GCP job —
@@ -98,7 +137,7 @@ exists for). **On the host, as the `lab` user:**
 ```bash
 cd /opt/tempotron-capacity
 sudo -u lab env $(grep -v '^#' /etc/lab/scheduler.env | xargs) \
-  lab doctor --cloud gcp               # credentials, project, billing, APIs, IAM, quota
+  /home/lab/.local/bin/lab doctor --cloud gcp   # credentials, project, billing, APIs, IAM, quota
 ```
 
 Every check should be `ok` or `skip`; **only a definitive negative blocks**, so a `skip` is not a

@@ -113,16 +113,6 @@ class ArtifactRecord(BaseModel):
     bytes: int
 
 
-class MetricRecord(BaseModel):
-    """A single point of a named metric series (FR-D2)."""
-
-    run_id: str
-    name: str
-    value: float
-    step: int
-    wall_time: float
-
-
 class JobSpec(BaseModel):
     """Input to ``submit`` (FR-A1 / MCP §9). ``code_ref`` is resolved to a commit."""
 

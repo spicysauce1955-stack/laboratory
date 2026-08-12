@@ -3125,6 +3125,14 @@ git commit -m "feat(scheduler): supervisor watchdog (adopt/teardown/fail) + peri
 
 - [ ] **Step 1: Write the assets**
 
+> **Superseded by v0.5.0.** The assets below (and the host runbook inside the README block) use
+> the pre-v0.5.0 "work inside the laboratory repo" model — `git clone <laboratory remote>
+> /opt/laboratory` + `uv sync`, `WorkingDirectory=/opt/laboratory`, `uv run lab …`. The lab is now
+> an installed tool (`uv tool install "laboratory[...] @ git+…@vX.Y.Z"`) pointed at the
+> *experiment* project. Do not copy-paste from here — follow
+> [`deploy/scheduler/README.md`](../../../deploy/scheduler/README.md), which is the current
+> deployment procedure. Kept verbatim as the record of what Task 16 originally built.
+
 `deploy/scheduler/lab-scheduler.service`:
 ```ini
 [Unit]

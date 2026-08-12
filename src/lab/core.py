@@ -8,6 +8,7 @@ chosen :class:`~lab.backends.base.Backend`.
 
 from __future__ import annotations
 
+import subprocess
 import hashlib
 import itertools
 import json
@@ -26,6 +27,7 @@ from lab._util import (
     duration_seconds,
     infer_artifact_type,
     now,
+    pid_alive,
     tail_last_line,
 )
 from lab.backends.base import Backend
@@ -34,6 +36,7 @@ from lab.manifest import (
     capture_diff,
     commit_exists,
     current_commit,
+    git_work_tree,
     is_dirty,
     repo_root,
     uv_lock_sha256,
@@ -363,7 +366,20 @@ class Lab:
             self.preflight(spec)
         job_id = _new_job_id()
         if code is None:
-            dirty = is_dirty(self.repo)
+            try:
+                dirty = is_dirty(self.repo)
+            except subprocess.CalledProcessError as e:
+                # git exits 128 outside a work tree. Provenance is fail-closed (FR-B1) — without a
+                # repo there is no commit to pin, so refusing is right — but this surfaced as a
+                # raw traceback. Reachable now that an installed lab is pointed at whatever
+                # directory you stand in, which need not be a repo yet (FR-F3).
+                if git_work_tree(self.repo) is None:
+                    raise LabError(
+                        f"{self.repo} is not a git repository — the lab pins the commit a run was "
+                        "produced from, so it cannot submit without one. Run `git init` and "
+                        "commit, or point the lab at your project with LAB_REPO_DIR."
+                    ) from e
+                raise
             if dirty and not allow_dirty:
                 raise LabError("working tree is dirty; commit or pass allow_dirty=True (FR-B1)")
             diff_ref: str | None = None
@@ -1071,7 +1087,6 @@ class Lab:
         box from every pass. Such jobs are reported under ``unsupervised``.
         """
         from lab.backends.skypilot import (  # local import: skypilot is an optional extra
-            _alive,
             _instance_label,
             cluster_name_for,
             list_vast_instances,
@@ -1095,7 +1110,7 @@ class Lab:
             if j.backend.provisioner == "skypilot":
                 age = (now() - (j.started_at or j.created_at)).total_seconds()
                 pid = self.store.read_runtime(j.job_id).get("runner_pid")
-                if age > UNSUPERVISED_GRACE_S and not _alive(pid):
+                if age > UNSUPERVISED_GRACE_S and not pid_alive(pid):
                     unsupervised.append({"job_id": j.job_id, "cluster": cluster})
                     continue  # dead supervisor -> the cluster is NOT protected
             running_clusters[cluster] = j.job_id

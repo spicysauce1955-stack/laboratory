@@ -24,7 +24,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from lab._util import infer_artifact_type, now, parse_duration
+from lab._util import infer_artifact_type, now, parse_duration, pid_alive
 from lab.manifest import sha256_file
 from lab.metrics import METRICS_FILE, read_points
 from lab.models import ArtifactRecord, JobManifest, JobState, ResourceRequest
@@ -863,18 +863,22 @@ def tear_down_and_record(
     if not succeeded:
         if cloud == "vast":
             remedy = (
-                "AND vast-sdk fallback. Run `lab reconcile --apply` "
-                "(or `vastai destroy_instance <id>`) to stop the bleed."
+                "AND vast-sdk fallback. Run `lab reconcile --apply` to stop the bleed "
+                "(add `--yes` when unattended: --apply asks first, and with no tty it "
+                "refuses and destroys nothing). Or `vastai destroy_instance <id>`."
             )
         elif cloud == "gcp":
             remedy = (
-                "AND gcp-direct fallback. Run `lab reconcile --apply` and check "
-                "`gcloud compute instances list --filter=\"name~'^lab-'\"` to stop the bleed."
+                "AND gcp-direct fallback. Run `lab reconcile --apply` to stop the bleed "
+                "(add `--yes` when unattended: with no tty --apply refuses and destroys "
+                "nothing), and check "
+                "`gcloud compute instances list --filter=\"name~'^lab-'\"`."
             )
         else:
             remedy = (
-                f"(no provider-direct fallback for {cloud}). Run `lab reconcile --apply` and "
-                f"check `sky status` / the {cloud} console to stop the bleed."
+                f"(no provider-direct fallback for {cloud}). Run `lab reconcile --apply` "
+                f"(add `--yes` when unattended: with no tty --apply refuses and destroys "
+                f"nothing), and check `sky status` / the {cloud} console."
             )
         annotation = (
             f"TEARDOWN FAILED for cluster {cluster!r}: {outcome['error']} after "
@@ -1067,16 +1071,6 @@ def build_task(manifest: JobManifest, workdir: Path, *, memo: Any | None = None)
     return task
 
 
-def _alive(pid: int | None) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
 
 
 class SkyPilotBackend:
@@ -1107,7 +1101,7 @@ class SkyPilotBackend:
         m = self.store.read_manifest(job_id)
         if m.status not in _TERMINAL:
             rt = self.store.read_runtime(job_id)
-            if rt.get("runner_pid") and not _alive(rt["runner_pid"]):
+            if rt.get("runner_pid") and not pid_alive(rt["runner_pid"]):
                 # The supervisor died before recording terminal state, so its teardown very
                 # likely never ran — attempt it here (idempotent) rather than flip to `failed`
                 # on a possibly-still-billing box (FR-C2). Quick backoffs: this is a status

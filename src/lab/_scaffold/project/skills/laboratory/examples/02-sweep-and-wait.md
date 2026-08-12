@@ -17,7 +17,7 @@ all of them as a single background task, then aggregate.
 
 ```python
 mcp__lab__sweep(
-    command="python experiments/tempotron_capacity.py",
+    command="python experiments/example.py",
     grid={"seed": [1, 2, 3], "K": [100, 200, 500]},   # 3 × 3 = 9 jobs
     backend="skypilot",
     accelerators="RTX4090:1",
@@ -44,7 +44,7 @@ Notes on the grid:
 ```bash
 uv run lab wait --sweep sweep-20260528-141900-9f00 \
                 --done-file /tmp/lab-done-sweep-9f00.json \
-                --timeout 7200   # SECONDS (= 2h). `lab wait --timeout` is NOT a duration string.
+                --timeout 2h   # duration string or bare seconds (7200 = the same)
 ```
 
 Run this as a Claude Code background task. Sweeps with skypilot run in

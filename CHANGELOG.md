@@ -6,7 +6,30 @@ with a **BREAKING** entry and an upgrade note.
 
 ## Unreleased
 
+### Changed
+- **`tempotron-capacity` extracted.** The experiment code, analysis scripts, sweep drivers and the
+  `runs/` archive moved to their own repo, which installs the lab as a pinned dependency. This
+  repo keeps `experiments/example_capacity.py` — the fixture its own tests run against — and is
+  now purely the tool's source.
+- Documentation swept against the shipped v0.5.0 behaviour: the packaged skill, the four backend
+  guides, the scheduler runbook, `CLAUDE.md`, and `docs/COMPATIBILITY.md`.
+
 ### Fixed
+- **The scaffolded `experiments/example.py` documented a command that fails.** Its docstring
+  showed `lab submit -c "..." --seed 0 -- steps=5`; `submit` takes no positional arguments, so
+  click rejects it. Overrides go inside the `-c` string. This was the first command a new user
+  ran.
+- **`docs/COMPATIBILITY.md` stated the wrong exit code** for `lab wait --timeout` (1, not 4) on
+  the page people script against, and omitted `lab reconcile`'s codes entirely. Both commands now
+  have a full table.
+- **`CLAUDE.md` claimed metrics go via MLflow.** There is no MLflow in `src/lab` and never was —
+  metrics are a `metrics.jsonl` file convention. It also claimed DO block volumes were uncovered
+  by `reconcile`, which stopped being true when the detached-volume pass shipped.
+- `lab submit` outside a git repository now explains itself instead of surfacing a raw
+  `CalledProcessError` from `git status` — reachable now that an installed lab runs against
+  whatever directory you stand in.
+- The `.skyignore` that `lab init` scaffolds was missing four entries the lab's own has. That file
+  is the mechanism keeping `.env` off remote boxes, so the copies must not drift.
 - Getting-started and README now say `uv init --python 3.12`. Bare `uv init` writes
   `requires-python = ">=3.11"` — uv's default floor regardless of the interpreter present — so
   the very next `uv add "laboratory @ ..."` failed as unsatisfiable. Found by installing v0.5.0
@@ -52,8 +75,13 @@ with a **BREAKING** entry and an upgrade note.
   that exist only in the lab's own checkout.
 
 ### Upgrade notes
-- Nothing is removed. Working inside the laboratory repo still functions; the packaged model is
-  the new recommended path — see `docs/guides/getting-started.md`.
+- **BREAKING (contributors only): the `cli` dependency group is gone.** Its contents (typer,
+  fastmcp, rich, python-dotenv) are real dependencies now, and `[dependency-groups]` holds only
+  `dev`. Any script or CI job running `uv sync --group cli` / `--no-group cli` will error — drop
+  the flag; plain `uv sync` installs everything, and the remote provisioner uses
+  `uv sync --frozen --no-default-groups`. This does not affect anyone installing the package.
+- Otherwise nothing is removed. Working inside the laboratory repo still functions; the packaged
+  model is the new recommended path — see `docs/guides/getting-started.md`.
 - Manifests written before v0.5.0 have no `lab_version` and read as `null`.
 
 ## v0.4.0 — 2026-08-12

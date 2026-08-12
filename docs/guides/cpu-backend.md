@@ -4,7 +4,7 @@ Run CPU-bound jobs (e.g. solver/oracle work) on a cheap multi-core DigitalOcean 
 of paying for an idle GPU.
 
 ```bash
-uv run lab submit --backend cpu -c "uv run analysis/v12_existence_oracle.py --milp" --timeout 1h
+uv run lab submit --backend cpu -c "python experiments/example.py" --timeout 1h
 uv run lab submit --backend cpu --cpus 32 -c "..." --timeout 2h    # up to 48 vCPU
 ```
 
@@ -30,20 +30,31 @@ A **fresh DO account** is tier-restricted in two ways that both surface as an op
 - **SkyPilot's default 256 GB volume** → DO `422 failed to create volume: invalid size specified`
   (the DO provisioner always attaches a block volume of `disk_size` GB; fresh-tier accounts cap it
   well under 256). That's why the `cpu` profile defaults `disk_size` to **50 GB** (override with
-  `--disk-size` once explicitly via the API; the field lives on `ResourceRequest`).
+  `--disk-size` on `lab submit` / `lab sweep`; the field lives on `ResourceRequest`).
 
 So the defaults (4 vCPU / 50 GB) are chosen to provision on an untouched DO account. To go bigger
 (`--cpus 32`, larger volumes) **open a DO ticket to raise your account tier** first.
 
 ## One-time setup
-- `uv sync --extra skypilot --extra do`
+- Install the lab into your project with the `do` extra:
+  ```bash
+  uv add "laboratory[do] @ git+https://github.com/spicysauce1955-stack/laboratory@v0.5.0"
+  ```
+  (Working on the lab itself, in a clone of *this* repo, the contributor equivalent is
+  `uv sync --extra do`.)
 - `doctl auth init` (writes a token to `~/.config/doctl/config.yaml`); confirm `sky check` shows
   **DO: enabled**.
 
 ## Cost-safety
 Teardown is `sky.down` + idle autostop + the on-box poweroff backstop. `lab reconcile` covers DO
 via a cloud-agnostic `sky.status` orphan pass (`sky_orphans`/`sky_destroyed` in its report).
-> **Volume caveat:** `reconcile`'s orphan pass checks **instances, not block volumes**. SkyPilot's
-> DO teardown deletes the attached volume together with the droplet, but if a teardown ever leaves
-> the droplet gone and the volume behind, `reconcile` will not flag it — check
-> `doctl compute volume list` for stray `lab-*` volumes if you suspect a leak.
+**Block volumes are covered too.** Alongside the instance pass, `reconcile` runs a **DO volume
+pass**: every `lab-*` block volume not tied to a running cluster is reported under
+`do_volume_orphans` (dry-run exits 3 like any other orphan; `--apply` deletes them after listing
+what it will destroy and asking). SkyPilot's DO teardown normally deletes the attached volume
+together with the droplet — the pass is the net under a *partial* teardown that leaves the droplet
+gone and the volume behind, which the instance passes cannot see by construction.
+> **It is best-effort.** If DO isn't configured on the machine running `reconcile` (no `do` extra,
+> no `doctl` token) the volume pass is skipped silently, so an empty `do_volume_orphans` from a box
+> without DO credentials is not evidence of no leak. `doctl compute volume list` is the manual
+> check for stray `lab-*` volumes.

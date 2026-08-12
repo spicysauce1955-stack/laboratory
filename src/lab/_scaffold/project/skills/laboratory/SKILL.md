@@ -2,7 +2,7 @@
 name: laboratory
 description: "Run/execute a reproducible ML or compute experiment via the lab runner (MCP tools / `lab` CLI) — in this project this is the right way to actually launch a training/experiment job, not running the script directly. Use when the user wants the work done, not just discussed: run, submit, or kick off an experiment; sweep a grid over hyperparameters/seeds and report which config won; shard a large-seed sweep into independently-bounded per-seed sub-jobs and aggregate one per-cell result (sweep-aggregate / sweep-retry); put a job on a remote GPU (RTX 4090 on Vast.ai via SkyPilot; T4/L4 on GCP) or a cheap remote CPU box (DigitalOcean/GCP, --backend cpu), cap its cost or runtime; REGISTER/schedule an experiment for later — run tonight/off-hours, run when a GPU price drops, run after another job, queue/hold/cancel deferred runs while the laptop is closed; stream live metrics and kill a diverging run early; fetch results/artifacts; reproduce a prior run or verify a result still reproduces (lab confirm); export a committable provenance bundle for the paper (lab export); or diagnose a billing/teardown leak ('am I still being charged?', stuck Vast rental, `lab wait` exit 3). Triggers: lab submit, lab sweep, lab sweep-aggregate, lab sweep-retry, lab wait, lab confirm, lab export, lab lint, lab register, lab queue, lab scheduler, lab reconcile. Skip for merely writing an experiment script or reading saved results."
 metadata:
-  version: "0.8.0"
+  version: "0.8.1"
   last_updated: "2026-08-12"
   status: active
 ---
@@ -102,7 +102,7 @@ A metric line is `{"name": "...", "value": <float>, "step": <int>, "wall_time": 
 The lab tolerates a half-written trailing line, so you can write line-by-line
 and the metrics tool will still read cleanly.
 
-**Reference template:** `experiments/example.py` (50 lines, contract-compliant).
+**Reference template:** `experiments/example.py` (~40 lines, contract-compliant).
 
 **For sharded sweeps (§4 `sweep` with `seeds`/`shard_size`)** the entrypoint additionally must:
 read its assigned seed subset from a config key (default `seeds`, a comma list like `seeds=0,1,2,3`)
@@ -188,11 +188,12 @@ updated cell view.
 > seed view; use `sweep_aggregate` for that.
 
 ### `mcp__lab__status`
-`{job_id}` → `{state, started_at, ended_at, exit_code, end_reason, cost,
-estimated_running_usd, last_log_line, teardown_status, sweep_id,
+`{job_id}` → `{state, lab_version, started_at, ended_at, exit_code, end_reason,
+cost, estimated_running_usd, last_log_line, teardown_status, sweep_id,
 code: {git_commit, git_dirty, diff_ref}, mirrored}`. A running remote job shows
 its spend-so-far (`estimated_running_usd`) and latest log line — enough to judge
-"is it alive and worth its bill" from one cheap call.
+"is it alive and worth its bill" from one cheap call. `lab_version` is the lab
+release that produced the run (`null` on pre-0.5.0 manifests) — see §8.
 States: `queued`, `running`, `succeeded`, `failed`, `cancelled`, `timed_out`,
 `preempted`. Cheap to poll. **`teardown_status: "failed"` is the FR-C2 money
 alarm** — call `mcp__lab__reconcile` immediately. Scheduler-launched (deferred)
@@ -228,7 +229,8 @@ covering DO/GCP clusters (`sky_orphans`), a DO detached-volume pass, a GCP
 compute-API pass (`lab-*` instances + unattached `lab-*` disks), plus `ghosts`
 and `unsupervised` (running jobs whose supervisor pid is dead — their clusters
 are NOT counted as healthy). Read-only: it never destroys anything — cleanup is
-`lab reconcile --apply` at the CLI.
+`lab reconcile --apply --yes` at the CLI (only `--apply` is CLI-only; the
+dry-run report is right here).
 
 ### `mcp__lab__metrics`
 `{job_id, names?, since_step?}` → `{"series": {name: [{step, value, wall_time}, ...]}}`.
@@ -309,9 +311,16 @@ DO/GCP clusters, DO detached volumes, GCP `lab-*` instances + unattached disks).
 exiting 3.**
 
 ```bash
-uv run lab reconcile             # dry-run: print orphans + ghosts
-uv run lab reconcile --apply     # destroy the orphans
+uv run lab reconcile               # dry-run: print orphans + ghosts
+uv run lab reconcile --apply --yes # destroy the orphans, unattended
 ```
+
+**`--apply` alone prompts.** It re-runs the dry sweep, lists every resource it is
+about to destroy on stderr, and asks — then destroys *only* the approved set.
+With **no tty (which is every agent invocation)** it refuses rather than
+prompting: exit `4`, `{"aborted": true, "reason": "no tty", "would_destroy":
+[...]}` on stdout, **nothing destroyed**. So from an agent always pass
+`--apply --yes`; use bare `--apply` only when a human is at the terminal.
 
 - **Orphans** = cloud resources labelled `lab-*` but not tied to any running
   lab job (probable leaks; bill until destroyed).
@@ -322,8 +331,9 @@ uv run lab reconcile --apply     # destroy the orphans
   clusters do NOT count as healthy, so a frozen `running` manifest can't hide a
   still-billing box.
 
-Exit code: `0` if nothing to do, `3` if orphans were found in dry-run
-mode (re-run with `--apply`), `2` on error.
+Exit codes: `0` nothing to do · `2` error · `3` orphans found in dry-run mode
+(action required — re-run with `--apply --yes`) · `4` the confirmation was
+declined **or** there was no tty to ask at (nothing was destroyed).
 
 ### `uv run lab dashboard` — live terminal view
 
@@ -334,19 +344,21 @@ column that flags `LEAK` rows loudly. Ctrl-C to exit.
 
 For "run this **tonight** / when a GPU is **cheap** / **after** that job — and let me close
 the laptop." A *registration* = a normal job spec + triggers + guardrails, written to an R2
-queue; an always-on droplet evaluates triggers every 60s and launches via skypilot. Spec:
+queue; an always-on host evaluates triggers every 60s and launches via skypilot. Spec:
 the [deferred-scheduling design](https://github.com/spicysauce1955-stack/laboratory/blob/main/docs/superpowers/specs/2026-06-10-deferred-scheduling-design.md); host runbook:
-`deploy/scheduler/README.md`.
+the [scheduler deploy README](https://github.com/spicysauce1955-stack/laboratory/blob/main/deploy/scheduler/README.md).
 
 **Prereq:** export `LAB_R2_ENDPOINT` (+ `LAB_R2_BUCKET=lab-artifacts`) — register/queue talk
-to R2, not the local store. The scheduler host is a playground-repo lab:
-`playground apply lab-scheduler` (re)creates it; `playground suspend lab-scheduler` destroys
-it when idle (~$6/mo while up; stateless — all state in R2, recreate-safe).
+to R2, not the local store. **And you need the scheduler host:** any always-on box running
+`lab scheduler tick` on a 60s timer (the host runbook linked above ships the systemd unit +
+timer; a small cloud VM costs a few $/mo). It is stateless — all state lives in R2, so it is recreate-safe
+and can be destroyed when idle. Without a live host, registrations just sit in the queue
+(`lab queue list` → `heartbeat_age_s` > 120s).
 
 **The canonical "run tonight" command:**
 
 ```bash
-uv run lab register -c "uv run experiments/v3_capacity_sweep.py" \
+uv run lab register -c "uv run experiments/example.py" \
     --gpu RTX4090:1 --timeout 2h \
     --window 23:00-07:00 --tz Europe/Berlin \
     --max-hourly 1.50 --max-cost 3 --expires +2d
@@ -361,7 +373,7 @@ uv run lab register -c "uv run experiments/v3_capacity_sweep.py" \
 | dependency | `--after <reg_id>` (repeatable) | dead/typo'd dep ⇒ auto-cancel, so get the id right |
 | run-by deadline | `--expires +2d` / ISO | **required**; entry expires, never fires late |
 | per-job cap | `--max-cost <$>` | vs best-offer×timeout |
-| no triggers | (none) | = launch ASAP under droplet supervision |
+| no triggers | (none) | = launch ASAP under scheduler-host supervision |
 
 **Manage:** `lab queue list` (states, skip reasons, `heartbeat_age_s` — >120s means the
 scheduler is down) · `queue show <reg_id>` · `queue cancel|hold|release <reg_id>` ·
@@ -385,11 +397,12 @@ R2-mirrored manifest, incl. cost) → `lab fetch <job_id>` (artifacts come from 
   `--timeout` × actual hourly, capped by `--max-cost`.
 - **`lab logs` / `lab metrics` do NOT work from the laptop for scheduler-launched jobs**
   (only the manifest is mirrored to R2; they exit 2 with a structured error). Use
-  `lab status` + `lab fetch` from the laptop; for live logs,
-  `ssh ubuntu@<droplet-ip> sudo tail /opt/laboratory/runs/<job_id>/logs.txt`.
+  `lab status` + `lab fetch` from the laptop; for live logs, tail them on the scheduler host
+  itself (`ssh <scheduler-host> sudo tail /opt/<your-project>/runs/<job_id>/logs.txt`, where
+  `/opt/<your-project>` is wherever its checkout lives — see the host runbook).
 - **Cancel applies on the next tick** (≤60s), including killing an already-launched job.
 - **Mirror lag:** `teardown_status` may read `null` from the laptop for a tick or two after
-  success; the droplet manifest is authoritative, `lab reconcile` is ground truth.
+  success; the scheduler host's manifest is authoritative, `lab reconcile` is ground truth.
 
 ## 6. Canonical workflows
 
@@ -432,10 +445,16 @@ so CLI grids and API ints hit the same cache). On a hit, returns the existing
 tree** (commit your changes first).
 
 ### E. Per-job extra runtime dep
-The remote env is lean (numpy/pydantic/hydra only). For a one-off dep:
-`mcp__lab__submit(command="python experiments/needs_scipy.py", with_pkg=["scipy"])`.
-This wraps the command as `uv run --with scipy python experiments/needs_scipy.py`
-(see `tests/test_util.py:12-23`). Same on the CLI: `lab submit -c "..." --with scipy`.
+The remote env is **this project's locked env**: the box syncs your checkout and
+runs `uv sync --frozen --no-default-groups`, so every runtime dependency in
+`pyproject.toml`/`uv.lock` is installed (including the `laboratory` dependency's
+own runtime deps) — only the dev/test groups (pytest, ruff, mypy) are skipped.
+A dep that isn't in the lockfile is *not* there. For a one-off, don't edit the
+project: `mcp__lab__submit(command="python experiments/needs_scipy.py",
+with_pkg=["scipy"])` wraps the command as
+`uv run --with scipy python experiments/needs_scipy.py`. Same on the CLI:
+`lab submit -c "..." --with scipy` (repeatable). If the dep is permanent,
+`uv add` it and commit instead — `--with` resolves on every launch.
 
 ### F. Verify a result still reproduces
 `mcp__lab__confirm(run_id)` relaunches the run from its pinned commit and
@@ -450,7 +469,7 @@ configs, diffs, `index.json`. This is how results leave git-ignored `runs/`.
 ### H. Recover from a teardown leak (FR-C2)
 See **`examples/04-reconcile-leak.md`**. Pattern: `lab wait` exits 3 (or you
 see `teardown_status: "failed"` in `lab status`) → `lab reconcile` (dry-run)
-→ inspect the orphans → `lab reconcile --apply` to destroy them. The lab
+→ inspect the orphans → `lab reconcile --apply --yes` to destroy them. The lab
 already retries `sky.down` and falls back to vastai-sdk directly on failure,
 so leaks are rare — but `reconcile` is the operational safety net when even
 that fails.
@@ -465,8 +484,9 @@ that fails.
 
 The **cloud** is orthogonal: `--cloud vast|do|gcp` (default `vast`) on
 submit/sweep/register. `--backend cpu --cloud gcp` runs the cpu profile on GCP
-— unlike DO, GCP allows spot there. GCP needs `the `gcp` extra on the `laboratory` dependency`, gcloud ADC
-auth, and (for GPUs) per-family regional quota; guide:
+— unlike DO, GCP allows spot there. GCP needs the `gcp` extra on the
+`laboratory` dependency, gcloud ADC auth, and (for GPUs) per-family regional
+quota; guide:
 the [GCP backend guide](https://github.com/spicysauce1955-stack/laboratory/blob/main/docs/guides/gcp-backend.md).
 
 The cpu-profile defaults are deliberately inside a **fresh DO account's tier**:
@@ -483,10 +503,18 @@ and marked `timed_out` if it overruns, and the machine is torn down.
 Every job writes `runs/<job_id>/manifest.json` (schema: `lab.models.JobManifest`)
 recording: created_at, git commit (+ dirty flag + `diff_ref`), uv.lock sha256,
 command, resolved config, seed, backend + machine type + region, status
-timeline, exit code + end reason, cost (estimated + actual), artifact URIs, and
-**`teardown_status`** (`"succeeded" | "failed" | null`) — the FR-C2 leak
-signal. A `"failed"` value means a paid rental may still be billing; the
-`end_reason` field is annotated with an actionable instruction in that case.
+timeline, exit code + end reason, cost (estimated + actual), artifact URIs,
+**`lab_version`**, and **`teardown_status`** (`"succeeded" | "failed" | null`) —
+the FR-C2 leak signal. A `"failed"` value means a paid rental may still be
+billing; the `end_reason` field is annotated with an actionable instruction in
+that case.
+
+**`lab_version`** is the lab release that produced the run (`null` on manifests
+written before v0.5.0). It matters because the lab is a *dependency* upgraded on
+its own schedule, independent of this project's commits: when `lab confirm`
+reports `drift`, compare the two runs' `lab_version` first — a lab upgrade
+between them explains a difference that the pinned commit + config + seed
+cannot.
 
 **Fail-closed provenance (FR-B1).** The store refuses to *create* a manifest
 whose `code` can't reproduce the run: `git_commit` is always a real SHA, and a
@@ -518,8 +546,9 @@ record artifact **URIs**, never credentials (spec FR-J1).
   avoid racing the provisioner.
 - **Provisioning watchdog → `failed` with "provisioning exceeded …".** A dead
   Vast host stuck in "loading" used to hang the job forever. The lab now aborts
-  any host that doesn't reach UP within the provision timeout (default **8m**,
-  override with `--provision-timeout 10m` / `provision_timeout="10m"`), tears it
+  any host that doesn't reach UP within the provision timeout (**per-cloud
+  default: vast 8m, do 12m, gcp 20m**; override with `--provision-timeout 10m` /
+  `provision_timeout="10m"`), tears it
   down, and marks the job `failed` with `end_reason` `provisioning exceeded
   <N>s (… likely a dead Vast offer)`. **This is a dead-host signal, not a code
   failure — just resubmit** (a fresh offer usually comes up healthy). Distinct
@@ -532,10 +561,13 @@ record artifact **URIs**, never credentials (spec FR-J1).
 - **`teardown_status: "failed"` is a money alarm.** The lab already retries
   `sky.down` for ~3.5 min and falls back to a cloud-direct destroy (vastai-sdk
   on Vast, compute API on GCP); a `"failed"` value means even that failed. **Always follow up with
-  `lab reconcile --apply`** to stop the bleed.
+  `lab reconcile --apply --yes`** to stop the bleed.
 - **MCP `wait` is bounded; MCP `reconcile` is read-only.** Don't block an MCP
-  call for hours — use `lab wait` as a background task for long runs. Destroying
-  orphans (`--apply`) is deliberately CLI-only.
+  call for hours — use `lab wait` as a background task for long runs. The
+  dry-run leak report *is* available over MCP; only destroying orphans
+  (`--apply`) is CLI-only — and `--apply` without `--yes` refuses (exit 4,
+  nothing destroyed) when no tty is there to confirm, which is always the case
+  for an agent.
 - **Skypilot jobs need explicit `accelerators` and `timeout`.** Missing
   either is the most common mistake.
 - **Grid values are strings on the argv.** The experiment (Hydra/typer/argparse)

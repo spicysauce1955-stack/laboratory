@@ -16,7 +16,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from lab._util import infer_artifact_type, now
+from lab._util import infer_artifact_type, now, pid_alive
 from lab.manifest import sha256_file
 from lab.metrics import METRICS_FILE, read_points
 from lab.models import ArtifactRecord, JobManifest, JobState
@@ -27,16 +27,6 @@ _TERMINAL = {
 }
 
 
-def _alive(pid: int | None) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
 
 
 def _kill(pid: int, *, group: bool) -> None:
@@ -70,7 +60,7 @@ class LocalBackend:
         m = self.store.read_manifest(job_id)
         if m.status not in _TERMINAL:
             rt = self.store.read_runtime(job_id)
-            if rt.get("runner_pid") and not _alive(rt["runner_pid"]):
+            if rt.get("runner_pid") and not pid_alive(rt["runner_pid"]):
                 return self.store.update_manifest(
                     job_id,
                     status=JobState.failed,

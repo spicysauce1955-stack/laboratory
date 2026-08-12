@@ -11,14 +11,22 @@ upgrade note.
 
 ## Frozen at a release
 
-- **CLI** — command names, flag names and their meaning, and documented exit codes: `lab wait`
-  exit 3 (teardown failed) and 4 (`--fail-fast` / timeout), `lab reconcile` exit 4 (no tty
-  without `--yes`).
+- **CLI** — command names, flag names and their meaning, including `lab init`, `lab mcp` and
+  `lab --version`, and these documented exit codes:
+
+  | Command | 0 | 1 | 2 | 3 | 4 |
+  |---|---|---|---|---|---|
+  | `lab wait` | clean | gave up on `--timeout` | bad args | teardown leaked — a paid machine may still be billing | `--fail-fast` tripped |
+  | `lab reconcile` | nothing to do | — | error | orphans found in dry-run (re-run with `--apply`) | declined the prompt, or no tty and no `--yes` — **nothing was destroyed** |
+
+  Exit 3 outranks 4 on `lab wait`: a confirmed leak is the more urgent signal.
 - **MCP** — tool names, argument names, and the shape of returned JSON.
 - **Experiment Contract** — `$LAB_RUN_ID`, `$LAB_RUN_DIR`, `$LAB_SEED`;
   `log_metric(name, value, step)`; `effective_config.json`; non-zero exit on failure.
 - **On disk** — the layout of `runs/<job_id>/` and the manifest schema. A newer lab always reads
-  manifests written by an older one; new fields are optional.
+  manifests written by an older one; new fields are optional. Every manifest records
+  `lab_version`, the release that produced the run, which is what makes that guarantee checkable
+  (it reads as `null` on anything written before v0.5.0).
 
 ## Free to change at any time
 
