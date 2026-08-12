@@ -1295,3 +1295,29 @@ def test_tear_down_and_record_gcp_annotation_names_cloud(tmp_path, monkeypatch):
     assert "gcp" in reason
     assert "vastai destroy_instance" not in reason and "vast-sdk" not in reason
     assert "lab reconcile" in reason
+
+
+def test_a_probed_preemption_survives_the_classifier(tmp_path, monkeypatch):
+    """Review finding: `classify_terminal` never trusts `sky_state=preempted` directly — it
+    reaches `preempted` only via `use_spot and cluster_gone`. The probe set `cluster_gone` but not
+    `use_spot`, and `use_spot` comes from `launched_spot`, which the adopt path never records — so
+    GCE's authoritative answer could be silently discarded and the job come out `failed`."""
+    import lab.sky_runner as runner_mod
+
+    store = _gcp_spot_job_whose_box_vanished(tmp_path, monkeypatch, "gp4")
+    # launched_spot absent AND the manifest not marked spot: the classifier would infer `failed`.
+    m = store.read_manifest("gp4")
+    m.resources.use_spot = False
+    m.backend.launched_spot = None
+    store.write_manifest(m)
+    monkeypatch.setattr(
+        "lab.backends.skypilot.list_gcp_instances",
+        lambda *a, **k: [
+            {"name": "lab-gp4-head-1a2b3c4d-compute", "zone": "us-central1-a",
+             "status": "TERMINATED", "preemptible": True}
+        ],
+    )
+
+    runner_mod.run_job(tmp_path / "runs" / "gp4", adopt=True)
+
+    assert store.read_manifest("gp4").status is JobState.preempted

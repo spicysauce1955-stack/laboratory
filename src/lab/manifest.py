@@ -35,15 +35,32 @@ def repo_root(start: Path | None = None) -> Path:
     if start is None:
         override = (os.environ.get("LAB_REPO_DIR") or "").strip()
         if override:
-            return Path(override)
+            # Resolve it like any other path (``~``, relative, symlinks) and then fall through to
+            # the git lookup below, so a value pointing *inside* a work tree still yields the
+            # tree's root. Callers assume a root: `current_commit`, `is_dirty` and `capture_diff`
+            # all pin provenance from it. A non-repo path still works — the scheduler host is
+            # allowed to point at a plain directory — it just returns itself.
+            start = Path(override).expanduser().resolve()
     start = start or Path.cwd()
+    return git_work_tree(start) or Path(start)
+
+
+def git_work_tree(start: Path) -> Path | None:
+    """The git work-tree root containing ``start``, or ``None`` when it is not inside one.
+
+    Distinct from :func:`repo_root`, which falls back to ``start`` itself: callers that need to
+    know *whether* a path is in a work tree cannot tell that apart from "it is the root" by
+    comparing paths.
+    """
     try:
         out = subprocess.check_output(
-            ["git", "-C", str(start), "rev-parse", "--show-toplevel"], text=True
+            ["git", "-C", str(start), "rev-parse", "--show-toplevel"],
+            text=True,
+            stderr=subprocess.DEVNULL,
         ).strip()
-        return Path(out)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return Path(start)
+    except (subprocess.CalledProcessError, FileNotFoundError, NotADirectoryError):
+        return None
+    return Path(out) if out else None
 
 
 def current_commit(repo: Path) -> str:

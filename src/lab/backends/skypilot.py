@@ -371,10 +371,15 @@ def gcp_project() -> str | None:
     a different project in ``~/.sky/config.yaml``, in which case reconcile scans a project the lab
     never launches into and truthfully reports it clean. Without the project in the report the
     reader cannot tell that all-clear from a real one.
+
+    Swallows *every* failure, not just :class:`GcpNotConfigured`. This is read into the reconcile
+    report after the destroy passes have already run, and it is a label rather than a leak signal
+    — letting a transport hiccup here propagate would discard the report of what was just
+    destroyed, on the one command whose purpose is an auditable account of what it did.
     """
     try:
         _creds, project = _gcp_default_credentials()
-    except GcpNotConfigured:
+    except Exception:  # noqa: BLE001 — a missing label must never cost us the destroy report
         return None
     return str(project) if project else None
 

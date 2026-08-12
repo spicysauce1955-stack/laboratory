@@ -25,7 +25,7 @@ def _register(tmp_path: Path, repo: Path, *extra: str) -> dict:
         env=_env(tmp_path, repo),
     )
     assert res.exit_code == 0, res.output
-    return json.loads(res.output)
+    return json.loads(res.stdout)
 
 
 def test_register_and_list(tmp_path: Path):
@@ -37,7 +37,7 @@ def test_register_and_list(tmp_path: Path):
     assert q.get_entry(out["reg_id"]).state is RegState.pending
 
     res = runner.invoke(app, ["queue", "list"], env=_env(tmp_path, repo))
-    listed = json.loads(res.output)
+    listed = json.loads(res.stdout)
     assert listed["entries"][0]["reg_id"] == out["reg_id"]
     assert listed["heartbeat_age_s"] is None  # no scheduler has ever ticked
 
@@ -51,7 +51,7 @@ def test_register_sweep_cli(tmp_path: Path):
         env=_env(tmp_path, repo),
     )
     assert res.exit_code == 0, res.output
-    out = json.loads(res.output)
+    out = json.loads(res.stdout)
     assert out["count"] == 2
     assert out["sweep_id"].startswith("sweep-")
     assert len(out["reg_ids"]) == 2
@@ -83,10 +83,10 @@ def test_queue_gc_cli(tmp_path: Path):
     src.write_bytes(b"x")
     orphan_key = q.put_bundle("orphan", src)  # referenced by no entry -> orphaned
 
-    dry = json.loads(runner.invoke(app, ["queue", "gc"], env=env).output)
+    dry = json.loads(runner.invoke(app, ["queue", "gc"], env=env).stdout)
     assert dry["orphaned"] == [orphan_key] and dry["deleted"] == [] and dry["applied"] is False
 
-    applied = json.loads(runner.invoke(app, ["queue", "gc", "--apply"], env=env).output)
+    applied = json.loads(runner.invoke(app, ["queue", "gc", "--apply"], env=env).stdout)
     assert applied["deleted"] == [orphan_key] and applied["applied"] is True
     assert q.list_bundle_keys() == [live_key]  # the live reg's bundle survived
 
@@ -116,7 +116,7 @@ def test_scheduler_tick_runs_once(tmp_path: Path):
     _register(tmp_path, repo)
     res = runner.invoke(app, ["scheduler", "tick"], env=_env(tmp_path, repo))
     assert res.exit_code == 0, res.output
-    rep = json.loads(res.output)
+    rep = json.loads(res.stdout)
     assert len(rep["launched"]) == 1
 
 
@@ -126,7 +126,7 @@ def test_queue_show_includes_skip_reason(tmp_path: Path):
     env = _env(tmp_path, repo)
     runner.invoke(app, ["scheduler", "tick"], env=env)
     res = runner.invoke(app, ["queue", "show", out["reg_id"]], env=env)
-    shown = json.loads(res.output)
+    shown = json.loads(res.stdout)
     assert "not_before" in shown["last_skip_reason"]
 
 

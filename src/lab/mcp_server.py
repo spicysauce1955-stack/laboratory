@@ -229,7 +229,7 @@ def build_server(lab: Lab) -> FastMCP:
 
     @mcp.tool
     def reconcile() -> dict[str, Any]:
-        """Dry-run cloud leak sweep (FR-C2): cross-checks provider instances (Vast rentals, SkyPilot-tracked clusters covering DO/GCP, DO volumes) against local jobs. Read-only — it never destroys anything; run `lab reconcile --apply` at the CLI to clean up. Non-empty orphans/sky_orphans/unsupervised means something may still be billing."""
+        """Dry-run cloud leak sweep (FR-C2): cross-checks provider instances (Vast rentals, SkyPilot-tracked clusters covering DO/GCP, GCE instances + unattached disks, DO volumes) against local jobs. Read-only — it never destroys anything; run `lab reconcile --apply --yes` at the CLI to clean up (`--apply` alone prompts, and refuses with exit 4 when there is no terminal). Non-empty orphans/sky_orphans/gcp_orphans/gcp_disk_orphans/do_volume_orphans/unsupervised means something may still be billing. `gcp_unmatched` lists `lab-*` GCE resources that did NOT match our node shape: they are never destroyed, but if they look like ours the leak passes have gone blind. `gcp_project` names the project actually swept — check it is the one SkyPilot launches into."""
         try:
             return _lab("skypilot").reconcile(apply=False)
         except LabError as e:

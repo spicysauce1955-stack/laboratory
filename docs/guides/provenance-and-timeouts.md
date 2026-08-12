@@ -129,9 +129,13 @@ be confirmed, `lab wait` exits with code `3` and the manifest's `teardown_status
 To check for orphaned rentals at any time:
 
 ```bash
-uv run lab reconcile            # dry run: lists any leaked lab-* Vast rentals
-uv run lab reconcile --apply    # destroy them
+uv run lab reconcile              # dry run: lists anything leaked (exit 3 if so)
+uv run lab reconcile --apply      # lists what it will destroy, then asks
+uv run lab reconcile --apply --yes  # unattended: no prompt
 ```
+
+`--apply` destroys only the set it showed you. Without a terminal to ask at (cron, CI, a
+non-interactive shell) it refuses and exits `4` rather than prompting — pass `--yes` there.
 
 ---
 

@@ -10,6 +10,7 @@ the library, which is untouched, so ``auto_reconcile`` keeps working with no pro
 
 import json
 
+import pytest
 from typer.testing import CliRunner
 
 import lab.cli as cli_mod
@@ -43,9 +44,16 @@ class _FakeLab:
         self.found = found
         self.calls: list[bool] = []
 
-    def reconcile(self, apply=False):
+    def reconcile(self, apply=False, only=None):
         self.calls.append(apply)
+        self.only = only
         return _report(**self.found, applied=apply)
+
+
+@pytest.fixture(autouse=True)
+def _interactive(monkeypatch):
+    """Default every test to 'a human is watching'; the non-interactive cases override it."""
+    monkeypatch.setattr(cli_mod, "_stdin_is_a_tty", lambda: True)
 
 
 def _patch(monkeypatch, found):
@@ -118,3 +126,105 @@ def test_stdout_stays_parseable_json(monkeypatch):
     )
 
     json.loads(result.stdout)  # raises if the prompt or preview leaked into stdout
+
+
+# --- review findings ---------------------------------------------------------------------------
+
+
+def test_no_tty_refuses_with_json_and_exit_4(monkeypatch):
+    """Review finding: `typer.confirm` raises `click.Abort` on EOF, so every non-interactive
+    caller (cron, CI, an agent shell — and every documented recovery recipe, none of which pass
+    `--yes`) exited 1 with **no JSON at all**, breaking the stdout-is-JSON contract and reporting
+    a generic error rather than the documented 'declined' code."""
+    monkeypatch.setattr(cli_mod, "_stdin_is_a_tty", lambda: False)
+    lab = _patch(monkeypatch, {"gcp_orphans": [ORPHAN_INSTANCE]})
+
+    result = runner.invoke(app, ["reconcile", "--apply"], input="")
+
+    assert True not in lab.calls
+    assert result.exit_code == 4
+    body = json.loads(result.stdout)
+    assert body["aborted"] is True and body["reason"] == "no tty"
+    assert "--yes" in result.stderr  # tell the operator how to proceed
+
+
+def test_no_tty_with_yes_still_applies(monkeypatch):
+    """--yes is the documented unattended path and must not need a terminal."""
+    monkeypatch.setattr(cli_mod, "_stdin_is_a_tty", lambda: False)
+    lab = _patch(monkeypatch, {"gcp_orphans": [ORPHAN_INSTANCE]})
+
+    result = runner.invoke(app, ["reconcile", "--apply", "--yes"], input="")
+
+    assert True in lab.calls
+    assert result.exit_code == 0
+
+
+def test_only_the_approved_set_is_destroyed(monkeypatch):
+    """Review finding: the confirmed pass is a second, independent sweep, so a resource that
+    becomes an orphan *between* the preview and the destroy was destroyed without ever being
+    shown — e.g. a running job whose supervisor pid dies in that window, dropping its live
+    cluster out of `running_clusters`. The approval is now binding."""
+    seen: list[set[str] | None] = []
+
+    class _DriftingLab:
+        """Second sweep finds an extra orphan the operator never saw."""
+
+        def reconcile(self, apply=False, only=None):
+            seen.append(only)
+            found = [ORPHAN_INSTANCE] if not apply else [ORPHAN_INSTANCE, {
+                "name": "lab-20260811-999999-ffffff-3dd12990-head-zzzzzzzz-compute",
+                "zone": "us-central1-b", "status": "RUNNING",
+            }]
+            return _report(gcp_orphans=found, applied=apply)
+
+    monkeypatch.setattr(cli_mod, "_lab", lambda backend="local": _DriftingLab())
+
+    runner.invoke(app, ["reconcile", "--apply"], input="y\n")
+
+    approved = seen[-1]
+    assert approved is not None, "the confirmed pass ran unfiltered"
+    assert approved == {f"gcp_orphans:{ORPHAN_INSTANCE['name']}"}
+    assert not any("999999" in k for k in approved)  # the drifted-in resource is not approved
+
+
+def test_yes_does_not_filter(monkeypatch):
+    """--yes solicits no approval, so there is no approved set to enforce — it must not
+    accidentally become an empty allowlist that silently destroys nothing."""
+    seen: list[set[str] | None] = []
+
+    class _Lab:
+        def reconcile(self, apply=False, only=None):
+            seen.append(only)
+            return _report(gcp_orphans=[ORPHAN_INSTANCE], applied=apply)
+
+    monkeypatch.setattr(cli_mod, "_lab", lambda backend="local": _Lab())
+
+    runner.invoke(app, ["reconcile", "--apply", "--yes"], input="")
+
+    assert seen == [None]
+
+
+def test_the_preview_shows_a_vast_label(monkeypatch):
+    """Review finding: `_describe_orphan` read a `volume_id` key no pass emits and dropped
+    `label` — the only human-readable field the Vast pass produces, and the thing that lets an
+    operator recognise which job a rental belonged to."""
+    _patch(monkeypatch, {"orphans": [{"id": 12345, "label": "lab-20260811-144501-c5b340"}]})
+
+    result = runner.invoke(app, ["reconcile", "--apply"], input="n\n")
+
+    assert "lab-20260811-144501-c5b340" in result.stderr
+    assert "12345" in result.stderr
+
+
+def test_unmatched_lab_resources_warn_loudly(monkeypatch):
+    """Review finding: narrowing the predicate demoted non-node `lab-*` resources to an advisory
+    field excluded from the exit-3 alarm, so a genuine leak under an unrecognised name shape made
+    reconcile exit 0 in silence. It still must not claim `--apply` fixes it — it can't — so the
+    signal is a loud warning, not an exit code."""
+    _patch(monkeypatch, {"gcp_unmatched": ["lab-notebook"]})
+
+    result = runner.invoke(app, ["reconcile"])
+
+    assert result.exit_code == 0
+    assert "lab-notebook" in result.stderr
+    assert "did not match" in result.stderr

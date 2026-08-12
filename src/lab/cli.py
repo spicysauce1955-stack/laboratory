@@ -6,6 +6,8 @@ Wired to the local backend by default; structured JSON output mirrors the MCP §
 from __future__ import annotations
 
 import json
+import os
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -19,11 +21,12 @@ from lab.core import (
     default_lab,
     default_disk_gb,
     job_status_view,
+    orphan_key,
     resolve_backend_profile,
     validate_cloud,
 )
 from lab.env import load_lab_env
-from lab.manifest import repo_root
+from lab.manifest import git_work_tree, repo_root
 from lab.models import JobSpec, ResourceRequest
 from lab.scheduler.models import Guardrails, RegState, Triggers
 from lab.scheduler.price import PriceFeed
@@ -51,6 +54,31 @@ def _load_env() -> None:
     layer down as an opaque auth error (GCP-CREDS-2).
     """
     load_lab_env(repo_root())
+    _warn_if_repo_override_shadows_cwd()
+
+
+def _warn_if_repo_override_shadows_cwd() -> None:
+    """Warn when ``LAB_REPO_DIR`` points somewhere other than the work tree you are standing in.
+
+    The override governs ``Lab.repo`` — the tree whose commit is pinned into the manifest and
+    whose contents are rsynced as the SkyPilot workdir. That is right on the scheduler host, whose
+    cwd is not a repo at all. But a laptop that has it set in ``.env`` and then runs `lab submit`
+    from a second checkout or a git worktree would silently launch the *other* tree's code and
+    record a commit that never contained the change — FR-B1 provenance wrong with no error
+    anywhere. Only fires when cwd really is inside a different work tree, so the scheduler's
+    intended use stays quiet.
+    """
+    override = (os.environ.get("LAB_REPO_DIR") or "").strip()
+    if not override:
+        return
+    here = git_work_tree(Path.cwd())
+    if here is not None and here != repo_root():  # cwd IS a work tree, and not the one we'd use
+        typer.echo(
+            f"warning: LAB_REPO_DIR={override} overrides the repo used for provenance and the "
+            f"workdir upload, but you are inside {here}. Jobs will pin and upload "
+            f"{repo_root()}, not the tree you are standing in.",
+            err=True,
+        )
 
 
 def _lab(backend: str = "local") -> Lab:
@@ -544,21 +572,33 @@ _ORPHAN_FIELDS = (
 
 
 def _describe_orphan(item: Any) -> str:
-    """One line naming a single doomed resource, however each pass shapes its entries."""
-    if isinstance(item, dict):
-        name = item.get("name") or item.get("id") or item.get("volume_id")
-        where = item.get("zone") or item.get("region")
-        return f"{name}{f'  ({where})' if where else ''}"
-    return str(item)
+    """One line naming a single doomed resource, however each pass shapes its entries.
+
+    Vast emits ``{id, label}`` — the label is the only human-readable thing it has, and it is what
+    lets an operator recognise which job a rental belonged to, so it must not be dropped.
+    """
+    if not isinstance(item, dict):
+        return str(item)
+    name = item.get("name") or item.get("label") or item.get("id")
+    extra = [str(v) for v in (item.get("zone") or item.get("region"), item.get("status")) if v]
+    if item.get("label") and item.get("id") is not None:
+        extra.insert(0, f"id={item['id']}")
+    return f"{name}{f'  ({", ".join(extra)})' if extra else ''}"
 
 
-def _preview_destruction(report: dict[str, Any]) -> list[str]:
-    """Every resource `--apply` would destroy, as ``pass: description`` lines. Empty = nothing."""
-    return [
-        f"{field}: {_describe_orphan(item)}"
-        for field in _ORPHAN_FIELDS
-        for item in report.get(field) or []
-    ]
+def _doomed(report: dict[str, Any]) -> list[tuple[str, Any]]:
+    """Every ``(pass, resource)`` `--apply` would destroy. Empty = nothing to confirm."""
+    return [(field, item) for field in _ORPHAN_FIELDS for item in report.get(field) or []]
+
+
+def _lines(doomed: list[tuple[str, Any]]) -> list[str]:
+    return [f"{field}: {_describe_orphan(item)}" for field, item in doomed]
+
+
+def _stdin_is_a_tty() -> bool:
+    """Whether there is a human to prompt. Test seam — a CliRunner swaps ``sys.stdin`` during
+    invoke, so patching the stream's own ``isatty`` from a test cannot reach it."""
+    return sys.stdin.isatty()
 
 
 @app.command()
@@ -589,31 +629,56 @@ def reconcile(
     ``lab-*`` is listed under ``gcp_unmatched`` and never destroyed.
     """
     lab = _lab(backend="skypilot")
+    approved: set[str] | None = None
     try:
         if apply and not yes:
-            # Price the blast radius before taking it. This re-lists on the confirmed pass rather
-            # than destroying a captured set: the window is seconds, and the alternative is
-            # threading a resource list through five independent destroy passes in the most
-            # cost-critical code in the repo. Diagnostics go to stderr — stdout is JSON (§9).
+            # Price the blast radius, then make the approval *binding*: the confirmed pass is a
+            # second, independent sweep, so a resource that becomes an orphan in between (a job
+            # whose supervisor dies, dropping its live cluster out of running_clusters) would
+            # otherwise be destroyed without ever having been shown. Diagnostics go to stderr —
+            # stdout carries only JSON, which callers parse (§9).
             dry = lab.reconcile(apply=False)
-            preview = _preview_destruction(dry)
-            if preview:
+            doomed = _doomed(dry)
+            if doomed:
+                if not _stdin_is_a_tty():
+                    # Nobody to ask. Fail closed and say exactly how to proceed — a bare
+                    # click.Abort here would exit 1 with no JSON at all.
+                    typer.echo(
+                        f"refusing to destroy {len(doomed)} resource(s) with no terminal to "
+                        "confirm at — re-run with --yes to proceed unattended.",
+                        err=True,
+                    )
+                    _emit({"aborted": True, "reason": "no tty", "would_destroy": _lines(doomed)})
+                    raise typer.Exit(code=4)
                 project = dry.get("gcp_project")
                 typer.echo(
-                    f"about to destroy {len(preview)} resource(s)"
+                    f"about to destroy {len(doomed)} resource(s)"
                     f"{f' in project {project}' if project else ''}:",
                     err=True,
                 )
-                for line in preview:
+                for line in _lines(doomed):
                     typer.echo(f"  {line}", err=True)
                 if not typer.confirm("proceed?", err=True):
-                    _emit({"aborted": True, "would_destroy": preview})
+                    _emit({"aborted": True, "would_destroy": _lines(doomed)})
                     raise typer.Exit(code=4)
-        report = lab.reconcile(apply=apply)
+                approved = {orphan_key(field, item) for field, item in doomed}
+        report = lab.reconcile(apply=apply, only=approved)
     except LabError as e:
         _emit({"error": str(e)})
         raise typer.Exit(code=2) from e
     _emit(report)
+    if unmatched := report.get("gcp_unmatched"):
+        # Not an orphan field (see above) — it is not `--apply`-able, so exit 3's "re-run with
+        # --apply" would be wrong advice. But it must not be silent either: if these are in fact
+        # our own nodes under a name shape we stopped recognising, the leak passes have gone
+        # blind and would report clean while the VMs bill (GCP-LEAK-7).
+        typer.echo(
+            f"warning: {len(unmatched)} `lab-*` GCP resource(s) did not match our node shape and "
+            "were NOT considered for cleanup — check whether they are ours:",
+            err=True,
+        )
+        for name in unmatched:
+            typer.echo(f"  {name}", err=True)
     if any(report.get(k) for k in _ORPHAN_FIELDS) and not apply:
         raise typer.Exit(code=3)  # action required: re-run with --apply
 

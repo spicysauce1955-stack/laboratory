@@ -74,6 +74,21 @@ def _new_job_id() -> str:
     return f"{now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
 
 
+def orphan_key(field: str, item: Any) -> str:
+    """Stable identity for one destroyable resource, as ``<pass>:<identifier>``.
+
+    Shared by the CLI's confirmation preview and :meth:`Lab.reconcile`'s ``only`` filter so that
+    an approval means exactly the set that was displayed. Each pass shapes its entries
+    differently — Vast emits ``{id, label}``, DO volumes ``{id, name}``, the GCP passes
+    ``{name, zone, …}``, and the sky pass bare cluster-name strings — so identity is resolved by
+    preference rather than by a single key.
+    """
+    if isinstance(item, dict):
+        ident = item.get("name") or item.get("id") or item.get("label")
+        return f"{field}:{ident}"
+    return f"{field}:{item}"
+
+
 def expand_grid(grid: dict[str, list[Any]]) -> list[dict[str, Any]]:
     """Cartesian product of a parameter grid -> one config dict per point (FR-A5)."""
     if not grid:
@@ -1009,8 +1024,15 @@ class Lab:
             orphans.append(name)
         return orphans
 
-    def reconcile(self, *, apply: bool = False) -> dict[str, Any]:
+    def reconcile(self, *, apply: bool = False, only: set[str] | None = None) -> dict[str, Any]:
         """Cross-check Vast.ai rentals against the local job DB (FR-C2 leak detection).
+
+        ``only`` restricts destruction to resources whose :func:`orphan_key` is in the set --
+        everything is still *listed*, only the destroy is filtered. The CLI passes the set the
+        operator actually approved, so a resource that becomes an orphan between the preview and
+        the confirmed pass (a job whose supervisor dies in that window, dropping its live cluster
+        out of ``running_clusters``) is reported but not destroyed. ``None`` means no approval
+        was solicited (``--yes``, or the scheduler's unattended sweep) and nothing is filtered.
 
         Returns a structured report of:
 
@@ -1076,6 +1098,10 @@ class Lab:
                 continue
             orphans.append({"id": inst.get("id"), "label": label})
 
+        def _approved(field: str, item: Any) -> bool:
+            """Whether this resource is inside the approved set (all of them when unfiltered)."""
+            return only is None or orphan_key(field, item) in only
+
         destroyed: list[int] = []
         if apply and orphans:
             from lab.backends.skypilot import _get_vast_client
@@ -1083,7 +1109,7 @@ class Lab:
             client = _get_vast_client()
             for orph in orphans:
                 inst_id = orph["id"]
-                if inst_id is None:
+                if inst_id is None or not _approved("orphans", orph):
                     continue
                 try:
                     client.destroy_instance(id=int(inst_id))
@@ -1099,6 +1125,8 @@ class Lab:
             import sky
 
             for cl in sky_orphans:
+                if not _approved("sky_orphans", cl):
+                    continue
                 try:
                     sky.get(sky.down(cl))
                     sky_destroyed.append(cl)
@@ -1126,7 +1154,7 @@ class Lab:
                 client = _get_do_client()
                 for vol in do_volume_orphans:
                     vol_id = vol.get("id")
-                    if vol_id is None:
+                    if vol_id is None or not _approved("do_volume_orphans", vol):
                         continue
                     try:
                         client.volumes.delete(volume_id=vol_id)
@@ -1168,6 +1196,8 @@ class Lab:
             gcp_orphans = _find_gcp_instance_orphans(gcp_instances, set(running_clusters))
             if apply and gcp_orphans:
                 for inst in gcp_orphans:
+                    if not _approved("gcp_orphans", inst):
+                        continue
                     try:
                         delete_gcp_instance(str(inst["name"]), str(inst["zone"]))
                         gcp_destroyed.append(str(inst["name"]))
@@ -1179,6 +1209,8 @@ class Lab:
             gcp_disk_orphans = _find_gcp_disk_orphans(gcp_disks, set(running_clusters))
             if apply and gcp_disk_orphans:
                 for disk in gcp_disk_orphans:
+                    if not _approved("gcp_disk_orphans", disk):
+                        continue
                     try:
                         delete_gcp_disk(str(disk["name"]), str(disk["zone"]))
                         gcp_disks_destroyed.append(str(disk["name"]))

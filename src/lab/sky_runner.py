@@ -616,7 +616,12 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             # genuinely failed.
             final, reached_terminal = JobState.failed, True
         elif probed is JobState.preempted:
-            final, cluster_gone = JobState.preempted, True
+            # `classify_terminal` never trusts sky_state=preempted directly — it reaches
+            # `preempted` only via `use_spot and cluster_gone`. GCE reporting a *preemptible*
+            # instance is itself authoritative about spot-ness (better evidence than the
+            # manifest's `launched_spot`, which the adopt path never records), so set both or the
+            # probe's answer is silently discarded and the job comes out `failed`.
+            final, cluster_gone, use_spot = JobState.preempted, True, True
 
     final = classify_terminal(
         sky_state=final,

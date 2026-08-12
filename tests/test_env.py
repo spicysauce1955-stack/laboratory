@@ -199,3 +199,65 @@ def test_default_queue_is_rooted_at_lab_repo_dir(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path.parent)
 
     assert default_queue().root == tmp_path / "queue"
+
+
+def test_lab_repo_dir_resolves_to_the_work_tree_root(monkeypatch):
+    """Review finding: the override returned its raw value, skipping the git lookup — so a value
+    pointing *inside* a repo was handed to `current_commit`/`is_dirty`/`capture_diff`, which all
+    assume a work-tree root and pin provenance from it."""
+    from lab.manifest import repo_root
+
+    repo = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv("LAB_REPO_DIR", str(repo / "tests"))
+
+    assert repo_root() == repo
+
+
+def test_lab_repo_dir_expands_a_tilde(monkeypatch):
+    """`.env` is hand-edited, so `~/laboratory` is the natural thing to write."""
+    from lab.manifest import repo_root
+
+    monkeypatch.setenv("LAB_REPO_DIR", "~")
+    assert repo_root() == Path.home().resolve()
+
+
+def test_a_non_repo_lab_repo_dir_still_works(monkeypatch, tmp_path):
+    """The scheduler host is allowed to point at a plain directory — it must not hard-fail."""
+    from lab.manifest import repo_root
+
+    plain = tmp_path / "notarepo"
+    plain.mkdir()
+    monkeypatch.setenv("LAB_REPO_DIR", str(plain))
+
+    assert repo_root() == plain.resolve()
+
+
+def test_lab_repo_dir_warns_when_it_shadows_the_tree_you_are_in(tmp_path, monkeypatch, capsys):
+    """Review finding: the override governs `Lab.repo` — the tree whose commit is pinned and
+    whose contents are uploaded. A laptop with it set in `.env` that then runs from a second
+    checkout or a git worktree would launch the *other* tree's code and record a commit that
+    never contained the change, with no error anywhere."""
+    from lab.cli import _warn_if_repo_override_shadows_cwd
+
+    repo = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv("LAB_REPO_DIR", str(tmp_path))
+    monkeypatch.chdir(repo)  # standing in a real work tree that is NOT the override
+
+    _warn_if_repo_override_shadows_cwd()
+
+    assert "LAB_REPO_DIR" in capsys.readouterr().err
+
+
+def test_no_warning_on_a_host_whose_cwd_is_not_a_repo(tmp_path, monkeypatch, capsys):
+    """The scheduler host's intended use: WorkingDirectory isn't a work tree, so there is no
+    shadowing and no warning to cry wolf with every tick."""
+    from lab.cli import _warn_if_repo_override_shadows_cwd
+
+    elsewhere = tmp_path / "notarepo"
+    elsewhere.mkdir()
+    monkeypatch.setenv("LAB_REPO_DIR", str(tmp_path))
+    monkeypatch.chdir(elsewhere)
+
+    _warn_if_repo_override_shadows_cwd()
+
+    assert capsys.readouterr().err == ""

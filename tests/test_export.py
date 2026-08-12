@@ -146,7 +146,7 @@ def test_cli_export_prints_index(tmp_path, monkeypatch):
     with patch.object(cli_mod, "_lab", return_value=lab):
         result = CliRunner().invoke(app, ["export", "j6", "--to", str(dest)])
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output)["jobs"][0]["job_id"] == "j6"
+    assert json.loads(result.stdout)["jobs"][0]["job_id"] == "j6"
     assert (dest / "index.json").exists()
 
 
