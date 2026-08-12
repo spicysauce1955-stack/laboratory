@@ -213,3 +213,47 @@ are already billing.
 **Proposed fix:** `lab sweep` knows its shard count before submitting; `doctor`'s quota probe could
 be asked for `n` concurrent units rather than one, and the sweep refused up front when the answer
 is no. That is admission control the cost-safety design already argues for elsewhere.
+
+### F8 — a GCP provisioning timeout blames a "dead Vast offer"
+
+`severity: medium` · `confirmed` (observed live + code)
+
+The stage-1 GPU job exhausted T4 capacity in **seven** GCP zones
+(`us-central1-b/c/f`, `us-east1-b/c/d`, `us-west1-a`) and hit the 20-minute provision budget. Its
+recorded `end_reason`:
+
+> `provisioning exceeded 1200s (host never reached UP — likely a dead Vast offer; resubmit for a
+> fresh host)`
+
+The job ran on **GCP**. There is no Vast offer. The advice — "resubmit for a fresh host" — is also
+wrong for this failure: resubmitting into a capacity crunch reproduces it, and the guide's actual
+remedy is `--region`/`--zone` steering or waiting.
+
+`sky_runner.py:549` hardcodes that string. The two sibling handlers in the *same* function —
+`TransientLaunchError` (line 562) and the generic `Exception` (line 571) — both route through
+`provision_failure_reason(generic, cloud)`, which is cloud-aware and already has a `gcp` branch
+that names `ZONE_RESOURCE_POOL_EXHAUSTED` and suggests `--spot`. Only the timeout path skips it.
+
+Same class as F5: a Vast-era assumption that silently became wrong when other clouds arrived, and
+it lands on the field an operator reads first when a job fails.
+
+**Proposed fix:** route the `ProvisionTimeout` branch through `provision_failure_reason` like its
+siblings, so the message names the cloud and the real cause.
+**Test:** a `ProvisionTimeout` with `cloud="gcp"` produces a reason mentioning capacity/zones and
+**not** "Vast".
+
+---
+
+## Stage 1 — GCP GPU smoke — **FAILED (capacity, not a defect)**
+
+T4 unavailable in every zone SkyPilot tried. `end_reason` recorded the 1200 s provision budget
+(see F8 for the message). No leak: `gcp_orphans`, `gcp_disk_orphans` and `sky_orphans` all empty
+afterwards, and SkyPilot's registry tracks only the live shards.
+
+Notable, and working as documented: `teardown_status` stayed `null` while the teardown completed
+asynchronously, `lab wait` warned `teardown_unconfirmed` and pointed at `lab reconcile`, and
+reconcile was indeed the ground truth. This is the 2026-08-11 "teardown is asynchronous" gotcha,
+reproduced exactly as the guide describes it.
+
+Retrying once on **L4** (quota held in five regions, typically better availability) before
+recording GPU as capacity-blocked.
