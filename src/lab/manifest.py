@@ -128,7 +128,12 @@ def capture_diff(repo: Path, dest_dir: Path) -> str | None:
         for rel in filter(None, untracked):
             dst = stage / "untracked" / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(repo / rel, dst)
+            # follow_symlinks=False: git lists an untracked symlink as a single entry, and
+            # copying through it either duplicates the target or — when it points at a
+            # directory — raises IsADirectoryError and takes the whole dirty-tree snapshot with
+            # it (FR-B1). Preserving the link is also the more faithful snapshot: apply_diff
+            # then restores what the tree actually contained.
+            shutil.copy2(repo / rel, dst, follow_symlinks=False)
         with tarfile.open(tar_path, "w:gz") as out:
             out.add(stage, arcname=".")
     return str(tar_path)
@@ -152,7 +157,14 @@ def apply_diff(tarball: Path, tree: Path) -> None:
             )
         untracked_root = stage / "untracked"
         for src in untracked_root.rglob("*"):
-            if src.is_file():
-                dst = tree / src.relative_to(untracked_root)
+            dst = tree / src.relative_to(untracked_root)
+            # Symlinks first: `is_file()` follows the link, and a captured link's target need not
+            # exist inside the staging dir, so a link would silently vanish from the restored
+            # tree. Recreate the link itself, matching what capture_diff stored.
+            if src.is_symlink():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.unlink(missing_ok=True)
+                dst.symlink_to(os.readlink(src))
+            elif src.is_file():
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
