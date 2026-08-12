@@ -3,6 +3,10 @@
 **Status (2026-08-11, second pass).** **Fixed:** `GCP-LEAK-1`…`GCP-LEAK-6`, `VAST-LEAK-1`,
 `GCP-COST-1`…`GCP-COST-6`, `GCP-PROV-1`, `GCP-PROV-2`, `GCP-PROV-3`, `GCP-PROV-5`, `GCP-PROV-6`,
 `GCP-PREEMPT-2`, `GCP-PREEMPT-3`, `GCP-TEST-1`, `GCP-TEST-2`, `GCP-DOC-1`.
+> **The remaining eight gaps have their own actionable backlog:**
+> `docs/proposals/2026-08-12-gcp-remaining-gaps.md`. This document stays the record of *why* each
+> gap exists; that one is *what to do next*, in priority order.
+
 **Partly:** `GCP-PROV-4` (GPU path attempted live; blocked by a project quota, not a lab defect —
 now predicted by `lab doctor` instead of discovered by a failed launch), `GCP-CREDS-1` (runbook
 fixed, live host unverified). Remaining analysis: `GCP-LEAK-7`…`-9`, `GCP-PREEMPT-1`,
