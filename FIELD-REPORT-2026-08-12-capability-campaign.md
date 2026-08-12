@@ -392,3 +392,55 @@ Two cheap improvements, in order of value:
 
 **Test:** a shard CSV with two rows sharing a seed produces an error naming `--row-key`, not a
 bare `ValueError`; and with a composite key those rows aggregate.
+
+### F12 — `lab doctor` blocks a legitimate TPU launch on a metric name GCP does not have
+
+`severity: medium-high` · `confirmed` · **blocks a launch the project has quota for**
+
+The campaign predicted doctor would be *blind* to TPUs, consulting `GPUS_ALL_REGIONS`. That
+prediction was wrong, and the reality is worse: doctor does construct a per-accelerator metric,
+but builds it as NVIDIA-only.
+
+`doctor.py:436`: `metric = f"NVIDIA_{family}_GPUS"`. For `tpu-v5litepod:1` that yields
+`NVIDIA_TPU_V5LITEPOD_GPUS`. GCP has no such metric — the real ones, measured directly on this
+project, are **`TPU_LITE_PODSLICE_V5 = 16`** and `PREEMPTIBLE_TPU_LITE_PODSLICE_V5 = 16` in
+us-central1 and europe-west4. `_region_quotas(...).get(metric)` returns `None`, absent is treated
+as zero, and the check reports:
+
+```
+quota_gpu  FAIL  no checked region has 1x TPU_V5LITEPOD free (us-central1=none)
+                 fix: request NVIDIA_TPU_V5LITEPOD_GPUS quota in a region you intend to use
+```
+
+Both halves are wrong: there *is* quota (16 of it), and the remedy names a metric that does not
+exist, so following the advice leads to a quota console with nothing matching.
+
+**It blocks.** Submit runs the cheap preflight subset by default, so a real launch is refused:
+
+```
+error: preflight refused this launch — it would fail after provisioning:
+  quota_gpu  FAIL  no checked region has 1x TPU_V5LITEPOD free
+```
+
+This breaks the design rule CLAUDE.md states for `lab doctor`: *"Only definitive negatives block —
+a check that cannot answer is `skip` and never blocks."* A metric the API never returned is a
+check that **could not answer**, not a definitive negative. The absent-vs-zero conflation is what
+turns it into a blocker.
+
+Related, same block: `GPUS_ALL_REGIONS` is consulted for TPU requests, where it has no bearing.
+It passed here only because the global limit happens to be 1; with the pre-grant 0 it would have
+falsely blocked TPUs too.
+
+**Proposed fix (three small parts):**
+1. Map TPU families to their real metric (`TPU_LITE_PODSLICE_V5`, and the `PREEMPTIBLE_` variant
+   when `--spot`), instead of the NVIDIA template.
+2. Treat a metric missing from the API response as **unknown → `_skip`**, not zero → `_fail`.
+   That alone converts this from a blocker into a warning.
+3. Skip the `GPUS_ALL_REGIONS` gate for non-NVIDIA accelerators.
+
+**Test:** a TPU spec whose regional TPU metric is present and sufficient passes; one whose metric
+is absent from the response `skip`s rather than fails; `GPUS_ALL_REGIONS=0` does not block a TPU.
+
+Honourable mention, correct behaviour on the same run: `catalog WARN — SkyPilot's catalog cannot
+price this spec, so cost guardrails will not apply to it`. That is exactly the right shape — it
+says what it cannot do and does not pretend otherwise.
