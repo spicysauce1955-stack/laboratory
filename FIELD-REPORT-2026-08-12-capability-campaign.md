@@ -467,8 +467,15 @@ for larger pods) and `lab reconcile` reports **clean, exit 0**, forever. There i
 channel — `robust_teardown`'s gcp-direct fallback also goes through the compute API, so it cannot
 destroy a TPU either.
 
-This is strictly worse than the GCP-LEAK-7 situation it resembles. That was an over-broad matcher
-that could delete the wrong thing loudly; this is a resource class the sweep cannot observe at all.
+**Partially mitigated, and the boundary matters.** The cloud-agnostic `sky.status` pass *does*
+see the cluster — the final check reported `sky_orphans: ["lab-20260812-145139-58f6aa"]` and
+exit 3 while the node was deleting. So a TPU is covered **as long as SkyPilot's registry still
+knows about it**.
+
+The gap is precisely the case the GCP compute-API pass was built for: clusters SkyPilot has
+*lost*. That pass is the second channel behind `sky.status`, and for TPUs it does not exist. So a
+TPU leak is invisible exactly when the primary channel has already failed — which is the only
+situation in which a second channel matters.
 
 The good news is that the hard part is already done. The node name
 `lab-<job_id>-<userhash>-head-<uuid8>-**tpu**` matches `_GCP_NODE_RE` unchanged — `tpu` is one of
