@@ -71,6 +71,23 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/lab"]
 
+# The sdist defaults to "every tracked file", which meant a release shipped this repo's research
+# bookkeeping — .coverage, formtest_done.json, the run_*.sh drivers, the whole experiments/ tree —
+# to anyone who installed from source. A distribution should carry the tool and the things needed
+# to build and check it, nothing else. (Most of that content leaves entirely when
+# `tempotron-capacity` is extracted; this keeps it out of released artifacts either way.)
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/lab",
+    "tests",
+    "docs",
+    "pyproject.toml",
+    "uv.lock",
+    "README.md",
+    "CHANGELOG.md",
+    "LAB-REQUIREMENTS.md",
+]
+
 [tool.ruff]
 line-length = 100
 
