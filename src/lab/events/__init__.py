@@ -4,5 +4,18 @@
 from __future__ import annotations
 
 from lab.events.models import ActionStat, Event, Note, SignatureStat, StatsView
+from lab.events.record import (
+    Call,
+    begin,
+    current,
+    error_dict,
+    finish,
+    finish_current,
+    note,
+    record,
+)
 
-__all__ = ["ActionStat", "Event", "Note", "SignatureStat", "StatsView"]
+__all__ = [
+    "ActionStat", "Call", "Event", "Note", "SignatureStat", "StatsView",
+    "begin", "current", "error_dict", "finish", "finish_current", "note", "record",
+]
