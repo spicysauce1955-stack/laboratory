@@ -31,9 +31,10 @@ def _entropy(s: str) -> float:
 
 
 def _looks_secret(value: str) -> bool:
-    # Hex-only strings (commit hashes, job IDs) are never secrets, so check first
-    # to prevent the base64 pattern from matching 40-char hex strings.
-    if _HEXISH.match(value):
+    # Hex-only strings ≤40 chars (commit SHAs, cell ids, job IDs) are never secrets, so check
+    # first to prevent the base64 pattern from matching 40-char hex strings. Longer hex strings
+    # (e.g. 64-char hex API tokens) fall through to entropy check and are masked.
+    if _HEXISH.match(value) and len(value) <= 40:
         return False
     if any(p.search(value) for p in _SECRET_VALUE):
         return True
@@ -76,19 +77,23 @@ def sanitize_params(params: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def sanitize_argv(argv: Sequence[str]) -> list[str]:
-    """Sanitize a raw command line: mask ``--flag=<secret>`` and the token after ``--flag``."""
-    out: list[str] = []
-    mask_next = False
-    for token in argv:
-        if mask_next:
-            out.append(MASK)
-            mask_next = False
-            continue
-        if token.startswith("-") and "=" in token:
-            flag, _, value = token.partition("=")
-            out.append(f"{flag}={MASK}" if _SECRET_KEY.search(flag) else f"{flag}={_scalar(value)}")
-            continue
-        if token.startswith("-") and _SECRET_KEY.search(token):
-            mask_next = True
-        out.append(_scalar(token))
-    return out
+    """Sanitize a raw command line: mask ``--flag=<secret>`` and the token after ``--flag``.
+    Never raises — a sanitizer that failed would take the whole record with it."""
+    try:
+        out: list[str] = []
+        mask_next = False
+        for token in argv:
+            if mask_next:
+                out.append(MASK)
+                mask_next = False
+                continue
+            if token.startswith("-") and "=" in token:
+                flag, _, value = token.partition("=")
+                out.append(f"{flag}={MASK}" if _SECRET_KEY.search(flag) else f"{flag}={_scalar(value)}")
+                continue
+            if token.startswith("-") and _SECRET_KEY.search(token):
+                mask_next = True
+            out.append(_scalar(token))
+        return out
+    except Exception:  # noqa: BLE001 — logging must never fail a command
+        return [MASK]
