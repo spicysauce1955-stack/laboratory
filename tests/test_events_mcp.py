@@ -97,3 +97,115 @@ def test_a_successful_call_records_real_refs_and_a_result_digest(tmp_path: Path)
     assert closed["outcome"] == "ok"
     assert closed["refs"] == {"job_id": job_id}
     assert closed["result"]["state"] == "succeeded"
+
+
+def test_history_tool_returns_recent_calls(tmp_path: Path) -> None:
+    _, server = _make(tmp_path)
+
+    async def go() -> dict:
+        async with Client(server) as client:
+            await client.call_tool("list", {})
+            result = await client.call_tool("history", {"limit": 10, "all_projects": True})
+            return result.data
+
+    data = asyncio.run(go())
+    actions = [e["action"] for e in data["events"]]
+    assert "list" in actions
+
+
+def test_history_tool_excludes_its_own_in_flight_call(tmp_path: Path) -> None:
+    """The middleware opens this very `history` call's ledger entry before the tool body runs,
+    and only closes it after the tool returns. Without self-exclusion the tool would see its
+    own still-open call as a phantom 'running-or-died' row, freshest-first, ahead of the real
+    'list' call recorded just before it."""
+    _, server = _make(tmp_path)
+
+    async def go() -> dict:
+        async with Client(server) as client:
+            await client.call_tool("list", {})
+            result = await client.call_tool("history", {"limit": 10, "all_projects": True})
+            return result.data
+
+    data = asyncio.run(go())
+    actions = [e["action"] for e in data["events"]]
+    assert actions == ["list"]
+    assert data["events"][0]["status"] == "ok"
+
+
+def test_history_stats_reflects_the_since_window(tmp_path: Path) -> None:
+    """`stats=True` must report the cutoff it actually applied, not null (which reads as
+    'unfiltered' even though a --since window was genuinely in effect)."""
+    _, server = _make(tmp_path)
+
+    async def go() -> dict:
+        async with Client(server) as client:
+            await client.call_tool("list", {})
+            result = await client.call_tool(
+                "history", {"since": "1h", "all_projects": True, "stats": True}
+            )
+            return result.data
+
+    data = asyncio.run(go())
+    assert data["since"] is not None
+    assert data["total"] == 1
+
+
+def test_history_tool_rejects_unparseable_since_with_a_clean_tool_error(tmp_path: Path) -> None:
+    """FastMCP wraps *any* uncaught exception as a ToolError, so merely asserting
+    `pytest.raises(ToolError)` would pass even with no explicit guard (its generic wrapper
+    message is `Error calling tool 'history': ...`). Assert on our own message instead, which
+    only appears if `since` is validated before `events.read` ever sees it."""
+    _, server = _make(tmp_path)
+
+    async def go() -> str:
+        async with Client(server) as client:
+            with pytest.raises(ToolError) as exc_info:
+                await client.call_tool("history", {"since": "not-a-duration"})
+            return str(exc_info.value)
+
+    message = asyncio.run(go())
+    assert "bad since" in message
+    assert "not-a-duration" in message
+
+
+def test_report_tool_returns_markdown(tmp_path: Path) -> None:
+    _, server = _make(tmp_path)
+
+    async def go() -> dict:
+        async with Client(server) as client:
+            result = await client.call_tool("report", {"since": "7d", "all_projects": True})
+            return result.data
+
+    data = asyncio.run(go())
+    assert data["markdown"].startswith("# Lab event report")
+
+
+def test_report_tool_reflects_the_since_window_in_its_header(tmp_path: Path) -> None:
+    """`report`'s markdown header must say the window it actually filtered by, not fall back
+    to 'all recorded history' while genuinely restricting to --since."""
+    _, server = _make(tmp_path)
+
+    async def go() -> dict:
+        async with Client(server) as client:
+            result = await client.call_tool("report", {"since": "7d", "all_projects": True})
+            return result.data
+
+    data = asyncio.run(go())
+    assert data["markdown"].startswith("# Lab event report — since ")
+    assert "all recorded history" not in data["markdown"]
+
+
+def test_report_tool_rejects_unparseable_since_with_a_clean_tool_error(tmp_path: Path) -> None:
+    """See the matching `history` test: assert on our own message so this fails without an
+    explicit guard, rather than passing on FastMCP's generic wrapper message."""
+    _, server = _make(tmp_path)
+
+    async def go() -> str:
+        async with Client(server) as client:
+            with pytest.raises(ToolError) as exc_info:
+                await client.call_tool("report", {"since": "not-a-duration"})
+            return str(exc_info.value)
+
+    message = asyncio.run(go())
+    assert "bad since" in message
+    assert "not-a-duration" in message
