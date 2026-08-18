@@ -122,6 +122,12 @@ def report(events: Sequence[Event], *, since: datetime | None = None) -> str:
             f"**Cost:** ${usd:.4f}  ",
         ]
         if job_ids:
+            # Deliberately a literal template, not a resolved path (`read.crossref` does that
+            # for `lab history --full`/MCP `history(full=True)`): `report()` is a pure function
+            # of `Event`s with no store, by design — "pure functions over the JSONL — no server,
+            # no daemon, each testable against a fixture file" — and giving it one would mean
+            # every caller (CLI `lab report`, the MCP `report` tool, and any future one) has to
+            # supply a `JobStore` just to render markdown for a home it doesn't otherwise touch.
             lines.append(f"**Jobs:** {', '.join(job_ids)} (`runs/<job_id>/logs.txt`)  ")
         if newest.trace:
             trace_lines = [f"+{n.t:>7}ms  {n.k}  {n.d}" for n in newest.trace]

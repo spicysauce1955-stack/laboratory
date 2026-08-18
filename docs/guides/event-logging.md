@@ -13,6 +13,18 @@ the call starts, and a `close` line when it ends. A `close` that never arrives �
 killed, the laptop slept mid-`submit`, a provision hung forever — is not lost data, it's the
 finding: `lab history` surfaces it as `running-or-died`.
 
+One exception: `lab mcp` itself is never opened as a call. It's a long-lived server, not a
+one-shot invocation — a client tears it down with SIGTERM or SIGKILL, neither of which the
+process gets a chance to react to, so every session would otherwise leave a permanent dangling
+`open` behind. The tool calls a running MCP server handles are still fully recorded (each is its
+own `open`/`close` pair, `surface: "mcp"`) — only the wrapper process itself is exempt.
+
+An MCP tool call that raises FastMCP's `ToolError` (a tool rejecting a bad input — an unknown
+job id, an unparseable duration) is recorded as `outcome: "error"`, the same bucket the CLI's
+`_fail` sites land in for the equivalent `lab status j-nope`. Anything else propagating out of a
+tool is `outcome: "crash"`. This is what lets `--stats`/`lab report` tell "the caller asked for
+something that doesn't exist" apart from "the lab has a bug".
+
 | Field (open) | Notes |
 |---|---|
 | `id` | a sortable id (millisecond timestamp + random hex) — no coordination needed |
@@ -30,7 +42,7 @@ finding: `lab history` surfaces it as `running-or-died`.
 | `outcome` | `ok` \| `error` \| `usage_error` \| `crash` \| `interrupted` |
 | `exit_code` | process exit code (CLI); absent for MCP |
 | `duration_ms` | |
-| `refs` | join keys back to a manifest: `job_id`, `job_ids`, `sweep_id`, `reg_id`, `run_id` |
+| `refs` | join keys back to a manifest: `job_id`, `job_ids`, `sweep_id`, `reg_id` |
 | `result` | a **digest** only — state, cost, item counts, not the full payload (that's already in the manifest) |
 | `error` | `{type, message, where}` when the call didn't succeed |
 | `trace` | **present only when `outcome != "ok"`** |
@@ -44,12 +56,15 @@ just say *what* failed, it shows the steps that led there.
 The supervisor's record is `action: "run"`, tagged with `refs.job_id`, so `lab history --job
 <id>` picks it up alongside the `submit` call that launched it.
 
-`--job` matches only `refs.job_id`/`refs.job_ids` — nothing else in `refs`. `run_id` is one of
-the key names `refs_from` recognizes, but no shipped command's result payload currently uses that
-key (`lab confirm`'s result is `{orig_id, confirm_id, verdict, ...}`), so `refs.run_id` never
-actually appears yet; a `lab confirm <run_id>` call's own ledger record has an **empty** `refs`.
-To find it, filter on `--action confirm` (or `--full`, and match the run id against `params.argv`
-instead).
+`--job` matches `refs.job_id` and `refs.job_ids` — nothing else in `refs`. `job_ids` is populated
+two ways: a top-level `job_ids` list of strings on the result (e.g. `lab sweep`'s
+`{sweep_id, count, job_ids: [...]}`), and `orig_id`/`confirm_id` on `lab confirm`'s result
+(`{orig_id, confirm_id, verdict, ...}`) — both are themselves job ids (`confirm_id` is a real job
+submitted to re-derive `orig_id`), so a `lab confirm` call is findable by `--job <orig_id>` or
+`--job <confirm_id>` the same way anything else that touched a job is. `job_ids` is capped at 64
+entries, with a `"…N more"` marker appended when truncated. There is deliberately **no** harvest
+of ids from an arbitrary nested list of job-shaped dicts (e.g. `lab list`'s `{"jobs": [...]}`) —
+that would make a call that touched nothing match every job that exists.
 
 ## 2. Where it lives
 
@@ -91,8 +106,10 @@ uv run lab history --limit 5
 ```
 
 **One job's calls, with the full detail** — every option that touched a job (`submit`,
-`wait`, `cancel`, ...), and with `--full`, the sanitized params, session id, exit code and (on
-failure) the trace:
+`wait`, `cancel`, ...), and with `--full`, the sanitized params, session id, exit code, (on
+failure) the trace, and a cross-reference to that job's manifest and `logs.txt` path (so the
+ledger is a jumping-off point rather than a silo — best-effort: a job whose `runs/` has since
+been cleaned up just omits these three fields rather than failing the read):
 
 ```bash
 uv run lab history --job j-4f2a --full
@@ -103,7 +120,9 @@ uv run lab history --job j-4f2a --full
   {"id": "...", "action": "submit", "status": "error", ..., "params": {"argv": [...]},
    "session": "sess_233b51f2", "exit_code": 1, "lab_version": "0.5.1",
    "error_detail": {"type": "ProvisionTimeout", "message": "...", "where": "..."},
-   "trace": [{"t": 38, "k": "placement.zone_skipped", "d": {"zone": "..."}}]}
+   "trace": [{"t": 38, "k": "placement.zone_skipped", "d": {"zone": "..."}}],
+   "manifest_state": "failed", "manifest_end_reason": "no capacity in europe-west1",
+   "logs_path": "runs/j-4f2a/logs.txt"}
 ]}
 ```
 

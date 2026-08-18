@@ -134,19 +134,46 @@ def _rewrite(path: Path, records: list[dict[str, Any]]) -> None:
 
 def compact(*, now: datetime, success_ttl_days: int) -> None:
     """Drop successful calls older than the TTL. Failures — and dangling opens, which are
-    themselves a finding — stay until the age cap takes them."""
+    themselves a finding — stay until the age cap takes them.
+
+    The succeeded-id set is built across *every* day file, not just the ones old enough to be
+    rewritten here: a call whose ``open`` lands in day N and whose ``close`` lands in day N+1
+    (any supervisor run of more than a few hours, or an overnight scheduled job — exactly the
+    expensive jobs this ledger most needs to get right) would otherwise never be recognised as
+    succeeded when day N is compacted on its own — day N has no close to prove it, and day N+1's
+    close, read on its own turn, has no matching open in *that* file to pair it with. Read that
+    way, a known success becomes a permanent "running-or-died" phantom after the TTL. Computing
+    the set globally first, then filtering each eligible file against it, closes that gap.
+    """
     cutoff = now - timedelta(days=success_ttl_days)
-    for path in day_files():
+    paths = day_files()
+    old_paths = []
+    for path in paths:
         try:
-            if datetime.strptime(path.stem, "%Y-%m-%d").replace(tzinfo=timezone.utc) >= cutoff:
-                continue
+            stamped = datetime.strptime(path.stem, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError as e:
+            debug(f"compaction skipped unparseable day file {path}: {e}")
+            continue
+        if stamped < cutoff:
+            old_paths.append(path)
+    if not old_paths:
+        return
+    try:
+        succeeded = {
+            r["id"] for r in iter_records(paths)
+            if r.get("phase") == "close" and r.get("outcome") == "ok"
+            and isinstance(r.get("id"), str)
+        }
+    except Exception as e:  # noqa: BLE001
+        debug(f"compaction failed building the succeeded set: {e}")
+        return
+    for path in old_paths:
+        try:
             lock = lock_path(path)
             with lock.open("a", encoding="utf-8") as lf:
                 fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
                 try:
                     records = list(iter_records([path]))
-                    succeeded = {r["id"] for r in records
-                                 if r.get("phase") == "close" and r.get("outcome") == "ok"}
                     kept = [r for r in records if r.get("id") not in succeeded]
                     if len(kept) != len(records):
                         _rewrite(path, kept)

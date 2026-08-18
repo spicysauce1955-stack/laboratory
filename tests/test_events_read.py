@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from lab.events import store
-from lab.events.read import fold, read, row
+from lab.events.read import crossref, fold, read, row
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
 
@@ -186,3 +186,62 @@ def test_row_is_brief_by_default_and_detailed_with_full() -> None:
     detailed = row(event, full=True)
     assert detailed["params"] == {"backend": "cpu"}
     assert detailed["trace"][0]["k"] == "provision.attempt"
+
+
+class _FakeManifest:
+    def __init__(self, state: str, end_reason: str | None) -> None:
+        self.status = _FakeState(state)
+        self.end_reason = end_reason
+
+
+class _FakeState:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+
+class _FakeStore:
+    """A minimal stand-in for `lab.store.JobStore` — proves `crossref`/`row` work against
+    anything shaped like a store, not a hard import of `JobStore` itself (the module-boundary
+    fix: `lab.events` takes an injected store rather than importing `lab.store`)."""
+
+    def __init__(self, manifests: dict[str, _FakeManifest]) -> None:
+        self._manifests = manifests
+
+    def read_manifest(self, job_id: str) -> _FakeManifest:
+        return self._manifests[job_id]  # KeyError on a miss, same as JobStore's file-not-found
+
+    def logs_path(self, job_id: str) -> str:
+        return f"runs/{job_id}/logs.txt"
+
+
+def test_crossref_resolves_manifest_state_and_logs_path() -> None:
+    (event,) = fold([_open("a"), _close("a", outcome="error", refs={"job_id": "j-1"})])
+    fake = _FakeStore({"j-1": _FakeManifest("failed", "timed out after 20m wall-clock cap")})
+    assert crossref(event, fake) == {
+        "manifest_state": "failed",
+        "manifest_end_reason": "timed out after 20m wall-clock cap",
+        "logs_path": "runs/j-1/logs.txt",
+    }
+
+
+def test_crossref_degrades_to_empty_on_a_missing_manifest() -> None:
+    """A job id in `refs` whose manifest is gone (cleaned-up runs/, or it never got that far)
+    must not raise — cross-referencing is best-effort, the forensic view still has everything
+    else in the row."""
+    (event,) = fold([_open("a"), _close("a", outcome="error", refs={"job_id": "j-missing"})])
+    assert crossref(event, _FakeStore({})) == {}
+
+
+def test_crossref_is_a_no_op_without_a_job_id() -> None:
+    (event,) = fold([_open("a"), _close("a", outcome="ok")])
+    assert crossref(event, _FakeStore({})) == {}
+
+
+def test_row_full_cross_references_when_a_store_is_supplied() -> None:
+    (event,) = fold([_open("a"), _close("a", outcome="error", refs={"job_id": "j-1"})])
+    fake = _FakeStore({"j-1": _FakeManifest("failed", "no capacity")})
+    brief = row(event, full=True)  # no store -> no crossref fields, no crash
+    assert "manifest_state" not in brief
+    detailed = row(event, full=True, job_store=fake)
+    assert detailed["manifest_state"] == "failed"
+    assert detailed["logs_path"] == "runs/j-1/logs.txt"

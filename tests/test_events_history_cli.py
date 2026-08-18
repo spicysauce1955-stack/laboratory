@@ -191,6 +191,39 @@ def test_report_out_to_an_unwritable_path_fails_cleanly() -> None:
     assert "nonexistent_dir_xyz" in result.stdout
 
 
+def test_history_full_cross_references_the_manifest_and_logs_path(tmp_path: Path) -> None:
+    """`--full`'s forensic view must resolve the failing call's job manifest and `logs.txt`
+    path — the spec: "Forensic adds the full `trace` and cross-references the manifest and the
+    `logs.txt` path for each `refs.job_id`, so the ledger is a jumping-off point rather than a
+    silo." Before this fix, nothing implemented it: `lab.report` printed the literal unresolved
+    template. Driven through a real subprocess (not `_invoke`) so `LAB_REPO_DIR` genuinely
+    governs which `runs/` the CLI reads — and so a `LAB_REPO_DIR`-shadows-cwd warning, if any,
+    lands on stderr, not mixed into the stdout this test parses as JSON."""
+    from helpers import make_manifest
+    from lab.models import JobState
+    from lab.store import JobStore
+
+    repo = tmp_path / "repo"
+    (repo / "runs").mkdir(parents=True)
+    manifest = make_manifest("j-1", "python x.py").model_copy(
+        update={"status": JobState.failed, "end_reason": "no capacity in europe-west1"}
+    )
+    JobStore(repo / "runs").create(manifest)
+
+    env = {**os.environ, "LAB_EVENTS_DIR": str(tmp_path / "events"), "LAB_REPO_DIR": str(repo)}
+    proc = subprocess.run(
+        [sys.executable, "-c", "from lab.cli import main; main()",
+         "history", "--all-projects", "--full"],
+        capture_output=True, text=True, env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    row_ = next(e for e in payload["events"] if e["id"] == "a")
+    assert row_["manifest_state"] == "failed"
+    assert row_["manifest_end_reason"] == "no capacity in europe-west1"
+    assert row_["logs_path"].endswith(str(Path("j-1") / "logs.txt"))
+
+
 def test_history_through_main_excludes_its_own_call(tmp_path: Path) -> None:
     """The `_invoke` helper above proves `_exclude_self` filters the currently-open call when
     driven straight through click's dispatch — but that bypasses `lab.cli.main`, the real

@@ -28,6 +28,7 @@ from lab.core import (
     validate_cloud,
 )
 from lab.env import load_lab_env
+from lab.events import store as events_store
 from lab.events.annotate import digest_of, refs_from
 from lab.events.sanitize import sanitize_argv
 from lab.manifest import git_work_tree, repo_root
@@ -46,6 +47,17 @@ app = typer.Typer(
     help="Laboratory — remote experiment runner (CLI mirror of the MCP tools, spec §9).",
     no_args_is_help=True,
 )
+
+# Commands that are long-lived servers, not one-shot calls: a client tears them down with
+# SIGTERM/SIGKILL, so `main()`'s post-dispatch close (see its docstring) never runs. Opening a
+# ledger call for one of these would leave a permanent dangling `open` every session — exempt
+# from compaction, so it accumulates until the 90-day cap, one per agent session, each counting
+# as a failure in `--stats`/`lab report`. `mcp` is the only case today; a second long-lived
+# command later is a one-line addition here, not a second special case in `_load_env`. (A
+# SIGTERM handler was considered instead — it does not cover SIGKILL, so not opening the call in
+# the first place is the fix.) The tool calls *inside* the server are still recorded — that's
+# `EventMiddleware`'s job in `mcp_server.py`, unaffected by this.
+_LONG_LIVED_COMMANDS = frozenset({"mcp"})
 
 
 def _version_callback(value: bool) -> None:
@@ -106,8 +118,12 @@ def _load_env(
     # own click fork under ``typer._click``, entirely disconnected from the top-level ``click``
     # package, so the latter's context stack is always empty here) is already resolved by the
     # time this callback runs: the group dispatches by name before invoking its own callback.
+    # Long-lived server commands (``_LONG_LIVED_COMMANDS``) never open a call at all — see that
+    # constant's docstring for why.
     if ctx is not None and ctx.invoked_subcommand:
-        events.begin("cli", _group_action(ctx), {"argv": sanitize_argv(sys.argv[1:])})
+        action = _group_action(ctx)
+        if action not in _LONG_LIVED_COMMANDS:
+            events.begin("cli", action, {"argv": sanitize_argv(sys.argv[1:])})
 
 
 def _warn_if_repo_override_shadows_cwd() -> None:
@@ -168,8 +184,11 @@ def _emit(obj: Any) -> None:
     """
     call = events.current()
     if call is not None:
-        call.ref(**refs_from(obj))
-        call.result(**digest_of(obj))
+        try:
+            call.ref(**refs_from(obj))
+            call.result(**digest_of(obj))
+        except Exception as e:  # noqa: BLE001 — annotating the ledger must never fail a command
+            events_store.debug(f"annotate failed: {e}")
     typer.echo(json.dumps(obj, indent=2, default=str))
 
 
@@ -527,7 +546,10 @@ def history(
     if stats:
         _emit(events.stats_dict(events.stats(found, since=cutoff)))
         return
-    _emit({"events": [events.row(e, full=full) for e in found]})
+    # Only built when needed: `--full`'s forensic view cross-references each row's job manifest
+    # and logs.txt path (spec: "the ledger is a jumping-off point rather than a silo").
+    job_store = JobStore(repo_root() / "runs") if full else None
+    _emit({"events": [events.row(e, full=full, job_store=job_store) for e in found]})
 
 
 def _exclude_self(found: list[events.Event]) -> list[events.Event]:

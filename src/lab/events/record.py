@@ -13,7 +13,7 @@ import uuid
 from collections import deque
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from datetime import datetime
 from typing import Any
 
@@ -86,6 +86,12 @@ class Call:
         self.notes: deque[dict[str, Any]] = deque(maxlen=RING)
         self._refs: dict[str, Any] = {}
         self._result: dict[str, Any] = {}
+        # Set by `begin()` right after `_current.set(call)`; `finish()` resets the ContextVar to
+        # this token rather than blindly clearing it, so a call that genuinely nests inside
+        # another (the MCP middleware's `record()` nested inside a hypothetical outer one, or
+        # two back-to-back `record()` blocks sharing a context) leaves the outer call current
+        # again once the inner one closes, instead of wiping it to `None`.
+        self._token: "Token[Call | None] | None" = None
 
     def ref(self, **ids: Any) -> None:
         self._refs.update({k: v for k, v in ids.items() if v is not None})
@@ -103,7 +109,7 @@ def begin(surface: str, action: str, params: Mapping[str, Any]) -> Call:
     global _seq, _pruned
     call = Call(_new_id(), now(), _seq)
     _seq += 1
-    _current.set(call)
+    call._token = _current.set(call)
     if not _pruned:
         _pruned = True
         store.maybe_prune(now=now())
@@ -147,7 +153,14 @@ def finish(
     if outcome != "ok" and call.notes:
         record_["trace"] = list(call.notes)
     store.append(record_, when=ended)
-    _current.set(None)
+    if call._token is not None:
+        try:
+            _current.reset(call._token)
+        except (RuntimeError, ValueError) as e:  # noqa: BLE001 — never fail a command
+            store.debug(f"context reset failed: {e}")
+            _current.set(None)
+    else:
+        _current.set(None)
 
 
 def finish_current(
@@ -160,13 +173,31 @@ def finish_current(
 
 
 @contextmanager
-def record(surface: str, action: str, params: Mapping[str, Any]) -> Iterator[Call]:
-    """Open a call, derive its outcome from how the block exits, close it. Re-raises unchanged."""
+def record(
+    surface: str,
+    action: str,
+    params: Mapping[str, Any],
+    *,
+    error_types: tuple[type[BaseException], ...] = (),
+) -> Iterator[Call]:
+    """Open a call, derive its outcome from how the block exits, close it. Re-raises unchanged.
+
+    ``error_types`` lets a caller designate an exception type that represents a *handled*
+    failure — e.g. the MCP middleware passing FastMCP's ``ToolError`` — so it's recorded as
+    ``outcome="error"`` instead of ``"crash"``, mirroring the CLI's own distinction between a
+    known ``_fail`` site and an unhandled traceback. This does not let a caller declare success
+    or pick an outcome for an arbitrary exception: only a pre-named type is ever reclassified,
+    everything else still derives to ``"crash"`` exactly as before — ``record()``'s
+    derive-don't-declare property holds either way.
+    """
     call = begin(surface, action, params)
     try:
         yield call
     except KeyboardInterrupt:
         finish(call, outcome="interrupted")
+        raise
+    except error_types as e:
+        finish(call, outcome="error", error=error_dict(e))
         raise
     except BaseException as e:  # noqa: BLE001 — every exit path must be recorded
         finish(call, outcome="crash", error=error_dict(e))

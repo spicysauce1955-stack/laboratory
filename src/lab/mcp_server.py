@@ -25,6 +25,7 @@ from lab import events
 from lab._util import now, parse_duration, wrap_with_extras
 from lab.core import Lab, LabError, default_lab, job_status_view, resolve_backend_profile
 from lab.env import load_lab_env
+from lab.events import store as events_store
 from lab.events.annotate import digest_of, refs_from
 from lab.manifest import repo_root
 from lab.models import JobManifest, JobSpec, ResourceRequest
@@ -69,7 +70,12 @@ def _exclude_self(found: list[events.Event]) -> list[events.Event]:
 
 
 class EventMiddleware(Middleware):
-    """Record every tool call in the ledger (one open/close pair), leaving results untouched."""
+    """Record every tool call in the ledger (one open/close pair), leaving results untouched.
+
+    A ``ToolError`` is a *handled* failure — the tool rejecting a bad input the same way a CLI
+    ``_fail`` site does — so it's recorded as ``outcome="error"``, matching the spec: "A
+    ``ToolError`` records ``outcome:"error"``; anything else propagating out records ``crash``."
+    """
 
     async def on_call_tool(
         self,
@@ -78,11 +84,15 @@ class EventMiddleware(Middleware):
     ) -> ToolResult:
         name = context.message.name
         arguments = context.message.arguments or {}
-        with events.record("mcp", name, dict(arguments)) as call:
+        with events.record("mcp", name, dict(arguments), error_types=(ToolError,)) as call:
             result = await call_next(context)
             payload = result.structured_content
-            call.ref(**refs_from(payload))
-            call.result(**digest_of(payload))
+            try:
+                call.ref(**refs_from(payload))
+                call.result(**digest_of(payload))
+            except Exception as e:  # noqa: BLE001 — annotating must never turn a success into
+                # a crash returned to the client for a tool call that actually succeeded.
+                events_store.debug(f"annotate failed: {e}")
             return result
 
 
@@ -600,7 +610,11 @@ def build_server(lab: Lab) -> FastMCP:
         )
         if stats:
             return events.stats_dict(events.stats(found, since=cutoff))
-        return {"events": [events.row(e, full=full) for e in found[:limit]]}
+        # Only built when needed: `full=True`'s forensic view cross-references each row's job
+        # manifest and logs.txt path (spec: "the ledger is a jumping-off point rather than a
+        # silo"). `store` is the same `JobStore(home)` every other tool in this server uses.
+        job_store = store if full else None
+        return {"events": [events.row(e, full=full, job_store=job_store) for e in found[:limit]]}
 
     @mcp.tool
     def report(since: str = "7d", all_projects: bool = False) -> dict[str, Any]:

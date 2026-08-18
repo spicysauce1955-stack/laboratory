@@ -67,6 +67,32 @@ def test_an_exception_records_a_crash_with_the_error_and_reraises() -> None:
     assert "test_events_record.py" in closed["error"]["where"]
 
 
+def test_a_designated_error_type_records_error_not_crash_and_reraises() -> None:
+    """The spec: "A ToolError records outcome:'error'; anything else propagating out records
+    crash." `record()` must let a caller designate a handled-exception type (what the MCP
+    middleware does for FastMCP's `ToolError`) without letting it *declare* success for an
+    arbitrary exception — only a pre-named type is ever reclassified, everything else still
+    falls to `crash`, preserving derive-don't-declare."""
+
+    class FakeToolError(Exception):
+        pass
+
+    with pytest.raises(FakeToolError):
+        with events.record("mcp", "status", {}, error_types=(FakeToolError,)):
+            raise FakeToolError("job 'j-nope' not found")
+    closed = _records()[1]
+    assert closed["outcome"] == "error"
+    assert closed["error"]["type"] == "FakeToolError"
+    assert "j-nope" in closed["error"]["message"]
+
+    # An exception NOT in error_types still falls through to "crash" — the designation doesn't
+    # widen into "any exception is now an error".
+    with pytest.raises(ValueError):
+        with events.record("mcp", "status", {}, error_types=(FakeToolError,)):
+            raise ValueError("unexpected")
+    assert _records()[3]["outcome"] == "crash"
+
+
 def test_keyboard_interrupt_records_interrupted() -> None:
     with pytest.raises(KeyboardInterrupt):
         with events.record("cli", "wait", {}):
@@ -108,6 +134,21 @@ def test_the_ring_buffer_is_bounded() -> None:
     assert trace[-1]["d"] == {"i": 499}  # the newest are the ones kept
 
 
+def test_finish_restores_the_outer_call_when_record_blocks_nest() -> None:
+    """`finish()` must reset the ContextVar to the token `begin()` captured, not blindly clear it
+    to `None`. With `lab mcp` shipped, the MCP middleware's `record()` genuinely nests inside
+    whatever the surrounding context already has current — harmless today only because FastMCP
+    happens to run each request in a copied context, a third-party implementation detail this
+    test does not rely on. Nesting two `record()` blocks directly here proves the outer call is
+    still current once the inner one closes, regardless of what runs them."""
+    with events.record("cli", "outer", {}) as outer:
+        assert events.current() is outer
+        with events.record("mcp", "inner", {}) as inner:
+            assert events.current() is inner
+        assert events.current() is outer
+    assert events.current() is None
+
+
 def test_ref_and_result_land_on_the_close_record() -> None:
     with events.record("cli", "submit", {}) as call:
         call.ref(job_id="j-4f2a")
@@ -143,9 +184,52 @@ def test_disabled_writes_nothing_and_still_yields_a_usable_call(
 
 def test_refs_from_pulls_known_ids_out_of_a_payload() -> None:
     assert refs_from({"job_id": "j-1", "irrelevant": 5}) == {"job_id": "j-1"}
-    assert refs_from({"sweep_id": "s-1", "jobs": [{"job_id": "j-1"}, {"job_id": "j-2"}]}) == {
-        "sweep_id": "s-1", "job_ids": ["j-1", "j-2"]}
     assert refs_from("not a mapping") == {}
+
+
+def test_refs_from_keeps_sweeps_job_ids_findable_by_job() -> None:
+    """`lab sweep` returns {sweep_id, count, job_ids:[str]} — a top-level list of job-id
+    strings. Before the fix these were lost entirely (refs only ever pulled `job_ids` out of a
+    nested list of job-*shaped dicts*, which a plain list of strings is not), so the call that
+    created the shards was not findable by `lab history --job <shard-id>`."""
+    payload = {"sweep_id": "s-1", "count": 2, "job_ids": ["j-1", "j-2"]}
+    assert refs_from(payload) == {"sweep_id": "s-1", "job_ids": ["j-1", "j-2"]}
+
+
+def test_refs_from_does_not_claim_every_job_from_a_listing_shaped_payload() -> None:
+    """`lab list` returns {jobs: [{job_id: ...}, ...]} — *every* job that exists, not every job
+    this call touched. The old nested-dict harvest walked any list of job-shaped dicts and
+    claimed them all as refs, so a call that touched nothing matched every job in the store —
+    bloating records and producing false positives in `lab history --job <id>`."""
+    payload = {"jobs": [{"job_id": "j-1"}, {"job_id": "j-2"}, {"job_id": "j-3"}]}
+    assert refs_from(payload) == {}
+
+
+def test_refs_from_maps_confirms_orig_and_confirm_id_onto_job_ids() -> None:
+    """`lab confirm` returns {orig_id, confirm_id, verdict}. Both ids are themselves job ids (a
+    confirm run submits `confirm_id` as a real job re-deriving `orig_id`) — not a separate id
+    namespace — so mapping them onto `job_ids` makes a confirm call findable by `--job
+    <orig_id>` or `--job <confirm_id>`, closing the "empty refs" hole the guide used to document
+    as a known gap."""
+    payload = {"orig_id": "j-1", "confirm_id": "j-2", "verdict": "match"}
+    assert refs_from(payload) == {"job_ids": ["j-1", "j-2"]}
+
+
+def test_id_keys_has_no_dead_entries() -> None:
+    """`run_id` used to sit in `_ID_KEYS` even though no shipped call site ever populates it —
+    a dead entry the guide had to call out as a known gap. Every key `refs_from` looks for by
+    name must be one some real payload actually uses."""
+    from lab.events.annotate import _ID_KEYS
+
+    assert "run_id" not in _ID_KEYS
+
+
+def test_refs_from_caps_job_ids_with_a_truncation_marker() -> None:
+    ids = [f"j-{i}" for i in range(100)]
+    refs = refs_from({"job_ids": ids})
+    assert len(refs["job_ids"]) == 65  # 64 kept + one marker
+    assert refs["job_ids"][:64] == ids[:64]
+    assert refs["job_ids"][64] == "…36 more"
 
 
 def test_digest_of_keeps_a_small_summary_not_the_payload() -> None:

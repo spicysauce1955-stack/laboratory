@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -120,6 +122,26 @@ def test_emit_annotates_the_call_with_refs_and_a_digest(
     assert closed["result"] == {"state": "succeeded", "cost_usd": 1.25}
 
 
+def test_emit_survives_a_broken_refs_from_without_turning_success_into_a_crash(
+    monkeypatch: pytest.MonkeyPatch, _events_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`refs_from`/`digest_of` run inside the open `record()` block, so an unguarded raise there
+    would finish the call as `crash` for a command that actually succeeded — the one thing the
+    design says must never happen. Break `refs_from` deliberately and prove `_emit` still prints
+    the real payload and the call still records `ok`."""
+    from lab import cli, events
+
+    def _boom(payload: object) -> dict[str, object]:
+        raise RuntimeError("refs_from is broken")
+
+    monkeypatch.setattr(cli, "refs_from", _boom)
+    with events.record("cli", "submit", {}):
+        cli._emit({"job_id": "j-4f2a", "state": "succeeded"})
+    closed = _folded(_events_dir)[1]
+    assert closed["outcome"] == "ok"
+    assert '"job_id": "j-4f2a"' in capsys.readouterr().out  # the real payload still printed
+
+
 def test_a_keyboard_interrupt_during_a_command_is_recorded_as_interrupted(
     _sandbox_app, _events_dir: Path
 ) -> None:
@@ -190,6 +212,43 @@ def test_wait_style_exit_codes_3_and_4_propagate_through_main(
     assert closed4["outcome"] == "error"
     assert closed4["exit_code"] == 4
     assert closed4["error"]["message"] == "simulated fail-fast"
+
+
+def test_load_env_does_not_open_a_ledger_call_for_the_mcp_command(_events_dir: Path) -> None:
+    """`lab mcp` is a long-lived server; a client kills it with SIGTERM/SIGKILL, so `main()`'s
+    post-dispatch close (see its docstring) never runs. Before this fix, `_load_env` opened a
+    ledger call for every command including `mcp`, so a killed server left a permanent dangling
+    `open` every session — dangling opens are exempt from compaction, so one accumulates per
+    agent session until the 90-day cap, and each counts as a failure in `--stats`/`lab report`.
+    `mcp` must never open a call in the first place, so there is nothing to leave dangling."""
+    from lab import cli, events
+
+    class _FakeCtx:
+        invoked_subcommand = "mcp"
+
+    cli._load_env(ctx=_FakeCtx())  # type: ignore[arg-type]
+    assert events.current() is None
+    assert _folded(_events_dir) == []
+
+
+def test_a_killed_mcp_process_leaves_no_dangling_open(_events_dir: Path) -> None:
+    """End-to-end version of the unit test above: actually launch `lab mcp` as a real process,
+    SIGKILL it (the same way an MCP client tears down its server, and the one signal a
+    SIGTERM handler could never catch), and check the ledger it left behind."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "from lab.cli import main; main()", "mcp"],
+        env={**os.environ, "LAB_EVENTS_DIR": str(_events_dir)},
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        # Give the interpreter time to start, import, and reach `_load_env` (which is where the
+        # bug's `events.begin` call lived) before it blocks forever on stdio.
+        time.sleep(1.5)
+        assert proc.poll() is None, "the mcp server exited before it could be killed"
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+    assert _folded(_events_dir) == []
 
 
 def test_queue_and_scheduler_subcommands_record_the_leaf_action(

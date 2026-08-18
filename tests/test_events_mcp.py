@@ -51,7 +51,7 @@ def test_a_tool_call_records_an_open_close_pair(tmp_path: Path) -> None:
     assert closed["outcome"] == "ok"
 
 
-def test_a_tool_error_records_a_crash_with_the_offending_job_id(tmp_path: Path) -> None:
+def test_a_tool_error_records_an_error_with_the_offending_job_id(tmp_path: Path) -> None:
     _, server = _make(tmp_path)
 
     async def go() -> None:
@@ -63,11 +63,43 @@ def test_a_tool_error_records_a_crash_with_the_offending_job_id(tmp_path: Path) 
     opened, closed = _records()
     assert opened["surface"] == "mcp" and opened["action"] == "status"
     assert opened["params"] == {"job_id": "j-nope"}
-    # A ToolError raised by the tool propagates through record() unrelabeled: the middleware
-    # does not choose "error" for a raised exception, it reports what actually happened.
-    assert closed["outcome"] == "crash"
+    # The spec is explicit: "A ToolError records outcome:"error"; anything else propagating out
+    # records crash." A ToolError is the tool *handling* a bad input (job not found) the same
+    # way the CLI's own `_fail` sites do — it must read as "error", the same bucket `lab status
+    # j-nope` lands in over the CLI, not "crash", which is reserved for the lab having a bug.
+    # Without this distinction, history/stats can't tell "caller asked for something that
+    # doesn't exist" apart from "the lab crashed" — and on MCP, the surface the agent actually
+    # uses, "error" was never emitted at all.
+    assert closed["outcome"] == "error"
     assert closed["error"]["type"] == "ToolError"
     assert "j-nope" in closed["error"]["message"]
+
+
+def test_a_broken_refs_from_never_turns_a_successful_tool_call_into_a_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`refs_from`/`digest_of` run inside the middleware's open `record()` block, so an
+    unguarded raise there would finish the call as `crash` *and* hand the client a `ToolError`
+    for a tool call that actually succeeded — the one thing the design says must never happen.
+    Break `refs_from` deliberately and prove a real tool call still returns its data and the
+    ledger still records `ok`."""
+    import lab.mcp_server as mcp_server_module
+
+    def _boom(payload: object) -> dict[str, object]:
+        raise RuntimeError("refs_from is broken")
+
+    monkeypatch.setattr(mcp_server_module, "refs_from", _boom)
+    _, server = _make(tmp_path)
+
+    async def go() -> dict:
+        async with Client(server) as client:
+            result = await client.call_tool("list", {})
+            return result.data
+
+    data = asyncio.run(go())
+    assert data == {"jobs": []}  # the tool's real result, not swallowed by the broken annotator
+    _, closed = _records()
+    assert closed["outcome"] == "ok"
 
 
 def test_a_successful_call_records_real_refs_and_a_result_digest(tmp_path: Path) -> None:
@@ -268,6 +300,34 @@ def test_history_tool_full_includes_the_trace(tmp_path: Path) -> None:
     data = asyncio.run(go())
     assert data["events"][0]["id"] == "seed-a"
     assert data["events"][0]["trace"][0]["k"] == "provision.attempt"
+
+
+def test_history_tool_full_cross_references_the_manifest_and_logs_path(tmp_path: Path) -> None:
+    """`full=True`'s forensic view must resolve the failing call's job manifest and `logs.txt`
+    path (spec: "the ledger is a jumping-off point rather than a silo"), using the exact same
+    `JobStore` this server already builds for every other tool — proving the CLI and MCP shells
+    stay identical rather than each growing its own copy of the cross-reference logic."""
+    from helpers import make_manifest
+    from lab.models import JobState
+    from lab.store import JobStore
+
+    lab, server = _make(tmp_path)
+    _seed_failure_with_trace()  # id "seed-a", refs={"job_id": "j-1"}
+    manifest = make_manifest("j-1", "python x.py").model_copy(
+        update={"status": JobState.failed, "end_reason": "no capacity"}
+    )
+    JobStore(lab.home).create(manifest)
+
+    async def go() -> dict:
+        async with Client(server) as client:
+            result = await client.call_tool("history", {"all_projects": True, "full": True})
+            return result.data
+
+    data = asyncio.run(go())
+    row_ = next(e for e in data["events"] if e["id"] == "seed-a")
+    assert row_["manifest_state"] == "failed"
+    assert row_["manifest_end_reason"] == "no capacity"
+    assert row_["logs_path"].endswith("j-1/logs.txt")
 
 
 def test_history_tool_filters_by_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

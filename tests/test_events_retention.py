@@ -53,6 +53,29 @@ def test_compaction_keeps_dangling_opens_regardless_of_age(_events_dir: Path) ->
     assert {r["id"] for r in store.iter_records(store.day_files())} == {"hung"}
 
 
+def test_compaction_recognizes_a_success_whose_close_landed_in_the_next_days_file(
+    _events_dir: Path,
+) -> None:
+    """A call that straddles UTC midnight: `open` in day N, `close` in day N+1 — any supervisor
+    run of more than a few hours, or an overnight scheduled job. Both days are old enough to be
+    eligible for compaction, so the bug isn't masked by day N+1 being too recent to touch.
+
+    The pre-fix `compact()` computed its `succeeded` id set per day file: day N's file has no
+    close to prove success, so its `open` survived; day N+1's close was dropped as a lone
+    success with no open to pair it with in that file. The `open` becomes a permanent
+    `running-or-died` phantom. Reproduced exactly as the reviewer described it:
+    ``before: [('A','ok',False)] -> after: [('A','running-or-died',True)]``."""
+    day_n = NOW - timedelta(days=30)
+    day_n_plus_1 = day_n + timedelta(days=1)
+    store.append({"id": "A", "phase": "open", "action": "submit"}, when=day_n)
+    store.append({"id": "A", "phase": "close", "outcome": "ok"}, when=day_n_plus_1)
+
+    store.compact(now=NOW, success_ttl_days=14)
+
+    ids = {r["id"] for r in store.iter_records(store.day_files())}
+    assert "A" not in ids, "a genuinely successful call must not survive as a phantom open"
+
+
 def test_age_cap_deletes_whole_day_files(_events_dir: Path) -> None:
     _write(NOW - timedelta(days=200), *_pair("ancient", "error"))
     _write(NOW - timedelta(days=2), *_pair("recent", "error"))
