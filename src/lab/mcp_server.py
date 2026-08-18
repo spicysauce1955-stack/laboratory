@@ -17,10 +17,15 @@ from typing import Any
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
+from fastmcp.tools import ToolResult
+from mcp.types import CallToolRequestParams
 
+from lab import events
 from lab._util import parse_duration, wrap_with_extras
 from lab.core import Lab, LabError, default_lab, job_status_view, resolve_backend_profile
 from lab.env import load_lab_env
+from lab.events.annotate import digest_of, refs_from
 from lab.manifest import repo_root
 from lab.models import JobManifest, JobSpec, ResourceRequest
 from lab.store import JobStore
@@ -30,8 +35,27 @@ def _iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt else None
 
 
+class EventMiddleware(Middleware):
+    """Record every tool call in the ledger (one open/close pair), leaving results untouched."""
+
+    async def on_call_tool(
+        self,
+        context: MiddlewareContext[CallToolRequestParams],
+        call_next: CallNext[CallToolRequestParams, ToolResult],
+    ) -> ToolResult:
+        name = context.message.name
+        arguments = context.message.arguments or {}
+        with events.record("mcp", name, dict(arguments)) as call:
+            result = await call_next(context)
+            payload = result.structured_content
+            call.ref(**refs_from(payload))
+            call.result(**digest_of(payload))
+            return result
+
+
 def build_server(lab: Lab) -> FastMCP:
     mcp: FastMCP = FastMCP("laboratory")
+    mcp.add_middleware(EventMiddleware())
     home = lab.home
     store = JobStore(home)
 
