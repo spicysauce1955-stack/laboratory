@@ -515,6 +515,7 @@ def history(
 
     This is *not* `lab logs`, which tails one job's stdout.
     """
+    cutoff = _since_cutoff(since)
     project = None if all_projects else repo_root().name
     found = events.read(
         since=since, project=project, action=action, session=session, job=job,
@@ -524,7 +525,7 @@ def history(
     if not stats:
         found = found[:limit]
     if stats:
-        _emit(events.stats_dict(events.stats(found)))
+        _emit(events.stats_dict(events.stats(found, since=cutoff)))
         return
     _emit({"events": [events.row(e, full=full) for e in found]})
 
@@ -543,6 +544,26 @@ def _exclude_self(found: list[events.Event]) -> list[events.Event]:
     return [e for e in found if e.id != current.id]
 
 
+def _since_cutoff(since: str | None) -> datetime | None:
+    """Validate ``--since`` and turn it into the cutoff datetime the display layer wants.
+
+    ``events.read`` calls ``parse_duration`` internally with no guard, so a bad duration string
+    (``--since garbage``) propagated a raw ``ValueError`` all the way out as an unhandled
+    traceback — the same class of input ``wait``'s ``--timeout`` already guards (see below).
+    Validating here, before ``events.read`` ever runs, produces a real ``BadParameter`` message
+    instead. The returned cutoff is reused by both commands so what they display as the window
+    (``report``'s markdown header, ``history --stats``'s ``since`` field) reflects what was
+    actually applied rather than always reading as unfiltered.
+    """
+    if since is None:
+        return None
+    try:
+        seconds = parse_duration(since)
+    except ValueError as e:
+        raise typer.BadParameter(f"bad --since {since!r}: {e}") from e
+    return now() - timedelta(seconds=seconds) if seconds is not None else None
+
+
 @app.command()
 def report(
     since: str = typer.Option("7d", "--since", help="window, e.g. 7d"),
@@ -550,16 +571,17 @@ def report(
     out: str | None = typer.Option(None, "--out", help="write to this file instead of stdout"),
 ) -> None:
     """A pasteable markdown digest of what failed and what it cost (field-report shaped)."""
+    cutoff = _since_cutoff(since)
     project = None if all_projects else repo_root().name
     found = _exclude_self(events.read(since=since, project=project))
-    # `events.read` already applied `since` to filter `found` — this re-derives the same cutoff
-    # only so the report's own header ("since <cutoff>" vs "all recorded history") reflects the
-    # window that was actually applied, instead of always claiming the latter.
-    window_seconds = parse_duration(since) if since else None
-    cutoff = now() - timedelta(seconds=window_seconds) if window_seconds is not None else None
     text = events.report(found, since=cutoff)
     if out:
-        Path(out).write_text(text)
+        try:
+            Path(out).write_text(text)
+        except OSError as e:
+            msg = f"lab report --out {out!r}: could not write file ({e})"
+            _emit({"error": msg})
+            _fail(1, msg)
         _emit({"written": out})
         return
     typer.echo(text)

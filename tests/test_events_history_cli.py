@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -69,7 +72,10 @@ def test_history_full_includes_the_trace() -> None:
     assert full["events"][0]["trace"][0]["k"] == "provision.attempt"
 
 
-def test_history_filters_by_job_and_failures() -> None:
+def test_history_filters_by_job() -> None:
+    """Renamed from the brief's `..._and_failures`: this test only ever exercised `--job` (the
+    dedicated `--failures` proof lives in `test_history_failures_flag_excludes_successful_calls`
+    below); the old name claimed coverage the test didn't have."""
     out = json.loads(_invoke("history", "--all-projects", "--job", "j-1").stdout)
     assert len(out["events"]) == 1
     empty = json.loads(_invoke("history", "--all-projects", "--job", "j-2").stdout)
@@ -146,3 +152,60 @@ def test_history_failures_flag_excludes_successful_calls() -> None:
         _invoke("history", "--all-projects", "--failures").stdout
     )
     assert {e["id"] for e in only_failed["events"]} == {"a"}
+
+
+def test_history_stats_since_reflects_the_applied_window() -> None:
+    """`--stats`'s `since` field used to always read `null`, even when `--since` genuinely
+    filtered the rows (`events.stats()` was called with no `since=` kwarg) — the sibling bug to
+    the one fixed in `report`'s markdown header. `NOW` is fixed at 2026-08-18T12:00Z; the fixture
+    events are stamped there, so `--since 1000d` keeps them in range while giving a
+    deterministic, checkable cutoff."""
+    out = json.loads(_invoke("history", "--all-projects", "--since", "1000d", "--stats").stdout)
+    assert out["since"] is not None
+    assert out["failures"] == 1  # the window still holds the fixture's one failure
+
+
+def test_history_since_garbage_is_a_clean_usage_error_not_a_crash() -> None:
+    """`events.read` calls `parse_duration` with no guard — an unparsable `--since` used to
+    propagate a raw `ValueError` out as an unhandled traceback (exit 1, ``crash`` in the ledger).
+    `wait`'s `--timeout` already turns the same `parse_duration` `ValueError` into a
+    `typer.BadParameter`; `--since` must do the same, landing as a normal exit-2 usage error."""
+    result = _invoke("history", "--all-projects", "--since", "garbage")
+    assert result.exit_code == 2
+    assert "garbage" in result.output
+
+
+def test_report_since_garbage_is_a_clean_usage_error_not_a_crash() -> None:
+    result = _invoke("report", "--all-projects", "--since", "garbage")
+    assert result.exit_code == 2
+    assert "garbage" in result.output
+
+
+def test_report_out_to_an_unwritable_path_fails_cleanly() -> None:
+    """`Path(out).write_text(text)` was unguarded — a bad `--out` directory raised a raw
+    `OSError` straight through as an unhandled traceback (exit 1, ``crash``). It must instead
+    exit 1 through `_fail`, with the path and the reason in a message the user can read, and
+    land in the ledger as a real, named cause rather than a generic crash."""
+    result = _invoke("report", "--all-projects", "--out", "/nonexistent_dir_xyz/report.md")
+    assert result.exit_code == 1
+    assert "nonexistent_dir_xyz" in result.stdout
+
+
+def test_history_through_main_excludes_its_own_call(tmp_path: Path) -> None:
+    """The `_invoke` helper above proves `_exclude_self` filters the currently-open call when
+    driven straight through click's dispatch — but that bypasses `lab.cli.main`, the real
+    console-script entry point that actually performs the close (`_invoke`'s own docstring
+    explains why). This drives `lab history` through a real subprocess running `main()`, the way
+    a person or an agent actually invokes it, and checks the same thing the task's manual
+    verification checked by hand: the command never lists itself as `running-or-died`."""
+    env = {**os.environ, "LAB_EVENTS_DIR": str(tmp_path / "events")}
+    proc = subprocess.run(
+        [sys.executable, "-c", "from lab.cli import main; main()", "history", "--all-projects"],
+        capture_output=True, text=True, env=env,
+    )
+    assert proc.returncode == 0
+    payload = json.loads(proc.stdout)
+    assert not any(
+        e["action"] == "history" and e["status"] == "running-or-died"
+        for e in payload["events"]
+    )
