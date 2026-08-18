@@ -15,9 +15,10 @@ from lab.events.record import (
     note,
     record,
 )
+from lab.events.stats import signature, stats, stats_dict
 
 __all__ = [
     "ActionStat", "Call", "Event", "Note", "SignatureStat", "StatsView",
     "begin", "current", "error_dict", "finish", "finish_current", "fold", "note", "read",
-    "record", "row",
+    "record", "row", "signature", "stats", "stats_dict",
 ]
