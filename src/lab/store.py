@@ -114,6 +114,7 @@ class JobStore:
         """
         import shlex
 
+        from lab import events
         from lab.experiment import parse_overrides, read_effective_config
 
         try:
@@ -133,6 +134,7 @@ class JobStore:
             update={"config_effective": eff, "unconsumed_config": unconsumed}
         )
         if flip and unconsumed and not updated.run.allow_unknown_config:
+            events.note("core.config_rejected", unknown=unconsumed)
             reason = (
                 f"unconsumed config keys: {unconsumed} — the entrypoint never consumed them "
                 "(fix the key/script, or pass allow_unknown_config to override)"

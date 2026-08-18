@@ -41,6 +41,15 @@ def _session_id() -> str:
     return _session
 
 
+def session_id() -> str:
+    """Public accessor for this process's effective session id (see ``_session_id``).
+
+    Lets a child process (e.g. the SkyPilot supervisor, spawned detached) inherit the exact
+    session its submitter resolved — including a per-process *generated* id, which a plain
+    environment inheritance would miss since it never existed as a real env var."""
+    return _session_id()
+
+
 def _new_id() -> str:
     """Time-ordered id: millisecond timestamp + randomness, sortable, needs no coordination."""
     return f"{int(now().timestamp() * 1000):013d}{secrets.token_hex(4)}"

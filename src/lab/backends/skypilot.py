@@ -951,6 +951,10 @@ def provision_with_watchdog(sky_mod: Any, request_id: Any, *, timeout_s: float) 
             sky_mod.api_cancel(request_id)  # best-effort abort; robust_teardown kills the host
         except Exception as e:  # noqa: BLE001
             print(f"[lab] api_cancel after provision timeout failed: {e}")
+        # No `cloud` field: this function's signature carries no cloud (only its caller in
+        # sky_runner.py does), and threading one through would be a real signature change rather
+        # than a note added at an existing decision point. Deliberate omission, not an oversight
+        # — the paired `provision.attempt` note (sky_runner.py) does carry it.
         events.note("provision.timeout", after_s=timeout_s)
         raise ProvisionTimeout(f"provisioning did not complete within {timeout_s:.0f}s")
 
@@ -1094,12 +1098,18 @@ class SkyPilotBackend:
         job_dir.mkdir(parents=True, exist_ok=True)
         # Supervisor's stdout/stderr (incl. sky.launch streamed logs) -> the job log file (FR-D1).
         logf = self.store.logs_path(manifest.job_id).open("w")
+        # Group the supervisor's own ledger call into this submit's session, even when
+        # LAB_SESSION_ID was never a real env var (the common case: this process generated one
+        # in memory) — plain env inheritance would miss that. job_id stays the join key either
+        # way (see run_job's events.begin call).
+        child_env = {**os.environ, "LAB_SESSION_ID": events.session_id()}
         proc = subprocess.Popen(
             [sys.executable, "-m", "lab.sky_runner", str(job_dir)],
             stdout=logf,
             stderr=subprocess.STDOUT,
             cwd=str(self.repo),
             start_new_session=True,
+            env=child_env,
         )
         self.store.write_runtime(
             manifest.job_id, runner_pid=proc.pid, cluster=cluster_name_for(manifest.job_id)

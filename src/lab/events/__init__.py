@@ -14,6 +14,7 @@ from lab.events.record import (
     finish_current,
     note,
     record,
+    session_id,
 )
 from lab.events.report import report, report_dict
 from lab.events.stats import signature, stats, stats_dict
@@ -21,5 +22,5 @@ from lab.events.stats import signature, stats, stats_dict
 __all__ = [
     "ActionStat", "Call", "Event", "Note", "SignatureStat", "StatsView",
     "begin", "current", "error_dict", "finish", "finish_current", "fold", "note", "read",
-    "record", "report", "report_dict", "row", "signature", "stats", "stats_dict",
+    "record", "report", "report_dict", "row", "session_id", "signature", "stats", "stats_dict",
 ]

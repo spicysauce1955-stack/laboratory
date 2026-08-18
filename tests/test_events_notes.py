@@ -9,26 +9,30 @@ the site, then raises to force the flush.
 
 from __future__ import annotations
 
+import json
 import subprocess
+import sys
 import time as _time
 import types
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from helpers import PYTHON, wait_terminal
+from helpers import PYTHON, make_manifest, wait_terminal
 from test_scheduler_tick import T0, FakeClock, make_sched, put_reg
 
 import lab.backends.skypilot as SKY
 import lab.core as core_mod
 import lab.doctor as D
+import lab.sky_runner as runner_mod
 from lab import events, placement
 from lab.backends.local import LocalBackend
 from lab.core import Lab
 from lab.events import store
 from lab.manifest import repo_root
-from lab.models import JobSpec, JobState, ResourceRequest
+from lab.models import JobSpec, JobState, ResourceRequest, RunSpec
 from lab.scheduler.models import Triggers
+from lab.store import JobStore
 
 
 @pytest.fixture(autouse=True)
@@ -38,9 +42,12 @@ def _events_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path / "events"
 
 
+def _last_close() -> dict:
+    return [r for r in store.iter_records(store.day_files()) if r["phase"] == "close"][-1]
+
+
 def _trace_kinds() -> list[str]:
-    close = [r for r in store.iter_records(store.day_files()) if r["phase"] == "close"][-1]
-    return [n["k"] for n in close.get("trace", [])]
+    return [n["k"] for n in _last_close().get("trace", [])]
 
 
 # --------------------------------------------------------------------------------------------
@@ -62,8 +69,7 @@ def test_placement_note_also_notes() -> None:
 def test_a_note_never_escapes_into_a_successful_record() -> None:
     with events.record("cli", "submit", {}):
         placement._note("harmless")
-    close = [r for r in store.iter_records(store.day_files()) if r["phase"] == "close"][-1]
-    assert "trace" not in close
+    assert "trace" not in _last_close()
 
 
 def _fake_placement_catalog() -> types.SimpleNamespace:
@@ -338,3 +344,161 @@ def test_scheduler_trigger_blocked_also_notes(tmp_path: Path) -> None:
             sched.tick()
             raise RuntimeError("boom")
     assert "scheduler.trigger" in _trace_kinds()
+
+
+# --------------------------------------------------------------------------------------------
+# Fix round 1: the supervisor's own ledger record (sky_runner.py), and store.py's
+# core.config_rejected.
+#
+# Round 1 hooked provisioning/teardown notes assuming they'd run inside a CLI/MCP call that
+# already had an open ledger record. They don't: `SkyPilotBackend.submit()` spawns
+# `python -m lab.sky_runner <job_dir>` as a *detached* subprocess (its own process, no inherited
+# contextvar), so `events.note(...)` there returned immediately every time — dead code on the
+# supervisor's own provisioning/teardown path, while the identical notes fired for real from the
+# scheduler tick and the cancel path (which do run inside a call). `run_job` now opens its own
+# `events.begin("supervisor", "run", ...)` record, so these tests drive `run_job` directly
+# (exactly as `test_runner_adopt.py`/`test_sky_launch_retry.py` already do, hermetically, no
+# cloud) and check the ledger, not just the return code.
+# --------------------------------------------------------------------------------------------
+
+
+def test_supervisor_success_opens_with_job_id_ref_and_no_trace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact scenario the fix targets: a note fires deep inside the supervisor (were one to
+    fire here) must land on a call the supervisor itself opened, not vanish into an unopened
+    context. On a clean run there's nothing to explain, so the trace is absent either way — but
+    the call must still be there, closed, with the job_id ref `lab history --job` needs."""
+    home = tmp_path / "runs"
+    jstore = JobStore(home)
+    m = make_manifest("sup-ok", "python x.py", timeout="1h").model_copy(
+        update={
+            "status": JobState.running,
+            "cost": None,
+        }
+    )
+    jstore.create(m)
+    jstore.write_runtime("sup-ok", runner_pid=1, cluster="lab-sup-ok")
+
+    fake_sky = types.ModuleType("sky")
+    monkeypatch.setitem(sys.modules, "sky", fake_sky)
+    monkeypatch.setattr(fake_sky, "launch", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(
+        runner_mod, "_wait_terminal", lambda *a, **k: (JobState.succeeded, True)
+    )
+    monkeypatch.setattr(runner_mod, "_rsync_down", lambda *a, **k: None)
+    monkeypatch.setattr(runner_mod, "tear_down_and_record", lambda *a, **k: True)
+    monkeypatch.setattr(runner_mod, "vast_hourly_for_cluster", lambda c: None)
+
+    from lab.backends.skypilot import SUCCESS_SENTINEL
+
+    output = jstore.output_dir("sup-ok")
+    output.mkdir(parents=True, exist_ok=True)
+    (output / SUCCESS_SENTINEL).write_text("1")
+
+    rc = runner_mod.run_job(home / "sup-ok", adopt=True)
+    assert rc == 0
+
+    close = _last_close()
+    assert close["outcome"] == "ok"
+    assert close["refs"].get("job_id") == "sup-ok"
+    assert "trace" not in close
+
+
+def test_supervisor_transient_launch_failure_notes_reach_the_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bug being fixed, proven directly: a `launch.retry` note fired from inside the
+    detached supervisor must actually reach the flushed trace, not silently no-op because no
+    call was open. Mirrors test_sky_launch_retry.py's transient-exhaustion fixture."""
+    home = tmp_path / "runs"
+    jstore = JobStore(home)
+    m = make_manifest("sup-retry", "python x.py", timeout="10m")
+    jstore.create(m)
+
+    field_report_error = RuntimeError(
+        "HTTPConnectionPool(host='127.0.0.1', port=46580): Max retries exceeded with url: "
+        "/api/stream?x (Caused by NewConnectionError: Failed to establish a new connection: "
+        "[Errno 111] Connection refused)"
+    )
+    fake_sky = types.ModuleType("sky")
+    monkeypatch.setitem(sys.modules, "sky", fake_sky)
+
+    def _launch(*a: object, **k: object) -> None:
+        raise field_report_error
+
+    monkeypatch.setattr(fake_sky, "launch", _launch, raising=False)
+    monkeypatch.setattr(runner_mod, "build_task", lambda *a, **k: "task")
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(runner_mod, "tear_down_and_record", lambda *a, **k: True)
+
+    rc = runner_mod.run_job(home / "sup-retry")
+    assert rc == 1
+
+    close = _last_close()
+    assert close["outcome"] != "ok"  # trace only flushes on non-"ok" (design, see record())
+    assert close["refs"].get("job_id") == "sup-retry"
+    assert "launch.retry" in _trace_kinds()
+
+
+def test_supervisor_provision_timeout_also_notes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drives `provision.attempt` + `provision.timeout` through the real `run_job` call site,
+    not the isolated `provision_with_watchdog` unit (already covered pre-fix)."""
+    home = tmp_path / "runs"
+    jstore = JobStore(home)
+    m = make_manifest(
+        "sup-timeout", "python x.py", resources=ResourceRequest(provision_timeout="0.05")
+    )
+    jstore.create(m)
+
+    fake_sky = types.ModuleType("sky")
+
+    def _stream_and_get(request_id: object) -> tuple:
+        _time.sleep(1.0)  # never finishes before the 0.05s watchdog
+        return (1, "handle")
+
+    monkeypatch.setattr(fake_sky, "stream_and_get", _stream_and_get, raising=False)
+    monkeypatch.setattr(fake_sky, "api_cancel", lambda rid: None, raising=False)
+    monkeypatch.setitem(sys.modules, "sky", fake_sky)
+    monkeypatch.setattr(runner_mod, "build_task", lambda *a, **k: "task")
+    monkeypatch.setattr(runner_mod, "_launch_with_retry", lambda *a, **k: "req-1")
+    monkeypatch.setattr(runner_mod, "tear_down_and_record", lambda *a, **k: True)
+
+    rc = runner_mod.run_job(home / "sup-timeout")
+    assert rc == 1
+
+    kinds = _trace_kinds()
+    assert "provision.attempt" in kinds
+    assert "provision.timeout" in kinds
+
+
+# --------------------------------------------------------------------------------------------
+# store.py — core.config_rejected
+# --------------------------------------------------------------------------------------------
+
+
+def test_config_rejected_also_notes(tmp_path: Path) -> None:
+    """Drives `JobStore._audit_effective_config`'s flip-to-failed branch (field-report #1):
+    an argv override the entrypoint's `effective_config.json` never consumed."""
+    jstore = JobStore(tmp_path)
+    command = "python x.py typo_key=2"
+    manifest = make_manifest("cfg1", command).model_copy(
+        update={
+            "run": RunSpec(
+                entrypoint_command=command, resolved_config={"typo_key": "2"}, seed=0
+            ),
+            "status": JobState.running,
+        }
+    )
+    jstore.create(manifest)
+    (jstore.output_dir("cfg1") / "effective_config.json").write_text(json.dumps({}))
+
+    with pytest.raises(RuntimeError):
+        with events.record("cli", "wait", {}):
+            updated = jstore.update_manifest("cfg1", status=JobState.succeeded)
+            assert updated.status is JobState.failed
+            assert updated.unconsumed_config == ["typo_key"]
+            raise RuntimeError("boom")
+    assert "core.config_rejected" in _trace_kinds()

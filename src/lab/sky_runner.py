@@ -16,6 +16,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from lab import events
 from lab._util import actual_cost, duration_seconds, now, parse_duration, timeout_reason
 from lab.backends.skypilot import (
     DEFAULT_AUTOSTOP_MIN,
@@ -333,6 +334,9 @@ def _launch_with_retry(
                     f"[lab] transient launch error (attempt {attempt + 1}/{attempts}), "
                     f"retrying in {delay:.1f}s: {e}"
                 )
+                events.note(
+                    "launch.retry", attempt=attempt + 1, backoff_s=delay, error=str(e)
+                )
                 sleep(delay)
     raise TransientLaunchError(
         f"local SkyPilot API unreachable after {attempts} attempts: {last}"
@@ -450,240 +454,269 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
     cluster = cluster_name_for(job_id)
     cloud = manifest.resources.cloud or "vast"
 
-    if not adopt:
-        started = now()
-        store.update_manifest(job_id, status=JobState.running, started_at=started)
-    else:
-        started = manifest.started_at or now()
-        print(f"[lab] adopting running cluster {cluster} (supervisor restart)")
+    call = events.begin(
+        "supervisor",
+        "run",
+        {"job_id": job_id, "cloud": cloud, "cluster": cluster, "adopt": adopt},
+    )
+    call.ref(job_id=job_id)
 
-    import sky
-
-    # provision_s is only set in the non-adopt branch (ProvisionTimeout can only be raised
-    # from sky.launch / provision_with_watchdog, which are also non-adopt only).  Initialise
-    # to 0.0 so the except-ProvisionTimeout error message below is always bound.
-    provision_s: float = 0.0
-
-    try:
+    def _impl() -> int:
         if not adopt:
-            memo = CapacityMemo.for_home(store.home)
-            task = build_task(manifest, workdir=Path.cwd(), memo=memo)
-            # Retries transient local-API failures (submit stampede) before giving up (fieldrep #4).
-            request_id = _launch_with_retry(sky, task, cluster)
-            # stream_and_get blocks until the job is submitted (0.12), i.e. until the host is UP.
-            # Bound it so a dead Vast offer stuck in "loading" can't hang the supervisor forever
-            # (FR-I1). The budget is per-cloud: Vast waits on one host, GCP walks a failover path.
-            provision_s = (
-                parse_duration(manifest.resources.provision_timeout)
-                or provision_timeout_min(cloud) * 60
-            )
-            sky_job_id, handle = provision_with_watchdog(sky, request_id, timeout_s=provision_s)
-            # Record cost up-front so a running job already shows it (FR-I2). The host is UP now,
-            # so the Vast rental exists — bill at its real dph_total, not SkyPilot's low catalog
-            # estimate.
-            # Record which instance kind SkyPilot actually launched (spot vs on-demand) — with
-            # spot_fallback the optimizer may pick on-demand, and the classifier must only infer
-            # preemption for a genuinely-spot launch. None when unknown / on-demand-only.
-            launched = getattr(handle, "launched_resources", None)
-            launched_spot = getattr(launched, "use_spot", None)
-            machine_type = getattr(launched, "instance_type", None)
-            region = getattr(launched, "region", None)
-            zone = getattr(launched, "zone", None)
-            if manifest.resources.use_spot and launched_spot is False:
-                # spot_fallback let the optimizer land on-demand, which on GCP is ~5x the spot
-                # price the user was budgeting for. Say so; nothing surfaced this before.
-                print(
-                    "[lab] NOTE: requested spot but launched ON-DEMAND (spot capacity was "
-                    "scarce). Pass --no-fallback to refuse this."
+            started = now()
+            store.update_manifest(job_id, status=JobState.running, started_at=started)
+        else:
+            started = manifest.started_at or now()
+            print(f"[lab] adopting running cluster {cluster} (supervisor restart)")
+
+        import sky
+
+        # provision_s is only set in the non-adopt branch (ProvisionTimeout can only be raised
+        # from sky.launch / provision_with_watchdog, which are also non-adopt only).  Initialise
+        # to 0.0 so the except-ProvisionTimeout error message below is always bound.
+        provision_s: float = 0.0
+
+        try:
+            if not adopt:
+                memo = CapacityMemo.for_home(store.home)
+                task = build_task(manifest, workdir=Path.cwd(), memo=memo)
+                # Retries transient local-API failures (submit stampede) before giving up (fieldrep #4).
+                request_id = _launch_with_retry(sky, task, cluster)
+                # stream_and_get blocks until the job is submitted (0.12), i.e. until the host is UP.
+                # Bound it so a dead Vast offer stuck in "loading" can't hang the supervisor forever
+                # (FR-I1). The budget is per-cloud: Vast waits on one host, GCP walks a failover path.
+                provision_s = (
+                    parse_duration(manifest.resources.provision_timeout)
+                    or provision_timeout_min(cloud) * 60
                 )
-            cost_info = resolve_cost(cluster, handle, manifest, cloud, instance_type=machine_type)
+                events.note(
+                    "provision.attempt",
+                    cloud=cloud,
+                    zone=manifest.resources.zone,
+                    region=manifest.resources.region,
+                    instance=manifest.resources.accelerators,
+                    timeout_s=provision_s,
+                )
+                sky_job_id, handle = provision_with_watchdog(sky, request_id, timeout_s=provision_s)
+                # Record cost up-front so a running job already shows it (FR-I2). The host is UP now,
+                # so the Vast rental exists — bill at its real dph_total, not SkyPilot's low catalog
+                # estimate.
+                # Record which instance kind SkyPilot actually launched (spot vs on-demand) — with
+                # spot_fallback the optimizer may pick on-demand, and the classifier must only infer
+                # preemption for a genuinely-spot launch. None when unknown / on-demand-only.
+                launched = getattr(handle, "launched_resources", None)
+                launched_spot = getattr(launched, "use_spot", None)
+                machine_type = getattr(launched, "instance_type", None)
+                region = getattr(launched, "region", None)
+                zone = getattr(launched, "zone", None)
+                if manifest.resources.use_spot and launched_spot is False:
+                    # spot_fallback let the optimizer land on-demand, which on GCP is ~5x the spot
+                    # price the user was budgeting for. Say so; nothing surfaced this before.
+                    print(
+                        "[lab] NOTE: requested spot but launched ON-DEMAND (spot capacity was "
+                        "scarce). Pass --no-fallback to refuse this."
+                    )
+                cost_info = resolve_cost(cluster, handle, manifest, cloud, instance_type=machine_type)
+                store.update_manifest(
+                    job_id,
+                    cost=cost_info,
+                    backend=BackendInfo(
+                        provisioner="skypilot",
+                        machine_type=machine_type,
+                        region=region,
+                        zone=zone,
+                        launched_spot=launched_spot,
+                    ),
+                )
+            else:
+                # Adopting a running cluster: re-price it, but keep the estimate agreed at launch —
+                # that number was the user's authorisation and must not drift under them.
+                cost_info = resolve_cost(
+                    cluster, None, manifest, cloud, instance_type=manifest.backend.machine_type
+                )
+                if manifest.cost is not None and manifest.cost.estimated_usd is not None:
+                    cost_info = cost_info.model_copy(
+                        update={"estimated_usd": manifest.cost.estimated_usd}
+                    )
+                sky_job_id = None  # match any job in the cluster queue
+
+            # Wait for the run to actually finish before fetching artifacts / tearing down.
+            try:
+                sky.tail_logs(cluster, sky_job_id, follow=True)  # streams run logs; blocks till done
+            except Exception as e:  # noqa: BLE001
+                print(f"[lab] tail_logs issue: {e}")
+
+            if not adopt:
+                max_wait = (parse_duration(manifest.resources.timeout) or 3600) + 300
+            else:
+                total = (parse_duration(manifest.resources.timeout) or 3600) + 300
+                elapsed = duration_seconds(started, now()) or 0.0
+                max_wait = max(60.0, total - elapsed)
+
+            def _heartbeat() -> None:
+                # Best-effort: pull partial results so a late/failed teardown can't lose them (§6c).
+                _rsync_down(cluster, REMOTE_RUN_DIR, store.output_dir(job_id))
+
+            raw_final, reached_terminal = _wait_terminal(
+                sky,
+                cluster,
+                sky_job_id,
+                max_wait,
+                heartbeat_s=HEARTBEAT_S,
+                on_heartbeat=_heartbeat,
+            )
+            final = raw_final
+        except ProvisionTimeout:
+            _remember_capacity(store, job_id, manifest, cloud, error_text="")
             store.update_manifest(
                 job_id,
-                cost=cost_info,
-                backend=BackendInfo(
-                    provisioner="skypilot",
-                    machine_type=machine_type,
-                    region=region,
-                    zone=zone,
-                    launched_spot=launched_spot,
-                ),
+                status=JobState.failed,
+                ended_at=now(),
+                end_reason=(
+                    f"provisioning exceeded {provision_s:.0f}s "
+                    "(host never reached UP — likely a dead Vast offer; resubmit for a fresh host)"
+                )[:300],
             )
-        else:
-            # Adopting a running cluster: re-price it, but keep the estimate agreed at launch —
-            # that number was the user's authorisation and must not drift under them.
-            cost_info = resolve_cost(
-                cluster, None, manifest, cloud, instance_type=manifest.backend.machine_type
+            tear_down_and_record(sky, cluster, store, job_id, cloud)
+            return 1
+        except TransientLaunchError as e:
+            # The launch never reached a provider — safe to auto-retry; the `transient:` prefix is
+            # the machine-readable hint (no traceback string-matching needed).
+            reason = f"transient: {provision_failure_reason(f'launch error: {e}', cloud)}"
+            store.update_manifest(
+                job_id, status=JobState.failed, ended_at=now(), end_reason=reason[:300]
             )
-            if manifest.cost is not None and manifest.cost.estimated_usd is not None:
-                cost_info = cost_info.model_copy(
-                    update={"estimated_usd": manifest.cost.estimated_usd}
-                )
-            sky_job_id = None  # match any job in the cluster queue
-
-        # Wait for the run to actually finish before fetching artifacts / tearing down.
-        try:
-            sky.tail_logs(cluster, sky_job_id, follow=True)  # streams run logs; blocks till done
+            tear_down_and_record(sky, cluster, store, job_id, cloud)
+            return 1
         except Exception as e:  # noqa: BLE001
-            print(f"[lab] tail_logs issue: {e}")
+            _remember_capacity(store, job_id, manifest, cloud, error_text=f"{type(e).__name__}: {e}")
+            reason = provision_failure_reason(f"launch error: {e}", cloud)
+            store.update_manifest(
+                job_id, status=JobState.failed, ended_at=now(), end_reason=reason[:300]
+            )
+            tear_down_and_record(sky, cluster, store, job_id, cloud)
+            return 1
 
-        if not adopt:
-            max_wait = (parse_duration(manifest.resources.timeout) or 3600) + 300
-        else:
-            total = (parse_duration(manifest.resources.timeout) or 3600) + 300
-            elapsed = duration_seconds(started, now()) or 0.0
-            max_wait = max(60.0, total - elapsed)
-
-        def _heartbeat() -> None:
-            # Best-effort: pull partial results so a late/failed teardown can't lose them (§6c).
+        try:
             _rsync_down(cluster, REMOTE_RUN_DIR, store.output_dir(job_id))
+        except Exception as e:  # noqa: BLE001
+            print(f"[lab] artifact rsync failed: {e}")
 
-        raw_final, reached_terminal = _wait_terminal(
-            sky,
-            cluster,
-            sky_job_id,
-            max_wait,
-            heartbeat_s=HEARTBEAT_S,
-            on_heartbeat=_heartbeat,
+        final = promote_timeout(final, store.output_dir(job_id))  # failed -> timed_out if sentinel
+        final = confirm_success(final, store.output_dir(job_id))  # succeeded only if .lab_success present
+
+        # Safety-critical: reconcile the observed terminal state with explicit/authoritative outcomes
+        # so an unmanaged-spot preemption is *inferred* only as the lowest-precedence fallback — never
+        # over a real cloud terminal, a user cancel, or a timeout (FR spot path). The classifier is a
+        # pure function; we compute its six inputs from disk + a single defensive cloud status probe.
+        # We pass the *confirmed* state (post promote_timeout/confirm_success) as ``sky_state`` so the
+        # success-sentinel integrity downgrade (succeeded->failed without .lab_success) is preserved —
+        # the classifier only ever *trusts* a succeeded/failed terminal, never invents one.
+        timed_out = (store.output_dir(job_id) / TIMEOUT_SENTINEL).exists()
+        fresh = store.read_manifest(job_id)
+        cancel_requested = fresh.status == JobState.cancelled
+        use_spot = (
+            fresh.backend.launched_spot
+            if fresh.backend.launched_spot is not None
+            else manifest.resources.use_spot
         )
-        final = raw_final
-    except ProvisionTimeout:
-        _remember_capacity(store, job_id, manifest, cloud, error_text="")
-        store.update_manifest(
-            job_id,
-            status=JobState.failed,
-            ended_at=now(),
-            end_reason=(
-                f"provisioning exceeded {provision_s:.0f}s "
-                "(host never reached UP — likely a dead Vast offer; resubmit for a fresh host)"
-            )[:300],
+        cluster_gone = not _cluster_up(sky, cluster)
+
+        # GCP-PREEMPT-1: on GCP we don't have to *infer* preemption — GCE states it, so ask. Only
+        # consulted when we hold no authoritative terminal of our own, since replacing the inference
+        # is the entire point; the probe abstains (None) on any doubt and the inference stands.
+        # This adjusts the classifier's inputs; the classifier itself stays pure and unchanged.
+        if cloud == "gcp" and not reached_terminal:
+            from lab.backends.skypilot import gcp_preemption_state
+
+            probed = gcp_preemption_state(cluster)
+            if probed is JobState.failed:
+                # GCE: the box stopped and was not preemptible. Feeding this as an authoritative
+                # terminal is what stops the scheduler resubmitting — and re-paying for — a job that
+                # genuinely failed.
+                final, reached_terminal = JobState.failed, True
+            elif probed is JobState.preempted:
+                # `classify_terminal` never trusts sky_state=preempted directly — it reaches
+                # `preempted` only via `use_spot and cluster_gone`. GCE reporting a *preemptible*
+                # instance is itself authoritative about spot-ness (better evidence than the
+                # manifest's `launched_spot`, which the adopt path never records), so set both or the
+                # probe's answer is silently discarded and the job comes out `failed`.
+                final, cluster_gone, use_spot = JobState.preempted, True, True
+
+        final = classify_terminal(
+            sky_state=final,
+            timed_out=timed_out,
+            cancel_requested=cancel_requested,
+            use_spot=use_spot,
+            cluster_gone=cluster_gone,
+            reached_terminal=reached_terminal,
         )
-        tear_down_and_record(sky, cluster, store, job_id, cloud)
-        return 1
-    except TransientLaunchError as e:
-        # The launch never reached a provider — safe to auto-retry; the `transient:` prefix is
-        # the machine-readable hint (no traceback string-matching needed).
-        reason = f"transient: {provision_failure_reason(f'launch error: {e}', cloud)}"
-        store.update_manifest(
-            job_id, status=JobState.failed, ended_at=now(), end_reason=reason[:300]
+
+        # Push the fetched outputs to durable storage (survives teardown / other machines).
+        artifacts_uri = None
+        if r2_enabled():
+            try:
+                r2 = R2Store.from_env()
+                if r2 is not None:
+                    n = r2.upload_dir(store.output_dir(job_id), job_id)
+                    artifacts_uri = r2.uri(job_id)
+                    print(f"[lab] uploaded {n} artifact(s) to {artifacts_uri}")
+            except Exception as e:  # noqa: BLE001
+                print(f"[lab] R2 upload failed: {e}")
+
+        ended = now()
+        dur = duration_seconds(started, ended)
+        cost = cost_info.model_copy(
+            update={
+                "duration_seconds": dur,
+                "actual_usd": actual_cost(cost_info.hourly_usd, dur),
+            }
         )
-        tear_down_and_record(sky, cluster, store, job_id, cloud)
-        return 1
-    except Exception as e:  # noqa: BLE001
-        _remember_capacity(store, job_id, manifest, cloud, error_text=f"{type(e).__name__}: {e}")
-        reason = provision_failure_reason(f"launch error: {e}", cloud)
-        store.update_manifest(
-            job_id, status=JobState.failed, ended_at=now(), end_reason=reason[:300]
-        )
-        tear_down_and_record(sky, cluster, store, job_id, cloud)
-        return 1
+
+        if final is JobState.timed_out:
+            wall = int(parse_duration(manifest.resources.timeout) or 0)
+            end_reason = timeout_reason(wall)
+        else:
+            end_reason = final.value
+
+        # Respect a concurrent cancel (backend set status=cancelled before killing us).
+        if store.read_manifest(job_id).status != JobState.cancelled:
+            # final_metrics is snapshotted centrally by the store on the succeeded transition (FR-B4).
+            store.update_manifest(
+                job_id,
+                status=final,
+                ended_at=ended,
+                exit_code=0 if final == JobState.succeeded else 1,
+                end_reason=end_reason,
+                artifacts_uri=artifacts_uri,
+                cost=cost,
+            )
+
+        teardown_ok = tear_down_and_record(sky, cluster, store, job_id, cloud)
+        if final is JobState.preempted and not preempted_teardown_confirmed(cloud, cluster):
+            # The instance vanished (preemption inferred), but we can't confirm the Vast rental is
+            # actually gone — flag it so `lab wait` exits 3 and the operator can run `lab reconcile`
+            # before any auto-resubmitter builds on a potentially-still-billing orphan (FR-C2).
+            store.update_manifest(
+                job_id,
+                teardown_status="failed",
+                end_reason="preempted but teardown unconfirmed — see `lab reconcile`",
+            )
+            teardown_ok = False
+        return 0 if teardown_ok else 2  # 2 = ran ok but teardown leaked — manifest has details
 
     try:
-        _rsync_down(cluster, REMOTE_RUN_DIR, store.output_dir(job_id))
-    except Exception as e:  # noqa: BLE001
-        print(f"[lab] artifact rsync failed: {e}")
-
-    final = promote_timeout(final, store.output_dir(job_id))  # failed -> timed_out if sentinel
-    final = confirm_success(final, store.output_dir(job_id))  # succeeded only if .lab_success present
-
-    # Safety-critical: reconcile the observed terminal state with explicit/authoritative outcomes
-    # so an unmanaged-spot preemption is *inferred* only as the lowest-precedence fallback — never
-    # over a real cloud terminal, a user cancel, or a timeout (FR spot path). The classifier is a
-    # pure function; we compute its six inputs from disk + a single defensive cloud status probe.
-    # We pass the *confirmed* state (post promote_timeout/confirm_success) as ``sky_state`` so the
-    # success-sentinel integrity downgrade (succeeded->failed without .lab_success) is preserved —
-    # the classifier only ever *trusts* a succeeded/failed terminal, never invents one.
-    timed_out = (store.output_dir(job_id) / TIMEOUT_SENTINEL).exists()
-    fresh = store.read_manifest(job_id)
-    cancel_requested = fresh.status == JobState.cancelled
-    use_spot = (
-        fresh.backend.launched_spot
-        if fresh.backend.launched_spot is not None
-        else manifest.resources.use_spot
+        code = _impl()
+    except KeyboardInterrupt:
+        events.finish(call, outcome="interrupted")
+        raise
+    except BaseException as e:  # noqa: BLE001 — every exit path must be recorded
+        events.finish(call, outcome="crash", error=events.error_dict(e))
+        raise
+    events.finish(
+        call, outcome=("ok" if code == 0 else "error"), exit_code=code,
     )
-    cluster_gone = not _cluster_up(sky, cluster)
-
-    # GCP-PREEMPT-1: on GCP we don't have to *infer* preemption — GCE states it, so ask. Only
-    # consulted when we hold no authoritative terminal of our own, since replacing the inference
-    # is the entire point; the probe abstains (None) on any doubt and the inference stands.
-    # This adjusts the classifier's inputs; the classifier itself stays pure and unchanged.
-    if cloud == "gcp" and not reached_terminal:
-        from lab.backends.skypilot import gcp_preemption_state
-
-        probed = gcp_preemption_state(cluster)
-        if probed is JobState.failed:
-            # GCE: the box stopped and was not preemptible. Feeding this as an authoritative
-            # terminal is what stops the scheduler resubmitting — and re-paying for — a job that
-            # genuinely failed.
-            final, reached_terminal = JobState.failed, True
-        elif probed is JobState.preempted:
-            # `classify_terminal` never trusts sky_state=preempted directly — it reaches
-            # `preempted` only via `use_spot and cluster_gone`. GCE reporting a *preemptible*
-            # instance is itself authoritative about spot-ness (better evidence than the
-            # manifest's `launched_spot`, which the adopt path never records), so set both or the
-            # probe's answer is silently discarded and the job comes out `failed`.
-            final, cluster_gone, use_spot = JobState.preempted, True, True
-
-    final = classify_terminal(
-        sky_state=final,
-        timed_out=timed_out,
-        cancel_requested=cancel_requested,
-        use_spot=use_spot,
-        cluster_gone=cluster_gone,
-        reached_terminal=reached_terminal,
-    )
-
-    # Push the fetched outputs to durable storage (survives teardown / other machines).
-    artifacts_uri = None
-    if r2_enabled():
-        try:
-            r2 = R2Store.from_env()
-            if r2 is not None:
-                n = r2.upload_dir(store.output_dir(job_id), job_id)
-                artifacts_uri = r2.uri(job_id)
-                print(f"[lab] uploaded {n} artifact(s) to {artifacts_uri}")
-        except Exception as e:  # noqa: BLE001
-            print(f"[lab] R2 upload failed: {e}")
-
-    ended = now()
-    dur = duration_seconds(started, ended)
-    cost = cost_info.model_copy(
-        update={
-            "duration_seconds": dur,
-            "actual_usd": actual_cost(cost_info.hourly_usd, dur),
-        }
-    )
-
-    if final is JobState.timed_out:
-        wall = int(parse_duration(manifest.resources.timeout) or 0)
-        end_reason = timeout_reason(wall)
-    else:
-        end_reason = final.value
-
-    # Respect a concurrent cancel (backend set status=cancelled before killing us).
-    if store.read_manifest(job_id).status != JobState.cancelled:
-        # final_metrics is snapshotted centrally by the store on the succeeded transition (FR-B4).
-        store.update_manifest(
-            job_id,
-            status=final,
-            ended_at=ended,
-            exit_code=0 if final == JobState.succeeded else 1,
-            end_reason=end_reason,
-            artifacts_uri=artifacts_uri,
-            cost=cost,
-        )
-
-    teardown_ok = tear_down_and_record(sky, cluster, store, job_id, cloud)
-    if final is JobState.preempted and not preempted_teardown_confirmed(cloud, cluster):
-        # The instance vanished (preemption inferred), but we can't confirm the Vast rental is
-        # actually gone — flag it so `lab wait` exits 3 and the operator can run `lab reconcile`
-        # before any auto-resubmitter builds on a potentially-still-billing orphan (FR-C2).
-        store.update_manifest(
-            job_id,
-            teardown_status="failed",
-            end_reason="preempted but teardown unconfirmed — see `lab reconcile`",
-        )
-        teardown_ok = False
-    return 0 if teardown_ok else 2  # 2 = ran ok but teardown leaked — manifest has details
+    return code
 
 
 if __name__ == "__main__":
