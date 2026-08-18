@@ -2686,9 +2686,10 @@ def test_concurrent_writers_produce_only_whole_lines(tmp_path: Path) -> None:
 - [ ] **Step 2: Run it to verify it passes with the lock and fails without**
 
 Run: `uv run pytest tests/test_events_concurrency.py -v`
-Expected: PASS. Then temporarily comment out the two `fcntl.flock` calls in `store.append` and
-re-run — with 3 KB records it must fail. Restore the lock. This confirms the test has teeth
-rather than passing because the writes were small enough to be atomic anyway.
+Expected: PASS. Then temporarily neutralise the lock `store.append` takes — the `flock`
+acquire/release around its write, which is held on the per-day `.lock` file rather than on the
+day file itself — and re-run. With 3 KB records it must fail. Restore the lock. This confirms
+the test has teeth rather than passing because the writes were small enough to be atomic anyway.
 
 - [ ] **Step 3: Extend the packaging test**
 
