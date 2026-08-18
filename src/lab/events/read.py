@@ -28,7 +28,12 @@ def _as_int(value: object, *, default: int, field: str, id_: str) -> int:
     if isinstance(value, bool):  # bool is an int subclass; keep it explicit rather than magic
         return int(value)
     if isinstance(value, (int, float)):
-        return int(value)
+        try:
+            return int(value)
+        except (ValueError, OverflowError):
+            # json.loads accepts NaN/Infinity/-Infinity by default, so a non-finite float is a
+            # genuinely reachable field value here, not a hypothetical.
+            pass
     if isinstance(value, str):
         try:
             return int(value)

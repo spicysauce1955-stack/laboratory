@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -89,6 +90,30 @@ def test_a_non_int_seq_defaults_but_the_batch_survives() -> None:
     events = fold([_open("a", seq="bad"), _close("a"), _open("b"), _close("b")])
     by_id = {e.id: e for e in events}
     assert by_id["a"].seq == 0
+    assert by_id["b"].id == "b"
+
+
+def test_a_non_finite_seq_defaults_but_the_batch_survives() -> None:
+    # json.loads accepts NaN/Infinity literals by default, so a non-finite float is reachable
+    # from a real ledger line, not just a hand-built Python float. Round-trip through json.dumps
+    # (allow_nan=True by default) and json.loads to prove that: the wire text really contains the
+    # bareword NaN literal, exactly as a line written by json.dumps(record, default=str) would.
+    raw = json.dumps(_open("a", seq=float("nan")))
+    assert '"seq":NaN' in raw.replace(" ", "")
+    open_a = json.loads(raw)
+    assert open_a["seq"] != open_a["seq"]  # sanity: really is NaN, not the literal string
+    events = fold([open_a, _close("a"), _open("b"), _close("b")])
+    by_id = {e.id: e for e in events}
+    assert by_id["a"].seq == 0
+    assert by_id["b"].id == "b"
+
+
+def test_a_non_finite_trace_t_defaults_but_the_entry_and_batch_survive() -> None:
+    close_a = _close("a", trace=[{"t": float("inf"), "k": "provision.attempt", "d": {}}])
+    events = fold([_open("a"), close_a, _open("b"), _close("b")])
+    by_id = {e.id: e for e in events}
+    assert by_id["a"].trace[0].t == 0
+    assert by_id["a"].trace[0].k == "provision.attempt"
     assert by_id["b"].id == "b"
 
 
