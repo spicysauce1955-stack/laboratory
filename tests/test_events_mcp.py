@@ -4,6 +4,7 @@ never change what a tool returns or raises."""
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -209,3 +210,89 @@ def test_report_tool_rejects_unparseable_since_with_a_clean_tool_error(tmp_path:
     message = asyncio.run(go())
     assert "bad since" in message
     assert "not-a-duration" in message
+
+
+_TRACE_SEED_TS = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
+
+
+def _seed_failure_with_trace() -> None:
+    """A pre-recorded open/close pair with a trace, appended directly to the ledger — the same
+    seeding pattern `test_events_history_cli.py` uses so the assertion is about `full`'s effect
+    on the row shape, not about whatever trace a live call happens to produce."""
+    store.append(
+        {
+            "id": "seed-a", "ts": _TRACE_SEED_TS.isoformat(), "phase": "open", "session": "s",
+            "seq": 0, "surface": "cli", "action": "submit", "params": {"backend": "cpu"},
+            "project": {"name": "capacity"}, "lab_version": "0.5.1",
+        },
+        when=_TRACE_SEED_TS,
+    )
+    store.append(
+        {
+            "id": "seed-a", "ts": _TRACE_SEED_TS.isoformat(), "phase": "close",
+            "outcome": "error", "exit_code": 1, "duration_ms": 2000,
+            "refs": {"job_id": "j-1"}, "result": {"cost_usd": 0.29},
+            "error": {"type": "ProvisionTimeout", "message": "no capacity"},
+            "trace": [{"t": 5, "k": "provision.attempt", "d": {"zone": "europe-west1-b"}}],
+        },
+        when=_TRACE_SEED_TS,
+    )
+
+
+def test_history_tool_omits_the_trace_unless_full_is_given(tmp_path: Path) -> None:
+    _, server = _make(tmp_path)
+    _seed_failure_with_trace()
+
+    async def go() -> dict:
+        async with Client(server) as client:
+            result = await client.call_tool("history", {"all_projects": True})
+            return result.data
+
+    data = asyncio.run(go())
+    assert data["events"][0]["id"] == "seed-a"
+    assert "trace" not in data["events"][0]
+
+
+def test_history_tool_full_includes_the_trace(tmp_path: Path) -> None:
+    """Separate invocation from the brief-view test above, mirroring the CLI test's reasoning:
+    a second `history` call in the same test would pick up the first call's now-closed row
+    alongside the seeded one."""
+    _, server = _make(tmp_path)
+    _seed_failure_with_trace()
+
+    async def go() -> dict:
+        async with Client(server) as client:
+            result = await client.call_tool("history", {"all_projects": True, "full": True})
+            return result.data
+
+    data = asyncio.run(go())
+    assert data["events"][0]["id"] == "seed-a"
+    assert data["events"][0]["trace"][0]["k"] == "provision.attempt"
+
+
+def test_history_tool_filters_by_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two `list` calls made under different sessions; requesting one session's id must return
+    only that session's row — excluded because of the filter, not because the other session's
+    call never happened."""
+    _, server = _make(tmp_path)
+
+    async def call_list() -> None:
+        async with Client(server) as client:
+            await client.call_tool("list", {})
+
+    monkeypatch.setenv("LAB_SESSION_ID", "sess-a")
+    asyncio.run(call_list())
+    monkeypatch.setenv("LAB_SESSION_ID", "sess-b")
+    asyncio.run(call_list())
+    monkeypatch.delenv("LAB_SESSION_ID", raising=False)
+
+    async def go() -> dict:
+        async with Client(server) as client:
+            result = await client.call_tool(
+                "history", {"all_projects": True, "session": "sess-a", "full": True}
+            )
+            return result.data
+
+    data = asyncio.run(go())
+    assert len(data["events"]) == 1
+    assert data["events"][0]["session"] == "sess-a"

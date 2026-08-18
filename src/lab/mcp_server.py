@@ -578,6 +578,7 @@ def build_server(lab: Lab) -> FastMCP:
         since: str | None = None,
         action: str | None = None,
         job: str | None = None,
+        session: str | None = None,
         failures: bool = False,
         all_projects: bool = False,
         full: bool = False,
@@ -585,14 +586,15 @@ def build_server(lab: Lab) -> FastMCP:
     ) -> dict[str, Any]:
         """Read the lab's own event ledger: which commands/tools ran, their outcome, duration,
         ids, cost and — with `full` — the internal trace behind a failure. This is what you
-        already tried; it is *not* `logs`, which tails one job's stdout. `stats` returns the
-        aggregate view instead (failure rates per action, ranked error signatures, dollars
-        burned)."""
+        already tried; it is *not* `logs`, which tails one job's stdout. session restricts to
+        one session id (the grouping `LAB_SESSION_ID` or a per-process default provides).
+        `stats` returns the aggregate view instead (failure rates per action, ranked error
+        signatures, dollars burned)."""
         cutoff = _since_cutoff(since)
         project = None if all_projects else repo_root().name
         found = _exclude_self(
             events.read(
-                since=since, project=project, action=action, job=job,
+                since=since, project=project, action=action, job=job, session=session,
                 failures_only=failures, limit=None,
             )
         )
