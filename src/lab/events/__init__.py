@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from lab.events.models import ActionStat, Event, Note, SignatureStat, StatsView
+from lab.events.read import fold, read, row
 from lab.events.record import (
     Call,
     begin,
@@ -17,5 +18,6 @@ from lab.events.record import (
 
 __all__ = [
     "ActionStat", "Call", "Event", "Note", "SignatureStat", "StatsView",
-    "begin", "current", "error_dict", "finish", "finish_current", "note", "record",
+    "begin", "current", "error_dict", "finish", "finish_current", "fold", "note", "read",
+    "record", "row",
 ]
