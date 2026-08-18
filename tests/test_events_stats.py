@@ -27,6 +27,15 @@ def test_signature_keeps_different_bugs_apart() -> None:
     assert signature(a) != signature(b)
 
 
+def test_signature_keeps_different_messages_apart_within_the_same_type() -> None:
+    # Same error type, different content-bearing wording — the normalizer must not collapse
+    # these into one row just because `type` matches. (A test differing in `type` alone would
+    # pass regardless of whether the message half of the signature preserves anything at all.)
+    a = {"type": "TeardownFailed", "message": "sky.down exhausted 3 retries"}
+    b = {"type": "TeardownFailed", "message": "vastai-sdk fallback exhausted 3 retries"}
+    assert signature(a) != signature(b)
+
+
 def test_signature_of_a_missing_error_is_stable() -> None:
     assert signature(None) == "unknown"
 
@@ -61,6 +70,18 @@ def test_stats_sums_dollars_burned_in_failed_calls_only() -> None:
     assert view.usd_burned == 0.29
 
 
+def test_stats_treats_a_non_numeric_cost_usd_as_absent_on_both_aggregation_paths() -> None:
+    # `result` comes straight off disk and can hold anything JSON can express. A malformed
+    # `cost_usd` must degrade to "no cost" rather than crash `stats()` — and must degrade the
+    # same way whether it's summed into the view-level total or the per-signature total.
+    err = {"type": "ProvisionTimeout", "message": "host never reached UP in 20m"}
+    bad = Event(id="1", ts=NOW, session="s", seq=0, surface="cli", action="submit",
+                outcome="error", duration_ms=1000, error=err, result={"cost_usd": "oops"})
+    view = stats([bad])
+    assert view.usd_burned == 0.0
+    assert view.signatures[0].usd == 0.0
+
+
 def test_stats_ranks_signatures_by_count_and_records_the_window_seen() -> None:
     err = {"type": "ProvisionTimeout", "message": "host never reached UP in 20m"}
     other = {"type": "TeardownFailed", "message": "sky.down exhausted 3 retries"}
@@ -74,8 +95,19 @@ def test_stats_ranks_signatures_by_count_and_records_the_window_seen() -> None:
 
 
 def test_median_duration_is_reported_per_action() -> None:
-    view = stats([_event("1", ms=1000), _event("2", ms=3000), _event("3", ms=2000)])
-    assert view.actions[0].median_ms == 2000
+    # Skewed on purpose: mean of [1, 2, 1000] is ~334, median is 2 — an implementation that
+    # accidentally used `statistics.mean` would pass a symmetric fixture unchanged, so the
+    # fixture has to make mean and median diverge sharply to prove which one is computed.
+    view = stats([_event("1", ms=1), _event("2", ms=1000), _event("3", ms=2)])
+    assert view.actions[0].median_ms == 2
+
+
+def test_median_duration_averages_the_middle_pair_for_an_even_count() -> None:
+    # statistics.median averages the two middle values when there's an even number of samples;
+    # [1, 3, 5, 1000] sorts to the same list, and the middle pair (3, 5) averages to 4 — nowhere
+    # close to the mean (~252), so this is pinning the even-count averaging behaviour specifically.
+    view = stats([_event(str(i), ms=ms) for i, ms in enumerate([1, 3, 5, 1000])])
+    assert view.actions[0].median_ms == 4
 
 
 def test_stats_dict_shapes_the_view_as_json_ready_data() -> None:
