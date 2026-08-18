@@ -210,7 +210,8 @@ cannot be read because one line is bad would fail at its only job.
 
 Recording argv means recording whatever was typed, and `lab.redact` only knows patterns that
 appear in *subprocess output* — it will not catch a key passed as a flag value. `params` therefore
-goes through a sanitizer with an allow-list posture, in order:
+goes through a sanitizer with a **deny-list** posture — default pass, mask on a matched
+pattern — not an allow-list, in order:
 
 1. Mask any key whose name matches `key|token|secret|password|credential|auth`.
 2. Mask any value matching a secret *shape*: `ya29.`, a PEM header, a long high-entropy run.

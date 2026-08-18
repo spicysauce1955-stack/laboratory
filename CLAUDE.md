@@ -113,7 +113,8 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   unrelated — that tails one job's stdout. Retention: successes compacted after 14d, files
   deleted past 90d or 50 MB (`LAB_EVENTS_SUCCESS_TTL_DAYS`/`LAB_EVENTS_MAX_AGE_DAYS`/
   `LAB_EVENTS_MAX_MB`), guarded by a per-day lock file (`<day>.jsonl.lock`) shared with
-  `append()`. `params` passes the `lab.events.sanitize` allow-list, never raw (FR-J1). The
+  `append()`. `params` passes through `lab.events.sanitize` first — a **deny-list**, not an
+  allow-list: mask by key name/value shape/entropy, default pass — never raw (FR-J1). The
   console entry point moved to `lab.cli:main`, which runs typer in standalone mode and records
   usage errors/crashes via a `_fail()` helper — `standalone_mode=False` was tried and abandoned
   (typer 0.26 swallows `Exit.__cause__` regardless); exit codes are unchanged and `lab wait`'s

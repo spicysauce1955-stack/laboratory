@@ -18,7 +18,7 @@ finding: `lab history` surfaces it as `running-or-died`.
 | `id` | a sortable id (millisecond timestamp + random hex) — no coordination needed |
 | `ts` | UTC timestamp |
 | `session` | groups related calls; per-process by default, exact with `LAB_SESSION_ID` — see §8 |
-| `seq` | monotonic within the session |
+| `seq` | monotonic within a single process (resets to 0 in each new process — see §8) |
 | `surface` | `cli` \| `mcp` \| `supervisor` — the SkyPilot supervisor is a detached process with no CLI/MCP caller around it, so it gets its own record instead of losing its internal notes |
 | `action` | command/tool name, e.g. `submit`, `scheduler tick` |
 | `params` | sanitized inputs (§6) |
@@ -30,7 +30,7 @@ finding: `lab history` surfaces it as `running-or-died`.
 | `outcome` | `ok` \| `error` \| `usage_error` \| `crash` \| `interrupted` |
 | `exit_code` | process exit code (CLI); absent for MCP |
 | `duration_ms` | |
-| `refs` | join keys back to a manifest: `job_id`, `job_ids`, `sweep_id`, `reg_id` |
+| `refs` | join keys back to a manifest: `job_id`, `job_ids`, `sweep_id`, `reg_id`, `run_id` |
 | `result` | a **digest** only — state, cost, item counts, not the full payload (that's already in the manifest) |
 | `error` | `{type, message, where}` when the call didn't succeed |
 | `trace` | **present only when `outcome != "ok"`** |
@@ -43,6 +43,13 @@ just say *what* failed, it shows the steps that led there.
 
 The supervisor's record is `action: "run"`, tagged with `refs.job_id`, so `lab history --job
 <id>` picks it up alongside the `submit` call that launched it.
+
+`--job` matches only `refs.job_id`/`refs.job_ids` — nothing else in `refs`. `run_id` is one of
+the key names `refs_from` recognizes, but no shipped command's result payload currently uses that
+key (`lab confirm`'s result is `{orig_id, confirm_id, verdict, ...}`), so `refs.run_id` never
+actually appears yet; a `lab confirm <run_id>` call's own ledger record has an **empty** `refs`.
+To find it, filter on `--action confirm` (or `--full`, and match the run id against `params.argv`
+instead).
 
 ## 2. Where it lives
 
@@ -58,7 +65,10 @@ somewhere else.
 
 Concurrent writers are safe: `append()` and the retention pass (`compact()`) both take a per-day
 lock file (`<day>.jsonl.lock`) before touching the day file, so a sharded sweep launching dozens
-of `lab` processes at once can't produce a torn or interleaved line.
+of `lab` processes at once can't produce a torn or interleaved line. The lock lives in its own
+file rather than on the day file itself because `compact()` rewrites that file by replacing it
+(`os.replace`, for an atomic swap) — a lock held on the old inode wouldn't block a writer that
+opens the file fresh afterward, so the lock has to be somewhere whose identity never changes.
 
 ## 3. Reading it
 
@@ -97,8 +107,8 @@ uv run lab history --job j-4f2a --full
 ]}
 ```
 
-**Aggregate view** — failure rates per action, error signatures (type + normalized message) ranked
-by how often each was seen, dollars burned in failed calls:
+**Aggregate view** — failure rates per action, error signatures (type + normalized message)
+ranked by count seen (ties broken by dollars burned), dollars burned in failed calls:
 
 ```bash
 uv run lab history --stats --since 30d
@@ -187,8 +197,9 @@ Every value entering the ledger — CLI argv and MCP tool arguments alike — pa
 - Hex-looking strings of **≤40 characters** are exempted from that entropy check, so commit SHAs,
   cell ids and job ids stay readable in the ledger — but longer hex strings (a 64-char hex API
   token, for instance) still fall through to the entropy check and get masked.
-- Strings are additionally passed through the same output-redaction patterns SkyPilot's log
-  scrubber uses, and truncated to 512 characters; lists are capped at 32 items.
+- Strings are additionally passed through `lab.redact` — the lab's own scrubber, built to catch
+  the secrets SkyPilot/gcloud/Vast subprocesses print to their own output — and truncated to
+  512 characters; lists are capped at 32 items.
 
 What's recorded is the **params a call was invoked with** (argv for the CLI, tool arguments for
 MCP) and a small **digest** of its result — never a raw environment dict and never file contents.
@@ -231,8 +242,13 @@ uv run lab wait j-...
 uv run lab history --session my-agent-run-42
 ```
 
-A real env var always wins over the generated default. This is also how a SkyPilot submit and its
-detached supervisor process end up in one session without you doing anything extra:
-`SkyPilotBackend.submit()` passes the submitting process's effective session id down to the
-supervisor's environment, so `lab history --session ...` shows the whole story — the `submit`
-call and the `supervisor run` behind it — as one group even though they're different processes.
+A real env var always wins over the generated default. Within a session that spans multiple
+processes this way, order calls by `ts`, not `seq` — `seq` is a counter local to one process (it
+resets to 0 in every new process, §1), so two calls from two different processes sharing one
+`LAB_SESSION_ID` can carry the same `seq` value.
+
+This is also how a SkyPilot submit and its detached supervisor process end up in one session
+without you doing anything extra: `SkyPilotBackend.submit()` passes the submitting process's
+effective session id down to the supervisor's environment, so `lab history --session ...` shows
+the whole story — the `submit` call and the `supervisor run` behind it — as one group, even
+though they're different processes.
