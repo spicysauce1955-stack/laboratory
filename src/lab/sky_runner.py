@@ -480,6 +480,13 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             if not adopt:
                 memo = CapacityMemo.for_home(store.home)
                 task = build_task(manifest, workdir=Path.cwd(), memo=memo)
+                events.note(
+                    "provision.attempt",
+                    cloud=cloud,
+                    zone=manifest.resources.zone,
+                    region=manifest.resources.region,
+                    instance=manifest.resources.accelerators,
+                )
                 # Retries transient local-API failures (submit stampede) before giving up (fieldrep #4).
                 request_id = _launch_with_retry(sky, task, cluster)
                 # stream_and_get blocks until the job is submitted (0.12), i.e. until the host is UP.
@@ -488,14 +495,6 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                 provision_s = (
                     parse_duration(manifest.resources.provision_timeout)
                     or provision_timeout_min(cloud) * 60
-                )
-                events.note(
-                    "provision.attempt",
-                    cloud=cloud,
-                    zone=manifest.resources.zone,
-                    region=manifest.resources.region,
-                    instance=manifest.resources.accelerators,
-                    timeout_s=provision_s,
                 )
                 sky_job_id, handle = provision_with_watchdog(sky, request_id, timeout_s=provision_s)
                 # Record cost up-front so a running job already shows it (FR-I2). The host is UP now,

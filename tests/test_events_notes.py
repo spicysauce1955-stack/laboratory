@@ -438,7 +438,14 @@ def test_supervisor_transient_launch_failure_notes_reach_the_ledger(
     close = _last_close()
     assert close["outcome"] != "ok"  # trace only flushes on non-"ok" (design, see record())
     assert close["refs"].get("job_id") == "sup-retry"
-    assert "launch.retry" in _trace_kinds()
+    kinds = _trace_kinds()
+    assert "provision.attempt" in kinds
+    assert "launch.retry" in kinds
+    # Narrative order: the attempt is noted before the launch it covers is even tried, not
+    # after — a note placed post-hoc (e.g. after _launch_with_retry returns/raises) would never
+    # land in this exact trace, since a transient-exhaustion TransientLaunchError propagates
+    # out of _launch_with_retry before any post-call code runs (fix round 2's bug, exactly).
+    assert kinds.index("provision.attempt") < kinds.index("launch.retry")
 
 
 def test_supervisor_provision_timeout_also_notes(
