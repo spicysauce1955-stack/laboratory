@@ -62,22 +62,20 @@ def test_unserializable_values_degrade_to_a_type_name() -> None:
 
 
 def test_long_hex_secret_is_masked_but_short_hex_ids_are_not() -> None:
-    # 64-char hex (typical HMAC token length) under innocent key → masked by entropy check
-    long_hex = "a" * 64
-    assert sanitize_params({"signature": long_hex}) == {"signature": MASK}
+    # 64-char hex (typical HMAC token length) under innocent key → masked by base64 pattern
+    # (64 chars of [0-9a-f] also matches [A-Za-z0-9+/]{40,})
+    long_hex_repeated = "a" * 64
+    assert sanitize_params({"signature": long_hex_repeated}) == {"signature": MASK}
+    # Also test genuinely random-looking 64-char hex to exercise entropy path
+    random_hex_64 = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0f1e2d3c4b5a6f7e8d9c0a1b"
+    assert sanitize_params({"token": random_hex_64}) == {"token": MASK}
     # 40-char commit SHA → still NOT masked (within exemption)
     assert sanitize_params({"commit": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"})["commit"].startswith("a1b2")
     # 8-hex cell id → still NOT masked
     assert sanitize_params({"cell_id": "a1b2c3d4"}) == {"cell_id": "a1b2c3d4"}
 
 
-def test_sanitize_argv_degrades_on_exception() -> None:
-    # Normally this works fine
-    assert len(sanitize_argv(["lab", "submit", "--backend", "cpu"])) > 1
-    # Create a sequence that will fail partway through (mock by passing non-string that breaks)
-    # We can't easily force an exception in the normal flow, but we test that the exception
-    # handling exists by verifying that if something does fail, the result is [MASK]
-    # rather than an exception. This is a robustness test for the try/except wrapper.
-    result = sanitize_argv(["lab", "submit"])
-    assert isinstance(result, list)
-    assert all(isinstance(s, str) for s in result)
+def test_sanitize_argv_degrades_instead_of_raising() -> None:
+    # A non-string token raises AttributeError on .startswith mid-loop. The guard must turn
+    # that into a masked result, never an exception escaping into the command.
+    assert sanitize_argv(["lab", "submit", 123]) == [MASK]  # type: ignore[list-item]
