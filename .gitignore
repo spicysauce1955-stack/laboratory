@@ -30,3 +30,6 @@ __pycache__/
 # and shipped inside the sdist.
 .coverage
 .coverage.*
+
+# Subagent-driven-development scratch (ledger, briefs, review packages)
+.superpowers/
