@@ -45,8 +45,13 @@ def _note(message: str) -> None:
     The CLI emits its results as JSON on stdout and callers parse it. A stray "[lab] catalog price
     unavailable" on stdout is not a log line, it is a corrupted payload — which is exactly what
     happened once pricing started running on the `lab register` path.
+
+    The same line is buffered into the event ledger, where it survives the terminal scrolling.
     """
+    from lab import events
+
     print(message, file=sys.stderr)
+    events.note("placement.warn", message=message)
 
 
 # --------------------------------------------------------------------------------------------
@@ -97,7 +102,11 @@ def effective_disk_gb(res: ResourceRequest) -> int | None:
         return res.disk_size
     if (res.cloud or "vast") not in STORAGE_BILLING_CLOUDS:
         return None
-    return GPU_DEFAULT_DISK_GB if res.accelerators else CPU_DEFAULT_DISK_GB
+    applied = GPU_DEFAULT_DISK_GB if res.accelerators else CPU_DEFAULT_DISK_GB
+    from lab import events
+
+    events.note("placement.disk_override", requested=res.disk_size, applied=applied)
+    return applied
 
 
 # How long a zone stays excluded after it reports a capacity exhaustion. GCP capacity comes back
@@ -233,6 +242,8 @@ class CapacityMemo:
         self, cloud: str, instance_type: str, zones: Iterable[str], *, now_s: float | None = None
     ) -> None:
         """Remember that these zones just ran out of capacity. Best-effort; never raises."""
+        from lab import events
+
         zones = list(zones)
         if not zones:
             return
@@ -241,6 +252,7 @@ class CapacityMemo:
             entries = self._live(self._load(), now_s=now_s)  # prune expired while we are here
             for z in zones:
                 entries[self._key(cloud, instance_type, z)] = now_s
+                events.note("placement.zone_exhausted", zone=z)
             atomic_write_text(
                 self.path, json.dumps({"version": 1, "entries": entries}, sort_keys=True)
             )
@@ -431,6 +443,8 @@ def candidates(
     *every* one of its zones is excluded — a single dead zone still leaves the region usable), and
     the price cap. Returns [] when nothing survives, which callers treat as "do not narrow".
     """
+    from lab import events
+
     cloud = res.cloud or "vast"
     use_spot = res.use_spot if spot is None else spot
     try:
@@ -460,6 +474,8 @@ def candidates(
         if res.zone is not None and res.zone not in zone_names:
             continue
         live = tuple(z for z in zone_names if z not in excluded)
+        for _skipped in (z for z in zone_names if z in excluded):
+            events.note("placement.zone_skipped", zone=_skipped, reason="exhausted_memo")
         # A region with no zone list at all (some catalogs omit them) is kept: we have nothing to
         # exclude on, so excluding it would be guessing.
         if zone_names and not live:
@@ -468,6 +484,7 @@ def candidates(
             price = _price(cat, instance_type, res, name, use_spot)
         except Exception:  # noqa: BLE001 — region simply has no listed price for this shape
             continue
+        events.note("placement.priced", instance=instance_type, region=name, hourly_usd=price)
         if res.max_hourly_usd is not None and price > res.max_hourly_usd:
             continue
         out.append(Candidate(region=name, zones=live or zone_names, hourly_usd=price))

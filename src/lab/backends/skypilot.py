@@ -24,6 +24,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from lab import events
 from lab._util import infer_artifact_type, now, parse_duration, pid_alive
 from lab.manifest import sha256_file
 from lab.metrics import METRICS_FILE, read_points
@@ -678,6 +679,7 @@ def vast_balance(client: Any | None = None) -> float | None:
         # stderr: this runs on the CLI's JSON path, where a stray stdout line is a corrupted
         # payload rather than a log line.
         print(f"[lab] vast balance lookup failed: {e}", file=sys.stderr)
+        events.note("vast.balance_failed", error=str(e))
         return None
     for key in ("credit", "balance"):
         val = info.get(key) if isinstance(info, dict) else getattr(info, key, None)
@@ -754,6 +756,7 @@ def robust_teardown(
     for attempt, delay in enumerate(delays, start=1):
         if delay:
             time.sleep(delay)
+        events.note("teardown.attempt", cluster=cluster, attempt=attempt)
         try:
             sky_mod.get(sky_mod.down(cluster))
             return {
@@ -768,6 +771,7 @@ def robust_teardown(
             print(
                 f"[lab] sky.down attempt {attempt}/{len(delays)} for {cluster} failed: {last_err}"
             )
+            events.note("teardown.retry", cluster=cluster, attempt=attempt, error=last_err)
 
     # SkyPilot teardown didn't take.
     if cloud == "gcp":
@@ -775,6 +779,7 @@ def robust_teardown(
         print(f"[lab] sky.down exhausted for {cluster}; falling back to gcp-direct destroy")
         try:
             gcp_destroyed, gcp_failures = _gcp_destroy_matching(cluster)
+            events.note("teardown.fallback", cluster=cluster, via="gcp", ok=not gcp_failures)
             return {
                 # Destroyed-or-none-found are both safe. Found-and-failed-to-destroy is not: that
                 # is a live box we know about and could not kill, so it must alarm (FR-C2).
@@ -791,6 +796,7 @@ def robust_teardown(
                 ),
             }
         except Exception as e:  # noqa: BLE001
+            events.note("teardown.fallback", cluster=cluster, via="gcp", ok=False)
             return {
                 "status": "failed",
                 "attempts": len(delays),
@@ -814,6 +820,7 @@ def robust_teardown(
     print(f"[lab] sky.down exhausted for {cluster}; falling back to vast-sdk direct destroy")
     try:
         destroyed, failures = _vast_destroy_matching(cluster)
+        events.note("teardown.fallback", cluster=cluster, via="vast", ok=not failures)
         return {
             # Destroyed-or-none-found are both safe. Found-and-failed-to-destroy is not: that is
             # a live rental we know about and could not kill, so it must alarm (FR-C2).
@@ -828,6 +835,7 @@ def robust_teardown(
             ),
         }
     except Exception as e:  # noqa: BLE001
+        events.note("teardown.fallback", cluster=cluster, via="vast", ok=False)
         return {
             "status": "failed",
             "attempts": len(delays),
@@ -943,6 +951,7 @@ def provision_with_watchdog(sky_mod: Any, request_id: Any, *, timeout_s: float) 
             sky_mod.api_cancel(request_id)  # best-effort abort; robust_teardown kills the host
         except Exception as e:  # noqa: BLE001
             print(f"[lab] api_cancel after provision timeout failed: {e}")
+        events.note("provision.timeout", after_s=timeout_s)
         raise ProvisionTimeout(f"provisioning did not complete within {timeout_s:.0f}s")
 
     if "error" in holder:

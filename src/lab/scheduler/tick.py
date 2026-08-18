@@ -416,6 +416,8 @@ class Scheduler:
     def _evaluate_and_launch(
         self, entries: list[Registration], control: ControlConfig, rep: TickReport
     ) -> None:
+        from lab import events
+
         running = [
             r for r in entries
             if r.state is RegState.launched and r.job_id is not None
@@ -441,6 +443,9 @@ class Scheduler:
                 rep.skipped[reg.reg_id] = "held"
                 continue
             blocked = self._trigger_block(reg, by_id, rep)
+            events.note(
+                "scheduler.trigger", reg_id=reg.reg_id, fired=blocked is None, reason=blocked
+            )
             if blocked is not None:
                 if blocked != "":  # "" => dependency hard-failure already handled
                     self._skip(reg, rep, blocked)

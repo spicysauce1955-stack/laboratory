@@ -31,6 +31,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal
 
+from lab import events
 from lab._util import atomic_write_text
 from lab.models import ResourceRequest
 from pydantic import BaseModel
@@ -644,6 +645,7 @@ def run_checks(
         cached = cacheable.get(cache_key) if cacheable is not None else None
         if cached is not None:
             out.append(cached)
+            events.note("doctor.check", name=name, status=cached.status, detail=cached.detail)
             continue
         try:
             with _quiet_google_http():
@@ -651,6 +653,7 @@ def run_checks(
         except Exception as e:  # noqa: BLE001 — a broken check must never block a launch
             result = _skip(name, f"check errored: {str(e)[:160]}")
         out.append(result)
+        events.note("doctor.check", name=name, status=result.status, detail=result.detail)
         # A `skip` means "could not answer", which is not a finding worth remembering.
         if cacheable is not None and result.status != "skip":
             cacheable.put(cache_key, result)
