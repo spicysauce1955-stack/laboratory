@@ -6,6 +6,15 @@ with a **BREAKING** entry and an upgrade note.
 
 ## Unreleased
 
+### Added
+- **Event ledger.** Every CLI and MCP call is recorded to `~/.lab/events/`, with the internal
+  trace attached when the call fails. New `lab history` (session, forensic and aggregate views)
+  and `lab report` (markdown digest). Guide: `docs/guides/event-logging.md`.
+
+### Changed
+- The `lab` console entry point moved from `lab.cli:app` to `lab.cli:main`. Exit codes and output
+  are unchanged; the wrapper exists to record usage errors and crashes.
+
 ## v0.5.1 — 2026-08-12
 
 ### Changed
