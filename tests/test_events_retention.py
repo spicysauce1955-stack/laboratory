@@ -4,9 +4,10 @@ failures once the anchor ages — the scheduler watchdog already taught us that.
 from __future__ import annotations
 
 import threading
-import time
+from collections.abc import Iterable, Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -86,58 +87,83 @@ def test_pruning_failure_is_swallowed(_events_dir: Path, monkeypatch: pytest.Mon
     store.maybe_prune(now=NOW)  # must not raise
 
 
-def test_concurrent_append_not_lost_during_compaction(_events_dir: Path) -> None:
-    """Verify the race is fixed: append during compact survives.
+def test_concurrent_append_not_lost_during_compaction(
+    _events_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent append() during compact()'s critical section must not be lost.
 
-    With the lock-file fix, both append() and compact() hold the same lock before
-    accessing the day file. This test starts compact in a thread with widened critical
-    section, appends a failure (non-compactable) while compact is locked, then verifies
-    the append survived. Without the fix, the append would be lost to the stale snapshot.
+    This calls the real ``store.compact`` — no re-implementation of its body. The only
+    test-controlled seam is a wrapper around ``store.iter_records``, a function compact()
+    already calls to take its snapshot. The wrapper does the real read, then blocks on a
+    ``threading.Event`` (not a sleep) so the main thread can deterministically start a
+    concurrent ``append()`` while compact is paused between "snapshot taken" and "decide
+    and rewrite" — exactly the window the pre-fix code left unlocked.
+
+    On the fixed store this passes because compact() takes the per-day lock file *before*
+    calling iter_records, so the paused window is still inside the lock: append() simply
+    blocks until compact() finishes and releases, and its write always lands after
+    compact()'s rewrite. Nothing is lost, only ordered. Reverting compact() to the pre-fix
+    body (which reads unlocked and only locks around the write) loses "concurrent_fail" to
+    exactly this interleaving — see the RED evidence in the fix report.
     """
     old = NOW - timedelta(days=30)
     _write(old, *_pair("old_ok", "ok"))
 
-    appended: list[bool] = []
+    real_iter_records = store.iter_records
+    snapshot_taken = threading.Event()
+    release_compact = threading.Event()
 
-    def compact_with_sleep() -> None:
-        """Compact with a sleep to widen the critical section."""
-        cutoff = NOW - timedelta(days=14)
-        for p in store.day_files():
-            try:
-                if datetime.strptime(p.stem, "%Y-%m-%d").replace(tzinfo=timezone.utc) >= cutoff:
-                    continue
-                lock = store.lock_path(p)
-                import fcntl
-                with lock.open("a", encoding="utf-8") as lf:
-                    fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-                    try:
-                        # Sleep inside the critical section to widen the window
-                        time.sleep(0.2)
-                        records = list(store.iter_records([p]))
-                        succeeded = {r["id"] for r in records
-                                     if r.get("phase") == "close" and r.get("outcome") == "ok"}
-                        kept = [r for r in records if r.get("id") not in succeeded]
-                        if len(kept) != len(records):
-                            store._rewrite(p, kept)
-                    finally:
-                        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
-            except Exception:
-                pass
+    def paused_iter_records(paths: Iterable[Path]) -> Iterator[dict[str, Any]]:
+        records = list(real_iter_records(paths))
+        snapshot_taken.set()
+        if not release_compact.wait(timeout=5):
+            raise TimeoutError("test never released compact's paused snapshot")
+        return iter(records)
 
-    # Start compact in background thread
-    compact_thread = threading.Thread(target=compact_with_sleep)
+    monkeypatch.setattr(store, "iter_records", paused_iter_records)
+
+    compact_errors: list[BaseException] = []
+
+    def run_compact() -> None:
+        try:
+            store.compact(now=NOW, success_ttl_days=14)
+        except BaseException as e:  # noqa: BLE001 — captured and re-raised in the main thread
+            compact_errors.append(e)
+
+    compact_thread = threading.Thread(target=run_compact)
     compact_thread.start()
-    # Give compact time to take the lock and start the critical section
-    time.sleep(0.05)
-    # Now append a FAILURE while compact holds the lock (will be blocked)
-    # Failures are never compacted, so we can verify it survives
-    store.append({"id": "concurrent_fail", "phase": "close", "outcome": "error"}, when=old)
-    appended.append(True)
-    # Wait for compact to finish
-    compact_thread.join()
-    # The concurrent append must survive on disk
+    assert snapshot_taken.wait(timeout=5), "compact() never reached its snapshot point"
+
+    append_errors: list[BaseException] = []
+
+    def run_append() -> None:
+        try:
+            store.append(
+                {"id": "concurrent_fail", "phase": "close", "outcome": "error"}, when=old
+            )
+        except BaseException as e:  # noqa: BLE001 — captured and re-raised in the main thread
+            append_errors.append(e)
+
+    # append() from a real production caller, concurrently, while compact() is paused —
+    # this is the interleaving under test, not a re-implementation of either function.
+    append_thread = threading.Thread(target=run_append)
+    append_thread.start()
+
+    release_compact.set()
+
+    compact_thread.join(timeout=5)
+    append_thread.join(timeout=5)
+
+    assert not compact_thread.is_alive(), "compact() thread did not finish in time"
+    assert not append_thread.is_alive(), "append() thread did not finish in time"
+    if compact_errors:
+        raise compact_errors[0]
+    if append_errors:
+        raise append_errors[0]
+
     ids = {r["id"] for r in store.iter_records(store.day_files())}
-    assert "concurrent_fail" in ids  # Failure must survive compaction
+    assert "concurrent_fail" in ids, "concurrent append was lost to the compaction race"
+    assert "old_ok" not in ids  # compaction still did its job on the pre-existing success
 
 
 def test_lock_file_structure(_events_dir: Path) -> None:
@@ -205,14 +231,14 @@ def test_enforce_caps_handles_missing_files(
     original_stat = Path.stat
     call_count = [0]
 
-    def patched_stat(self: Path) -> object:
+    def patched_stat(self: Path, *args: object, **kwargs: object) -> object:
         # First call on our target file: delete it, then raise
         if self == target_file and call_count[0] == 0:
             call_count[0] += 1
             target_file.unlink()
             raise OSError("File vanished")
-        # All other calls: use original
-        return original_stat(self)
+        # All other calls: use original — must accept e.g. follow_symlinks=... too
+        return original_stat(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "stat", patched_stat)
     # This should not raise even though a file disappeared mid-loop
