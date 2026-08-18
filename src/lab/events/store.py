@@ -20,6 +20,15 @@ from typing import Any
 DEFAULT_DIR = "~/.lab/events"
 
 
+def lock_path(path: Path) -> Path:
+    """Return the stable-inode lock file for a day file.
+
+    Uses string concatenation (not with_suffix) to avoid replacing .jsonl,
+    ensuring lock files remain outside the ????-??-??.jsonl glob.
+    """
+    return Path(str(path) + ".lock")
+
+
 def enabled() -> bool:
     return (os.environ.get("LAB_EVENTS") or "").strip() != "0"
 
@@ -61,11 +70,13 @@ def append(record: dict[str, Any], *, when: datetime) -> None:
         path = day_file(when)
         path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(record, default=str, separators=(",", ":")) + "\n"
-        with path.open("a", encoding="utf-8") as f:
+        lock = lock_path(path)
+        with lock.open("a", encoding="utf-8") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
-                f.write(line)
-                f.flush()
+                with path.open("a", encoding="utf-8") as day_f:
+                    day_f.write(line)
+                    day_f.flush()
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
     except Exception as e:  # noqa: BLE001 — logging must never fail a command
@@ -110,16 +121,15 @@ def _float_env(name: str, default: float) -> float:
 
 
 def _rewrite(path: Path, records: list[dict[str, Any]]) -> None:
-    """Replace a day file under the same lock appends take."""
+    """Replace a day file. Caller must hold the lock via lock_path(path).
+
+    The caller takes the lock, reads the file, computes kept records, writes this temp file
+    under the lock, then replaces atomically. This ensures concurrent appends cannot be lost.
+    """
     tmp = path.with_suffix(".jsonl.tmp")
     text = "".join(json.dumps(r, default=str, separators=(",", ":")) + "\n" for r in records)
-    with path.open("a", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
-            tmp.write_text(text, encoding="utf-8")
-            os.replace(tmp, path)
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def compact(*, now: datetime, success_ttl_days: int) -> None:
@@ -130,12 +140,18 @@ def compact(*, now: datetime, success_ttl_days: int) -> None:
         try:
             if datetime.strptime(path.stem, "%Y-%m-%d").replace(tzinfo=timezone.utc) >= cutoff:
                 continue
-            records = list(iter_records([path]))
-            succeeded = {r["id"] for r in records
-                         if r.get("phase") == "close" and r.get("outcome") == "ok"}
-            kept = [r for r in records if r.get("id") not in succeeded]
-            if len(kept) != len(records):
-                _rewrite(path, kept)
+            lock = lock_path(path)
+            with lock.open("a", encoding="utf-8") as lf:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                try:
+                    records = list(iter_records([path]))
+                    succeeded = {r["id"] for r in records
+                                 if r.get("phase") == "close" and r.get("outcome") == "ok"}
+                    kept = [r for r in records if r.get("id") not in succeeded]
+                    if len(kept) != len(records):
+                        _rewrite(path, kept)
+                finally:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
         except Exception as e:  # noqa: BLE001
             debug(f"compaction failed for {path}: {e}")
 
@@ -158,7 +174,11 @@ def enforce_caps(*, now: datetime, max_age_days: int, max_mb: float) -> None:
     for path in remaining:  # oldest first
         if total <= budget:
             break
-        total -= path.stat().st_size
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        total -= size
         path.unlink(missing_ok=True)
 
 
@@ -169,10 +189,10 @@ def maybe_prune(*, now: datetime) -> None:
     try:
         stamp = events_dir() / STAMP
         today = now.strftime("%Y-%m-%d")
-        if stamp.exists() and stamp.read_text().strip() == today:
+        if stamp.exists() and stamp.read_text(encoding="utf-8").strip() == today:
             return
         stamp.parent.mkdir(parents=True, exist_ok=True)
-        stamp.write_text(today)
+        stamp.write_text(today, encoding="utf-8")
         compact(now=now, success_ttl_days=_int_env("LAB_EVENTS_SUCCESS_TTL_DAYS", 14))
         enforce_caps(
             now=now,
