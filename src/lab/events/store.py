@@ -13,7 +13,7 @@ import json
 import os
 import sys
 from collections.abc import Iterable, Iterator
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -90,3 +90,94 @@ def iter_records(paths: Iterable[Path]) -> Iterator[dict[str, Any]]:
                         yield record
         except OSError as e:
             debug(f"read failed for {path}: {e}")
+
+
+STAMP = ".pruned"
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int((os.environ.get(name) or "").strip() or default)
+    except ValueError:
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float((os.environ.get(name) or "").strip() or default)
+    except ValueError:
+        return default
+
+
+def _rewrite(path: Path, records: list[dict[str, Any]]) -> None:
+    """Replace a day file under the same lock appends take."""
+    tmp = path.with_suffix(".jsonl.tmp")
+    text = "".join(json.dumps(r, default=str, separators=(",", ":")) + "\n" for r in records)
+    with path.open("a", encoding="utf-8") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+def compact(*, now: datetime, success_ttl_days: int) -> None:
+    """Drop successful calls older than the TTL. Failures — and dangling opens, which are
+    themselves a finding — stay until the age cap takes them."""
+    cutoff = now - timedelta(days=success_ttl_days)
+    for path in day_files():
+        try:
+            if datetime.strptime(path.stem, "%Y-%m-%d").replace(tzinfo=timezone.utc) >= cutoff:
+                continue
+            records = list(iter_records([path]))
+            succeeded = {r["id"] for r in records
+                         if r.get("phase") == "close" and r.get("outcome") == "ok"}
+            kept = [r for r in records if r.get("id") not in succeeded]
+            if len(kept) != len(records):
+                _rewrite(path, kept)
+        except Exception as e:  # noqa: BLE001
+            debug(f"compaction failed for {path}: {e}")
+
+
+def enforce_caps(*, now: datetime, max_age_days: int, max_mb: float) -> None:
+    """Delete whole day files past the age cap, then oldest-first until under the byte cap."""
+    cutoff = now - timedelta(days=max_age_days)
+    remaining: list[Path] = []
+    for path in day_files():
+        try:
+            stamped = datetime.strptime(path.stem, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if stamped < cutoff:
+            path.unlink(missing_ok=True)
+        else:
+            remaining.append(path)
+    budget = max_mb * 1024 * 1024
+    total = sum(p.stat().st_size for p in remaining if p.exists())
+    for path in remaining:  # oldest first
+        if total <= budget:
+            break
+        total -= path.stat().st_size
+        path.unlink(missing_ok=True)
+
+
+def maybe_prune(*, now: datetime) -> None:
+    """Run retention at most once per UTC day per machine. Lazy, stamp-gated, best-effort."""
+    if not enabled():
+        return
+    try:
+        stamp = events_dir() / STAMP
+        today = now.strftime("%Y-%m-%d")
+        if stamp.exists() and stamp.read_text().strip() == today:
+            return
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(today)
+        compact(now=now, success_ttl_days=_int_env("LAB_EVENTS_SUCCESS_TTL_DAYS", 14))
+        enforce_caps(
+            now=now,
+            max_age_days=_int_env("LAB_EVENTS_MAX_AGE_DAYS", 90),
+            max_mb=_float_env("LAB_EVENTS_MAX_MB", 50),
+        )
+    except Exception as e:  # noqa: BLE001
+        debug(f"pruning failed: {e}")
