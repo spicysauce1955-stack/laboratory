@@ -170,7 +170,12 @@ def enforce_caps(*, now: datetime, max_age_days: int, max_mb: float) -> None:
         else:
             remaining.append(path)
     budget = max_mb * 1024 * 1024
-    total = sum(p.stat().st_size for p in remaining if p.exists())
+    total = 0
+    for p in remaining:
+        try:
+            total += p.stat().st_size
+        except OSError:
+            continue
     for path in remaining:  # oldest first
         if total <= budget:
             break
