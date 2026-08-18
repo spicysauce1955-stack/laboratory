@@ -41,7 +41,7 @@ def signature(error: dict[str, Any] | None) -> str:
     return f"{error.get('type', 'Error')}: {message[:120]}".strip()
 
 
-def _cost_usd(event: Event) -> float:
+def cost_usd(event: Event) -> float:
     """``result`` is whatever the entrypoint wrote to JSON — ``cost_usd`` can be any JSON value,
     not just a number. A non-numeric value is treated as no cost rather than raised, so one
     malformed record degrades instead of crashing the whole aggregate view."""
@@ -61,7 +61,7 @@ def stats(events: Sequence[Event], *, since: datetime | None = None) -> StatsVie
             dangling += 1
         if event.failed:
             by_sig[signature(event.error)].append(event)
-            usd_burned += _cost_usd(event)
+            usd_burned += cost_usd(event)
 
     actions: list[ActionStat] = []
     for action, group in by_action.items():
@@ -83,7 +83,7 @@ def stats(events: Sequence[Event], *, since: datetime | None = None) -> StatsVie
             first_seen=min(e.ts for e in group),
             last_seen=max(e.ts for e in group),
             actions=sorted({e.action for e in group}),
-            usd=round(sum(_cost_usd(e) for e in group), 4),
+            usd=round(sum(cost_usd(e) for e in group), 4),
         )
         for sig, group in by_sig.items()
     ]

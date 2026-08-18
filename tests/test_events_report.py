@@ -67,7 +67,7 @@ def test_only_failed_calls_carry_cost_into_the_report() -> None:
 
 def test_report_treats_a_non_numeric_cost_as_zero_without_crashing() -> None:
     # `result` is whatever the entrypoint wrote to JSON; `cost_usd` can be any JSON value. This
-    # must degrade to "no cost", the same rule `stats._cost_usd` already enforces, rather than
+    # must degrade to "no cost", the same rule `stats.cost_usd` already enforces, rather than
     # raising out of a naive `float(...)` call.
     text = report([_event("a", result={"cost_usd": "oops"})])
     assert "$0.0000" in text
@@ -77,3 +77,32 @@ def test_report_dict_wraps_the_markdown() -> None:
     d = report_dict([_event("a")])
     assert set(d.keys()) == {"markdown"}
     assert d["markdown"] == report([_event("a")])
+
+
+def test_multiline_error_message_does_not_corrupt_the_heading_or_observed_line() -> None:
+    # `error_dict` stores `str(exc)[:2048]` verbatim, and `signature()` only strips the ends —
+    # embedded newlines survive into `key`. Rendered raw, `## F1 — ...` would truncate at the
+    # newline and the rest of the message would spill out as an orphan, unlabeled line.
+    multiline = {"type": "ShellFail",
+                 "message": "cmd `sky launch --cloud gcp | tee log.txt`\nexit 1"}
+    text = report([_event("a", error=multiline)])
+    lines = text.splitlines()
+    heading_idx = next(i for i, line in enumerate(lines) if line.startswith("## F1 —"))
+    # the heading survives as one line — nothing after the embedded newline leaks onto its own
+    # unlabeled line between the heading and the blank line that must follow it
+    assert lines[heading_idx + 1] == ""
+    assert lines[heading_idx + 2].startswith("**Attempted:**")
+    # and the fragment that would have orphaned is still present, just folded into the heading
+    assert "exit" in lines[heading_idx]
+
+
+def test_trace_with_a_literal_backtick_run_does_not_break_its_code_fence() -> None:
+    from lab.events.models import Note
+
+    tricky = Note(t=5, k="stderr", d={"snippet": "```rm -rf /```"})
+    text = report([_event("a", trace=[tricky])])
+    fence_lines = [line for line in text.splitlines() if line and set(line) == {"`"}]
+    assert len(fence_lines) == 2  # a matching opening and closing fence
+    fence = fence_lines[0]
+    assert fence == fence_lines[1]
+    assert len(fence) > 3  # strictly longer than the 3-backtick run embedded in the content

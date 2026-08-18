@@ -6,15 +6,18 @@ per-finding *attempted / observed / cost*, with the job ids that reach the manif
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
 from lab.events.models import Event
-from lab.events.stats import _cost_usd, signature, stats
+from lab.events.stats import cost_usd, signature, stats
 
 _DANGLING_KEY = "never closed (running-or-died)"
+_WS_RUN = re.compile(r"\s+")
+_BACKTICK_RUN = re.compile(r"`+")
 
 
 def _severity(count: int, usd: float) -> float:
@@ -23,15 +26,33 @@ def _severity(count: int, usd: float) -> float:
     return count * (1.0 + usd)
 
 
+def _inline(text: str) -> str:
+    """Collapse embedded newlines/carriage-returns and runs of whitespace so free text stays on
+    one line wherever it's rendered outside a fenced code block. Error messages come from
+    ``str(exc)`` verbatim (``error_dict``) and routinely span multiple lines — a subprocess
+    traceback, a pydantic validation error — which would otherwise truncate a markdown heading
+    or split a ``**Observed:**`` line onto an orphan line with no label."""
+    return _WS_RUN.sub(" ", text).strip()
+
+
 def _escape_cell(text: str) -> str:
-    """A pipe inside a table cell would split it into extra columns; a newline would break the
-    row onto multiple lines. Both are realistic in an error message, so neutralize them rather
-    than trust upstream text to already be table-safe."""
-    return text.replace("|", "\\|").replace("\n", " ")
+    """A literal pipe inside a table cell would split it into extra columns. Whitespace
+    collapsing is a separate job (``_inline``) — compose the two for table cells rather than
+    merging them, since prose sections need inlining without ever needing pipe-escaping."""
+    return text.replace("|", "\\|")
+
+
+def _fence_for(lines: list[str]) -> str:
+    """A fenced code block's fence must be at least as long as any run of backticks inside it,
+    or a literal ``` ` `` `` in the content (a quoted shell pipeline, a markdown snippet in an
+    error) closes the fence early and spills the rest of the trace into the document as prose."""
+    longest = max((len(m.group()) for line in lines for m in _BACKTICK_RUN.finditer(line)),
+                  default=0)
+    return "`" * max(3, longest + 1)
 
 
 def _params_line(event: Event) -> str:
-    items = ", ".join(f"{k}={v}" for k, v in list(event.params.items())[:6])
+    items = ", ".join(f"{k}={_inline(str(v))}" for k, v in list(event.params.items())[:6])
     return f"`lab {event.action}` ({items})" if items else f"`lab {event.action}`"
 
 
@@ -62,7 +83,7 @@ def report(events: Sequence[Event], *, since: datetime | None = None) -> str:
         grouped[_group_key(event)].append(event)
     ranked = sorted(
         grouped.items(),
-        key=lambda kv: -_severity(len(kv[1]), sum(_cost_usd(e) for e in kv[1])),
+        key=lambda kv: -_severity(len(kv[1]), sum(cost_usd(e) for e in kv[1])),
     )
 
     lines += [
@@ -72,36 +93,42 @@ def report(events: Sequence[Event], *, since: datetime | None = None) -> str:
         "|---|---|---|---|---|",
     ]
     for i, (key, group) in enumerate(ranked, 1):
-        usd = sum(_cost_usd(e) for e in group)
+        usd = sum(cost_usd(e) for e in group)
         actions = ", ".join(sorted({e.action for e in group}))
         lines.append(
-            f"| F{i} | {_escape_cell(key)} | {len(group)} | ${usd:.4f} | "
-            f"{_escape_cell(actions)} |"
+            f"| F{i} | {_escape_cell(_inline(key))} | {len(group)} | ${usd:.4f} | "
+            f"{_escape_cell(_inline(actions))} |"
         )
     lines += ["", "---", ""]
 
     for i, (key, group) in enumerate(ranked, 1):
         newest = max(group, key=lambda e: e.ts)
-        usd = sum(_cost_usd(e) for e in group)
+        usd = sum(cost_usd(e) for e in group)
         job_ids = sorted({str(e.refs.get("job_id")) for e in group if e.refs.get("job_id")})
+        message = _inline(str(newest.error.get("message"))) if newest.error else ""
+        where = (
+            _inline(str(newest.error.get("where")))
+            if newest.error and "where" in newest.error else ""
+        )
         lines += [
-            f"## F{i} — {key}",
+            f"## F{i} — {_inline(key)}",
             "",
             f"**Attempted:** {_params_line(newest)}  ",
             f"**Observed:** {newest.status}"
-            + (f" — {newest.error.get('message')}" if newest.error else "")
-            + (f" (at `{newest.error.get('where')}`)" if newest.error and "where" in newest.error
-               else "") + "  ",
-            f"**Seen:** {len(group)}\u00d7 between {min(e.ts for e in group).isoformat()} "
+            + (f" — {message}" if newest.error else "")
+            + (f" (at `{where}`)" if where else "") + "  ",
+            f"**Seen:** {len(group)}× between {min(e.ts for e in group).isoformat()} "
             f"and {max(e.ts for e in group).isoformat()}  ",
             f"**Cost:** ${usd:.4f}  ",
         ]
         if job_ids:
             lines.append(f"**Jobs:** {', '.join(job_ids)} (`runs/<job_id>/logs.txt`)  ")
         if newest.trace:
-            lines += ["", "Trace of the most recent occurrence:", "", "```"]
-            lines += [f"+{n.t:>7}ms  {n.k}  {n.d}" for n in newest.trace]
-            lines += ["```"]
+            trace_lines = [f"+{n.t:>7}ms  {n.k}  {n.d}" for n in newest.trace]
+            fence = _fence_for(trace_lines)
+            lines += ["", "Trace of the most recent occurrence:", "", fence]
+            lines += trace_lines
+            lines += [fence]
         lines.append("")
     return "\n".join(lines)
 
