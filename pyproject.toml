@@ -43,7 +43,7 @@ r2 = ["boto3>=1.34"]
 tracking = ["mlflow>=2"]
 
 [project.scripts]
-lab = "lab.cli:app"
+lab = "lab.cli:main"
 
 [dependency-groups]
 # Only what you need to DEVELOP the lab. Everything needed to USE it is a real dependency or an
