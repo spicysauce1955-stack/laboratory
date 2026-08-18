@@ -9,7 +9,7 @@ import json
 import os
 import sys
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -497,6 +497,72 @@ def logs(job_id: str, tail: int = typer.Option(100)) -> None:
     """Tail a job's logs (FR-D1)."""
     for line in _lab_for_or_fail(job_id).logs(job_id, tail=tail):
         typer.echo(line)
+
+
+@app.command()
+def history(
+    limit: int = typer.Option(50, "--limit", "-n", help="most recent N calls"),
+    since: str | None = typer.Option(None, "--since", help="window, e.g. 2d / 30m"),
+    action: str | None = typer.Option(None, "--action", help="filter to one command/tool"),
+    job: str | None = typer.Option(None, "--job", help="calls that touched this job id"),
+    session: str | None = typer.Option(None, "--session", help="filter to one session id"),
+    failures: bool = typer.Option(False, "--failures", help="only calls that did not succeed"),
+    all_projects: bool = typer.Option(False, "--all-projects", help="across every project"),
+    full: bool = typer.Option(False, "--full", help="include params and the failure trace"),
+    stats: bool = typer.Option(False, "--stats", help="aggregate view instead of rows"),
+) -> None:
+    """Read the lab's own event ledger — what was run, what it did, why it failed.
+
+    This is *not* `lab logs`, which tails one job's stdout.
+    """
+    project = None if all_projects else repo_root().name
+    found = events.read(
+        since=since, project=project, action=action, session=session, job=job,
+        failures_only=failures, limit=None,
+    )
+    found = _exclude_self(found)
+    if not stats:
+        found = found[:limit]
+    if stats:
+        _emit(events.stats_dict(events.stats(found)))
+        return
+    _emit({"events": [events.row(e, full=full) for e in found]})
+
+
+def _exclude_self(found: list[events.Event]) -> list[events.Event]:
+    """Drop this very invocation's own still-open call.
+
+    `_load_env` opens this command's own ledger entry before its body runs, and the matching
+    close only lands after the body returns (in `main`) — so a `read()` taken mid-body always
+    sees itself as a dangling `running-or-died` row, freshest-first, ahead of everything real.
+    Left in, `lab history`/`lab report` would always report on themselves.
+    """
+    current = events.current()
+    if current is None:
+        return found
+    return [e for e in found if e.id != current.id]
+
+
+@app.command()
+def report(
+    since: str = typer.Option("7d", "--since", help="window, e.g. 7d"),
+    all_projects: bool = typer.Option(False, "--all-projects", help="across every project"),
+    out: str | None = typer.Option(None, "--out", help="write to this file instead of stdout"),
+) -> None:
+    """A pasteable markdown digest of what failed and what it cost (field-report shaped)."""
+    project = None if all_projects else repo_root().name
+    found = _exclude_self(events.read(since=since, project=project))
+    # `events.read` already applied `since` to filter `found` — this re-derives the same cutoff
+    # only so the report's own header ("since <cutoff>" vs "all recorded history") reflects the
+    # window that was actually applied, instead of always claiming the latter.
+    window_seconds = parse_duration(since) if since else None
+    cutoff = now() - timedelta(seconds=window_seconds) if window_seconds is not None else None
+    text = events.report(found, since=cutoff)
+    if out:
+        Path(out).write_text(text)
+        _emit({"written": out})
+        return
+    typer.echo(text)
 
 
 @app.command()
