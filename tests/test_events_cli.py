@@ -18,11 +18,29 @@ def _events_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path / "events"
 
 
-def _run(*args: str, env_dir: Path) -> subprocess.CompletedProcess[str]:
+@pytest.fixture
+def _sandbox_app():
+    """Registers throwaway commands on the shared module-level ``cli.app`` for one test, then
+    removes them. ``cli.app`` is a process-wide singleton every other test in the session also
+    imports — a command left behind here (as the original version of this test did) pollutes
+    every test that runs afterward, in this file and beyond."""
+    from lab import cli
+
+    before = list(cli.app.registered_commands)
+    yield cli.app
+    cli.app.registered_commands[:] = before
+
+
+def _run(
+    *args: str, env_dir: Path, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    env = {**dict(__import__("os").environ), "LAB_EVENTS_DIR": str(env_dir)}
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         [sys.executable, "-c", "from lab.cli import main; main()", *args],
         capture_output=True, text=True,
-        env={**dict(__import__("os").environ), "LAB_EVENTS_DIR": str(env_dir)},
+        env=env,
     )
 
 
@@ -70,12 +88,12 @@ def test_an_unknown_command_records_a_usage_error_with_sanitized_argv(_events_di
 
 
 def test_the_cause_behind_typer_exit_becomes_the_recorded_error(
-    monkeypatch: pytest.MonkeyPatch, _events_dir: Path
+    _sandbox_app, _events_dir: Path
 ) -> None:
     from lab import cli
 
-    @cli.app.command()
-    def boom() -> None:  # a stand-in for the ~25 `_fail(N, e)` call sites
+    @_sandbox_app.command()
+    def boom() -> None:  # a stand-in for the ~30 `_fail(N, e)` call sites
         try:
             raise RuntimeError("no capacity in europe-west1")
         except RuntimeError as e:
@@ -100,3 +118,98 @@ def test_emit_annotates_the_call_with_refs_and_a_digest(
     closed = _folded(_events_dir)[1]
     assert closed["refs"] == {"job_id": "j-4f2a"}
     assert closed["result"] == {"state": "succeeded", "cost_usd": 1.25}
+
+
+def test_a_keyboard_interrupt_during_a_command_is_recorded_as_interrupted(
+    _sandbox_app, _events_dir: Path
+) -> None:
+    """click's own dispatch catches an in-command Ctrl-C and re-raises it as `Exit(130)`, so
+    this arrives at `main()`'s `except SystemExit` branch, not the dedicated
+    `except KeyboardInterrupt` handler — that branch must classify code 130 as `interrupted`,
+    not fabricate a generic `"error"`."""
+    from lab import cli
+
+    @_sandbox_app.command()
+    def boominterrupt() -> None:
+        raise KeyboardInterrupt()
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["boominterrupt"])
+    assert exc.value.code == 130
+    closed = _folded(_events_dir)[1]
+    assert closed["outcome"] == "interrupted"
+    assert closed["exit_code"] == 130
+
+
+def test_an_unhandled_exception_is_recorded_as_a_crash(
+    _sandbox_app, _events_dir: Path
+) -> None:
+    from lab import cli
+
+    @_sandbox_app.command()
+    def boomcrash() -> None:
+        raise ValueError("unexpected: disk full")
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["boomcrash"])
+    assert exc.value.code == 1
+    closed = _folded(_events_dir)[1]
+    assert closed["outcome"] == "crash"
+    assert closed["exit_code"] == 1
+    assert closed["error"]["type"] == "ValueError"
+    assert closed["error"]["message"] == "unexpected: disk full"
+
+
+def test_wait_style_exit_codes_3_and_4_propagate_through_main(
+    _sandbox_app, _events_dir: Path
+) -> None:
+    """`lab wait`'s exit codes are contract (3 teardown leak, 4 fail-fast) — stand-ins for the
+    exact `_fail(3, ...)`/`_fail(4, ...)` calls `wait` itself makes, driven through `main()`."""
+    from lab import cli
+
+    @_sandbox_app.command()
+    def boom3() -> None:
+        cli._fail(3, "simulated teardown leak")
+
+    @_sandbox_app.command()
+    def boom4() -> None:
+        cli._fail(4, "simulated fail-fast")
+
+    with pytest.raises(SystemExit) as exc3:
+        cli.main(["boom3"])
+    assert exc3.value.code == 3
+    closed3 = _folded(_events_dir)[1]
+    assert closed3["outcome"] == "error"
+    assert closed3["exit_code"] == 3
+    assert closed3["error"]["message"] == "simulated teardown leak"
+
+    with pytest.raises(SystemExit) as exc4:
+        cli.main(["boom4"])
+    assert exc4.value.code == 4
+    closed4 = _folded(_events_dir)[-1]
+    assert closed4["outcome"] == "error"
+    assert closed4["exit_code"] == 4
+    assert closed4["error"]["message"] == "simulated fail-fast"
+
+
+def test_queue_and_scheduler_subcommands_record_the_leaf_action(
+    tmp_path: Path, _events_dir: Path
+) -> None:
+    """`ctx.invoked_subcommand` only ever resolves to the immediate top-level child, so without
+    `_group_action` every `lab queue ...`/`lab scheduler ...` invocation would collapse to the
+    same indistinguishable action name (`"queue"`/`"scheduler"`). The design doc names
+    `action: "scheduler tick"` specifically as what the scheduler's systemd timer records."""
+    (tmp_path / "repo").mkdir()
+    (tmp_path / "queue").mkdir()
+    extra_env = {"LAB_REPO_DIR": str(tmp_path / "repo"), "LAB_QUEUE_DIR": str(tmp_path / "queue")}
+
+    proc = _run("queue", "list", env_dir=_events_dir, extra_env=extra_env)
+    assert proc.returncode == 0, proc.stderr
+    opened = _folded(_events_dir)[0]
+    assert opened["action"] == "queue list"
+
+    proc = _run("scheduler", "tick", env_dir=_events_dir, extra_env=extra_env)
+    assert proc.returncode == 0, proc.stderr
+    records = _folded(_events_dir)
+    tick_opened = records[2]  # after queue-list's open+close pair
+    assert tick_opened["action"] == "scheduler tick"

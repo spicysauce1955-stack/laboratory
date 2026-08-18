@@ -54,6 +54,28 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
+def _group_action(ctx: typer.Context) -> str:
+    """The ledger's action name for this invocation: the leaf subcommand for a two-level group
+    dispatch (``lab queue list`` -> ``"queue list"``), or the top-level command name otherwise.
+
+    ``ctx.invoked_subcommand`` only ever resolves to the *immediate* child of the top-level
+    group, so a group sub-app's (``queue``, ``scheduler``) own subcommands would otherwise all
+    collapse to one indistinguishable action name. This is spec-mandated, not cosmetic: the
+    design doc names ``action: "scheduler tick"`` as what the scheduler's systemd timer records.
+    The group names are read off ``app.registered_groups`` rather than hardcoded, so a third
+    sub-app added later doesn't silently regress back to this bug.
+    """
+    action = ctx.invoked_subcommand
+    assert action is not None  # only called when the caller has already checked this
+    group_names = {g.name for g in app.registered_groups if g.name}
+    if action in group_names and action in sys.argv:
+        rest = sys.argv[sys.argv.index(action) + 1 :]
+        leaf = next((tok for tok in rest if not tok.startswith("-")), None)
+        if leaf:
+            return f"{action} {leaf}"
+    return action
+
+
 @app.callback()
 def _load_env(
     # Deliberately bare ``typer.Context``, not ``Context | None``: typer's own parameter-type
@@ -85,7 +107,7 @@ def _load_env(
     # package, so the latter's context stack is always empty here) is already resolved by the
     # time this callback runs: the group dispatches by name before invoking its own callback.
     if ctx is not None and ctx.invoked_subcommand:
-        events.begin("cli", ctx.invoked_subcommand, {"argv": sanitize_argv(sys.argv[1:])})
+        events.begin("cli", _group_action(ctx), {"argv": sanitize_argv(sys.argv[1:])})
 
 
 def _warn_if_repo_override_shadows_cwd() -> None:
@@ -1229,8 +1251,13 @@ def main(argv: list[str] | None = None) -> None:
         app(args=argv)
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
-        outcome = "ok" if code == 0 else "error"
+        # click's own dispatch (`typer/core.py::_main`) catches a Ctrl-C raised *during a
+        # command* itself and re-raises it as `Exit(130)` before we ever see a raw
+        # KeyboardInterrupt — so the common case arrives here, not in the handler below.
+        outcome = "ok" if code == 0 else ("interrupted" if code == 130 else "error")
     except KeyboardInterrupt:
+        # Only reachable for a Ctrl-C outside that window (e.g. during shell-completion
+        # handling or before click's dispatch takes over) — kept as a safety net.
         code, outcome = 130, "interrupted"
     except Exception as e:  # noqa: BLE001 — record, then behave exactly as before
         traceback.print_exc()
