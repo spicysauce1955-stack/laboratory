@@ -105,3 +105,39 @@ def test_installed_wheel_scaffolds_and_runs_a_job(tmp_path: Path) -> None:
     assert ledger, "the installed wheel must write its ledger with no checkout on sys.path"
     records = [json.loads(line) for p in ledger for line in p.read_text().splitlines()]
     assert any(r.get("phase") == "open" and r.get("action") == "submit" for r in records)
+
+
+@pytest.mark.packaging
+def test_built_artifacts_carry_the_skill_payload(tmp_path: Path) -> None:
+    """Build the way the release workflow does, and check the skill is actually in there.
+
+    `.claude/skills/laboratory` symlinks into the scaffold so this repo's own sessions read the
+    file the package ships. Hatchling's sdist walker resolves that symlink and then skips the real
+    directory, and `uv build` with no flags builds the wheel FROM the sdist — so v0.5.1 through
+    v0.6.1 published wheels with no skill in them, and `lab init` scaffolded none. The other
+    guards all missed it: `test_skill_ships_in_the_payload` reads the source tree through
+    `importlib.resources`, and the wheel test above builds with `--wheel`, which walks the tree
+    directly and is not affected. Only a bare `uv build` reproduces the release path.
+    """
+    import tarfile
+    import zipfile
+
+    dist = tmp_path / "dist"
+    _run(["uv", "build", "-o", str(dist)], cwd=REPO)
+
+    (sdist,) = list(dist.glob("*.tar.gz"))
+    with tarfile.open(sdist) as tar:
+        sdist_skill = [n for n in tar.getnames() if n.endswith("skills/laboratory/SKILL.md")]
+    assert sdist_skill, f"the sdist carries no skill: {sorted(dist.iterdir())}"
+
+    (wheel,) = list(dist.glob("*.whl"))
+    with zipfile.ZipFile(wheel) as zf:
+        names = zf.namelist()
+        wheel_skill = [n for n in names if n.endswith("skills/laboratory/SKILL.md")]
+        examples = [n for n in names if "skills/laboratory/examples/" in n]
+        text = zf.read(wheel_skill[0]).decode() if wheel_skill else ""
+    assert wheel_skill, (
+        "the wheel built from the sdist carries no skill — `lab init` would ship none"
+    )
+    assert examples, "the skill's examples/ walkthroughs are missing from the wheel"
+    assert "mcp__lab__submit" in text, "the packaged SKILL.md is not the real skill"
