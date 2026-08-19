@@ -106,3 +106,19 @@ def test_trace_with_a_literal_backtick_run_does_not_break_its_code_fence() -> No
     fence = fence_lines[0]
     assert fence == fence_lines[1]
     assert len(fence) > 3  # strictly longer than the 3-backtick run embedded in the content
+
+
+def test_an_explicit_null_where_renders_no_location_suffix() -> None:
+    """`_fail` records `where: None` for every chosen non-zero exit — the commonest failure shape
+    there is — so a key-presence guard would print "(at `None`)" on nearly every finding."""
+    err = {"type": "Exit", "message": "unknown job id j-nope", "where": None}
+    text = report([_event("a", error=err)])
+    assert "unknown job id j-nope" in text  # the message still renders
+    assert "(at `None`)" not in text
+    assert "(at `" not in text  # no location suffix at all when there is no location
+
+
+def test_a_real_where_still_renders_its_location() -> None:
+    err = {"type": "ProvisionTimeout", "message": "no capacity", "where": "lab/x.py:12"}
+    text = report([_event("a", error=err)])
+    assert "(at `lab/x.py:12`)" in text

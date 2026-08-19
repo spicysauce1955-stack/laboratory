@@ -106,9 +106,12 @@ def report(events: Sequence[Event], *, since: datetime | None = None) -> str:
         usd = sum(cost_usd(e) for e in group)
         job_ids = sorted({str(e.refs.get("job_id")) for e in group if e.refs.get("job_id")})
         message = _inline(str(newest.error.get("message"))) if newest.error else ""
+        # Truthiness, not key presence: `_fail` records `where: None` for every chosen non-zero
+        # exit, which is the commonest failure shape there is — a key-presence guard renders
+        # "(at `None`)" on nearly every finding.
         where = (
             _inline(str(newest.error.get("where")))
-            if newest.error and "where" in newest.error else ""
+            if newest.error and newest.error.get("where") else ""
         )
         lines += [
             f"## F{i} — {_inline(key)}",
