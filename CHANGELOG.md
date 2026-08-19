@@ -4,6 +4,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning is 
 breaks the surface in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md); MINOR may, and says so
 with a **BREAKING** entry and an upgrade note.
 
+## v0.6.1 — 2026-08-19
+
+### Changed
+- **The packaged skill teaches the ledger.** `lab history` and `lab report` shipped in v0.6.0 but
+  the scaffolded `laboratory` skill never mentioned them, so an agent driving the lab had no way
+  to know it could ask what it had already tried or why a call failed. The skill now documents
+  both MCP tools with their real return shapes, adds a workflow for diagnosing a failure, and
+  spells out the two distinctions an agent gets wrong: `history` is the tool's own ledger while
+  `logs` is one job's stdout (a submit that never became a job has no log), and a
+  `running-or-died` row is a finding, not a glitch. Re-run `uv run lab init` to refresh it.
+
+### Fixed
+- **`lab report` printed ``(at `None`)`` under nearly every finding.** The location suffix
+  guarded on key presence, but a chosen non-zero exit records `where: None` — the commonest
+  failure shape there is. Guards on truthiness now.
+- **A sweep-retry test raced the shard subprocess it was overriding.** `test_retry_sweep` drives a
+  real `LocalBackend`, whose shards write their own terminal status asynchronously; when that
+  write landed after the test's, the shard was left non-terminal, `retry_sweep` treated it as
+  in-flight, and resubmitted nothing. Tests now wait for terminal before overriding. Test-only —
+  no shipped behaviour changed.
+
 ## v0.6.0 — 2026-08-19
 
 ### Added
