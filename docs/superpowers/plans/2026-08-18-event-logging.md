@@ -1017,6 +1017,7 @@ from collections import deque
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import datetime
 from typing import Any
 
 from lab import __version__
@@ -1072,7 +1073,7 @@ def error_dict(exc: BaseException) -> dict[str, Any]:
 class Call:
     """A call in flight. Annotate it with :meth:`ref` and :meth:`result`; nothing else."""
 
-    def __init__(self, id: str, started: Any, seq: int) -> None:
+    def __init__(self, id: str, started: datetime, seq: int) -> None:
         self.id = id
         self.started = started
         self.seq = seq
@@ -1595,6 +1596,7 @@ git commit -m "feat(events): record MCP tool calls via on_call_tool middleware"
 - Produces:
   - `fold(records: Iterable[dict]) -> list[Event]`
   - `read(*, since: str | None = None, project: str | None = None, action: str | None = None, session: str | None = None, job: str | None = None, failures_only: bool = False, limit: int | None = None, now_: datetime | None = None) -> list[Event]` — newest first
+  - `row(event: Event, *, full: bool = False) -> dict[str, Any]` — the display shape both shells emit
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1694,6 +1696,20 @@ def test_read_since_uses_the_duration_parser(_ledger: None) -> None:
 
 def test_read_limit_applies_after_filtering(_ledger: None) -> None:
     assert len(read(limit=1)) == 1
+
+
+def test_row_is_brief_by_default_and_detailed_with_full() -> None:
+    from lab.events.read import row
+
+    (event,) = fold([_open("a", params={"backend": "cpu"}),
+                     _close("a", outcome="error",
+                            trace=[{"t": 5, "k": "provision.attempt", "d": {"z": "b"}}])])
+    brief = row(event)
+    assert brief["status"] == "error" and brief["action"] == "submit"
+    assert "trace" not in brief and "params" not in brief
+    detailed = row(event, full=True)
+    assert detailed["params"] == {"backend": "cpu"}
+    assert detailed["trace"][0]["k"] == "provision.attempt"
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1793,11 +1809,32 @@ def read(
     if failures_only:
         events = [e for e in events if e.failed]
     return events[:limit] if limit else events
+
+
+def row(event: Event, *, full: bool = False) -> dict[str, Any]:
+    """The display shape. Lives here so the CLI and the MCP server emit identical rows without
+    either shell importing the other."""
+    out: dict[str, Any] = {
+        "id": event.id, "ts": event.ts.isoformat(), "action": event.action,
+        "surface": event.surface, "status": event.status, "duration_ms": event.duration_ms,
+        "project": event.project.get("name"), "refs": event.refs, "result": event.result,
+        "error": (event.error or {}).get("message"),
+    }
+    if full:
+        out |= {
+            "params": event.params, "session": event.session, "exit_code": event.exit_code,
+            "lab_version": event.lab_version, "error_detail": event.error,
+            "trace": [vars(n) for n in event.trace],
+        }
+    return out
 ```
 
-- [ ] **Step 4: Export `fold` and `read` from `src/lab/events/__init__.py`**
+`read.py` needs `from typing import Any` for `row`'s return type.
 
-Add `from lab.events.read import fold, read` and extend `__all__` with `"fold"`, `"read"`.
+- [ ] **Step 4: Export `fold`, `read` and `row` from `src/lab/events/__init__.py`**
+
+Add `from lab.events.read import fold, read, row` and extend `__all__` with `"fold"`, `"read"`,
+`"row"`.
 
 - [ ] **Step 5: Run the tests**
 
@@ -2043,7 +2080,9 @@ git commit -m "feat(events): aggregate stats built on a normalized error signatu
 
 **Interfaces:**
 - Consumes: `models.Event`, `stats.stats`, `stats.signature`.
-- Produces: `report(events: Sequence[Event], *, since: datetime | None = None) -> str`
+- Produces:
+  - `report(events: Sequence[Event], *, since: datetime | None = None) -> str`
+  - `report_dict(events: Sequence[Event], *, since: datetime | None = None) -> dict[str, Any]`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2317,22 +2356,6 @@ Expected: FAIL — `No such command 'history'`
 Add near the other read-only commands (after `logs`):
 
 ```python
-def _event_row(event: "events.Event", *, full: bool) -> dict[str, Any]:
-    row: dict[str, Any] = {
-        "id": event.id, "ts": event.ts.isoformat(), "action": event.action,
-        "surface": event.surface, "status": event.status, "duration_ms": event.duration_ms,
-        "project": event.project.get("name"), "refs": event.refs, "result": event.result,
-        "error": (event.error or {}).get("message"),
-    }
-    if full:
-        row |= {
-            "params": event.params, "session": event.session, "exit_code": event.exit_code,
-            "lab_version": event.lab_version, "error_detail": event.error,
-            "trace": [vars(n) for n in event.trace],
-        }
-    return row
-
-
 @app.command()
 def history(
     limit: int = typer.Option(50, "--limit", "-n", help="most recent N calls"),
@@ -2357,7 +2380,7 @@ def history(
     if stats:
         _emit(events.stats_dict(events.stats(found)))
         return
-    _emit({"events": [_event_row(e, full=full) for e in found]})
+    _emit({"events": [events.row(e, full=full) for e in found]})
 
 
 @app.command()
@@ -2399,7 +2422,7 @@ git commit -m "feat(cli): lab history and lab report over the event ledger"
 - Test: `tests/test_events_mcp.py` (extend)
 
 **Interfaces:**
-- Consumes: `events.read`, `events.stats`, `events.stats_dict`, `events.report_dict`, `cli._event_row` is **not** reused — the MCP layer builds its own row to avoid importing the CLI.
+- Consumes: `events.read`, `events.row`, `events.stats`, `events.stats_dict`, `events.report_dict`. The row builder is shared through `lab.events`, so neither shell imports the other.
 - Produces: MCP tools `history`, `report`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -2455,18 +2478,7 @@ Expected: FAIL — unknown tool `history`.
         )
         if stats:
             return events.stats_dict(events.stats(found))
-        rows = []
-        for e in found:
-            row: dict[str, Any] = {
-                "id": e.id, "ts": e.ts.isoformat(), "action": e.action, "surface": e.surface,
-                "status": e.status, "duration_ms": e.duration_ms, "refs": e.refs,
-                "result": e.result, "error": (e.error or {}).get("message"),
-            }
-            if full:
-                row |= {"params": e.params, "error_detail": e.error,
-                        "trace": [vars(n) for n in e.trace]}
-            rows.append(row)
-        return {"events": rows}
+        return {"events": [events.row(e, full=full) for e in found]}
 
     @mcp.tool
     def report(since: str = "7d", all_projects: bool = False) -> dict[str, Any]:
@@ -2674,9 +2686,10 @@ def test_concurrent_writers_produce_only_whole_lines(tmp_path: Path) -> None:
 - [ ] **Step 2: Run it to verify it passes with the lock and fails without**
 
 Run: `uv run pytest tests/test_events_concurrency.py -v`
-Expected: PASS. Then temporarily comment out the two `fcntl.flock` calls in `store.append` and
-re-run — with 3 KB records it must fail. Restore the lock. This confirms the test has teeth
-rather than passing because the writes were small enough to be atomic anyway.
+Expected: PASS. Then temporarily neutralise the lock `store.append` takes — the `flock`
+acquire/release around its write, which is held on the per-day `.lock` file rather than on the
+day file itself — and re-run. With 3 KB records it must fail. Restore the lock. This confirms
+the test has teeth rather than passing because the writes were small enough to be atomic anyway.
 
 - [ ] **Step 3: Extend the packaging test**
 

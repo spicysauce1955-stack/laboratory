@@ -189,9 +189,15 @@ packaging` exercises.
 Each event carries `project`, so per-project filtering is a read-side concern.
 
 **Concurrency.** A sharded sweep launches many `lab` processes at once against the same file.
-Each line is written as a single `O_APPEND` write under `flock`. Cheap, and it rules out the
-torn or interleaved lines that would make the store untrustworthy in exactly the situation where
-it matters most.
+Each line is written as a single `O_APPEND` write, serialised by an `flock` on a **per-day lock
+file** (`<day>.jsonl.lock`). Cheap, and it rules out the torn or interleaved lines that would
+make the store untrustworthy in exactly the situation where it matters most.
+
+The lock lives on its own file rather than on the day file because compaction replaces the day
+file via `os.replace`, which swaps its inode: a writer blocked on the *old* inode's lock would
+wake holding a lock on an unlinked file and write a record nobody can read. A separate lock file
+has a stable inode, so both writers serialise against the same object. Lock files are excluded
+from the `????-??-??.jsonl` glob, so they never reach a reader or the byte budget.
 
 **Failure is never fatal.** Every write path is best-effort inside `try/except`. An unwritable or
 corrupt event store must never fail a `submit` — the same posture as the advisory zone memo.
@@ -204,7 +210,8 @@ cannot be read because one line is bad would fail at its only job.
 
 Recording argv means recording whatever was typed, and `lab.redact` only knows patterns that
 appear in *subprocess output* — it will not catch a key passed as a flag value. `params` therefore
-goes through a sanitizer with an allow-list posture, in order:
+goes through a sanitizer with a **deny-list** posture — default pass, mask on a matched
+pattern — not an allow-list, in order:
 
 1. Mask any key whose name matches `key|token|secret|password|credential|auth`.
 2. Mask any value matching a secret *shape*: `ya29.`, a PEM header, a long high-entropy run.

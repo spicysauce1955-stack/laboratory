@@ -70,6 +70,9 @@ def test_installed_wheel_scaffolds_and_runs_a_job(tmp_path: Path) -> None:
     env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
     env.pop("LAB_REPO_DIR", None)
     env.pop("VIRTUAL_ENV", None)
+    # lab.events must work from the installed wheel with no checkout on sys.path; point it at a
+    # scratch dir so this test doesn't write into the developer's real ~/.lab/events.
+    env["LAB_EVENTS_DIR"] = str(tmp_path / "events")
 
     _run([lab, "init"], cwd=project, env=env)
     assert (project / ".mcp.json").is_file()
@@ -95,3 +98,10 @@ def test_installed_wheel_scaffolds_and_runs_a_job(tmp_path: Path) -> None:
 
     check = subprocess.run([lab, "init", "--check"], cwd=project, env=env, capture_output=True)
     assert check.returncode == 0, check.stdout
+
+    # lab.events must be a real base dependency, not something only present in this checkout —
+    # the same class of failure this whole test module exists to catch.
+    ledger = sorted((tmp_path / "events").glob("*.jsonl"))
+    assert ledger, "the installed wheel must write its ledger with no checkout on sys.path"
+    records = [json.loads(line) for p in ledger for line in p.read_text().splitlines()]
+    assert any(r.get("phase") == "open" and r.get("action") == "submit" for r in records)

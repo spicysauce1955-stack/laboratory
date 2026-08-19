@@ -24,6 +24,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from lab import events
 from lab._util import infer_artifact_type, now, parse_duration, pid_alive
 from lab.manifest import sha256_file
 from lab.metrics import METRICS_FILE, read_points
@@ -678,6 +679,7 @@ def vast_balance(client: Any | None = None) -> float | None:
         # stderr: this runs on the CLI's JSON path, where a stray stdout line is a corrupted
         # payload rather than a log line.
         print(f"[lab] vast balance lookup failed: {e}", file=sys.stderr)
+        events.note("vast.balance_failed", error=str(e))
         return None
     for key in ("credit", "balance"):
         val = info.get(key) if isinstance(info, dict) else getattr(info, key, None)
@@ -754,6 +756,7 @@ def robust_teardown(
     for attempt, delay in enumerate(delays, start=1):
         if delay:
             time.sleep(delay)
+        events.note("teardown.attempt", cluster=cluster, attempt=attempt)
         try:
             sky_mod.get(sky_mod.down(cluster))
             return {
@@ -768,6 +771,7 @@ def robust_teardown(
             print(
                 f"[lab] sky.down attempt {attempt}/{len(delays)} for {cluster} failed: {last_err}"
             )
+            events.note("teardown.retry", cluster=cluster, attempt=attempt, error=last_err)
 
     # SkyPilot teardown didn't take.
     if cloud == "gcp":
@@ -775,6 +779,7 @@ def robust_teardown(
         print(f"[lab] sky.down exhausted for {cluster}; falling back to gcp-direct destroy")
         try:
             gcp_destroyed, gcp_failures = _gcp_destroy_matching(cluster)
+            events.note("teardown.fallback", cluster=cluster, via="gcp", ok=not gcp_failures)
             return {
                 # Destroyed-or-none-found are both safe. Found-and-failed-to-destroy is not: that
                 # is a live box we know about and could not kill, so it must alarm (FR-C2).
@@ -791,6 +796,7 @@ def robust_teardown(
                 ),
             }
         except Exception as e:  # noqa: BLE001
+            events.note("teardown.fallback", cluster=cluster, via="gcp", ok=False)
             return {
                 "status": "failed",
                 "attempts": len(delays),
@@ -814,6 +820,7 @@ def robust_teardown(
     print(f"[lab] sky.down exhausted for {cluster}; falling back to vast-sdk direct destroy")
     try:
         destroyed, failures = _vast_destroy_matching(cluster)
+        events.note("teardown.fallback", cluster=cluster, via="vast", ok=not failures)
         return {
             # Destroyed-or-none-found are both safe. Found-and-failed-to-destroy is not: that is
             # a live rental we know about and could not kill, so it must alarm (FR-C2).
@@ -828,6 +835,7 @@ def robust_teardown(
             ),
         }
     except Exception as e:  # noqa: BLE001
+        events.note("teardown.fallback", cluster=cluster, via="vast", ok=False)
         return {
             "status": "failed",
             "attempts": len(delays),
@@ -943,6 +951,11 @@ def provision_with_watchdog(sky_mod: Any, request_id: Any, *, timeout_s: float) 
             sky_mod.api_cancel(request_id)  # best-effort abort; robust_teardown kills the host
         except Exception as e:  # noqa: BLE001
             print(f"[lab] api_cancel after provision timeout failed: {e}")
+        # No `cloud` field: this function's signature carries no cloud (only its caller in
+        # sky_runner.py does), and threading one through would be a real signature change rather
+        # than a note added at an existing decision point. Deliberate omission, not an oversight
+        # — the paired `provision.attempt` note (sky_runner.py) does carry it.
+        events.note("provision.timeout", after_s=timeout_s)
         raise ProvisionTimeout(f"provisioning did not complete within {timeout_s:.0f}s")
 
     if "error" in holder:
@@ -1085,12 +1098,18 @@ class SkyPilotBackend:
         job_dir.mkdir(parents=True, exist_ok=True)
         # Supervisor's stdout/stderr (incl. sky.launch streamed logs) -> the job log file (FR-D1).
         logf = self.store.logs_path(manifest.job_id).open("w")
+        # Group the supervisor's own ledger call into this submit's session, even when
+        # LAB_SESSION_ID was never a real env var (the common case: this process generated one
+        # in memory) — plain env inheritance would miss that. job_id stays the join key either
+        # way (see run_job's events.begin call).
+        child_env = {**os.environ, "LAB_SESSION_ID": events.session_id()}
         proc = subprocess.Popen(
             [sys.executable, "-m", "lab.sky_runner", str(job_dir)],
             stdout=logf,
             stderr=subprocess.STDOUT,
             cwd=str(self.repo),
             start_new_session=True,
+            env=child_env,
         )
         self.store.write_runtime(
             manifest.job_id, runner_pid=proc.pid, cluster=cluster_name_for(manifest.job_id)

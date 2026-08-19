@@ -101,6 +101,24 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   (`LAB_SUBMIT_STAGGER_S`, default 1.5s). `lab export <job|sweep> --to DIR` writes the
   committable provenance bundle (manifests + tables + diffs + index.json). `lab status` shows
   `estimated_running_usd` + `last_log_line`. Grid is optional when `--seeds` is given.
+- **Event ledger (`lab.events`):** every CLI/MCP call writes an open/close pair to
+  `~/.lab/events/YYYY-MM-DD.jsonl` (user-global, project-tagged; `LAB_EVENTS_DIR` overrides,
+  `LAB_EVENTS=0` disables). Internals call `events.note(...)`, buffered in memory and flushed
+  into the record **only when the call fails** — successes stay tiny, failures carry the trace.
+  The SkyPilot supervisor gets its own `surface: "supervisor"` record (it's a detached process,
+  so notes there would otherwise be dead), joined to its submitter's session via
+  `LAB_SESSION_ID` passthrough. Read it with **`lab history`**
+  (`--job/--session/--since/--failures/--full/--stats`) and **`lab report`** (markdown digest);
+  both default to the current project and exclude their own in-flight call; `lab logs` is
+  unrelated — that tails one job's stdout. Retention: successes compacted after 14d, files
+  deleted past 90d or 50 MB (`LAB_EVENTS_SUCCESS_TTL_DAYS`/`LAB_EVENTS_MAX_AGE_DAYS`/
+  `LAB_EVENTS_MAX_MB`), guarded by a per-day lock file (`<day>.jsonl.lock`) shared with
+  `append()`. `params` passes through `lab.events.sanitize` first — a **deny-list**, not an
+  allow-list: mask by key name/value shape/entropy, default pass — never raw (FR-J1). The
+  console entry point moved to `lab.cli:main`, which runs typer in standalone mode and records
+  usage errors/crashes via a `_fail()` helper — `standalone_mode=False` was tried and abandoned
+  (typer 0.26 swallows `Exit.__cause__` regardless); exit codes are unchanged and `lab wait`'s
+  3/4 remain contract. Guide: `docs/guides/event-logging.md`.
 
 ## Conventions
 - `ruff` (line length 100), `mypy --strict` on `src/lab`. CLI and MCP server are thin shells over

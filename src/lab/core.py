@@ -41,7 +41,7 @@ from lab.manifest import (
     repo_root,
     uv_lock_sha256,
 )
-from lab import placement
+from lab import events, placement
 from lab.metrics import final_values, group_series
 from lab.storage import R2Store, r2_enabled
 from lab.models import (
@@ -397,6 +397,11 @@ class Lab:
                         "working tree changed during submit (no diff to capture); retry (FR-B1)"
                     )
                 diff_ref = blob
+                try:
+                    diff_bytes: int | None = Path(blob).stat().st_size
+                except OSError:
+                    diff_bytes = None
+                events.note("core.dirty_snapshot", diff_ref=diff_ref, bytes=diff_bytes)
                 if r2_enabled():
                     r2 = R2Store.from_env()
                     if r2 is not None:
@@ -406,6 +411,7 @@ class Lab:
                             diff_ref = r2.uri(rel)
                         except Exception as e:  # noqa: BLE001 — local diff_ref stays fail-closed
                             print(f"[lab] diff R2 upload failed, keeping local copy: {e}")
+                            events.note("storage.upload_failed", key=rel, error=str(e))
             code = CodeRef(
                 git_commit=current_commit(self.repo), git_dirty=dirty, diff_ref=diff_ref
             )
@@ -473,6 +479,7 @@ class Lab:
                 )
                 == key
             ):
+                events.note("core.cache_hit", job_id=m.job_id)
                 return m.job_id
         return None
 
@@ -560,6 +567,7 @@ class Lab:
             for shard in shards:
                 if all_job_ids and stagger:
                     time.sleep(stagger)  # don't stampede the local SkyPilot API server
+                    events.note("core.submit_stagger", seconds=stagger, shard=shard[0])
                 point = {**cell, seed_axis_key: seeds_to_arg(shard)}
                 spec = build_sweep_point_spec(
                     command, point, seed=shard[0], resources=resources,
@@ -627,6 +635,7 @@ class Lab:
         for point in points:
             if job_ids and stagger:
                 time.sleep(stagger)  # don't stampede the local SkyPilot API server
+                events.note("core.submit_stagger", seconds=stagger, shard=None)
             spec = build_sweep_point_spec(
                 command, point, seed=seed, resources=resources,
                 code_ref=code_ref, submitted_by=submitted_by,
@@ -696,12 +705,12 @@ class Lab:
                 if r2_enabled():
                     r2 = R2Store.from_env()
                     if r2 is not None:
+                        rel = f"{sweep_id}/cells/{cell.cell_id}/{cell.results_file}"
                         try:
-                            r2.upload_file(
-                                dest, f"{sweep_id}/cells/{cell.cell_id}/{cell.results_file}"
-                            )
+                            r2.upload_file(dest, rel)
                         except Exception as e:  # noqa: BLE001 — local aggregate stays authoritative
                             print(f"[lab] aggregate R2 mirror failed, keeping local copy: {e}")
+                            events.note("storage.upload_failed", key=rel, error=str(e))
         self.store.write_sweep_plan(plan)
         return plan
 

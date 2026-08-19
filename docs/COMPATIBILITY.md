@@ -20,6 +20,14 @@ upgrade note.
   | `lab reconcile` | nothing to do | — | error | orphans found in dry-run (re-run with `--apply`) | declined the prompt, or no tty and no `--yes` — **nothing was destroyed** |
 
   Exit 3 outranks 4 on `lab wait`: a confirmed leak is the more urgent signal.
+
+  The console script's target changed from `lab.cli:app` to `lab.cli:main` (event-ledger work):
+  `main()` wraps the typer `app` to record usage errors and crashes to the event ledger before
+  exiting. Frozen means the `lab` command's names, flags and exit codes — not this import path.
+  It's invisible to anyone invoking `lab` on the command line; it matters only to code that
+  imported `lab.cli:app` directly instead of going through the console script (`app` itself
+  still exists and is unchanged — only what `pyproject.toml`'s `[project.scripts]` points at
+  moved).
 - **MCP** — tool names, argument names, and the shape of returned JSON.
 - **Experiment Contract** — `$LAB_RUN_ID`, `$LAB_RUN_DIR`, `$LAB_SEED`;
   `log_metric(name, value, step)`; `effective_config.json`; non-zero exit on failure.

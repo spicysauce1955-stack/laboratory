@@ -4,7 +4,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning is 
 breaks the surface in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md); MINOR may, and says so
 with a **BREAKING** entry and an upgrade note.
 
-## Unreleased
+## v0.6.0 — 2026-08-19
+
+### Added
+- **Event ledger.** The lab recorded jobs well and recorded itself not at all. Now every CLI
+  invocation, MCP tool call and SkyPilot supervisor run writes an `open` line at entry and a
+  `close` line at exit to `~/.lab/events/YYYY-MM-DD.jsonl` — so a `close` that never arrives is
+  itself the finding, not a silence. Internals call `events.note(...)`, buffered in memory and
+  flushed into the record **only when the call fails**: successes stay tiny, failures carry the
+  provisioning attempts, zone skips, launch retries and teardown steps that explain them.
+- **`lab history`** — the ledger's read surface: the recent narrative by default, `--job` /
+  `--since` / `--action` / `--session` / `--failures` for forensics, `--full` for the failure
+  trace plus a cross-reference to the job's manifest and `logs.txt`, and `--stats` for failure
+  rates per command, ranked error signatures and dollars burned on failed calls.
+- **`lab report`** — a markdown digest shaped like the hand-written field report it automates:
+  a triage table ranked by frequency × cost, then per-finding attempted / observed / cost.
+- **MCP `history` and `report` tools**, mirroring both commands so an agent can read back what it
+  already tried without shelling out.
+- Retention keeps the store bounded without maintenance: successes compacted after 14 days, files
+  deleted past 90 days or 50 MB. `LAB_EVENTS=0` disables recording, `LAB_EVENTS_DEBUG=1` surfaces
+  anything the ledger swallows, `LAB_SESSION_ID` groups a run's calls exactly.
+  Guide: [`docs/guides/event-logging.md`](docs/guides/event-logging.md).
+
+### Changed
+- **BREAKING (import only).** The `lab` console entry point moved from `lab.cli:app` to
+  `lab.cli:main`. Invoking `lab` on the command line is unaffected — same exit codes, same
+  output; the wrapper exists to record usage errors and crashes. Only code importing
+  `lab.cli:app` directly needs updating, and `app` itself is unchanged.
+  See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
 
 ## v0.5.1 — 2026-08-12
 

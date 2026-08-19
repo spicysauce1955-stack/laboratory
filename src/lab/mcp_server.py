@@ -11,16 +11,22 @@ manifest), mirroring the CLI. ``build_server(lab)`` lets tests inject a Lab at a
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
+from fastmcp.tools import ToolResult
+from mcp.types import CallToolRequestParams
 
-from lab._util import parse_duration, wrap_with_extras
+from lab import events
+from lab._util import now, parse_duration, wrap_with_extras
 from lab.core import Lab, LabError, default_lab, job_status_view, resolve_backend_profile
 from lab.env import load_lab_env
+from lab.events import store as events_store
+from lab.events.annotate import digest_of, refs_from
 from lab.manifest import repo_root
 from lab.models import JobManifest, JobSpec, ResourceRequest
 from lab.store import JobStore
@@ -30,8 +36,69 @@ def _iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt else None
 
 
+def _since_cutoff(since: str | None) -> datetime | None:
+    """Validate ``since`` and turn it into the cutoff datetime callers reflect back.
+
+    ``events.read`` calls ``parse_duration`` internally with no guard, so a bad duration string
+    (``since="garbage"``) would propagate a raw ``ValueError`` out of the tool body (FastMCP
+    would still mask it as a ``ToolError``, but with its generic wrapper message rather than a
+    clean one). Validating here up front produces a real error before ``events.read`` runs, and
+    the same cutoff is threaded through to ``stats``/``report_dict`` so what they report as the
+    window (``report``'s markdown header, ``history --stats``'s ``since`` field) reflects what
+    was actually applied instead of always reading as unfiltered. Mirrors the CLI's
+    ``_since_cutoff`` in ``cli.py``."""
+    if since is None:
+        return None
+    try:
+        seconds = parse_duration(since)
+    except ValueError as e:
+        raise ToolError(f"bad since {since!r}: {e}") from e
+    return now() - timedelta(seconds=seconds) if seconds is not None else None
+
+
+def _exclude_self(found: list[events.Event]) -> list[events.Event]:
+    """Drop this very tool call's own still-open ledger entry.
+
+    ``EventMiddleware`` opens a call before the tool body runs and only closes it after the
+    tool returns, so a ``events.read()`` taken mid-body always sees itself as a dangling
+    ``running-or-died`` row, freshest-first, ahead of everything real. Left in, ``history`` and
+    ``report`` would always report on themselves. Mirrors the CLI's ``_exclude_self``."""
+    current = events.current()
+    if current is None:
+        return found
+    return [e for e in found if e.id != current.id]
+
+
+class EventMiddleware(Middleware):
+    """Record every tool call in the ledger (one open/close pair), leaving results untouched.
+
+    A ``ToolError`` is a *handled* failure — the tool rejecting a bad input the same way a CLI
+    ``_fail`` site does — so it's recorded as ``outcome="error"``, matching the spec: "A
+    ``ToolError`` records ``outcome:"error"``; anything else propagating out records ``crash``."
+    """
+
+    async def on_call_tool(
+        self,
+        context: MiddlewareContext[CallToolRequestParams],
+        call_next: CallNext[CallToolRequestParams, ToolResult],
+    ) -> ToolResult:
+        name = context.message.name
+        arguments = context.message.arguments or {}
+        with events.record("mcp", name, dict(arguments), error_types=(ToolError,)) as call:
+            result = await call_next(context)
+            payload = result.structured_content
+            try:
+                call.ref(**refs_from(payload))
+                call.result(**digest_of(payload))
+            except Exception as e:  # noqa: BLE001 — annotating must never turn a success into
+                # a crash returned to the client for a tool call that actually succeeded.
+                events_store.debug(f"annotate failed: {e}")
+            return result
+
+
 def build_server(lab: Lab) -> FastMCP:
     mcp: FastMCP = FastMCP("laboratory")
+    mcp.add_middleware(EventMiddleware())
     home = lab.home
     store = JobStore(home)
 
@@ -514,6 +581,49 @@ def build_server(lab: Lab) -> FastMCP:
         queue = default_queue()
         queue.write_control(queue.read_control().model_copy(update={"paused": paused}))
         return {"paused": paused}
+
+    @mcp.tool
+    def history(
+        limit: int = 50,
+        since: str | None = None,
+        action: str | None = None,
+        job: str | None = None,
+        session: str | None = None,
+        failures: bool = False,
+        all_projects: bool = False,
+        full: bool = False,
+        stats: bool = False,
+    ) -> dict[str, Any]:
+        """Read the lab's own event ledger: which commands/tools ran, their outcome, duration,
+        ids, cost and — with `full` — the internal trace behind a failure. This is what you
+        already tried; it is *not* `logs`, which tails one job's stdout. session restricts to
+        one session id (the grouping `LAB_SESSION_ID` or a per-process default provides).
+        `stats` returns the aggregate view instead (failure rates per action, ranked error
+        signatures, dollars burned)."""
+        cutoff = _since_cutoff(since)
+        project = None if all_projects else repo_root().name
+        found = _exclude_self(
+            events.read(
+                since=since, project=project, action=action, job=job, session=session,
+                failures_only=failures, limit=None,
+            )
+        )
+        if stats:
+            return events.stats_dict(events.stats(found, since=cutoff))
+        # Only built when needed: `full=True`'s forensic view cross-references each row's job
+        # manifest and logs.txt path (spec: "the ledger is a jumping-off point rather than a
+        # silo"). `store` is the same `JobStore(home)` every other tool in this server uses.
+        job_store = store if full else None
+        return {"events": [events.row(e, full=full, job_store=job_store) for e in found[:limit]]}
+
+    @mcp.tool
+    def report(since: str = "7d", all_projects: bool = False) -> dict[str, Any]:
+        """A markdown digest of what failed in the window and what it cost — triage table plus
+        per-finding attempted/observed/cost. Paste into an issue or hand to a developer."""
+        cutoff = _since_cutoff(since)
+        project = None if all_projects else repo_root().name
+        found = _exclude_self(events.read(since=since, project=project))
+        return events.report_dict(found, since=cutoff)
 
     return mcp
 

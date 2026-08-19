@@ -1,0 +1,27 @@
+"""The lab's ledger of its own behaviour. See
+``docs/superpowers/specs/2026-08-18-event-logging-design.md``."""
+
+from __future__ import annotations
+
+from lab.events.models import ActionStat, Event, Note, SignatureStat, StatsView
+from lab.events.read import crossref, fold, read, row
+from lab.events.record import (
+    Call,
+    begin,
+    current,
+    error_dict,
+    finish,
+    finish_current,
+    note,
+    record,
+    session_id,
+)
+from lab.events.report import report, report_dict
+from lab.events.stats import signature, stats, stats_dict
+
+__all__ = [
+    "ActionStat", "Call", "Event", "Note", "SignatureStat", "StatsView",
+    "begin", "crossref", "current", "error_dict", "finish", "finish_current", "fold", "note",
+    "read", "record", "report", "report_dict", "row", "session_id", "signature", "stats",
+    "stats_dict",
+]

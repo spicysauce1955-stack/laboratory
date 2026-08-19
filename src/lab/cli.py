@@ -8,13 +8,14 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import datetime
+import traceback
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import typer
 
-from lab import __version__
+from lab import __version__, events
 from lab._util import atomic_write_text, now, parse_duration, wrap_with_extras
 from lab.core import (
     Lab,
@@ -27,6 +28,9 @@ from lab.core import (
     validate_cloud,
 )
 from lab.env import load_lab_env
+from lab.events import store as events_store
+from lab.events.annotate import digest_of, refs_from
+from lab.events.sanitize import sanitize_argv
 from lab.manifest import git_work_tree, repo_root
 from lab.models import JobSpec, ResourceRequest
 from lab.scheduler.models import Guardrails, RegState, Triggers
@@ -44,6 +48,17 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 
+# Commands that are long-lived servers, not one-shot calls: a client tears them down with
+# SIGTERM/SIGKILL, so `main()`'s post-dispatch close (see its docstring) never runs. Opening a
+# ledger call for one of these would leave a permanent dangling `open` every session — exempt
+# from compaction, so it accumulates until the 90-day cap, one per agent session, each counting
+# as a failure in `--stats`/`lab report`. `mcp` is the only case today; a second long-lived
+# command later is a one-line addition here, not a second special case in `_load_env`. (A
+# SIGTERM handler was considered instead — it does not cover SIGKILL, so not opening the call in
+# the first place is the fix.) The tool calls *inside* the server are still recorded — that's
+# `EventMiddleware`'s job in `mcp_server.py`, unaffected by this.
+_LONG_LIVED_COMMANDS = frozenset({"mcp"})
+
 
 def _version_callback(value: bool) -> None:
     if value:
@@ -51,8 +66,36 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
+def _group_action(ctx: typer.Context) -> str:
+    """The ledger's action name for this invocation: the leaf subcommand for a two-level group
+    dispatch (``lab queue list`` -> ``"queue list"``), or the top-level command name otherwise.
+
+    ``ctx.invoked_subcommand`` only ever resolves to the *immediate* child of the top-level
+    group, so a group sub-app's (``queue``, ``scheduler``) own subcommands would otherwise all
+    collapse to one indistinguishable action name. This is spec-mandated, not cosmetic: the
+    design doc names ``action: "scheduler tick"`` as what the scheduler's systemd timer records.
+    The group names are read off ``app.registered_groups`` rather than hardcoded, so a third
+    sub-app added later doesn't silently regress back to this bug.
+    """
+    action = ctx.invoked_subcommand
+    assert action is not None  # only called when the caller has already checked this
+    group_names = {g.name for g in app.registered_groups if g.name}
+    if action in group_names and action in sys.argv:
+        rest = sys.argv[sys.argv.index(action) + 1 :]
+        leaf = next((tok for tok in rest if not tok.startswith("-")), None)
+        if leaf:
+            return f"{action} {leaf}"
+    return action
+
+
 @app.callback()
 def _load_env(
+    # Deliberately bare ``typer.Context``, not ``Context | None``: typer's own parameter-type
+    # resolver only special-cases the exact type (it doesn't unwrap ``Optional``), so a Union
+    # annotation here makes it try to build a real CLI option for it and crash at startup. The
+    # ``None`` default exists only so this function stays callable directly, the way it always
+    # was, for unit tests that check `.env`-loading in isolation without going through typer.
+    ctx: typer.Context = None,  # type: ignore[assignment]
     version: bool = typer.Option(
         False,
         "--version",
@@ -70,6 +113,17 @@ def _load_env(
     """
     load_lab_env(repo_root())
     _warn_if_repo_override_shadows_cwd()
+    # Opened here, closed in main(): a killed process leaves a visible dangling `open` line.
+    # ``ctx.invoked_subcommand`` (not ``click.get_current_context()`` — typer 0.26 vendors its
+    # own click fork under ``typer._click``, entirely disconnected from the top-level ``click``
+    # package, so the latter's context stack is always empty here) is already resolved by the
+    # time this callback runs: the group dispatches by name before invoking its own callback.
+    # Long-lived server commands (``_LONG_LIVED_COMMANDS``) never open a call at all — see that
+    # constant's docstring for why.
+    if ctx is not None and ctx.invoked_subcommand:
+        action = _group_action(ctx)
+        if action not in _LONG_LIVED_COMMANDS:
+            events.begin("cli", action, {"argv": sanitize_argv(sys.argv[1:])})
 
 
 def _warn_if_repo_override_shadows_cwd() -> None:
@@ -114,19 +168,46 @@ def _lab_for_or_fail(job_id: str) -> Lab:
     try:
         return _lab_for(job_id)
     except FileNotFoundError:
-        _emit(
-            {
-                "error": (
-                    f"unknown job id {job_id!r} — not in local runs/ "
-                    "(for scheduler-launched jobs only `lab status` reads the mirrored manifest)"
-                )
-            }
+        msg = (
+            f"unknown job id {job_id!r} — not in local runs/ "
+            "(for scheduler-launched jobs only `lab status` reads the mirrored manifest)"
         )
-        raise typer.Exit(code=2) from None
+        _emit({"error": msg})
+        _fail(2, msg)
 
 
 def _emit(obj: Any) -> None:
+    """Print a command's JSON payload, and annotate the open ledger call with its ids/digest.
+
+    Nearly every command funnels its result through here, which makes it the one place to learn
+    what a call produced without touching each command.
+    """
+    call = events.current()
+    if call is not None:
+        try:
+            call.ref(**refs_from(obj))
+            call.result(**digest_of(obj))
+        except Exception as e:  # noqa: BLE001 — annotating the ledger must never fail a command
+            events_store.debug(f"annotate failed: {e}")
     typer.echo(json.dumps(obj, indent=2, default=str))
+
+
+def _fail(code: int, cause: BaseException | str | None = None) -> NoReturn:
+    """Exit with ``code``, recording why in the ledger, then raise the ``typer.Exit`` every
+    call site already raised before this task.
+
+    Not ``raise typer.Exit(code) from e``-and-catch-it-in-main: click's own dispatcher special-
+    cases ``Exit`` and converts it straight to a return value even with ``standalone_mode=False``
+    (see ``main``'s docstring), discarding the exception — and its ``__cause__`` — before any
+    caller-level ``except`` could ever see it. So the reason is recorded explicitly, here, at the
+    point it's known, instead of being reconstructed after the fact.
+    """
+    if cause is not None:
+        if isinstance(cause, BaseException):
+            events.note("cli.error", type=type(cause).__name__, message=str(cause))
+        else:
+            events.note("cli.error", type="Exit", message=cause)
+    raise typer.Exit(code=code)
 
 
 def _parse_grid(items: list[str]) -> dict[str, list[str]]:
@@ -206,7 +287,7 @@ def submit(
         provisioner, resources = resolve_backend_profile(backend, resources)
     except LabError as e:  # e.g. --backend cpu with --accelerators, unknown --cloud (FR-F3)
         _emit({"error": str(e)})
-        raise typer.Exit(code=1) from e
+        _fail(1, e)
     lab = _lab(provisioner)
     spec = JobSpec(
         code_ref=code_ref,
@@ -223,7 +304,7 @@ def submit(
         job_id = lab.submit(spec, allow_dirty=not no_dirty, preflight=not no_preflight)
     except LabError as e:  # fail-loud, actionable (FR-F3)
         _emit({"error": str(e)})
-        raise typer.Exit(code=1) from e
+        _fail(1, e)
     _emit({"job_id": job_id, "cached": False, "status": lab.status(job_id).value})
 
 
@@ -255,10 +336,10 @@ def confirm(
         )
     except LabError as e:  # the gate (non-succeeded/dirty) and missing-baseline are fail-loud
         _emit({"error": str(e)})
-        raise typer.Exit(code=1) from e
+        _fail(1, e)
     _emit(result)
     if result["verdict"] not in {"match", "pending"}:
-        raise typer.Exit(code=1)
+        _fail(1, f"confirm verdict: {result['verdict']!r}")
 
 
 @app.command()
@@ -311,7 +392,7 @@ def sweep(
         provisioner, resources = resolve_backend_profile(backend, resources)
     except LabError as e:  # e.g. --backend cpu with --accelerators (FR-F3)
         _emit({"error": str(e)})
-        raise typer.Exit(code=1) from e
+        _fail(1, e)
     lab = _lab(provisioner)
     try:
         sweep_id, job_ids = lab.sweep(
@@ -336,7 +417,7 @@ def sweep(
         )
     except LabError as e:
         _emit({"error": str(e)})
-        raise typer.Exit(code=1) from e
+        _fail(1, e)
     if lab.store.has_sweep_plan(sweep_id):
         plan = lab.sweep_plan(sweep_id)
         _emit(plan.view())
@@ -360,7 +441,7 @@ def export(
         _emit(_lab().export(target_id, to, include_logs=logs))
     except LabError as e:
         _emit({"error": str(e)})
-        raise typer.Exit(code=1) from e
+        _fail(1, e)
 
 
 @app.command()
@@ -378,13 +459,14 @@ def lint(
 
     script = next((tok for tok in command.split() if tok.endswith(".py")), None)
     if script is None or not Path(script).exists():
-        _emit({"error": f"could not find a .py entrypoint in {command!r} to lint"})
-        raise typer.Exit(code=2)
+        msg = f"could not find a .py entrypoint in {command!r} to lint"
+        _emit({"error": msg})
+        _fail(2, msg)
     keys = list(_parse_grid(grid)) + list(key)
     missing = unreferenced_keys(Path(script).read_text(), keys)
     _emit({"script": script, "checked_keys": sorted(keys), "missing_keys": missing})
     if missing:
-        raise typer.Exit(code=1)
+        _fail(1, f"lint: {len(missing)} unreferenced config key(s): {missing}")
 
 
 @app.command()
@@ -413,7 +495,8 @@ def init(
         )
     _emit(report)
     if check and not report["ok"]:
-        raise typer.Exit(code=1)
+        stale = len(report["created"]) + len(report["refreshed"]) + len(report["merged"])
+        _fail(1, f"init --check: scaffold is stale ({stale} file(s) would change)")
 
 
 @app.command()
@@ -423,8 +506,9 @@ def status(job_id: str) -> None:
     try:
         _emit(job_status_view(repo_root() / "runs", repo_root(), job_id))
     except FileNotFoundError:
-        _emit({"error": f"unknown job id {job_id!r}"})
-        raise typer.Exit(code=2) from None
+        msg = f"unknown job id {job_id!r}"
+        _emit({"error": msg})
+        _fail(2, msg)
 
 
 @app.command()
@@ -432,6 +516,97 @@ def logs(job_id: str, tail: int = typer.Option(100)) -> None:
     """Tail a job's logs (FR-D1)."""
     for line in _lab_for_or_fail(job_id).logs(job_id, tail=tail):
         typer.echo(line)
+
+
+@app.command()
+def history(
+    limit: int = typer.Option(50, "--limit", "-n", help="most recent N calls"),
+    since: str | None = typer.Option(None, "--since", help="window, e.g. 2d / 30m"),
+    action: str | None = typer.Option(None, "--action", help="filter to one command/tool"),
+    job: str | None = typer.Option(None, "--job", help="calls that touched this job id"),
+    session: str | None = typer.Option(None, "--session", help="filter to one session id"),
+    failures: bool = typer.Option(False, "--failures", help="only calls that did not succeed"),
+    all_projects: bool = typer.Option(False, "--all-projects", help="across every project"),
+    full: bool = typer.Option(False, "--full", help="include params and the failure trace"),
+    stats: bool = typer.Option(False, "--stats", help="aggregate view instead of rows"),
+) -> None:
+    """Read the lab's own event ledger — what was run, what it did, why it failed.
+
+    This is *not* `lab logs`, which tails one job's stdout.
+    """
+    cutoff = _since_cutoff(since)
+    project = None if all_projects else repo_root().name
+    found = events.read(
+        since=since, project=project, action=action, session=session, job=job,
+        failures_only=failures, limit=None,
+    )
+    found = _exclude_self(found)
+    if not stats:
+        found = found[:limit]
+    if stats:
+        _emit(events.stats_dict(events.stats(found, since=cutoff)))
+        return
+    # Only built when needed: `--full`'s forensic view cross-references each row's job manifest
+    # and logs.txt path (spec: "the ledger is a jumping-off point rather than a silo").
+    job_store = JobStore(repo_root() / "runs") if full else None
+    _emit({"events": [events.row(e, full=full, job_store=job_store) for e in found]})
+
+
+def _exclude_self(found: list[events.Event]) -> list[events.Event]:
+    """Drop this very invocation's own still-open call.
+
+    `_load_env` opens this command's own ledger entry before its body runs, and the matching
+    close only lands after the body returns (in `main`) — so a `read()` taken mid-body always
+    sees itself as a dangling `running-or-died` row, freshest-first, ahead of everything real.
+    Left in, `lab history`/`lab report` would always report on themselves.
+    """
+    current = events.current()
+    if current is None:
+        return found
+    return [e for e in found if e.id != current.id]
+
+
+def _since_cutoff(since: str | None) -> datetime | None:
+    """Validate ``--since`` and turn it into the cutoff datetime the display layer wants.
+
+    ``events.read`` calls ``parse_duration`` internally with no guard, so a bad duration string
+    (``--since garbage``) propagated a raw ``ValueError`` all the way out as an unhandled
+    traceback — the same class of input ``wait``'s ``--timeout`` already guards (see below).
+    Validating here, before ``events.read`` ever runs, produces a real ``BadParameter`` message
+    instead. The returned cutoff is reused by both commands so what they display as the window
+    (``report``'s markdown header, ``history --stats``'s ``since`` field) reflects what was
+    actually applied rather than always reading as unfiltered.
+    """
+    if since is None:
+        return None
+    try:
+        seconds = parse_duration(since)
+    except ValueError as e:
+        raise typer.BadParameter(f"bad --since {since!r}: {e}") from e
+    return now() - timedelta(seconds=seconds) if seconds is not None else None
+
+
+@app.command()
+def report(
+    since: str = typer.Option("7d", "--since", help="window, e.g. 7d"),
+    all_projects: bool = typer.Option(False, "--all-projects", help="across every project"),
+    out: str | None = typer.Option(None, "--out", help="write to this file instead of stdout"),
+) -> None:
+    """A pasteable markdown digest of what failed and what it cost (field-report shaped)."""
+    cutoff = _since_cutoff(since)
+    project = None if all_projects else repo_root().name
+    found = _exclude_self(events.read(since=since, project=project))
+    text = events.report(found, since=cutoff)
+    if out:
+        try:
+            Path(out).write_text(text)
+        except OSError as e:
+            msg = f"lab report --out {out!r}: could not write file ({e})"
+            _emit({"error": msg})
+            _fail(1, msg)
+        _emit({"written": out})
+        return
+    typer.echo(text)
 
 
 @app.command()
@@ -483,7 +658,7 @@ def sweep_aggregate(
         plan = _lab().aggregate_sweep(sweep_id, include_partial=not strict, row_key=row_key)
     except LabError as e:
         _emit({"error": str(e)})
-        raise typer.Exit(code=1) from e
+        _fail(1, e)
     _emit(plan.view())
 
 
@@ -494,7 +669,7 @@ def sweep_retry(sweep_id: str) -> None:
         plan = _lab().retry_sweep(sweep_id)
     except LabError as e:
         _emit({"error": str(e)})
-        raise typer.Exit(code=1) from e
+        _fail(1, e)
     _emit(plan.view())
 
 
@@ -550,12 +725,13 @@ def wait(
     if not ids:
         msg = f"sweep {sweep!r} matched no jobs" if sweep else "pass job id(s) or --sweep <sweep_id>"
         _emit({"error": msg})
-        raise typer.Exit(code=2)
+        _fail(2, msg)
     store = JobStore(repo_root() / "runs")
     missing = [j for j in ids if not store.manifest_path(j).exists()]
     if missing:  # fail-loud (FR-F3), not a raw traceback
-        _emit({"error": f"unknown job id(s): {missing}"})
-        raise typer.Exit(code=2)
+        msg = f"unknown job id(s): {missing}"
+        _emit({"error": msg})
+        _fail(2, msg)
     the_lab = _lab_for(ids[0])
     on_update = (
         (lambda s: atomic_write_text(done_file, json.dumps(s, indent=2, default=str)))
@@ -579,11 +755,15 @@ def wait(
     if summary["failed_fast"]:
         # A confirmed leak outranks the fail-fast signal: exit 3 is the documented URGENT
         # "a paid machine may still be billing — run `lab reconcile` now" alarm (FR-C2).
-        raise typer.Exit(code=3 if teardown_leaks else 4)
+        _fail(
+            3 if teardown_leaks else 4,
+            "fail-fast: teardown leaked" if teardown_leaks else "fail-fast: a job failed/timed out",
+        )
     if not all_terminal:
-        raise typer.Exit(code=1)
+        _fail(1, "gave up: --timeout elapsed before all jobs reached a terminal state")
     if teardown_leaks:
-        raise typer.Exit(code=3)  # all terminal but at least one cluster may still be billing
+        # all terminal but at least one cluster may still be billing
+        _fail(3, "teardown leaked on at least one job")
 
 
 @app.command()
@@ -693,7 +873,7 @@ def reconcile(
                         err=True,
                     )
                     _emit({"aborted": True, "reason": "no tty", "would_destroy": _lines(doomed)})
-                    raise typer.Exit(code=4)
+                    _fail(4, f"refusing to destroy {len(doomed)} resource(s) with no tty to confirm at")
                 project = dry.get("gcp_project")
                 typer.echo(
                     f"about to destroy {len(doomed)} resource(s)"
@@ -704,12 +884,12 @@ def reconcile(
                     typer.echo(f"  {line}", err=True)
                 if not typer.confirm("proceed?", err=True):
                     _emit({"aborted": True, "would_destroy": _lines(doomed)})
-                    raise typer.Exit(code=4)
+                    _fail(4, f"user declined to destroy {len(doomed)} resource(s)")
                 approved = {orphan_key(field, item) for field, item in doomed}
         report = lab.reconcile(apply=apply, only=approved)
     except LabError as e:
         _emit({"error": str(e)})
-        raise typer.Exit(code=2) from e
+        _fail(2, e)
     _emit(report)
     if unmatched := report.get("gcp_unmatched"):
         # Not an orphan field (see above) — it is not `--apply`-able, so exit 3's "re-run with
@@ -724,7 +904,8 @@ def reconcile(
         for name in unmatched:
             typer.echo(f"  {name}", err=True)
     if any(report.get(k) for k in _ORPHAN_FIELDS) and not apply:
-        raise typer.Exit(code=3)  # action required: re-run with --apply
+        # action required: re-run with --apply
+        _fail(3, "orphaned resource(s) found in dry-run — re-run with --apply")
 
 
 @app.command()
@@ -760,7 +941,7 @@ def doctor(
         validate_cloud(cloud)
     except LabError as e:
         _emit({"error": str(e)})
-        raise typer.Exit(code=2) from e
+        _fail(2, e)
     # Apply the same disk defaults a real submit would, so the quota check asks about the size
     # that would actually be provisioned rather than the one the user happened to type.
     resources = resources.model_copy(update={"disk_size": default_disk_gb(resources)})
@@ -770,8 +951,8 @@ def doctor(
     else:
         typer.echo(f"lab doctor — {cloud or 'vast'}")
         typer.echo(format_report(results))
-    if any(r.status == "fail" for r in results):
-        raise typer.Exit(code=1)
+    if failing := [r.name for r in results if r.status == "fail"]:
+        _fail(1, f"doctor: failing check(s): {failing}")
 
 
 @app.command()
@@ -832,8 +1013,9 @@ def register(
 ) -> None:
     """Register a deferred job; the scheduler launches it when all triggers hold (spec §6)."""
     if accelerators and timeout is None:
-        _emit({"error": "--timeout is required for GPU registrations (it is the cost bound)"})
-        raise typer.Exit(code=1)
+        msg = "--timeout is required for GPU registrations (it is the cost bound)"
+        _emit({"error": msg})
+        _fail(1, msg)
     queue = default_queue()
     try:
         expires_at = parse_expires(expires)
@@ -864,7 +1046,7 @@ def register(
         reg = sched_register(repo_root(), queue, spec, triggers, guardrails)
     except LabError as e:  # fail-loud, actionable (FR-F3)
         _emit({"error": str(e)})
-        raise typer.Exit(code=1) from e
+        _fail(1, e)
     if hold:
         queue.hold(reg.reg_id)
     _emit(
@@ -938,8 +1120,9 @@ def register_sweep(
 ) -> None:
     """Register a grid as N deferred points sharing one sweep_id + ceiling; the scheduler paces them."""
     if accelerators and timeout is None:
-        _emit({"error": "--timeout is required for GPU registrations (it is the cost bound)"})
-        raise typer.Exit(code=1)
+        msg = "--timeout is required for GPU registrations (it is the cost bound)"
+        _emit({"error": msg})
+        _fail(1, msg)
     queue = default_queue()
     try:
         expires_at = parse_expires(expires)
@@ -970,7 +1153,7 @@ def register_sweep(
         )
     except LabError as e:  # fail-loud, actionable (FR-F3)
         _emit({"error": str(e)})
-        raise typer.Exit(code=1) from e
+        _fail(1, e)
     _emit({"sweep_id": sweep_id, "count": len(regs), "reg_ids": [r.reg_id for r in regs]})
 
 
@@ -990,8 +1173,9 @@ def _require_entry(queue: QueueStore, reg_id: str) -> None:
     try:
         queue.get_entry(reg_id)
     except FileNotFoundError:
-        _emit({"error": f"unknown registration {reg_id!r}"})
-        raise typer.Exit(code=2) from None
+        msg = f"unknown registration {reg_id!r}"
+        _emit({"error": msg})
+        _fail(2, msg)
 
 
 @queue_app.command(name="list")
@@ -1139,5 +1323,78 @@ def scheduler_tick(
     _emit(json.loads(sched.tick().model_dump_json()))
 
 
+def _last_error_note(call: events.Call | None) -> dict[str, Any] | None:
+    """The most recent ``cli.error`` note ``_fail`` left on ``call``, promoted into the ledger's
+    ``error`` field: the reason for a non-zero exit, recorded at the point it was known (see
+    ``_fail``'s docstring for why it can't be reconstructed here from the exception instead)."""
+    if call is None:
+        return None
+    for entry in reversed(call.notes):
+        if entry.get("k") == "cli.error":
+            d = entry.get("d") or {}
+            return {"type": d.get("type"), "message": d.get("message"), "where": None}
+    return None
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Console entry point.
+
+    Runs ``app()`` in ordinary (standalone) click dispatch — so stdout, stderr and every exit
+    code (``lab wait``'s 3 teardown / 4 fail-fast included) are exactly what they were before
+    this module started keeping a ledger — then folds the outcome into it afterward.
+
+    ``standalone_mode=False`` looked like the natural way to tell a usage error apart from a
+    command that ran and failed, and to recover the ``__cause__`` behind every existing
+    ``raise typer.Exit(code=1) from e`` site for free. Neither held up: click's own dispatcher
+    special-cases ``Exit`` and converts it straight to a plain return value even when
+    ``standalone_mode=False`` — discarding the exception, and therefore its ``__cause__``,
+    before any caller-level ``except`` could ever see it — and the exception it actually raises
+    lives in ``typer._click``, a private vendored fork of click with no relationship to the
+    top-level ``click`` package (confirmed: ``typer.Exit.__mro__`` has no ``click`` class in it,
+    and a probe showed ``app(args=[...], standalone_mode=False)`` *returning* the exit code
+    rather than raising). So: real standalone dispatch, and ``_fail`` records the reason for a
+    non-zero exit explicitly, at the point it's known, instead of this function trying to
+    reconstruct it after the fact.
+    """
+    outcome, code, error = "ok", 0, None
+    try:
+        app(args=argv)
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+        # click's own dispatch (`typer/core.py::_main`) catches a Ctrl-C raised *during a
+        # command* itself and re-raises it as `Exit(130)` before we ever see a raw
+        # KeyboardInterrupt — so the common case arrives here, not in the handler below.
+        outcome = "ok" if code == 0 else ("interrupted" if code == 130 else "error")
+    except KeyboardInterrupt:
+        # Only reachable for a Ctrl-C outside that window (e.g. during shell-completion
+        # handling or before click's dispatch takes over) — kept as a safety net.
+        code, outcome = 130, "interrupted"
+    except Exception as e:  # noqa: BLE001 — record, then behave exactly as before
+        traceback.print_exc()
+        code, outcome, error = 1, "crash", events.error_dict(e)
+    call = events.current()
+    if call is None:
+        if outcome != "ok":
+            # Parsing never reached the group callback (unknown command, group-level bad flag),
+            # so no call is open. Synthesise one: a caller getting the interface wrong is a
+            # finding, and the sanitized argv on it is what tells the reader what was typed.
+            events.begin("cli", "<unparsed>", {"argv": sanitize_argv(sys.argv[1:])})
+            if outcome == "error":
+                outcome = "usage_error"
+    elif outcome == "error":
+        note = _last_error_note(call)
+        if note is not None:
+            error = note
+        elif code == 2:
+            # A known command's own option parsing rejected the input (bad flag, bad type) —
+            # click's parser raised before the command body ever ran, so no `_fail` call
+            # recorded a reason. The argv already on the open record is the explanation.
+            outcome = "usage_error"
+        else:
+            error = {"type": "Exit", "message": f"exited {code}", "where": None}
+    events.finish_current(outcome=outcome, exit_code=code, error=error)
+    sys.exit(code)
+
+
 if __name__ == "__main__":
-    app()
+    main()
