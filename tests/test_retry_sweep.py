@@ -7,13 +7,28 @@ from lab.core import Lab
 from lab.manifest import repo_root
 from lab.models import JobState
 
+from helpers import wait_terminal
+
 
 def _lab(tmp_path: Path) -> Lab:
     repo = repo_root(Path.cwd())
     return Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
 
 
+def _settle(lab: Lab, job_id: str) -> None:
+    """Wait for the shard's own subprocess to write its terminal status.
+
+    `_lab` uses a real `LocalBackend`, so each shard runs `true` in a subprocess that writes its
+    own status asynchronously. A manual `update_manifest` before that write races it: the runner
+    can land last and leave the shard non-terminal, whereupon `retry_sweep` treats it as in-flight
+    and resubmits nothing. Settling first makes the test's write provably the last one — nothing
+    writes after a terminal state.
+    """
+    wait_terminal(lab.backend, job_id)
+
+
 def _succeed(lab: Lab, job_id: str, seeds: list[int]) -> None:
+    _settle(lab, job_id)
     out = lab.store.output_dir(job_id)
     out.mkdir(parents=True, exist_ok=True)
     (out / "results.csv").write_text("seed,acc\n" + "".join(f"{s},0.{s}\n" for s in seeds))
@@ -25,6 +40,7 @@ def test_retry_resubmits_only_missing_shards(tmp_path: Path):
     sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0-3", shard_size=2)
     cell = lab.sweep_plan(sweep_id).cells[0]
     _succeed(lab, cell.shard_job_ids[0], [0, 1])
+    _settle(lab, cell.shard_job_ids[1])
     lab.store.update_manifest(cell.shard_job_ids[1], status=JobState.failed)
     lab.aggregate_sweep(sweep_id)
 
@@ -45,6 +61,7 @@ def test_retry_sweep_no_duplicate_when_prior_retry_in_flight(tmp_path: Path):
 
     # Succeed shard [0,1]; fail shard [2,3]
     _succeed(lab, cell.shard_job_ids[0], [0, 1])
+    _settle(lab, cell.shard_job_ids[1])
     lab.store.update_manifest(cell.shard_job_ids[1], status=JobState.failed)
     lab.aggregate_sweep(sweep_id)
 
@@ -58,6 +75,7 @@ def test_retry_sweep_no_duplicate_when_prior_retry_in_flight(tmp_path: Path):
     assert "seeds=2,3" in lab.manifest(new_id).run.entrypoint_command
 
     # Simulate the retry job still being in-flight (non-terminal: running)
+    _settle(lab, new_id)
     lab.store.update_manifest(new_id, status=JobState.running)
 
     # Second retry — the in-flight job covers seeds [2,3], so NO additional job should be added
@@ -77,6 +95,7 @@ def test_retry_resubmits_only_missing_seeds_of_partial_shard(tmp_path):
     out = lab.store.output_dir(cell.shard_job_ids[1])
     out.mkdir(parents=True, exist_ok=True)
     (out / "results.csv").write_text("seed,acc\n2,0.2\n")
+    _settle(lab, cell.shard_job_ids[1])
     lab.store.update_manifest(cell.shard_job_ids[1], status=JobState.timed_out)
 
     plan = lab.retry_sweep(sweep_id)
@@ -93,10 +112,12 @@ def test_retry_skips_when_inflight_superset_covers_missing(tmp_path):
     cell = lab.sweep_plan(sweep_id).cells[0]
     _succeed(lab, cell.shard_job_ids[0], [0, 1])
     # shard 2 ([2,3]) times out with NO recovered rows -> first retry re-runs the full shard
+    _settle(lab, cell.shard_job_ids[1])
     lab.store.update_manifest(cell.shard_job_ids[1], status=JobState.timed_out)
     first = lab.retry_sweep(sweep_id)
     retry_jid = first.cells[0].shard_job_ids[-1]
     assert "seeds=2,3" in lab.manifest(retry_jid).run.entrypoint_command
+    _settle(lab, retry_jid)
     lab.store.update_manifest(retry_jid, status=JobState.running)  # pin the retry in flight
     # seed 2 now surfaces from the timed-out shard's late-rsynced partial output
     out = lab.store.output_dir(cell.shard_job_ids[1])
