@@ -1,9 +1,9 @@
 ---
 name: laboratory
-description: "Run/execute a reproducible ML or compute experiment via the lab runner (MCP tools / `lab` CLI) — in this project this is the right way to actually launch a training/experiment job, not running the script directly. Use when the user wants the work done, not just discussed: run, submit, or kick off an experiment; sweep a grid over hyperparameters/seeds and report which config won; shard a large-seed sweep into independently-bounded per-seed sub-jobs and aggregate one per-cell result (sweep-aggregate / sweep-retry); put a job on a remote GPU (RTX 4090 on Vast.ai via SkyPilot; T4/L4 on GCP) or a cheap remote CPU box (DigitalOcean/GCP, --backend cpu), cap its cost or runtime; REGISTER/schedule an experiment for later — run tonight/off-hours, run when a GPU price drops, run after another job, queue/hold/cancel deferred runs while the laptop is closed; stream live metrics and kill a diverging run early; fetch results/artifacts; reproduce a prior run or verify a result still reproduces (lab confirm); export a committable provenance bundle for the paper (lab export); or diagnose a billing/teardown leak ('am I still being charged?', stuck Vast rental, `lab wait` exit 3). Triggers: lab submit, lab sweep, lab sweep-aggregate, lab sweep-retry, lab wait, lab confirm, lab export, lab lint, lab register, lab queue, lab scheduler, lab reconcile. Skip for merely writing an experiment script or reading saved results."
+description: "Run/execute a reproducible ML or compute experiment via the lab runner (MCP tools / `lab` CLI) — in this project this is the right way to actually launch a training/experiment job, not running the script directly. Use when the user wants the work done, not just discussed: run, submit, or kick off an experiment; sweep a grid over hyperparameters/seeds and report which config won; shard a large-seed sweep into independently-bounded per-seed sub-jobs and aggregate one per-cell result (sweep-aggregate / sweep-retry); put a job on a remote GPU (RTX 4090 on Vast.ai via SkyPilot; T4/L4 on GCP) or a cheap remote CPU box (DigitalOcean/GCP, --backend cpu), cap its cost or runtime; REGISTER/schedule an experiment for later — run tonight/off-hours, run when a GPU price drops, run after another job, queue/hold/cancel deferred runs while the laptop is closed; stream live metrics and kill a diverging run early; fetch results/artifacts; reproduce a prior run or verify a result still reproduces (lab confirm); export a committable provenance bundle for the paper (lab export); diagnose a billing/teardown leak ('am I still being charged?', stuck Vast rental, `lab wait` exit 3); or read back the lab's own event ledger — what have I already tried this session, why did that submit/sweep actually fail, which failures keep recurring and what have they cost (lab history / lab report). Triggers: lab submit, lab sweep, lab sweep-aggregate, lab sweep-retry, lab wait, lab confirm, lab export, lab lint, lab register, lab queue, lab scheduler, lab reconcile, lab history, lab report. Skip for merely writing an experiment script or reading saved results."
 metadata:
-  version: "0.8.1"
-  last_updated: "2026-08-12"
+  version: "0.9.0"
+  last_updated: "2026-08-19"
   status: active
 ---
 
@@ -37,6 +37,8 @@ Invoke this skill when the user asks (in any phrasing):
 - "Export these results so they can be committed / cited" (`lab export`).
 - Anything that wants a remote GPU (Vast.ai or GCP) or a cheap remote CPU box,
   or a cost-bounded job, or a manifest-tracked run.
+- "What have I already tried?" / "why did that submit fail?" / "what keeps
+  breaking and what has it cost me?" — the event ledger (§4b, §6 I).
 
 **Don't** invoke this skill for a one-off local sanity check that doesn't need
 tracking — just running `uv run python experiments/foo.py` is fine.
@@ -240,6 +242,32 @@ Designed for live polling at ~5–15s cadence (the early-kill loop).
 ### `mcp__lab__logs`
 `{job_id, tail=100}` → `{"lines": [...]}`. The stdout/stderr of the job.
 
+### `mcp__lab__history`
+`{limit=50, since?, action?, job?, session?, failures?, full?, stats?}` →
+`{"events": [{id, ts, action, surface, status, duration_ms, refs, result,
+error}, ...]}`. **The lab's record of its own calls** — every CLI invocation and
+MCP tool call, with `status` one of `ok` / `error` / `usage_error` / `crash` /
+`interrupted` / `running-or-died`. Use it to answer *what did I already try*
+before repeating a submit, and *why did that fail* afterwards.
+
+- `full=True` adds the params, the internal trace (provisioning attempts,
+  zone skips, launch retries, teardown steps) and a cross-reference to the
+  job's manifest state and `logs.txt` path.
+- `stats=True` returns the aggregate instead of rows: failure rate per command,
+  ranked error signatures, dollars burned on failed calls.
+- `job=<id>` finds every call that touched a job — including the SkyPilot
+  supervisor's own record, which is where a provisioning or teardown failure
+  is explained.
+
+**This is not `logs`.** `logs` tails one job's stdout; `history` reads the
+tool's own ledger.
+
+### `mcp__lab__report`
+`{since="7d", all_projects?}` → `{"markdown": "..."}`. A digest of what failed
+in the window and what it cost: a triage table ranked by frequency × dollars,
+then per-finding attempted / observed / cost. Hand this to the user (or paste
+into an issue) when they ask what keeps going wrong.
+
 ### `mcp__lab__fetch_artifacts`
 `{job_id}` → `{"local_paths": [...], "artifacts": [...]}`. Pulls artifacts into
 `runs/<job_id>/output/`. For skypilot jobs with R2 enabled, falls back to R2 if
@@ -256,7 +284,8 @@ the local output is empty (e.g. after a fresh clone).
 
 Every MCP tool has a matching CLI command (`uv run lab submit / confirm / sweep /
 sweep-aggregate / sweep-retry / export / lint / status / logs / metrics / fetch /
-cancel / list`). The `lab` CLI prints JSON mirroring the MCP returns. (`lab submit
+cancel / list / history / report`).
+The `lab` CLI prints JSON mirroring the MCP returns. (`lab submit
 --no-dirty` is the CLI form of `allow_dirty=false` — refuse a dirty tree instead
 of snapshotting it.) Sharded-sweep CLI form:
 `lab sweep -c "<cmd>" --grid N=1000,1500 --seeds 0-31 --shard-size 8`, then
@@ -474,6 +503,17 @@ already retries `sky.down` and falls back to vastai-sdk directly on failure,
 so leaks are rare — but `reconcile` is the operational safety net when even
 that fails.
 
+### I. Work out what went wrong (and what keeps going wrong)
+The lab records every call it runs. After a failure:
+`mcp__lab__history(job=<id>, full=True)` — the failing call plus its internal
+trace (which zones were skipped, which provision attempt timed out, how
+teardown went) and the pointer to that job's manifest and `logs.txt`. Before
+repeating an expensive submit: `mcp__lab__history(limit=20)` to see what this
+session already attempted. For a pattern rather than an incident:
+`mcp__lab__history(stats=True, since="30d")`, or `mcp__lab__report(since="7d")`
+for a pasteable digest. Successful calls carry no trace — the detail appears
+only where something failed.
+
 ## 7. Backend selection
 
 | Backend | When to use | Required kwargs |
@@ -572,6 +612,13 @@ record artifact **URIs**, never credentials (spec FR-J1).
   either is the most common mistake.
 - **Grid values are strings on the argv.** The experiment (Hydra/typer/argparse)
   coerces types — the lab doesn't guess.
+- **`history` is the tool's ledger; `logs` is a job's stdout.** Reaching for
+  `logs` to find out why a *submit* failed will not work — a submit that never
+  became a job has no log. `history` covers it, including the calls that failed
+  before a manifest existed.
+- **A `running-or-died` row means the process never closed its call** — killed,
+  OOMed, or still running. It is a finding, not a glitch: something ended
+  without recording an outcome.
 
 ## 10. Pointers
 
@@ -592,4 +639,5 @@ In the [laboratory repo](https://github.com/spicysauce1955-stack/laboratory)
 - **CPU backend:** [guide](https://github.com/spicysauce1955-stack/laboratory/blob/main/docs/guides/cpu-backend.md).
 - **GCP backend:** [guide](https://github.com/spicysauce1955-stack/laboratory/blob/main/docs/guides/gcp-backend.md).
 - **Sharded sweeps:** [guide](https://github.com/spicysauce1955-stack/laboratory/blob/main/docs/guides/sharded-sweeps.md).
+- **Event ledger:** [guide](https://github.com/spicysauce1955-stack/laboratory/blob/main/docs/guides/event-logging.md).
 - **Spec:** [LAB-REQUIREMENTS.md](https://github.com/spicysauce1955-stack/laboratory/blob/main/LAB-REQUIREMENTS.md) (RFC-2119, FR/AC/NFR).
