@@ -93,6 +93,19 @@ include = [
 # setup instructions in the same tree as current ones.
 exclude = ["docs/archive"]
 
+# The scaffold's skill payload must be forced in. `.claude/skills/laboratory` is a symlink into
+# `src/lab/_scaffold/project/skills/laboratory` (so this repo's own agent sessions read the same
+# file the package ships), and hatchling's sdist walker resolves that symlink and then skips the
+# real directory — silently dropping the skill from the sdist. `uv build` with no flags builds the
+# wheel FROM the sdist, so every published wheel inherited the hole: v0.5.1 through v0.6.1 shipped
+# without the skill, and `lab init` scaffolded no skill at all for anyone installing the package.
+# The wheel target's own walker handles the symlink correctly, so forcing it here (and only here)
+# fixes both artifacts — adding it to the wheel target as well collides when the wheel is built
+# from an sdist that already contains the files. Guarded by
+# `test_built_artifacts_carry_the_skill_payload`.
+[tool.hatch.build.targets.sdist.force-include]
+"src/lab/_scaffold/project/skills" = "src/lab/_scaffold/project/skills"
+
 [tool.ruff]
 line-length = 100
 
