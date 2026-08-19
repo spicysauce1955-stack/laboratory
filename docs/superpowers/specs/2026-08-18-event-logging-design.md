@@ -28,9 +28,19 @@ half-fail last Tuesday", "what should I fix first").
 ### Non-goals
 
 - **Not a replacement for `logs.txt`.** Job output stays where it is. The ledger references it.
-- **Not remote-supervisor telemetry.** The supervisor on the cloud box logs to `logs.txt`;
-  unifying across the network costs more than it returns. Everything the *launching* process
-  observes — provisioning, retries, teardown, timeouts — is captured, because that runs locally.
+- **Not remote telemetry.** Work running *on the cloud box* logs to `logs.txt`; unifying across
+  the network costs more than it returns.
+
+  **Corrected during implementation.** This bullet originally claimed that "everything the
+  launching process observes — provisioning, retries, teardown, timeouts — is captured, because
+  that runs locally". That was false, and it made Task 12's instrumentation dead code on the path
+  that matters most. `sky_runner` is a *detached local process* (`start_new_session=True`), so it
+  has no open ledger call and `events.note()` there returned immediately — while the same notes
+  did fire from the scheduler tick and cancel paths, which run inside a CLI call. Half-live is
+  worse than uniformly dead: the ledger would have looked like it covered teardown while omitting
+  the normal job path. The supervisor therefore gets **its own record** (`surface: "supervisor"`,
+  `refs.job_id`, session inherited via `LAB_SESSION_ID`), and provisioning, launch retries and
+  teardown are genuinely captured for ordinary jobs.
 - **Not metrics or tracing infrastructure.** No server, no daemon, no sampling, no spans.
 - **Not analytics leaving the machine.** The store is local-only. Nothing uploads.
 
