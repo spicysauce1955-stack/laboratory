@@ -4,6 +4,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning is 
 breaks the surface in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md); MINOR may, and says so
 with a **BREAKING** entry and an upgrade note.
 
+## v0.6.2 — 2026-08-19
+
+### Fixed
+- **The skill never shipped in any released artifact.** `.claude/skills/laboratory` is a symlink
+  into the scaffold, so this repo's own sessions read the file the package ships — but hatchling's
+  sdist walker resolves that symlink and then skips the real directory, and `uv build` (what the
+  release workflow runs) builds the wheel *from the sdist*. Every wheel since the symlink landed —
+  **v0.5.1, v0.6.0 and v0.6.1** — carried no skill, so `lab init` scaffolded none: an installed lab
+  gave the driving agent no documentation at all. The payload is now force-included into the sdist,
+  and `test_built_artifacts_carry_the_skill_payload` builds the way the release does and fails if
+  it ever goes missing again. **If you installed any of those versions, re-run `uv run lab init`
+  after upgrading to pick the skill up.**
+
 ## v0.6.1 — 2026-08-19
 
 ### Changed
