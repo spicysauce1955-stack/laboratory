@@ -374,3 +374,47 @@ class TestStatusSurfacesTheCause:
         assert backend.status("jexit") is JobState.cancelled
         reason = backend.store.read_manifest("jexit").end_reason
         assert reason is not None and reason.startswith("cancelled by user")
+
+
+def test_lab_status_surfaces_the_exit_record(tmp_path, monkeypatch):
+    """The capture is only worth having if a caller can read it.
+
+    `end_reason` carries the human sentence, but an agent driving the MCP tools reasons from the
+    JSON. `runner_exit` absent means nobody looked; `source: "disappeared"` means we looked and
+    the kernel no longer knows -- a real answer, and the distinction F5 exists to preserve.
+    """
+    from lab.core import _status_fields
+    from lab.models import JobState
+
+    from helpers import make_manifest
+
+    manifest = make_manifest("jx", "python x.py", timeout="1h").model_copy(
+        update={"status": JobState.failed}
+    )
+    record = {"source": "waitpid", "returncode": -9, "signal": 9, "detail": "killed by SIGKILL"}
+
+    fields = _status_fields(manifest, state="failed", mirrored=False, runner_exit=record)
+
+    assert fields["runner_exit"] == record
+
+
+def test_lab_status_distinguishes_unlooked_from_unknowable(tmp_path):
+    from lab.core import _status_fields
+    from lab.models import JobState
+
+    from helpers import make_manifest
+
+    manifest = make_manifest("jy", "python x.py", timeout="1h").model_copy(
+        update={"status": JobState.failed}
+    )
+
+    nobody_looked = _status_fields(manifest, state="failed", mirrored=False)
+    looked_and_gone = _status_fields(
+        manifest,
+        state="failed",
+        mirrored=False,
+        runner_exit={"source": "disappeared", "detail": "reaped by init before we looked"},
+    )
+
+    assert nobody_looked["runner_exit"] is None
+    assert looked_and_gone["runner_exit"]["source"] == "disappeared"

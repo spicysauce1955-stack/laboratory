@@ -1697,12 +1697,21 @@ def job_status_view(home: Path, repo: Path, job_id: str) -> dict[str, Any]:
     state = lab.status(job_id)
     m = store.read_manifest(job_id)  # re-read: status may have just finalized/torn down the job
     return _status_fields(
-        m, state=state.value, mirrored=False, logs_path=store.logs_path(job_id)
+        m,
+        state=state.value,
+        mirrored=False,
+        logs_path=store.logs_path(job_id),
+        runner_exit=store.read_runtime(job_id).get("runner_exit"),
     )
 
 
 def _status_fields(
-    m: JobManifest, *, state: str, mirrored: bool, logs_path: Path | None = None
+    m: JobManifest,
+    *,
+    state: str,
+    mirrored: bool,
+    logs_path: Path | None = None,
+    runner_exit: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     last_line, last_at = tail_last_line(logs_path) if logs_path is not None else (None, None)
     return {
@@ -1721,6 +1730,12 @@ def _status_fields(
             else None
         ),
         "teardown_status": m.teardown_status,  # FR-C2 — "failed" means a box may still bill
+        # How the supervisor actually died, when that could be observed (F5): `{source,
+        # returncode, signal, detail}`. `source: "disappeared"` is a real answer — the kernel no
+        # longer knows — and deliberately distinct from this field being absent, which means
+        # nobody looked. A SIGKILL here is the difference between "the OOM killer took it" and
+        # "the code crashed", which is otherwise unrecoverable after the fact.
+        "runner_exit": runner_exit,
         # Where it actually landed. GCP prices and exhausts per zone, so "which zone" is the
         # difference between a $0.034/hr job and a $0.12/hr one.
         "placement": {
