@@ -617,6 +617,41 @@ Anything reading either — the user's watchdog scripts, `lab dashboard`, the MC
 
 ---
 
+## Live verification — 2026-08-20, and the one finding it produced
+
+Two DO jobs were submitted from this repo and killed deliberately. Total cost about four cents.
+
+**R8 confirmed in production.** With the job streaming output, its droplet was destroyed via the
+DO API. The supervisor recorded `status: failed`, `end_reason: "cluster disappeared mid-run:
+Cluster 'lab-laboratory-…' does not exist."` **22 seconds later** (destroyed 16:21:20Z, recorded
+16:21:42Z), then tore down and exited; `teardown_status: succeeded`, no droplet residue,
+`lab wait` exit 0. Before this work it would have sat `running` for the full `timeout + 300s`.
+
+**The attribution guard confirmed on the destructive path.** `lab reconcile --apply --yes` — the
+exact command that destroyed seven running jobs that morning — destroyed exactly one leaked volume
+belonging to this project and left all 8 `tempotron-capacity` resources alone, naming their owner
+on stderr. Four live jobs were running throughout and were unharmed.
+
+### NEW — P4-a: `teardown_status: "succeeded"` does not mean nothing is billing on DO
+
+`severity: medium` · `confirmed live`
+
+The first job failed during launch. Its teardown recorded **`succeeded`** — and left a **50 GB
+detached block volume** behind, which was still there and still billing 17 minutes later.
+`sky.down` returned cleanly, so the DO-direct fallback (which destroys the droplet *and* its
+volume) never ran; nothing else checks. The volume is created before the droplet is fully up, so a
+launch that fails partway is exactly the case that strands one.
+
+This is the same leak class F2 addressed, reached by the opposite route: F2 covers `sky.down`
+*failing*, this is `sky.down` *succeeding* and being incomplete. `reconcile` does catch it
+(`do_volume_orphans`, exit 3), so it is a detection-latency problem rather than an invisible leak
+— but a "succeeded" teardown that leaves 50 GB billing undermines the same signal R10 was about.
+
+**Proposed fix:** on DO, before recording `succeeded`, list volumes matching the cluster prefix;
+if any remain, delete them (the `_do_destroy_matching` volume half already does exactly this) and
+record `failed`/`unknown` if they cannot be removed. **Test:** a `sky.down` that succeeds while a
+matching volume remains must not record `teardown_status: "succeeded"`.
+
 ## Self-review
 
 **Coverage:** every register row with status OPEN maps to a task — R8→1, R9→2, R14/F2→3, R10→4,
