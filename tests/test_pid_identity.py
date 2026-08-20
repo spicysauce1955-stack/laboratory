@@ -20,6 +20,7 @@ is precisely the 2026-08-20 failure pointing the other way.
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -95,26 +96,37 @@ class TestSpawnRecordsIdentity:
     is more than one such path (the local backend and the skypilot backend).
     """
 
-    @pytest.mark.parametrize("module", ["lab.backends.local", "lab.backends.skypilot"])
-    def test_every_runner_pid_write_carries_its_identity(self, module):
-        import ast
-        import importlib
+    def test_every_runner_pid_write_carries_its_identity(self):
+        """Scans the whole tree, not a hand-listed pair of modules.
 
-        source = Path(importlib.import_module(module).__file__).read_text()
-        tree = ast.parse(source)
+        The first version of this test was parametrised over `lab.backends.local` and
+        `lab.backends.skypilot` — the two spawn sites that existed when it was written — and
+        therefore said nothing about `lab/scheduler/tick.py`, which respawns a supervisor on the
+        adopt path and did *not* record the identity. That omission is worse than the original
+        blind spot it was meant to guard: `write_runtime` **merges**, so the previous supervisor's
+        `runner_start_time` survived beside the new pid, `pid_alive` compared them, mismatched,
+        and reported a freshly respawned supervisor dead on the very next check — which tears down
+        its cluster and fails a live job. Enumerating the tree is the only version of this test
+        that can catch the next such site.
+        """
+        import ast
+
         offenders = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            if not (isinstance(func, ast.Attribute) and func.attr == "write_runtime"):
-                continue
-            kwargs = {kw.arg for kw in node.keywords}
-            if "runner_pid" in kwargs and "runner_start_time" not in kwargs:
-                offenders.append(f"{module}:{node.lineno}")
+        for path in sorted(Path("src/lab").rglob("*.py")):
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if not (isinstance(func, ast.Attribute) and func.attr == "write_runtime"):
+                    continue
+                kwargs = {kw.arg for kw in node.keywords}
+                if "runner_pid" in kwargs and "runner_start_time" not in kwargs:
+                    offenders.append(f"{path}:{node.lineno}")
         assert not offenders, (
-            f"runner_pid recorded without runner_start_time at {offenders} — a pid with no "
-            "identity can be recycled and will then read as alive forever (F4)"
+            f"runner_pid recorded without runner_start_time at {offenders} — write_runtime merges, "
+            "so a stale identity survives beside the new pid and pid_alive reports the live "
+            "supervisor dead (F4)"
         )
 
 
@@ -246,3 +258,43 @@ def test_every_liveness_check_passes_the_recorded_identity():
         f"pid_alive called without start_time= at {offenders} — a recycled PID will report these "
         "as alive forever, disabling the self-heal that depends on them (F4)"
     )
+
+
+class TestZombiesAreNotAlive:
+    """An exited-but-unreaped process must not read as a live supervisor.
+
+    `os.kill(pid, 0)` succeeds for a zombie and its start-time is unchanged, so both of the checks
+    above call it alive -- for as long as its parent declines to reap it. Under a long-lived parent
+    (the MCP server, `lab sweep`, the scheduler tick) that is indefinitely, and every self-heal
+    keyed on supervisor liveness quietly stops firing while the machine bills. This is the same
+    defect F4 is about, reached by a different route.
+    """
+
+    def test_an_unreaped_child_is_not_alive(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(0)"])
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline and proc.poll() is None:
+                time.sleep(0.02)
+            # Deliberately not reaped: `proc.poll()` above only checks, and the corpse is ours.
+            recorded = process_start_time(proc.pid)
+
+            assert pid_alive(proc.pid, start_time=recorded) is False
+            assert pid_alive(proc.pid) is False
+        finally:
+            proc.wait()
+
+    def test_a_live_child_is_still_alive(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            assert pid_alive(proc.pid, start_time=process_start_time(proc.pid)) is True
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_an_unreadable_proc_entry_does_not_read_as_dead(self, monkeypatch):
+        """No /proc must never mean "everything is dead" -- that would destroy live machines."""
+        import lab._util as util
+
+        monkeypatch.setattr(util, "_is_zombie", lambda pid: False)
+        assert util.pid_alive(os.getpid()) is True

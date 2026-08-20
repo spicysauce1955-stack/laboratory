@@ -130,6 +130,21 @@ def process_start_time(pid: int | None) -> int | None:
         return None
 
 
+def _is_zombie(pid: int) -> bool:
+    """Has ``pid`` exited but not yet been reaped? Unknown reads as *not* a zombie.
+
+    ``/proc/<pid>/stat`` field 3. The comm field before it is parenthesised and may contain
+    spaces and parens, so the state is taken from after the last ``)``. Any failure to read
+    returns ``False``, which keeps the caller on its conservative "assume alive" path — no
+    ``/proc`` must never mean "everything is dead".
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return stat[stat.rindex(")") + 1 :].split()[0] == "Z"
+    except (OSError, ValueError, IndexError):
+        return False
+
+
 def pid_alive(pid: int | None, *, start_time: int | None = None) -> bool:
     """Is this pid still running — and, when ``start_time`` is given, still the *same* process?
 
@@ -157,6 +172,14 @@ def pid_alive(pid: int | None, *, start_time: int | None = None) -> bool:
         return False
     except PermissionError:
         return True  # exists, owned by someone else
+    if _is_zombie(pid):
+        # A zombie has *exited*; only its exit status is still held, by a parent that has not
+        # reaped it. `os.kill(pid, 0)` succeeds and the start-time is unchanged, so both checks
+        # above call it alive — for as long as that parent lives. Under a long-lived parent (the
+        # MCP server, `lab sweep`, the scheduler) that is forever, and every self-heal keyed on
+        # supervisor liveness silently stops firing while the machine bills. Verified on this
+        # platform: an unreaped child reads state `Z` with its start-time intact.
+        return False
     if start_time is None:
         return True
     current = process_start_time(pid)

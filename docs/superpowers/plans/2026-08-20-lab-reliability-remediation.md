@@ -555,7 +555,31 @@ Anything reading either — the user's watchdog scripts, `lab dashboard`, the MC
 
 ### Phase 3 — Observability
 
-#### Task 6: SIGTERM handler in the supervisor (R13 / F1)
+#### Task 6: SIGTERM handler in the supervisor (R13 / F1) — DONE
+
+> **F1 re-measured, 2026-08-20 (second correction).** The register's headline "15/52 = 29% of
+> supervisor calls never close" is **stale and overstated**. Re-counting the whole live ledger
+> gives **11 of 57 = 19.3%**, and the composition matters more than the rate:
+>
+> * **8 of 11 are `lab cancel`.** Each has a matching `cli/cancel <that job_id>` call, and
+>   `cancel` stops a supervisor with `os.kill(pid, SIGTERM)`. So the dominant producer of
+>   `running-or-died` supervisor records is *the tool deliberately stopping them* — not DO
+>   flakiness, which is what F1 originally blamed.
+> * **1 of 11 was still running when sampled.** `running-or-died` means exactly that: both. Any
+>   point-in-time rate counts in-flight supervisors as deaths and therefore overstates them.
+> * **2 of 11 remain undetermined** — no cancel, no reboot, no OOM entry in the journal.
+>   SIGTERM is plausible but unproven. F5's capture is what would settle future cases.
+>
+> The fix is still worth having: a signalled supervisor should label its own death, and until now
+> it also **abandoned its machine** (below). But "DO supervisors die silently ~40% of the time"
+> should not survive into anyone's mental model.
+
+> **A correction to this plan's Task 6 text.** It said to "re-raise as `SystemExit` so the
+> existing `except BaseException` teardown path still runs". **There was no teardown path there** —
+> the pre-change handler was `events.finish(...)` then `raise`, and every `tear_down_and_record`
+> call site sat on an *expected* exit inside `_impl`. A signalled supervisor would have closed its
+> ledger row neatly and still walked away from a running machine. Task 6 therefore had to add the
+> teardown, not just the handler.
 
 **Files:** `src/lab/sky_runner.py` (entrypoint), `tests/test_sky_runner_signals.py`.
 

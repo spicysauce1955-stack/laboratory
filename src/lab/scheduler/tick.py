@@ -13,7 +13,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from lab._util import now, parse_duration, pid_alive
+from lab._util import now, parse_duration, pid_alive, process_start_time
 from lab.core import Lab, build_backend
 from lab.models import JobManifest, JobState, ResourceRequest
 from lab.scheduler.bundle import extract_bundle
@@ -90,7 +90,13 @@ class Scheduler:
                 [sys.executable, "-m", "lab.sky_runner", str(job_dir), "--adopt"],
                 stdout=logf, stderr=subprocess.STDOUT, start_new_session=True,
             )
-        self.store.write_runtime(job_id, runner_pid=proc.pid)
+        # The identity must be rewritten with the pid, not left over from the supervisor
+        # this one replaces: `write_runtime` merges, so a stale `runner_start_time` beside a
+        # fresh pid makes `pid_alive` mismatch and report the new supervisor dead at once —
+        # which tears down its cluster and fails a live job (F4).
+        self.store.write_runtime(
+            job_id, runner_pid=proc.pid, runner_start_time=process_start_time(proc.pid)
+        )
 
     def _teardown(self, cluster: str, job_id: str, cloud: str = "vast") -> bool:
         """Robust teardown of an overdue orphan. Test seam."""

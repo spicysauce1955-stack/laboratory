@@ -393,9 +393,17 @@ def _instance_label(inst: dict[str, Any]) -> str:
 
     SkyPilot's Vast adapter tags the rental with the cluster name in ``label``; we also probe
     a few neighbouring field names so a Vast SDK change doesn't silently disable matching.
+
+    Only the fields an instance actually carries are joined. Padding the result with the
+    separators of the absent ones rendered a rental holding just ``label`` as
+    ``"lab-…-head   "`` — harmless to the ``in`` test callers run, but this string is printed
+    verbatim into reconcile reports and teardown failure lines that people read mid-incident.
     """
-    parts = [str(inst.get(k, "")) for k in ("label", "name", "instance_label", "machine_name")]
-    return " ".join(parts).lower()
+    parts = [
+        str(inst.get(k) or "").strip()
+        for k in ("label", "name", "instance_label", "machine_name")
+    ]
+    return " ".join(p for p in parts if p).lower()
 
 
 def list_vast_instances(client: Any | None = None) -> list[dict[str, Any]]:
@@ -1435,6 +1443,229 @@ def build_task(manifest: JobManifest, workdir: Path, *, memo: Any | None = None)
 
 
 
+# ---------------------------------------------------------------------------
+# Supervisor exit capture (F5) — *how* the detached supervisor died.
+# ---------------------------------------------------------------------------
+#
+# The exit status of a process is a one-shot value: only its parent can collect it, and only
+# until it is reaped. `submit` spawns the supervisor detached and does not wait on it — it must
+# outlive the CLI — so after a bare `lab submit` the parent is gone in milliseconds, the
+# supervisor reparents to init, and init reaps it the moment it dies. **In that case the exit
+# status is unrecoverable, full stop.** No later poll from any process gets it back; `os.waitid`
+# only works on your own children.
+#
+# What *is* recoverable, and what this module records:
+#
+#   waitpid      the spawning process is still alive — the MCP server, `lab sweep`,
+#                `lab submit --wait`, the scheduler. Its Popen handle is kept here, so a poll
+#                yields the exact status, signal included. This is the agent-facing path.
+#   proc_zombie  a live parent elsewhere holds the corpse unreaped. `/proc/<pid>/stat` field 52
+#                is the waitpid-form status and is readable by any same-uid process.
+#   recycled     the PID is held by a different process now (its start-time moved, F4).
+#   disappeared  nothing holds it. Exit status unrecoverable — recorded *as* unrecoverable.
+#
+# The last two carry no signal, and that is the point of writing them down anyway: "we looked and
+# the kernel no longer knows" and "nobody ever looked" are different facts, and F5 is the
+# complaint that they currently read identically.
+
+# job_id -> (handle, store) for supervisors *this* process spawned. Holding the handle is what
+# makes the status collectable at all; it also keeps CPython's opportunistic `subprocess._cleanup`
+# from reaping (and discarding) the status behind our back the next time anything spawns.
+_SUPERVISORS: dict[str, tuple[subprocess.Popen[bytes], JobStore]] = {}
+_SUPERVISORS_LOCK = threading.Lock()
+
+# Why a signal is worth naming, in the words an operator needs. SIGKILL is the one F5 was raised
+# for: it cannot be caught, so the supervisor's own SIGTERM handler and `except BaseException`
+# teardown never run, and nothing on disk explains the silence.
+_SIGNAL_HINT = {
+    "SIGKILL": "uncatchable, so most likely the OOM killer or kill -9",
+    "SIGTERM": "a polite kill — lab cancel, a systemd stop, or a closing shell",
+}
+
+
+def _register_supervisor(job_id: str, proc: subprocess.Popen[bytes], store: JobStore) -> None:
+    with _SUPERVISORS_LOCK:
+        _SUPERVISORS[job_id] = (proc, store)
+
+
+def _forget_supervisor(job_id: str) -> None:
+    with _SUPERVISORS_LOCK:
+        _SUPERVISORS.pop(job_id, None)
+
+
+def _signal_name(num: int) -> str:
+    try:
+        return signal.Signals(num).name
+    except ValueError:
+        return f"signal {num}"
+
+
+def _status_detail(returncode: int | None, signal_name: str | None) -> str:
+    """One human sentence for a *known* exit status — this ends up in the manifest's
+    ``end_reason``, which is what ``lab status`` prints."""
+    if signal_name is not None:
+        hint = _SIGNAL_HINT.get(signal_name)
+        return f"killed by {signal_name}" + (f" — {hint}" if hint else "")
+    return f"exited with code {returncode}"
+
+
+def _exit_record(
+    source: str, *, returncode: int | None = None, signal_name: str | None = None, detail: str
+) -> dict[str, Any]:
+    return {
+        "source": source,
+        "returncode": returncode,
+        "signal": signal_name,
+        "detail": detail,
+        "observed_at": now().isoformat(),
+    }
+
+
+def _record_from_returncode(rc: int) -> dict[str, Any]:
+    """``Popen.returncode`` form: negative means "killed by that signal"."""
+    if rc < 0:
+        name = _signal_name(-rc)
+        return _exit_record("waitpid", signal_name=name, detail=_status_detail(None, name))
+    return _exit_record("waitpid", returncode=rc, detail=_status_detail(rc, None))
+
+
+def _proc_stat_tail(pid: int) -> list[str] | None:
+    """``/proc/<pid>/stat`` from field 3 onwards, so ``tail[n - 3]`` is field ``n``.
+
+    Split on the **last** ``)``: field 2 (``comm``) is parenthesised and may itself contain
+    spaces and parens. Same parse as :func:`lab._util.process_start_time`, kept local because
+    this needs three fields out of it rather than one.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return stat[stat.rindex(")") + 1 :].split()
+    except (OSError, ValueError):
+        return None
+
+
+def _stat_field(tail: list[str], number: int) -> str | None:
+    idx = number - 3
+    return tail[idx] if 0 <= idx < len(tail) else None
+
+
+def _owned_by_us(pid: int) -> bool:
+    """The kernel prints ``exit_code`` as ``0`` — indistinguishable from a clean exit — when the
+    reader lacks ``PTRACE_MODE_READ`` on the task. Our own supervisors are always our own uid, so
+    refusing to read anyone else's turns that silent lie into an honest "unknown"."""
+    try:
+        return os.stat(f"/proc/{pid}").st_uid == os.getuid()
+    except OSError:
+        return False
+
+
+def _collect_from_proc(pid: int, start_time: int | None) -> dict[str, Any] | None:
+    """Read the corpse out of ``/proc``, or say why it cannot be read. ``None`` = still alive."""
+    tail = _proc_stat_tail(pid)
+    if tail is None:
+        # No `/proc` entry is not by itself a death: on any platform without procfs there is
+        # never one, and reading that as "gone" would flip every healthy job to failed and tear
+        # its machine down. Signal 0 is the portable question, and it is the one that decides.
+        if pid_alive(pid, start_time=start_time):
+            return None
+        return _exit_record(
+            "disappeared",
+            detail=(
+                f"exit status unrecoverable: pid {pid} was already reaped — only the process "
+                "that spawned it could have collected it, and lab submit exits at once"
+            ),
+        )
+    if start_time is not None and _stat_field(tail, 22) != str(start_time):
+        return _exit_record(
+            "recycled",
+            detail=f"exit status unrecoverable: pid {pid} now belongs to a different process",
+        )
+    if _stat_field(tail, 3) != "Z":
+        return None  # running, sleeping, stopped — all still alive
+    raw = _stat_field(tail, 52)
+    if raw is None or not _owned_by_us(pid):
+        return _exit_record(
+            "disappeared",
+            detail=f"exit status unreadable: pid {pid} is an unreaped corpse we may not read",
+        )
+    try:
+        status = int(raw)
+    except ValueError:
+        return _exit_record(
+            "disappeared", detail=f"exit status unreadable: pid {pid} reported {raw!r}"
+        )
+    # waitpid form: low 7 bits are the terminating signal, the next byte up the exit code.
+    sig = status & 0x7F
+    if sig:
+        name = _signal_name(sig)
+        return _exit_record("proc_zombie", signal_name=name, detail=_status_detail(None, name))
+    code = (status >> 8) & 0xFF
+    return _exit_record("proc_zombie", returncode=code, detail=_status_detail(code, None))
+
+
+def observe_supervisor_exit(store: JobStore, job_id: str) -> dict[str, Any] | None:
+    """How this job's supervisor died, or ``None`` while it is still running.
+
+    Written once into ``_runtime.json`` under ``runner_exit`` — durable by construction, since the
+    process that observes the death is usually not the one that will report it. Never overwritten:
+    the first observation is the most informative one (a later reader has only ``/proc``, and by
+    then often not even that), so a re-observation must not degrade an exact answer to a guess.
+
+    Also the *only* honest liveness answer for an unreaped corpse. A zombie answers
+    ``os.kill(pid, 0)`` and keeps its start-time, so :func:`lab._util.pid_alive` calls it alive —
+    for as long as its parent lives, which under a long-running MCP server is forever. That kept
+    :meth:`SkyPilotBackend.status`'s dead-supervisor teardown from ever firing while the box bills.
+    """
+    rt = store.read_runtime(job_id)
+    recorded = rt.get("runner_exit")
+    if isinstance(recorded, dict):
+        _forget_supervisor(job_id)
+        return recorded
+    pid = rt.get("runner_pid")
+    if not pid:
+        return None  # queued, or a runtime file older than this field: unknown stays unknown
+    with _SUPERVISORS_LOCK:
+        entry = _SUPERVISORS.get(job_id)
+    if entry is not None:
+        # Our own child: authoritative, and the poll reaps it so nothing accumulates.
+        rc = entry[0].poll()
+        rec = None if rc is None else _record_from_returncode(rc)
+    else:
+        rec = _collect_from_proc(int(pid), rt.get("runner_start_time"))
+    if rec is None:
+        return None
+    store.write_runtime(job_id, runner_exit=rec)
+    _forget_supervisor(job_id)
+    events.note("supervisor.exit", job_id=job_id, pid=int(pid), **rec)
+    return rec
+
+
+def reap_supervisors() -> None:
+    """Collect any finished supervisor this process spawned. Hygiene, called on each submit.
+
+    Without it a long-lived MCP server holds one unreaped corpse per job it launched until
+    somebody happens to poll that job's status — and the corpses are exactly what makes
+    ``pid_alive`` lie about them. Never raises: this is bookkeeping on the launch path.
+    """
+    with _SUPERVISORS_LOCK:
+        items = list(_SUPERVISORS.items())
+    for job_id, (proc, store) in items:
+        if proc.poll() is None:
+            continue
+        try:
+            observe_supervisor_exit(store, job_id)
+        except Exception as e:  # noqa: BLE001 — bookkeeping must never break a launch
+            print(f"[lab] could not record supervisor exit for {job_id}: {e}", file=sys.stderr)
+            _forget_supervisor(job_id)
+
+
+def dead_supervisor_reason(exit_record: dict[str, Any] | None) -> str:
+    """The manifest ``end_reason`` for a job whose supervisor vanished, naming the cause when one
+    could be collected. ``lab status`` prints this; ``_runtime.json`` keeps the structured form."""
+    base = "supervisor exited without recording status"
+    detail = (exit_record or {}).get("detail")
+    return f"{base} ({detail})" if detail else base
+
+
 class SkyPilotBackend:
     name = "skypilot"
 
@@ -1443,6 +1674,8 @@ class SkyPilotBackend:
         self.repo = Path(repo) if repo else Path.cwd()
 
     def submit(self, manifest: JobManifest) -> str:
+        # Before adding another child, collect the ones that have already finished (F5).
+        reap_supervisors()
         job_dir = self.store.job_dir(manifest.job_id)
         job_dir.mkdir(parents=True, exist_ok=True)
         # Supervisor's stdout/stderr (incl. sky.launch streamed logs) -> the job log file (FR-D1).
@@ -1468,14 +1701,22 @@ class SkyPilotBackend:
             runner_start_time=process_start_time(proc.pid),
             cluster=cluster_name_for(manifest.job_id),
         )
+        # Keep the handle: it is the only thing that can ever collect this process's exit signal,
+        # and it stays valid for exactly as long as *this* process lives (F5).
+        _register_supervisor(manifest.job_id, proc, self.store)
         return manifest.job_id
 
     def status(self, job_id: str) -> JobState:
         m = self.store.read_manifest(job_id)
         if m.status not in _TERMINAL:
             rt = self.store.read_runtime(job_id)
-            if rt.get("runner_pid") and not pid_alive(
-                rt["runner_pid"], start_time=rt.get("runner_start_time")
+            # Ask *how* it died before asking whether it did: an unreaped corpse passes
+            # `pid_alive` (it answers signal 0 and keeps its start-time), so on the paths where
+            # the spawner outlives the supervisor this is the only branch that ever notices.
+            exit_record = observe_supervisor_exit(self.store, job_id)
+            if rt.get("runner_pid") and (
+                exit_record is not None
+                or not pid_alive(rt["runner_pid"], start_time=rt.get("runner_start_time"))
             ):
                 # The supervisor died before recording terminal state, so its teardown very
                 # likely never ran — attempt it here (idempotent) rather than flip to `failed`
@@ -1506,7 +1747,10 @@ class SkyPilotBackend:
                         "cancelled by user (teardown completed by recovery after the cancel "
                         "was interrupted)"
                         if cancelling
-                        else "supervisor exited without recording status"
+                        # A cancel sends the SIGTERM itself, so naming it here would dress a
+                        # deliberate act up as a supervisor failure. Only the crash path reports
+                        # the cause of death.
+                        else dead_supervisor_reason(exit_record)
                     ),
                 ).status
         return m.status

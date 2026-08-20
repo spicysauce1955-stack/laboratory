@@ -9,11 +9,15 @@ Entry point:  python -m lab.sky_runner <job_dir>
 
 from __future__ import annotations
 
+import argparse
 import os
+import signal
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import FrameType
 from typing import Any
 
 from lab import events
@@ -495,6 +499,140 @@ def provision_failure_reason(generic: str, cloud: str) -> str:
     return generic
 
 
+# ---------------------------------------------------------------------------------------------
+# Termination signals (R13 / field report F1)
+# ---------------------------------------------------------------------------------------------
+# 15 of 52 `supervisor/run` ledger calls on this box never wrote a close line — they read as
+# `running-or-died`. They were not dying spontaneously: `lab cancel` stops a supervisor with
+# `os.kill(runner_pid, SIGTERM)` and the scheduler watchdog with `os.killpg(pgid, SIGTERM)`, and
+# SIGTERM's *default* disposition terminates the interpreter without raising anything. So
+# `run_job`'s `except BaseException` — the one place that records an outcome, and now also the
+# one place that tears down after an unplanned exit — never ran, and neither did the teardown
+# that was in flight. Turning the signal into an exception makes both happen.
+
+_TERMINATION_SIGNALS: tuple[signal.Signals, ...] = (signal.SIGTERM, signal.SIGHUP)
+# SIGINT is deliberately absent: Python's own handler already raises `KeyboardInterrupt`, which
+# `run_job` catches and now tears down on. Replacing a working mechanism could only break it.
+# SIGHUP is included even though `submit` spawns the supervisor with `start_new_session=True`
+# (so a closing terminal cannot hang it up): an explicit `kill -HUP`, or a service manager
+# configured to stop with it, still terminates just as silently as SIGTERM does.
+
+_terminating: str | None = None
+
+
+class SupervisorTerminated(SystemExit):
+    """The supervisor was asked to stop by a signal.
+
+    A ``SystemExit`` subclass on purpose. The ``except Exception`` branches inside :func:`run_job`
+    exist to classify *launch* failures, and must not be able to swallow a shutdown request; a
+    dedicated type additionally lets the abort path tell "someone signalled us" from "our own code
+    raised", which is the distinction the ledger was missing.
+    """
+
+    def __init__(self, signum: int) -> None:
+        self.signal_name = signal.Signals(signum).name
+        super().__init__(128 + signum)  # the conventional exit status for a signalled process
+
+    def __str__(self) -> str:
+        return f"supervisor terminated by {self.signal_name}"
+
+
+def _emit(message: str) -> None:
+    """Write a diagnostic straight to fd 2.
+
+    Not ``print``: this is called from a signal handler, and a buffered stream's lock is not
+    reentrant — a signal landing while the main thread already holds ``sys.stderr``'s lock would
+    deadlock the very process we are trying to shut down cleanly. ``os.write`` takes no
+    Python-level lock. By this point fd 2 is the job log (``install_log_redaction``), so the line
+    still lands where an operator reads it.
+    """
+    try:
+        os.write(2, message.encode("utf-8", "replace"))
+    except OSError:
+        pass  # a closed fd must not turn a shutdown into a crash
+
+
+def _on_termination_signal(signum: int, _frame: FrameType | None) -> None:
+    """Label the death in the ledger, then re-raise it into the main thread as an exception."""
+    global _terminating
+    name = signal.Signals(signum).name
+    if _terminating is not None:
+        # Already unwinding — and unwinding is what runs the teardown. Raising a second
+        # `SystemExit` from here would abort the one thing that stops the machine billing, which
+        # is the opposite of the point. Whoever is impatient still has SIGKILL.
+        _emit(f"[lab] {name} while already shutting down on {_terminating} — ignored\n")
+        return
+    _terminating = name
+    # Buffered in the call's ring and flushed into `trace` because the outcome is not "ok" — so
+    # `lab history --full` can say which signal ended a supervisor, months later.
+    events.note("signal", sig=name.removeprefix("SIG"))
+    _emit(f"[lab] {name} received — recording the outcome and tearing down\n")
+    raise SupervisorTerminated(signum)
+
+
+def install_signal_handlers() -> list[str]:
+    """Claim the signals that would otherwise kill the supervisor silently; return what we got.
+
+    Called from :func:`main` — the ``python -m lab.sky_runner`` entrypoint — and never at import
+    time. ``lab.sky_runner`` is imported by the SkyPilot backend, the scheduler tick and the test
+    suite; changing SIGTERM's disposition as a side effect of an import would be a nasty surprise
+    in any of them, and in ``lab cancel``'s process it would hijack the caller's own shutdown.
+
+    ``signal.signal`` also only works on the main thread. A supervisor that cannot install the
+    handler must still supervise, so a refusal is reported and never raised.
+    """
+    installed: list[str] = []
+    for sig in _TERMINATION_SIGNALS:
+        try:
+            signal.signal(sig, _on_termination_signal)
+        except (OSError, RuntimeError, ValueError) as e:
+            _emit(f"[lab] could not install the {sig.name} handler: {e}\n")
+        else:
+            installed.append(sig.name)
+    return installed
+
+
+# The default ladder is 5+15+30+60+120 = 230s of `sky.down` retries before the provider-direct
+# fallback even starts. A process that has been signalled cannot count on that much time — a
+# system shutdown SIGKILLs 90s later by default — and the fallback is the half that actually asks
+# the provider whether a machine is still billing. Spend the budget where it settles the question.
+_ABORT_TEARDOWN_BACKOFFS = (5, 15, 30)
+
+
+def _teardown_on_abort(
+    store: JobStore, job_id: str, cluster: str, cloud: str, *, why: str, launched: bool
+) -> None:
+    """Stop the machine for a supervisor unwinding out of ``_impl`` on an unplanned exception.
+
+    Every *expected* exit from ``_impl`` tears down on its own way out. This covers the ones that
+    are not expected — a signal, a Ctrl-C, a bug — which previously recorded nothing and left the
+    instance running: FR-C2's leak with no leak signal, since the manifest kept saying ``running``
+    and no ``teardown_status`` was ever written.
+
+    Never raises: it runs while another exception is already propagating, and masking that with a
+    teardown error would destroy the evidence of why the supervisor died.
+    """
+    if not launched:
+        return  # no launch request was ever issued, so nothing can be billing
+    sky_mod = sys.modules.get("sky")
+    if sky_mod is None:  # pragma: no cover — implied by `launched`; kept as a hard guard
+        return
+    try:
+        if store.read_manifest(job_id).teardown_status is None:
+            tear_down_and_record(
+                sky_mod, cluster, store, job_id, cloud, backoffs=_ABORT_TEARDOWN_BACKOFFS
+            )
+        if store.read_manifest(job_id).status in (JobState.queued, JobState.running):
+            # Nothing supervises this job any more, so `running` can only go stale — that is what
+            # made `lab wait` hang for its full timeout and drove the operator's 5-minute status
+            # poller. A concurrent `lab cancel` sets `cancelled` first; any terminal state stands.
+            store.update_manifest(
+                job_id, status=JobState.failed, ended_at=now(), end_reason=why[:300]
+            )
+    except Exception as e:  # noqa: BLE001 — never mask the exception we are unwinding on
+        _emit(f"[lab] teardown after abort ({why}) failed: {type(e).__name__}: {e}\n")
+
+
 def run_job(job_dir: Path, adopt: bool = False) -> int:
     job_dir = Path(job_dir)
     store = JobStore(job_dir.parent)
@@ -515,7 +653,14 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
     )
     call.ref(job_id=job_id)
 
+    # Flipped once a machine may exist, i.e. once a launch has been *asked for* (a request that
+    # errors can still have created an instance) or once we have adopted a live cluster. Read by
+    # `_teardown_on_abort`, so that a supervisor signalled before it ever reached SkyPilot does
+    # not raise a teardown alarm about a machine that was never provisioned.
+    machine_requested = adopt
+
     def _impl() -> int:
+        nonlocal machine_requested
         if not adopt:
             started = now()
             store.update_manifest(job_id, status=JobState.running, started_at=started)
@@ -546,6 +691,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                     instance=manifest.resources.accelerators,
                 )
                 # Retries transient local-API failures (submit stampede) before giving up (fieldrep #4).
+                machine_requested = True  # from here on, an abort must tear down
                 request_id = _launch_with_retry(sky, task, cluster)
                 # stream_and_get blocks until the job is submitted (0.12), i.e. until the host is UP.
                 # Bound it so a dead Vast offer stuck in "loading" can't hang the supervisor forever
@@ -779,13 +925,31 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             teardown_ok = False
         return 0 if teardown_ok else 2  # 2 = ran ok but teardown leaked — manifest has details
 
+    def _abort(exc: BaseException, *, outcome: str, why: str) -> None:
+        """Record the outcome, *then* stop the machine — in that order, deliberately.
+
+        Teardown can take a minute, and whoever sent a signal may follow it with SIGKILL, which
+        nothing can catch. A close line written now is guaranteed; one written after the teardown
+        is a gamble against exactly the death this path exists to make visible. The teardown's own
+        outcome is durable in the other place that matters — `tear_down_and_record` writes
+        `teardown_status` on the manifest, which is what `lab wait` (exit 3/6) and `lab reconcile`
+        read.
+        """
+        events.note("abort", why=why, cluster=cluster, teardown=machine_requested)
+        exit_code = exc.code if isinstance(exc, SystemExit) and isinstance(exc.code, int) else None
+        events.finish(call, outcome=outcome, exit_code=exit_code, error=events.error_dict(exc))
+        _teardown_on_abort(store, job_id, cluster, cloud, why=why, launched=machine_requested)
+
     try:
         code = _impl()
-    except KeyboardInterrupt:
-        events.finish(call, outcome="interrupted")
+    except SupervisorTerminated as e:
+        _abort(e, outcome="interrupted", why=str(e))
+        raise
+    except KeyboardInterrupt as e:
+        _abort(e, outcome="interrupted", why="supervisor interrupted (SIGINT)")
         raise
     except BaseException as e:  # noqa: BLE001 — every exit path must be recorded
-        events.finish(call, outcome="crash", error=events.error_dict(e))
+        _abort(e, outcome="crash", why=f"supervisor crashed: {type(e).__name__}: {e}")
         raise
     events.finish(
         call, outcome=("ok" if code == 0 else "error"), exit_code=code,
@@ -793,15 +957,24 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
     return code
 
 
-if __name__ == "__main__":
-    import argparse
+def main(argv: list[str] | None = None) -> int:
+    """The supervisor entrypoint: ``python -m lab.sky_runner <job_dir> [--adopt]``.
 
-    ap = argparse.ArgumentParser()
+    A function rather than bare code under ``if __name__ == "__main__"`` so that the signal
+    handling installed here is reachable from a real subprocess in the tests — the defect it fixes
+    lives in the interpreter's *default* signal disposition, which only a real signal can prove.
+    """
+    ap = argparse.ArgumentParser(prog="lab.sky_runner")
     ap.add_argument("job_dir", type=Path)
     ap.add_argument(
         "--adopt",
         action="store_true",
         help="re-attach to an already-launched cluster (scheduler watchdog)",
     )
-    ns = ap.parse_args()
-    raise SystemExit(run_job(ns.job_dir, adopt=ns.adopt))
+    ns = ap.parse_args(argv)
+    install_signal_handlers()
+    return run_job(ns.job_dir, adopt=ns.adopt)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
