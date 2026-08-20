@@ -151,7 +151,12 @@ class JobManifest(BaseModel):
     exit_code: int | None = None
     end_reason: str | None = None
     cost: CostInfo | None = None  # FR-I2
-    teardown_status: str | None = None  # "succeeded" | "failed" | None — FR-C2 leak detection
+    # FR-C2 leak detection. "succeeded" = the machine is confirmed gone. "failed" = the
+    # destroy was definitively refused, a real leak, `lab wait` exits 3. "unknown" = the
+    # outcome could not be read and nothing could verify it — exits 6, go check the
+    # provider. None = no teardown was ever recorded. Treat an unrecognised value as
+    # "unknown", never as "succeeded".
+    teardown_status: str | None = None
     metrics_uri: str | None = None
     logs_uri: str | None = None
     artifacts_uri: str | None = None  # durable object-store prefix, e.g. r2://lab-artifacts/<id>

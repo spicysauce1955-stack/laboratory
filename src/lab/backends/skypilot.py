@@ -1019,6 +1019,7 @@ def robust_teardown(
     raised — a human needs to check ``vastai show_instances`` (and ``lab reconcile``) NOW.
     """
     last_err: str | None = None
+    last_undecodable = False
     delays = (0, *backoffs)  # first try has no delay
     for attempt, delay in enumerate(delays, start=1):
         if delay:
@@ -1035,6 +1036,13 @@ def robust_teardown(
             }
         except Exception as e:  # noqa: BLE001
             last_err = f"{type(e).__name__}: {e}"
+            # Was the *reply* unreadable rather than the request refused? Under client/server
+            # version skew `sky.get` cannot unpickle a SUCCESS, so this error very likely sits on
+            # top of a teardown that actually happened (incident 2026-08-20). Remembered, not
+            # acted on here: a provider-direct fallback below can still settle it outright.
+            from lab._skycompat import classify_sky_error
+
+            last_undecodable = classify_sky_error(e).outcome == "undecodable_response"
             print(
                 f"[lab] sky.down attempt {attempt}/{len(delays)} for {cluster} failed: {last_err}"
             )
@@ -1065,7 +1073,8 @@ def robust_teardown(
         except Exception as e:  # noqa: BLE001
             events.note("teardown.fallback", cluster=cluster, via="gcp", ok=False)
             return {
-                "status": "failed",
+                # sky could not tell us and GCP could not either: genuinely unknown (R10).
+                "status": "unknown" if last_undecodable else "failed",
                 "attempts": len(delays),
                 "vast_fallback_used": False,
                 "vast_destroyed": [],
@@ -1097,7 +1106,8 @@ def robust_teardown(
         except Exception as e:  # noqa: BLE001 — an unreachable DO API is not "nothing is running"
             events.note("teardown.fallback", cluster=cluster, via="do", ok=False)
             return {
-                "status": "failed",
+                # sky could not tell us and DO could not either: genuinely unknown (R10).
+                "status": "unknown" if last_undecodable else "failed",
                 "attempts": len(delays),
                 "vast_fallback_used": False,
                 "vast_destroyed": [],
@@ -1107,9 +1117,12 @@ def robust_teardown(
             }
     if cloud != "vast":
         # No provider-direct fallback for this cloud; sky.down + autostop + the poweroff
-        # backstop + `lab reconcile` (sky.status pass) are the safety net. Report the failure.
+        # backstop + `lab reconcile` (sky.status pass) are the safety net. Nothing here can
+        # settle an unreadable reply, so say "unknown" rather than raising a leak alarm we
+        # cannot stand behind — a `failed` that is usually wrong teaches operators to ignore
+        # the one signal that matters (R10).
         return {
-            "status": "failed",
+            "status": "unknown" if last_undecodable else "failed",
             "attempts": len(delays),
             "vast_fallback_used": False,
             "vast_destroyed": [],
@@ -1136,7 +1149,8 @@ def robust_teardown(
     except Exception as e:  # noqa: BLE001
         events.note("teardown.fallback", cluster=cluster, via="vast", ok=False)
         return {
-            "status": "failed",
+            # sky could not tell us and Vast could not either: genuinely unknown (R10).
+            "status": "unknown" if last_undecodable else "failed",
             "attempts": len(delays),
             "vast_fallback_used": True,
             "vast_destroyed": [],
@@ -1155,19 +1169,42 @@ def tear_down_and_record(
 ) -> bool:
     """Call :func:`robust_teardown` and persist its outcome on the job manifest.
 
-    Returns ``True`` iff teardown succeeded. On failure, ``teardown_status='failed'`` is
-    written and ``end_reason`` is annotated with an actionable instruction so the leak is
-    visible in ``lab status`` / ``lab dashboard`` / ``lab wait``. ``backoffs`` overrides the
-    retry ladder for callers that must stay quick (e.g. a status poll); None keeps the default.
+    Returns ``True`` iff teardown **succeeded**. Three states are written, not two (R10):
+
+    * ``"succeeded"`` -- the machine is confirmed gone.
+    * ``"failed"`` -- the destroy was definitively refused. A real leak; ``lab wait`` exits 3.
+    * ``"unknown"`` -- the reply was unreadable and nothing could verify it. ``lab wait`` exits
+      6. This exists because on 2026-08-20 seven teardowns recorded ``failed`` while all seven
+      machines had in fact been destroyed; an alarm that is usually wrong stops being an alarm.
+
+    ``unknown`` is deliberately narrow. A provider-direct fallback that looks and finds nothing
+    has *verified* the outcome, so that stays ``succeeded`` -- manufacturing doubt we do not have
+    would be the same error as raising an alarm we cannot support. ``end_reason`` is annotated
+    either way so the state is visible in ``lab status`` / ``lab dashboard`` / ``lab wait``.
+    ``backoffs`` overrides the retry ladder for callers that must stay quick (e.g. a status
+    poll); None keeps the default.
     """
     if backoffs is None:
         outcome = robust_teardown(sky_mod, cluster, cloud=cloud)
     else:
         outcome = robust_teardown(sky_mod, cluster, cloud=cloud, backoffs=backoffs)
     succeeded: bool = outcome["status"] == "succeeded"
-    fields: dict[str, Any] = {"teardown_status": "succeeded" if succeeded else "failed"}
+    unknown: bool = outcome["status"] == "unknown"
+    fields: dict[str, Any] = {"teardown_status": outcome["status"]}
     annotation: str | None = None
-    if not succeeded:
+    if unknown:
+        # Not an alarm and not an all-clear. Say plainly that the answer is unreadable and name
+        # the one place that can settle it, because the operator's instinct after 2026-08-20 is
+        # to disbelieve whichever way this reads.
+        annotation = (
+            f"TEARDOWN OUTCOME UNKNOWN for cluster {cluster!r}: {outcome['error']} after "
+            f"{outcome['attempts']} sky.down attempts. The machine may already be gone OR may "
+            f"still be billing — this cannot be told from the client. Verify against the "
+            f"provider itself (`doctl compute droplet list`, `gcloud compute instances list "
+            f"--filter=\"name~'^lab-'\"`, `vastai show_instances`), then `lab reconcile "
+            f"--apply --yes` if anything remains."
+        )
+    elif not succeeded:
         if cloud == "vast":
             remedy = (
                 "AND vast-sdk fallback. Run `lab reconcile --apply` to stop the bleed "

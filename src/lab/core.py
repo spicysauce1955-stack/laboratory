@@ -1508,6 +1508,15 @@ class Lab:
                 key=lambda m: m.status not in (JobState.failed, JobState.timed_out),
             )
         teardown_leaks = [m.job_id for m in manifests if m.teardown_status == "failed"]
+        # Distinct from both: the destroy ran and its outcome could not be read (R10). Anything
+        # unrecognised lands here too rather than in the all-clear — a value this version does
+        # not know about must never be optimistically read as "succeeded".
+        teardown_unknown = [
+            m.job_id
+            for m in manifests
+            if m.teardown_status is not None
+            and m.teardown_status not in ("succeeded", "failed")
+        ]
         teardown_unconfirmed = [
             m.job_id
             for m in manifests
@@ -1520,6 +1529,7 @@ class Lab:
             "failed_fast": failed_fast,
             "pending": pending,  # still running — and, for remote jobs, still billing
             "teardown_leaks": teardown_leaks,
+            "teardown_unknown": teardown_unknown,
             "teardown_unconfirmed": teardown_unconfirmed,
             "jobs": [
                 {

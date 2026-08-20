@@ -126,6 +126,23 @@ timeout reads as a timeout — not a generic failure.
 
 A timed-out (or cancelled, or failed) remote job always runs through teardown. If teardown can't
 be confirmed, `lab wait` exits with code `3` and the manifest's `teardown_status` is `failed`.
+
+`teardown_status` has three non-null values, and the distinction is the difference between an
+alarm you can trust and one you learn to ignore:
+
+| value | meaning | `lab wait` |
+|---|---|---|
+| `succeeded` | the machine is confirmed gone | `0` |
+| `failed` | the destroy was definitively refused — a real leak, act now | `3` |
+| `unknown` | the outcome could not be read and nothing could verify it | `6` |
+| `null` | no teardown was ever recorded | `0`, with a warning |
+
+`unknown` exists because of the 2026-08-20 incident: seven teardowns recorded `failed` while all
+seven machines had in fact been destroyed — the client could not decode the server's success
+reply. Folding that case into `failed` makes exit 3 mostly noise, and the next real leak goes
+unnoticed. On `unknown`, check the provider directly (`doctl compute droplet list`,
+`gcloud compute instances list --filter="name~'^lab-'"`, `vastai show_instances`) before
+concluding anything. Treat an unrecognised value as `unknown`, never as `succeeded`.
 To check for orphaned rentals at any time:
 
 ```bash

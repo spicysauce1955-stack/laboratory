@@ -746,9 +746,19 @@ def wait(
     )
     all_terminal = summary["all_terminal"]
     teardown_leaks = summary["teardown_leaks"]
+    teardown_unknown = summary.get("teardown_unknown") or []
     teardown_unconfirmed = summary["teardown_unconfirmed"]
     _emit(summary)
-    if teardown_unconfirmed and not teardown_leaks:
+    if teardown_unknown:
+        typer.echo(
+            f"[lab] warning: teardown outcome UNKNOWN for {teardown_unknown} — the machine may "
+            "already be gone OR may still be billing, and the client cannot tell which. Verify "
+            "against the provider (`doctl compute droplet list`, `gcloud compute instances list "
+            "--filter=\"name~'^lab-'\"`, `vastai show_instances`), then `lab reconcile --apply "
+            "--yes` if anything remains.",
+            err=True,
+        )
+    if teardown_unconfirmed and not teardown_leaks and not teardown_unknown:
         typer.echo(
             f"[lab] warning: teardown not confirmed for {teardown_unconfirmed} "
             "(status is null, not 'failed') — run `lab reconcile` to be sure no machine or "
@@ -756,17 +766,23 @@ def wait(
             err=True,
         )
     if summary["failed_fast"]:
-        # A confirmed leak outranks the fail-fast signal: exit 3 is the documented URGENT
-        # "a paid machine may still be billing — run `lab reconcile` now" alarm (FR-C2).
-        _fail(
-            3 if teardown_leaks else 4,
-            "fail-fast: teardown leaked" if teardown_leaks else "fail-fast: a job failed/timed out",
-        )
+        # Money outranks the fail-fast signal. Exit 3 is the documented URGENT "a paid machine
+        # may still be billing — run `lab reconcile` now" alarm (FR-C2); exit 6 is the same
+        # concern without the certainty, and it still outranks 4 because an unverified machine
+        # costs the same as a verified one (R10).
+        if teardown_leaks:
+            _fail(3, "fail-fast: teardown leaked")
+        if teardown_unknown:
+            _fail(6, "fail-fast: teardown outcome unknown")
+        _fail(4, "fail-fast: a job failed/timed out")
     if not all_terminal:
         _fail(1, "gave up: --timeout elapsed before all jobs reached a terminal state")
     if teardown_leaks:
         # all terminal but at least one cluster may still be billing
         _fail(3, "teardown leaked on at least one job")
+    if teardown_unknown:
+        # all terminal, nothing confirmed leaked, but at least one outcome is unreadable
+        _fail(6, "teardown outcome unknown on at least one job — verify with the provider")
 
 
 @app.command()

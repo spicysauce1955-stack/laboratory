@@ -31,8 +31,11 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
 - **Experiment Contract (§7):** any committed `uv run` entrypoint, determined by config+seed,
   writes to `$LAB_RUN_DIR`, logs metrics via `log_metric(name, value, step)`, exits non-zero on fail.
 - **Teardown is cost-critical (FR-C2):** every skypilot job runs through `robust_teardown`
-  (sky.down retries → vastai-sdk fallback). A persistent failure flips `teardown_status="failed"`
-  on the manifest and makes `lab wait` exit 3. **Recovery: `uv run lab reconcile [--apply]`**
+  (sky.down retries → vastai-sdk/gcp/DO-direct fallback). A definitive failure flips
+  `teardown_status="failed"` and makes `lab wait` exit 3; an **unreadable** outcome flips it to
+  `"unknown"` and exits **6** — the machine may be gone or may be billing, so verify against the
+  provider itself. `failed` is kept rare on purpose: an alarm that is usually wrong gets ignored
+  (R10). Treat an unrecognised value as `unknown`, never as success. **Recovery: `uv run lab reconcile [--apply]`**
   finds orphaned rentals/instances not tied to a running job and destroys them. `--apply` lists
   what it will destroy and **asks**; add `--yes` for unattended use (with no tty it refuses and
   exits 4 rather than prompting). Only the approved set is destroyed.
