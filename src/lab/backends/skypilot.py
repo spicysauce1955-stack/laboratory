@@ -28,7 +28,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from lab import events
-from lab._util import infer_artifact_type, now, parse_duration, pid_alive
+from lab._util import (
+    infer_artifact_type,
+    now,
+    parse_duration,
+    pid_alive,
+    process_start_time,
+)
 from lab.manifest import repo_root, sha256_file
 from lab.metrics import METRICS_FILE, read_points
 from lab.models import ArtifactRecord, JobManifest, JobState, ResourceRequest
@@ -1455,7 +1461,12 @@ class SkyPilotBackend:
             env=child_env,
         )
         self.store.write_runtime(
-            manifest.job_id, runner_pid=proc.pid, cluster=cluster_name_for(manifest.job_id)
+            manifest.job_id,
+            runner_pid=proc.pid,
+            # Identity, not just the number: a recycled PID would otherwise report this
+            # supervisor alive forever and disable every self-heal that depends on it (F4).
+            runner_start_time=process_start_time(proc.pid),
+            cluster=cluster_name_for(manifest.job_id),
         )
         return manifest.job_id
 
@@ -1463,7 +1474,9 @@ class SkyPilotBackend:
         m = self.store.read_manifest(job_id)
         if m.status not in _TERMINAL:
             rt = self.store.read_runtime(job_id)
-            if rt.get("runner_pid") and not pid_alive(rt["runner_pid"]):
+            if rt.get("runner_pid") and not pid_alive(
+                rt["runner_pid"], start_time=rt.get("runner_start_time")
+            ):
                 # The supervisor died before recording terminal state, so its teardown very
                 # likely never ran — attempt it here (idempotent) rather than flip to `failed`
                 # on a possibly-still-billing box (FR-C2). Quick backoffs: this is a status

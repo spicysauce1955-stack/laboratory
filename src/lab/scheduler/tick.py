@@ -240,7 +240,7 @@ class Scheduler:
                 # max_concurrent after a host crash/reboot.
                 rt = self.store.read_runtime(reg.job_id)
                 pid = rt.get("runner_pid")
-                if pid and not pid_alive(int(pid)):
+                if pid and not pid_alive(int(pid), start_time=rt.get("runner_start_time")):
                     pgid = rt.get("command_pgid")
                     if pgid:  # orphaned experiment process: nothing enforces its timeout now
                         try:
@@ -257,7 +257,7 @@ class Scheduler:
             ):
                 rt = self.store.read_runtime(reg.job_id)
                 pid = rt.get("runner_pid")
-                if pid and not pid_alive(int(pid)):
+                if pid and not pid_alive(int(pid), start_time=rt.get("runner_start_time")):
                     from lab.backends.skypilot import cluster_name_for
 
                     cluster = str(rt.get("cluster") or cluster_name_for(reg.job_id))

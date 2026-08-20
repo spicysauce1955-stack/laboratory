@@ -494,7 +494,7 @@ git commit -m "feat(teardown): DO-direct fallback when SkyPilot loses the cluste
 
 ### Phase 2 — Leak-net integrity
 
-#### Task 4: A third teardown state (R10)
+#### Task 4: A third teardown state (R10) — DONE `2be0e3c`
 
 **DECIDED 2026-08-20 — three states, with a distinct exit code.** `teardown_status` becomes:
 
@@ -528,7 +528,7 @@ Anything reading either — the user's watchdog scripts, `lab dashboard`, the MC
       the `laboratory` skill's exit-code table. All six state the two-value contract today.
 - [ ] **Step 5:** Commit.
 
-#### Task 5: Process identity beyond a bare PID, and reconcile remediation (R16 / F4, R15 / F3)
+#### Task 5: Process identity beyond a bare PID, and reconcile remediation (R16 / F4, R15 / F3) — DONE
 
 **Files:** `src/lab/_util.py:107-122` (`pid_alive`), `src/lab/core.py` (reconcile), `tests/test_pid_identity.py`.
 
@@ -544,6 +544,14 @@ Anything reading either — the user's watchdog scripts, `lab dashboard`, the MC
 - [ ] **Step 5:** Run the full suite; commit.
 
 ---
+
+> **Task 5 note (2026-08-20).** Recording the identity at the spawn sites is only half the fix —
+> three `pid_alive()` callers (`backends/local.py`, and two in `scheduler/tick.py`) still passed a
+> bare PID and would have kept the blind spot open where nobody was looking. That class of omission
+> is invisible at the call site and untestable by behaviour (PID reuse is rare and
+> non-deterministic), so `tests/test_pid_identity.py` enforces it structurally instead: an AST scan
+> asserting every `pid_alive` call in `src/lab` passes `start_time=`, and every `write_runtime`
+> recording a `runner_pid` also records `runner_start_time`. Any new call site fails the suite.
 
 ### Phase 3 — Observability
 

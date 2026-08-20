@@ -1183,7 +1183,12 @@ class Lab:
             runtime = self.store.read_runtime(j.job_id)
             if j.backend.provisioner == "skypilot":
                 age = (now() - (j.started_at or j.created_at)).total_seconds()
-                if age > UNSUPERVISED_GRACE_S and not pid_alive(runtime.get("runner_pid")):
+                # Identity, not just the PID: a recycled number would report a long-dead
+                # supervisor alive forever and silently disable this whole branch (F4).
+                alive = pid_alive(
+                    runtime.get("runner_pid"), start_time=runtime.get("runner_start_time")
+                )
+                if age > UNSUPERVISED_GRACE_S and not alive:
                     unsupervised.append({"job_id": j.job_id, "cluster": cluster})
                     continue  # dead supervisor -> the cluster is NOT protected
             running_clusters[cluster] = j.job_id
@@ -1438,6 +1443,25 @@ class Lab:
                         gcp_disks_destroyed.append(str(disk["name"]))
                     except Exception as e:  # noqa: BLE001
                         _unconfirmed("gcp_disk_orphans", disk, e)
+
+        if apply and unsupervised:
+            # Detection without remediation is the actual gap (F3). The dry run already *reports*
+            # these; flipping one to terminal and attempting its teardown used to require someone
+            # running `lab status` on that exact job id, which on an unattended box nobody does.
+            # `--apply` is already the destructive, opted-in path, so finish the job here the same
+            # way `SkyPilotBackend.status()` would. Best-effort: a crash must not abort the sweep,
+            # because the report it produces is the thing the operator acts on.
+            from lab.backends.skypilot import SkyPilotBackend
+
+            for entry in unsupervised:
+                try:
+                    SkyPilotBackend(home=self.home, repo=self.repo).status(entry["job_id"])
+                except Exception as e:  # noqa: BLE001
+                    print(
+                        f"[lab] reconcile could not finalise unsupervised job "
+                        f"{entry['job_id']}: {e}",
+                        file=sys.stderr,
+                    )
 
         return {
             "vast_pass": vast_pass,

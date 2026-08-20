@@ -16,7 +16,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from lab._util import infer_artifact_type, now, pid_alive
+from lab._util import infer_artifact_type, now, pid_alive, process_start_time
 from lab.manifest import sha256_file
 from lab.metrics import METRICS_FILE, read_points
 from lab.models import ArtifactRecord, JobManifest, JobState
@@ -53,14 +53,18 @@ class LocalBackend:
             cwd=str(self.repo),
             start_new_session=True,
         )
-        self.store.write_runtime(manifest.job_id, runner_pid=proc.pid)
+        self.store.write_runtime(
+            manifest.job_id, runner_pid=proc.pid, runner_start_time=process_start_time(proc.pid)
+        )
         return manifest.job_id
 
     def status(self, job_id: str) -> JobState:
         m = self.store.read_manifest(job_id)
         if m.status not in _TERMINAL:
             rt = self.store.read_runtime(job_id)
-            if rt.get("runner_pid") and not pid_alive(rt["runner_pid"]):
+            if rt.get("runner_pid") and not pid_alive(
+                rt["runner_pid"], start_time=rt.get("runner_start_time")
+            ):
                 return self.store.update_manifest(
                     job_id,
                     status=JobState.failed,
