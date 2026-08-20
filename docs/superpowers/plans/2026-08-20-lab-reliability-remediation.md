@@ -96,7 +96,11 @@ Status key: **FIXED** (done, on branch `fix/reconcile-attribution-safety`) · **
 
 ### Phase 0 — Environment (no code, do first)
 
-- [ ] **Step 1: Kill the live version skew**
+- [x] **Step 1: Kill the live version skew** — DONE 2026-08-20. `uv lock --upgrade-package skypilot`
+      moved 0.12.3 → 0.13.0 (the `>=0.12` constraint already allowed it; only the lock pinned it).
+      `sky_versions()` now reports `client=0.13.0 server=0.13.0 compatible=True`. Full suite 982
+      passed on the new version, packaging guard passed. **`tempotron-capacity` was NOT touched** —
+      it was already on 0.13.0, which is why its teardowns worked while this repo's did not.
 
 The machine is running client 0.12.3 against server 0.13.0 right now, which is R4. Until this is done, `lab reconcile --apply` is hard-blocked by design and every teardown outcome is unreliable.
 
@@ -116,7 +120,10 @@ for p in /home/user/.superset/projects/*/; do
 done
 ```
 
-- [ ] **Step 2: Commit the work already on the branch**
+- [x] **Step 2: Commit the work already on the branch** — DONE 2026-08-20, three commits:
+      `3d296d0` deps, `df5f43c` the reconcile fix, `f1c0ed4` docs. Working tree clean.
+      Live dry-run reconcile with a *working* client: every destroyable list empty, 10
+      `tempotron-capacity` resources under `other_projects`, exit 0.
 
 ```bash
 git add -A
