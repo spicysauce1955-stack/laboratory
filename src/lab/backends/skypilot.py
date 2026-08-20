@@ -12,6 +12,7 @@ object storage (R2/S3) is a P1 item (research/15).
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shlex
@@ -21,12 +22,14 @@ import sys
 import threading
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from lab import events
 from lab._util import infer_artifact_type, now, parse_duration, pid_alive
-from lab.manifest import sha256_file
+from lab.manifest import repo_root, sha256_file
 from lab.metrics import METRICS_FILE, read_points
 from lab.models import ArtifactRecord, JobManifest, JobState, ResourceRequest
 from lab.preemption import gcp_terminal_state
@@ -82,10 +85,173 @@ def map_job_status(status_name: str) -> JobState:
     return _STATUS_MAP.get(status_name, JobState.failed)
 
 
-def cluster_name_for(job_id: str) -> str:
-    """SkyPilot cluster name: starts with a letter, lowercase alnum + hyphen."""
-    safe = re.sub(r"[^a-z0-9-]", "-", job_id.lower()).strip("-")
-    return f"lab-{safe}"[:60]
+# ----------------------------------------------------------------------------
+# Project identity on provisioned resources
+#
+# A job id is a timestamp plus randomness, so `lab-<job_id>` says *when* a box was launched and
+# nothing about *who* launched it — and the `lab-` prefix is shared by every project on the
+# machine and in the cloud account. That is why `lab reconcile --apply --yes` was able to destroy
+# seven running clusters belonging to a different project on 2026-08-20: from the cloud side the
+# question "is this mine?" had no answer, not even a wrong one.
+#
+# So we stamp the project onto the resource at launch, by the two carriers that survive:
+#
+# * the **cluster name** — the one string that reaches every cloud, since SkyPilot derives the
+#   instance/rental name from it on Vast, DO and GCP alike; and
+# * real **instance labels**, where the cloud has them (see :func:`project_labels`).
+#
+# The name is the load-bearing one: it is what `sky.status`, the Vast rental label and the GCP
+# instance name all show, and it is the only carrier that works on a cloud SkyPilot cannot label.
+# ----------------------------------------------------------------------------
+
+CLUSTER_NAME_MAX = 60  # SkyPilot cluster name budget (pre-existing; unchanged by the slug)
+# Keep the slug short: it is spent from the same 60 characters as the job id, and — worse — GCP
+# truncates the whole name to 35 characters on the cloud, where every character we add pushes
+# more of the tail off the instance name.
+PROJECT_SLUG_MAX = 12
+_SLUG_DIGEST_LEN = 4  # collision breaker appended when a slug is truncated or unrepresentable
+
+# The real job-id shape, from `lab.core._new_job_id`: `%Y%m%d-%H%M%S` + 6 hex. Pinning the shape
+# is what makes the name parseable at all — the slug and the job id are both hyphenated lowercase
+# text, so only a fixed-width anchor at the end can tell where one ends and the other begins.
+_JOB_ID_PATTERN = r"[0-9]{8}-[0-9]{6}-[0-9a-f]{6}"
+# Both shapes in one pattern: `lab-<slug>-<job_id>` (new) and `lab-<job_id>` (legacy, still
+# running in the wild). The slug group is optional, never greedy past the anchored tail.
+_CLUSTER_NAME_RE = re.compile(rf"^lab-(?:(?P<project>[a-z0-9-]+)-)?(?P<job_id>{_JOB_ID_PATTERN})$")
+
+
+@dataclass(frozen=True)
+class ClusterIdentity:
+    """Who and what a cluster name refers to.
+
+    ``project`` is the *slug* (:func:`project_slug`), not the directory name — the name only ever
+    carried the slug. ``None`` means the name predates project stamping, i.e. **ownership
+    unknown**, which is emphatically not the same as "not ours": a legacy cluster is one we may
+    well own, and treating unknown as foreign would leak it, while treating it as ours is what
+    caused the incident. Callers must decide explicitly.
+    """
+
+    job_id: str
+    project: str | None
+
+
+def project_slug(project: str) -> str:
+    """A short, stable, cluster-name-safe slug for a project name.
+
+    Directory names are unconstrained (spaces, underscores, capitals, CJK, leading digits);
+    cluster names are lowercase alphanumerics and hyphens. Anything unrepresentable collapses to
+    hyphens, and a name that leaves *nothing* behind still gets a slug — a digest — because an
+    empty slug would silently emit the legacy shape and lose the attribution we came here for.
+
+    Truncation appends the same digest rather than cutting bare, because a bare prefix is exactly
+    how two neighbouring projects (`machine-learning-alpha`, `machine-learning-beta`) would map
+    onto one name and hand `reconcile` back the false match this whole change removes.
+    """
+    safe = re.sub(r"[^a-z0-9]+", "-", project.lower()).strip("-")
+    digest = hashlib.sha256(project.encode("utf-8")).hexdigest()[:_SLUG_DIGEST_LEN]
+    if not safe:
+        return f"p{digest}"  # leading letter: a slug may head the name after the `lab-` prefix
+    if len(safe) <= PROJECT_SLUG_MAX:
+        return safe
+    head = safe[: PROJECT_SLUG_MAX - _SLUG_DIGEST_LEN - 1].rstrip("-")
+    return f"{head}-{digest}"
+
+
+@lru_cache(maxsize=32)
+def _project_name(_cwd: str, _repo_dir: str) -> str | None:
+    """Cached repo-directory name. The arguments are cache keys only.
+
+    ``repo_root`` shells out to ``git rev-parse``, and `Lab.reconcile` asks for a cluster name
+    once per job — so an uncached lookup turns a leak sweep into a few hundred subprocesses. The
+    two things that can change the answer (the cwd and the ``LAB_REPO_DIR`` override) are passed
+    in so they key the cache instead of being invisible to it.
+    """
+    try:
+        return repo_root().name or None
+    except Exception as e:  # noqa: BLE001 — not every cwd is a repo, and a name is never critical
+        events.note("project probe failed", error=str(e))
+        return None
+
+
+def current_project() -> str | None:
+    """The project this process is operating on — the repo directory name, ``None`` if unknowable.
+
+    Deliberately the *same* derivation the event ledger uses (``lab.events.record._project``):
+    the ledger and the cluster names are read side by side when a run is being traced, and two
+    disagreeing notions of "project" would make that join silently wrong. Going through
+    :func:`lab.manifest.repo_root` also means ``LAB_REPO_DIR`` is honoured, which is what keeps
+    the scheduler host — whose cwd is not the repo — from stamping its own directory on every
+    job it launches.
+    """
+    return _project_name(os.getcwd(), (os.environ.get("LAB_REPO_DIR") or "").strip())
+
+
+def cluster_name_for(job_id: str, *, project: str | None = None) -> str:
+    """SkyPilot cluster name for a job: ``lab-<project-slug>-<job_id>``.
+
+    Starts with a letter, lowercase alphanumerics and hyphens, at most
+    :data:`CLUSTER_NAME_MAX` characters — e.g. job ``20260820-071905-771110`` in the
+    ``laboratory`` repo becomes ``lab-laboratory-20260820-071905-771110`` (37 chars).
+
+    ``project`` defaults to :func:`current_project`; pass it explicitly when launching on behalf
+    of a project that is not the caller's own working directory (the scheduler's case).
+
+    **The job id never gives way.** It is the key reconcile and teardown match on, so when the
+    budget is tight the *slug* is dropped — a job id long enough to consume the whole budget
+    simply yields the legacy ``lab-<job_id>`` shape rather than a truncated, unrecoverable id.
+    """
+    safe_job = _safe_segment(job_id)
+    name = current_project() if project is None else project
+    slug = project_slug(name) if name else ""
+    budget = CLUSTER_NAME_MAX - len("lab-") - len(safe_job) - 1
+    if slug and budget >= len(slug):
+        return f"lab-{slug}-{safe_job}"
+    return f"lab-{safe_job}"[:CLUSTER_NAME_MAX]
+
+
+def parse_cluster_name(name: str) -> ClusterIdentity | None:
+    """Recover the job id (and project slug, if stamped) from a cluster name, or ``None``.
+
+    ``None`` means "not a cluster this tool launched" — a hand-named `lab-notebook` in a shared
+    account parses to nothing, which is the answer that keeps a leak sweep off it (GCP-LEAK-7).
+    A legacy ``lab-<job_id>`` parses with ``project=None``; see :class:`ClusterIdentity` for why
+    that must not be read as "foreign".
+    """
+    m = _CLUSTER_NAME_RE.match(name.strip().lower())
+    if m is None:
+        return None
+    return ClusterIdentity(job_id=m.group("job_id"), project=m.group("project"))
+
+
+def project_labels(job_id: str, *, project: str | None = None) -> dict[str, str]:
+    """Cloud instance labels stamping the owning project (and job) onto the resource itself.
+
+    A second carrier alongside the name, and on GCP a strictly better one: SkyPilot truncates the
+    cluster name to GCP's 35-character instance-name limit, so `lab-laboratory-20260820-071905-
+    771110` reaches the console as `lab-laboratory-20260820-ef-<userhash>` — project intact, job
+    id shorn. The label keeps the full id, queryable via ``--filter labels.lab-job-id=…``.
+
+    **Not every cloud stores these.** SkyPilot 0.12.3 renders `labels` into `gcp-ray.yml.j2` (and
+    AWS/Kubernetes) only; `do-ray.yml.j2` and `vast-ray.yml.j2` have no labels block, and the DO
+    provisioner tags droplets from `ProvisionConfig.tags`, which `provisioner.py` hard-codes to
+    `{}`. Their base `Cloud.is_label_valid` accepts anything, so the labels are *dropped without
+    error* there — which is why the cluster name, not this, is the load-bearing carrier. Setting
+    them unconditionally anyway costs nothing and starts working the day SkyPilot wires a cloud up.
+
+    Keys and values are constrained by GCP's validator (`^[a-z]([a-z0-9_-]{0,62})?$` /
+    `^[a-z0-9_-]{0,63}$`); the slug and the sanitised job id are inside it by construction, and
+    ``test_gcp_accepts_our_labels`` asks GCP's own validator rather than trusting this comment.
+    """
+    labels = {"lab-job-id": _safe_segment(job_id)[:63]}
+    name = current_project() if project is None else project
+    if name:
+        labels["lab-project"] = project_slug(name)
+    return labels
+
+
+def _safe_segment(value: str) -> str:
+    """Lowercase, hyphenate anything a cluster name cannot hold. Unchanged from the original."""
+    return re.sub(r"[^a-z0-9-]", "-", value.lower()).strip("-")
 
 
 def build_setup_script() -> str:
@@ -269,6 +435,58 @@ def do_volume_orphans(
     return orphans
 
 
+def list_do_droplets(client: Any | None = None) -> list[dict[str, Any]]:
+    """Every DO droplet on the account as plain dicts. Raises if the client or listing fails —
+    a leak-detection caller must never read an API error as "nothing is running"."""
+    if client is None:
+        client = _get_do_client()
+    resp = client.droplets.list(per_page=200)
+    droplets = resp.get("droplets", []) if isinstance(resp, dict) else resp
+    return [dict(d) for d in (droplets or [])]
+
+
+def _do_destroy_matching(cluster: str) -> tuple[list[Any], list[str]]:
+    """Destroy the droplet(s) and block volume(s) belonging to ``cluster``, via the DO API.
+
+    The provider-direct fallback DigitalOcean was missing while Vast and GCP both had one (F2).
+    It matters most in exactly the case SkyPilot cannot help with: its registry has lost the
+    cluster (``ClusterDoesNotExist``) but the droplet is alive and billing.
+
+    Two resources, not one. SkyPilot's DO provisioner attaches a block volume named after the
+    cluster, and destroying the droplet alone leaves it behind — detached, invisible to every
+    instance-level pass, and still charged for. That residue is what the 2026-08-20 sweep found.
+
+    Matching is ``name.startswith(cluster)``, which is exact enough to be safe here: DO does not
+    truncate instance names (unlike GCP — see :func:`gcp_name_matches`), and the cluster name now
+    carries the owning project, so another project's droplet cannot share this prefix. Returns
+    ``(destroyed_ids, failures)``; finding nothing is success, since nothing is billing.
+    """
+    client = _get_do_client()
+    destroyed: list[Any] = []
+    failures: list[str] = []
+    prefix = cluster.lower()
+
+    for d in list_do_droplets(client):
+        if not str(d.get("name", "")).lower().startswith(prefix):
+            continue
+        try:
+            client.droplets.destroy(droplet_id=int(d["id"]))
+            destroyed.append(int(d["id"]))
+        except Exception as e:  # noqa: BLE001 — a box we found and could not kill must alarm
+            failures.append(f"droplet {d.get('name')}: {type(e).__name__}: {e}")
+
+    for v in list_do_volumes(client):
+        if not str(v.get("name", "")).lower().startswith(prefix):
+            continue
+        try:
+            client.volumes.delete(volume_id=str(v["id"]))
+            destroyed.append(v["id"])
+        except Exception as e:  # noqa: BLE001
+            failures.append(f"volume {v.get('name')}: {type(e).__name__}: {e}")
+
+    return destroyed, failures
+
+
 class GcpNotConfigured(RuntimeError):
     """GCP isn't set up on this machine: the provider extra isn't installed, there are no
     application-default credentials, or no project is selected.
@@ -317,7 +535,7 @@ def _zone_name(url: str) -> str:
 
 
 def list_gcp_instances(compute: Any | None = None, project: str | None = None) -> list[dict[str, Any]]:
-    """Every GCE instance on the project as ``{name, zone, status, preemptible}`` dicts, via
+    """Every GCE instance on the project as ``{name, zone, status, preemptible, labels}`` dicts, via
     ``instances.aggregatedList`` (all zones, paginated). Raises if GCP isn't configured —
     best-effort callers (the reconcile pass) swallow that.
 
@@ -338,6 +556,12 @@ def list_gcp_instances(compute: Any | None = None, project: str | None = None) -
                         "zone": _zone_name(str(inst.get("zone", ""))),
                         "status": inst.get("status"),
                         "preemptible": bool((inst.get("scheduling") or {}).get("preemptible")),
+                        # GCE's own copy of what `project_labels` stamped at launch. Unlike the
+                        # name, a label is not truncated to 35 chars, so this is the *only* place
+                        # a GCP instance states its full owning project and job id — which is
+                        # what lets a leak sweep tell one project's box from another's rather
+                        # than guessing from a shared `lab-` prefix.
+                        "labels": dict(inst.get("labels") or {}),
                     }
                 )
         req = compute.instances().aggregatedList_next(previous_request=req, previous_response=resp)
@@ -428,18 +652,64 @@ def is_lab_cluster_node(name: str) -> bool:
     return bool(_GCP_NODE_RE.match(name))
 
 
+@lru_cache(maxsize=256)
+def gcp_name_fragment(cluster: str) -> str:
+    """The part of ``cluster``'s GCE resource names that is stable enough to match on.
+
+    SkyPilot does not name a GCE instance after the cluster verbatim: it runs the display name
+    through ``make_cluster_name_on_cloud`` at GCP's 35-character limit, which **truncates to 23
+    characters and appends a 2-char digest plus the launching user's hash** before
+    ``_generate_node_name`` adds ``-<head|worker>-<uuid8>-<compute|tpu|mig>``.
+
+    This never mattered while clusters were called ``lab-<job_id>``, because that is 26 characters
+    against a 26-character budget — it fit by exactly zero, so the display name survived intact
+    and a plain substring test worked. Adding a project slug spends that zero. Without this
+    helper, `lab-laboratory-20260820-071905-771110` stops being a substring of its own instance
+    `lab-laboratory-20260820-ef-<userhash>-head-…`, every *live* GCP box stops matching its
+    running job, and `reconcile --apply` proceeds to destroy it — the 2026-08-20 incident,
+    recreated by the fix for it.
+
+    We drop the trailing user hash so the match does not silently depend on *which* user runs
+    `reconcile`, and derive the rest with SkyPilot's own function rather than reimplementing its
+    truncation. When nothing was truncated this returns the display name unchanged, so legacy
+    ``lab-<job_id>`` clusters match exactly as before. Cached: reconcile asks per instance per job.
+    """
+    from sky.clouds.gcp import GCP
+    from sky.utils.common_utils import make_cluster_name_on_cloud
+
+    on_cloud = make_cluster_name_on_cloud(cluster, max_length=GCP.max_cluster_name_length())
+    return on_cloud.rsplit("-", 1)[0].lower()  # strip `-<user_hash>`
+
+
+def gcp_name_matches(cluster: str, name: str) -> bool:
+    """Whether GCE resource ``name`` belongs to cluster ``cluster`` (instances and their disks).
+
+    Falls back to the raw display name if SkyPilot cannot be imported or its naming helpers
+    raise: a degraded match may miss a leak, whereas raising here would abort the leak sweep
+    entirely, and half a report beats none.
+    """
+    lowered = name.lower()
+    if cluster.lower() in lowered:
+        return True
+    try:
+        return gcp_name_fragment(cluster) in lowered
+    except Exception as e:  # noqa: BLE001 — never let a naming helper abort a leak sweep
+        events.note("gcp name fragment failed", cluster=cluster, error=str(e))
+        return False
+
+
 def gcp_instance_orphans(
     instances: list[dict[str, Any]], running_clusters: set[str]
 ) -> list[dict[str, Any]]:
     """Lab-cluster GCE instances not tied to any running cluster — the out-of-band GCP analogue of
-    the Vast rental pass (SkyPilot names instances after their cluster, so a running cluster name
-    is a substring of its instance names). Pure."""
+    the Vast rental pass (SkyPilot names instances after their cluster — see
+    :func:`gcp_name_matches` for why that is not a plain substring test)."""
     orphans: list[dict[str, Any]] = []
     for inst in instances:
         name = str(inst.get("name", ""))
         if not is_lab_cluster_node(name):
             continue  # not ours — leave it alone
-        if any(c.lower() in name.lower() for c in running_clusters):
+        if any(gcp_name_matches(c, name) for c in running_clusters):
             continue  # backs a live job
         orphans.append(inst)
     return orphans
@@ -458,7 +728,7 @@ def gcp_disk_orphans(
             continue
         if disk.get("users"):
             continue  # attached — deleted together with its instance
-        if any(c.lower() in name.lower() for c in running_clusters):
+        if any(gcp_name_matches(c, name) for c in running_clusters):
             continue
         orphans.append(disk)
     return orphans
@@ -527,7 +797,7 @@ def delete_gcp_disk(
 
 
 def _gcp_destroy_matching(cluster: str) -> tuple[list[str], list[str]]:
-    """Destroy every GCE instance whose name contains ``cluster``.
+    """Destroy every GCE instance belonging to ``cluster`` (see :func:`gcp_name_matches`).
 
     Returns ``(destroyed, failures)``. We keep going after a failure — the next instance might
     still die — but the failures are **returned, not just printed**: a destroy we attempted and
@@ -535,11 +805,10 @@ def _gcp_destroy_matching(cluster: str) -> tuple[list[str], list[str]]:
     teardown (FR-C2).
     """
     compute, project = _get_gcp_compute()
-    needle = cluster.lower()
     destroyed: list[str] = []
     failures: list[str] = []
     for inst in list_gcp_instances(compute, project):
-        if needle not in inst["name"].lower():
+        if not gcp_name_matches(cluster, str(inst["name"])):
             continue
         try:
             delete_gcp_instance(inst["name"], inst["zone"], compute, project)
@@ -574,8 +843,7 @@ def confirm_no_instance(cluster: str) -> bool:
         instances = list_gcp_instances()
     except Exception:  # noqa: BLE001 — uncertainty must read as "still maybe billing"
         return False
-    needle = cluster.lower()
-    return not any(needle in str(inst.get("name", "")).lower() for inst in instances)
+    return not any(gcp_name_matches(cluster, str(inst.get("name", ""))) for inst in instances)
 
 
 def gcp_preemption_state(cluster: str) -> JobState | None:
@@ -591,9 +859,8 @@ def gcp_preemption_state(cluster: str) -> JobState | None:
         instances = list_gcp_instances()
     except Exception:  # noqa: BLE001 — no answer is a valid answer here; inference still applies
         return None
-    needle = cluster.lower()
     return gcp_terminal_state(
-        [i for i in instances if needle in str(i.get("name", "")).lower()]
+        [i for i in instances if gcp_name_matches(cluster, str(i.get("name", "")))]
     )
 
 
@@ -732,8 +999,8 @@ def robust_teardown(
     provider API timeout) used to leak rentals — the cluster kept billing while we marked the
     job ``failed`` and moved on. We now retry sky.down with exponential backoff, then bypass
     SkyPilot's local registry entirely and ask the provider itself to destroy any instance
-    matching the cluster name (vastai-sdk on Vast, the compute API on GCP; DO has no direct
-    channel and reports the failure).
+    matching the cluster name: vastai-sdk on Vast, the compute API on GCP, and the DO API on
+    DigitalOcean (droplet plus the block volume SkyPilot attaches to it).
 
     Returns a structured outcome suitable for persistence on the manifest:
 
@@ -806,8 +1073,40 @@ def robust_teardown(
                 "gcp_destroyed": [],
                 "error": f"sky.down: {last_err}; gcp-direct: {type(e).__name__}: {e}",
             }
+    if cloud == "do":
+        # Talk to DigitalOcean directly — droplet first, then the block volume SkyPilot attaches
+        # alongside it, which outlives the droplet and keeps billing if left (F2).
+        print(f"[lab] sky.down exhausted for {cluster}; falling back to do-direct destroy")
+        try:
+            do_destroyed, do_failures = _do_destroy_matching(cluster)
+            events.note("teardown.fallback", cluster=cluster, via="do", ok=not do_failures)
+            return {
+                # Destroyed-or-none-found are both safe. Found-and-failed-to-destroy is not.
+                "status": "failed" if do_failures else "succeeded",
+                "attempts": len(delays),
+                "vast_fallback_used": False,
+                "vast_destroyed": [],
+                "do_fallback_used": True,
+                "do_destroyed": do_destroyed,  # report what DID die even when we alarm
+                "error": (
+                    f"sky.down: {last_err}; do-direct: {'; '.join(do_failures)}"
+                    if do_failures
+                    else last_err
+                ),
+            }
+        except Exception as e:  # noqa: BLE001 — an unreachable DO API is not "nothing is running"
+            events.note("teardown.fallback", cluster=cluster, via="do", ok=False)
+            return {
+                "status": "failed",
+                "attempts": len(delays),
+                "vast_fallback_used": False,
+                "vast_destroyed": [],
+                "do_fallback_used": True,
+                "do_destroyed": [],
+                "error": f"sky.down: {last_err}; do-direct: {type(e).__name__}: {e}",
+            }
     if cloud != "vast":
-        # No provider-direct fallback for this cloud (DO); sky.down + autostop + the poweroff
+        # No provider-direct fallback for this cloud; sky.down + autostop + the poweroff
         # backstop + `lab reconcile` (sky.status pass) are the safety net. Report the failure.
         return {
             "status": "failed",
@@ -1055,10 +1354,17 @@ def build_task(manifest: JobManifest, workdir: Path, *, memo: Any | None = None)
     # only on the CLI/MCP submit path — the scheduler launches registrations straight through
     # `Lab.submit`, so without this a deferred GCP job still inherits SkyPilot's 256 GB default.
     disk_gb = placement.effective_disk_gb(res)
+    # Same reasoning as the disk invariant above, and the same reason it lives *here*: every
+    # launch passes through `build_task`, including the scheduler's, which never calls
+    # `resolve_backend_profile`. A resource stamped only on the CLI path is a resource that is
+    # unattributable exactly when a deferred job leaks. See `project_labels` for which clouds
+    # actually store these.
+    labels = project_labels(manifest.job_id)
 
     def _res(*, use_spot: bool | None = None, region: str | None = None) -> sky.Resources:
         return sky.Resources(
             cloud=_cloud,
+            labels=labels,
             cpus=res.cpus,
             memory=res.memory,
             accelerators=res.accelerators or None,
@@ -1137,11 +1443,21 @@ class SkyPilotBackend:
                 except Exception as e:  # noqa: BLE001 — the alarm must survive a crashed attempt
                     print(f"[lab] teardown attempt for dead-supervisor job {job_id} crashed: {e}")
                     self.store.update_manifest(job_id, teardown_status="failed")
+                # Attribute the outcome honestly. A job whose cancel was interrupted is
+                # `cancelled` -- someone asked for it; calling that a crash would misreport a
+                # deliberate act and, worse, make a cancel indistinguishable from the supervisor
+                # failure this branch exists to catch.
+                cancelling = bool(rt.get("cancelling"))
                 return self.store.update_manifest(
                     job_id,
-                    status=JobState.failed,
+                    status=JobState.cancelled if cancelling else JobState.failed,
                     ended_at=now(),
-                    end_reason="supervisor exited without recording status",
+                    end_reason=(
+                        "cancelled by user (teardown completed by recovery after the cancel "
+                        "was interrupted)"
+                        if cancelling
+                        else "supervisor exited without recording status"
+                    ),
                 ).status
         return m.status
 
@@ -1155,29 +1471,45 @@ class SkyPilotBackend:
         return lines[-tail:] if tail else lines
 
     def cancel(self, job_id: str) -> JobState:
+        """Stop the job and release its machine, recording the terminal status **last**.
+
+        Ordering is the whole point (R9, incident 2026-08-20). This used to write
+        ``status=cancelled`` first and then do the slow part; seven cancels were killed by an
+        impatient caller mid-``robust_teardown`` and each left a manifest reading ``cancelled``
+        with ``teardown_status: None`` -- terminal, so ``lab wait`` was satisfied and every
+        dashboard went quiet, while the machine may well have still been billing.
+
+        Now the *intent* is recorded in ``_runtime.json`` up front and the manifest stays
+        non-terminal until teardown has actually been attempted. An interrupted cancel therefore
+        leaves a job that still looks unfinished -- which is true, and which lets
+        :meth:`status` finish it (its supervisor is already gone, having been SIGTERMed below).
+        """
         m = self.store.read_manifest(job_id)
         if m.status in _TERMINAL:
             return m.status
-        self.store.update_manifest(
-            job_id, status=JobState.cancelled, ended_at=now(), end_reason="cancelled by user"
-        )
+        # Durable before anything slow or killable: this is what tells a later `status()` that
+        # the job was on its way out deliberately, so recovery reports `cancelled` rather than
+        # inventing a crash that never happened.
+        self.store.write_runtime(job_id, cancelling=True)
         rt = self.store.read_runtime(job_id)
         if rt.get("runner_pid"):
             try:
                 os.kill(rt["runner_pid"], signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 pass
+        # The name recorded at launch, not one recomputed today: `cluster_name_for` gained a
+        # project slug, so recomputing can address a different machine than the one we started.
         cluster = rt.get("cluster") or cluster_name_for(job_id)
-        try:
-            import sky
+        import sky
 
+        try:
             sky.get(sky.cancel(cluster, all=True))  # 0.12: RequestId
         except Exception:  # noqa: BLE001 - best-effort; teardown below is what matters
             pass
-        import sky
-
         tear_down_and_record(sky, cluster, self.store, job_id, m.resources.cloud or "vast")
-        return JobState.cancelled
+        return self.store.update_manifest(
+            job_id, status=JobState.cancelled, ended_at=now(), end_reason="cancelled by user"
+        ).status
 
     def collect_artifacts(self, job_id: str, dest: str) -> list[ArtifactRecord]:
         # The supervisor rsyncs the remote run dir into output/ before teardown; read it locally.

@@ -167,6 +167,19 @@ def _seed_running_job(lab: Lab, job_id: str) -> None:
     lab.store.create(m)
 
 
+def _seed_finished_job(lab: Lab, job_id: str) -> None:
+    """A job this project ran and that has since finished — the shape a real leak has.
+
+    Since the 2026-08-20 incident reconcile only destroys resources it can attribute to this
+    project; an id with no record anywhere is `unattributed` and left alone on purpose. Seeding
+    the finished job is what makes its outlived machine/volume a destroyable orphan rather than
+    an unknown someone else may be using.
+    """
+    m = make_manifest(job_id, "python x.py")
+    m.status = JobState.succeeded
+    lab.store.create(m)
+
+
 def _patch_empty_sky(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make reconcile's external passes hermetic: a fake ``sky`` module (cloud-agnostic status pass)
     and an empty DO block-volume listing (this dev box has doctl configured, so without the stub the
@@ -183,21 +196,30 @@ def _patch_empty_sky(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_reconcile_finds_orphans_dry_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """A Vast rental labeled lab-* with no matching running lab job is an orphan."""
+    """A Vast rental for a job of *ours* that is no longer running is an orphan.
+
+    "No matching running job" is necessary but no longer sufficient: since the 2026-08-20 incident
+    the rental must also be attributable to this project, because a `lab-*` name alone is shared by
+    every lab project in the account and mistaking one for a leak destroyed seven live jobs.
+    """
     repo = repo_root(Path.cwd())
     lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
     _seed_running_job(lab, "job-alive")  # cluster: lab-job-alive
+    _seed_finished_job(lab, "old-orphan-deadbe")
     vast_instances = [
         {"id": 100, "label": "sky-lab-job-alive-abcdef"},  # matches running job
-        {"id": 200, "label": "sky-lab-old-orphan-deadbe"},  # lab-prefix, no match -> orphan
+        {"id": 200, "label": "sky-lab-old-orphan-deadbe"},  # ours, finished -> orphan
         {"id": 300, "label": "other-users-rental"},  # not ours -> ignored
+        {"id": 400, "label": "sky-lab-nobody-knows-me"},  # lab-*, unattributable -> left alone
     ]
     monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda: vast_instances)
     _patch_empty_sky(monkeypatch)
 
     report = lab.reconcile(apply=False)
-    assert report["instances_total"] == 3
+    assert report["instances_total"] == 4
     assert [o["id"] for o in report["orphans"]] == [200]
+    # The unattributable one is reported, never silently dropped -- and never destroyed.
+    assert any("nobody-knows-me" in u for u in report["unattributed"])
     assert report["destroyed"] == []  # dry run
     assert report["ghosts"] == []  # the only running job matched
     assert report["applied"] is False
@@ -206,6 +228,7 @@ def test_reconcile_finds_orphans_dry_run(tmp_path: Path, monkeypatch: pytest.Mon
 def test_reconcile_apply_destroys_orphans(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     repo = repo_root(Path.cwd())
     lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
+    _seed_finished_job(lab, "stale")
     vast_instances = [{"id": 42, "label": "sky-lab-stale-abcdef"}]
     monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda: vast_instances)
 
@@ -233,7 +256,7 @@ def test_reconcile_finds_ghosts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     _patch_empty_sky(monkeypatch)
     report = lab.reconcile(apply=False)
     assert report["orphans"] == []
-    assert report["ghosts"] == ["lab-job-ghost"]
+    assert report["ghosts"] == [skypilot_mod.cluster_name_for("job-ghost")]
 
 
 def test_reconcile_finds_and_destroys_do_volume_orphans(
@@ -244,6 +267,7 @@ def test_reconcile_finds_and_destroys_do_volume_orphans(
     repo = repo_root(Path.cwd())
     lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
     _seed_running_job(lab, "job-alive")  # cluster: lab-job-alive
+    _seed_finished_job(lab, "job-dead")
     monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda: [])
     _patch_empty_sky(monkeypatch)
     volumes = [

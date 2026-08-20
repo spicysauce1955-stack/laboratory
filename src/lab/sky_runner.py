@@ -60,6 +60,37 @@ def _job_status_name(sky_mod: Any, cluster: str, sky_job_id: int | None) -> str 
     return None
 
 
+# The one poll error that can never resolve itself. `lab._skycompat` calls several more
+# exceptions "failed" (connection refused, auth, policy, version mismatch), but those are verdicts
+# about *the call* — correct for a destroy that provably never left the client, wrong as evidence
+# that a remote box has gone away. Reading a local API-server blip as a lost cluster would fail a
+# healthy job and walk away from a still-billing instance: the same bug as R8, pointing the other
+# way. Matched by type name so this module needs no `sky` import (see `lab._skycompat`).
+_CLUSTER_GONE_ERROR = "ClusterDoesNotExist"
+
+
+def _cluster_lost_reason(exc: BaseException) -> str | None:
+    """sky's message iff ``exc`` definitively says the cluster is gone, else ``None``.
+
+    Both halves must hold: :func:`~lab._skycompat.classify_sky_error` must rule the request
+    definitively refused rather than merely unreadable or unknown (so retrying is pointless), and
+    the refusal must be about the cluster itself. The ``__cause__``/``__context__`` chain is
+    walked because sky re-wraps freely.
+    """
+    from lab._skycompat import classify_sky_error
+
+    if classify_sky_error(exc).outcome != "failed":
+        return None
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen and len(seen) < 5:
+        seen.add(id(cur))
+        if type(cur).__name__ == _CLUSTER_GONE_ERROR:
+            return str(cur) or _CLUSTER_GONE_ERROR
+        cur = cur.__cause__ or cur.__context__
+    return None
+
+
 def _wait_terminal(
     sky_mod: Any,
     cluster: str,
@@ -69,7 +100,7 @@ def _wait_terminal(
     poll_s: float = 10.0,
     heartbeat_s: float | None = None,
     on_heartbeat: Callable[[], None] | None = None,
-) -> tuple[JobState, bool]:
+) -> tuple[JobState, bool, str | None]:
     """Poll the remote job until terminal — sky.launch (0.12) returns at submit time, not
     completion, so we must wait before fetching artifacts and tearing down.
 
@@ -77,19 +108,36 @@ def _wait_terminal(
     ``heartbeat_s`` of polling so the supervisor can fetch partial results mid-run; a callback
     error is logged, never fatal (§6c — don't lose ``results.csv`` to a late teardown).
 
-    Returns ``(mapped_state, reached_terminal)`` where ``reached_terminal`` is True iff the loop
-    broke because the cloud reported a terminal status (name in ``_TERMINAL_NAMES``); it is False
-    when the loop exited via the deadline. The spot classifier needs to distinguish "the cloud
-    told us it ended" from "we gave up waiting" (the latter, on spot, can mean preemption).
+    Returns ``(mapped_state, reached_terminal, lost_reason)``.
+
+    ``reached_terminal`` is True iff the loop broke because the cloud reported a terminal status
+    (name in ``_TERMINAL_NAMES``); it is False when the loop exited via the deadline or because
+    the cluster vanished. The spot classifier needs to distinguish "the cloud told us it ended"
+    from "we gave up waiting" (the latter, on spot, can mean preemption).
+
+    ``lost_reason`` is ``None`` unless polling produced a *definitive* answer that the cluster no
+    longer exists, in which case it carries sky's message and the state is ``failed``. Only that
+    one answer ends the wait early — see :func:`_cluster_lost_reason`.
     """
     deadline = time.time() + max_wait
     name: str | None = None
     since_beat = 0.0
     reached = False
+    lost_reason: str | None = None
     while time.time() < deadline:
         try:
             name = _job_status_name(sky_mod, cluster, sky_job_id)
         except Exception as e:  # noqa: BLE001
+            # A poll failure has three meanings and only one of them is "keep waiting".
+            # `ClusterDoesNotExist` is definitive: the machine is gone, the job can never reach a
+            # terminal status, and waiting out `max_wait` (timeout + 300s) only burns the budget
+            # while the manifest claims `running`. Observed 2026-08-20 on job
+            # 20260820-071913-be3c72: 65 consecutive such answers, each printed and ignored, on a
+            # job that then sat `running` until an external watchdog cancelled it (R8).
+            lost_reason = _cluster_lost_reason(e)
+            if lost_reason is not None:
+                print(f"[lab] cluster is gone, ending wait: {e}")
+                break
             print(f"[lab] queue poll error: {e}")
         if name in _TERMINAL_NAMES:
             reached = True
@@ -103,7 +151,9 @@ def _wait_terminal(
                     on_heartbeat()
                 except Exception as e:  # noqa: BLE001
                     print(f"[lab] heartbeat rsync skipped: {e}")
-    return map_job_status(name or "FAILED"), reached
+    if lost_reason is not None:
+        return JobState.failed, False, lost_reason
+    return map_job_status(name or "FAILED"), reached, None
 
 
 def cluster_up_or_raise(sky_mod: Any, cluster: str) -> bool:
@@ -451,7 +501,11 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
     job_id = job_dir.name
     install_log_redaction(store.logs_path(job_id))  # scrub secrets before any SkyPilot output
     manifest = store.read_manifest(job_id)
-    cluster = cluster_name_for(job_id)
+    # Prefer the name recorded at launch over recomputing it. `cluster_name_for` now stamps a
+    # project slug, so recomputing would invent a *different* name for any job launched by an
+    # older release or from another project directory — and on the adopt path that means
+    # supervising, and tearing down, the wrong (or no) machine.
+    cluster = str(store.read_runtime(job_id).get("cluster") or cluster_name_for(job_id))
     cloud = manifest.resources.cloud or "vast"
 
     call = events.begin(
@@ -475,6 +529,10 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         # from sky.launch / provision_with_watchdog, which are also non-adopt only).  Initialise
         # to 0.0 so the except-ProvisionTimeout error message below is always bound.
         provision_s: float = 0.0
+        # Set only by `_wait_terminal`, which is the last statement in the try below; every
+        # except-branch returns, so the post-try read is always bound. Declared here so that
+        # stays true no matter how the try grows.
+        lost_reason: str | None = None
 
         try:
             if not adopt:
@@ -556,7 +614,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                 # Best-effort: pull partial results so a late/failed teardown can't lose them (§6c).
                 _rsync_down(cluster, REMOTE_RUN_DIR, store.output_dir(job_id))
 
-            raw_final, reached_terminal = _wait_terminal(
+            raw_final, reached_terminal, lost_reason = _wait_terminal(
                 sky,
                 cluster,
                 sky_job_id,
@@ -592,6 +650,23 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             reason = provision_failure_reason(f"launch error: {e}", cloud)
             store.update_manifest(
                 job_id, status=JobState.failed, ended_at=now(), end_reason=reason[:300]
+            )
+            tear_down_and_record(sky, cluster, store, job_id, cloud)
+            return 1
+
+        if lost_reason is not None:
+            # The cluster vanished mid-run (R8). Nothing left to fetch over ssh, and nothing for
+            # `classify_terminal` to weigh: no terminal status will ever arrive. Record the real
+            # cause and go straight to teardown, the same shape as the ProvisionTimeout branch
+            # above. Teardown is NOT skipped just because SkyPilot says the cluster is gone —
+            # a lost SkyPilot registration is exactly when a provider-side rental is most likely
+            # to outlive it, and `robust_teardown`'s fallbacks ask the provider directly (FR-C2).
+            # Whatever the heartbeat rsync already pulled stays in the run dir.
+            store.update_manifest(
+                job_id,
+                status=JobState.failed,
+                ended_at=now(),
+                end_reason=f"cluster disappeared mid-run: {lost_reason}"[:300],
             )
             tear_down_and_record(sky, cluster, store, job_id, cloud)
             return 1

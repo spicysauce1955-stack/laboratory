@@ -4196,7 +4196,7 @@ wheels = [
 
 [[package]]
 name = "skypilot"
-version = "0.12.3"
+version = "0.13.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiofiles" },
@@ -4250,9 +4250,9 @@ dependencies = [
     { name = "uvicorn", extra = ["standard"] },
     { name = "wheel" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4f/36/2750e47986b431ca931c149e84839bf1fa1469d600bd42d553a44f3c33a1/skypilot-0.12.3.tar.gz", hash = "sha256:0f98a1c96bd56416d3c06be6e7321eba4a5767422d4bdb61752a103ec28c3a74", size = 3325220, upload-time = "2026-05-23T22:00:59.076Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/69/b1/0ad50c2e89a3b18dafca3e8b5910e11aa9608dae8977394902fe59ba1e0d/skypilot-0.13.0.tar.gz", hash = "sha256:0bd0c59a649d59fa21f1093534318e6c2f50b30e10fb3f54f4d702acf2615fb7", size = 3313547, upload-time = "2026-07-22T17:29:35.125Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fd/79/5a83b92f1f513a46e5ca7f1617797dcaf76aca6b5a9db8b924cdb5dd5625/skypilot-0.12.3-py3-none-any.whl", hash = "sha256:3f1b600c8158ae4e9c8fa5c8e9faee87825e1fbdb2c34448b49320b3e1a8c987", size = 3654805, upload-time = "2026-05-23T22:00:55.673Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/d9/a503213b79d362e7a5da595dd7fa38186a6d1adb3642466f1399045bafe2/skypilot-0.13.0-py3-none-any.whl", hash = "sha256:30411fb3622140e61d386494dfaaeefaee737f76565a3838d72a31157571d96c", size = 3653109, upload-time = "2026-07-22T17:29:32.508Z" },
 ]
 
 [package.optional-dependencies]

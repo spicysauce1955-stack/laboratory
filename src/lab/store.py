@@ -16,6 +16,7 @@ from typing import Any
 
 from lab import __version__
 from lab._util import atomic_write_text
+from lab.attribution import local_project, record_job
 from lab.metrics import snapshot_final_metrics
 from lab.models import JobManifest, JobState, SweepPlan
 
@@ -66,6 +67,11 @@ class JobStore:
         self.output_dir(manifest.job_id).mkdir(parents=True, exist_ok=True)
         self.logs_path(manifest.job_id).touch()
         self.write_manifest(manifest)
+        # Claim this job in the machine-wide index, so a `reconcile` run from *any* project can
+        # tell whose `lab-*` cloud resources it is looking at. Deliberately after the fail-closed
+        # guard and the manifest write: a rejected job must not appear in the index. Never raises,
+        # so it cannot break a submit (incident 2026-08-20).
+        record_job(manifest.job_id, project=local_project(), runs_dir=self.home)
         return self.job_dir(manifest.job_id)
 
     def write_manifest(self, manifest: JobManifest) -> None:

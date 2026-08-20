@@ -9,11 +9,13 @@ chosen :class:`~lab.backends.base.Backend`.
 from __future__ import annotations
 
 import subprocess
+import sys
 import hashlib
 import itertools
 import json
 import math
 import platform
+import re
 import shlex
 import time
 import uuid
@@ -44,6 +46,7 @@ from lab.manifest import (
 from lab import events, placement
 from lab.metrics import final_values, group_series
 from lab.storage import R2Store, r2_enabled
+from lab.attribution import attribute_jobs, local_project
 from lab.models import (
     ArtifactRecord,
     BackendInfo,
@@ -75,6 +78,48 @@ class LabError(RuntimeError):
 
 def _new_job_id() -> str:
     return f"{now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+
+
+def _lab_identity(identifier: str) -> tuple[str | None, list[str]]:
+    """Read a provider's resource identifier as ``(stamped project slug, candidate job ids)``.
+
+    Cloud identifiers are not bare cluster names. SkyPilot appends node suffixes
+    (``lab-…-3dd12990-f5bf-head``), and the Vast pass matches against several concatenated
+    fields at once, so neither :func:`parse_cluster_name` (anchored, full-match) nor a naive
+    ``removeprefix("lab-")`` can be used on its own.
+
+    Two signals come back, because they fail in different places:
+
+    * the **stamped slug**, when some run of the identifier parses as a canonical cluster name.
+      Authoritative and free — it travels on the resource itself, so it still answers after a
+      job store or ledger is gone. Only present on names minted after project stamping.
+    * **candidate job ids**, longest first, for :func:`lab.attribution.attribute_jobs`. Runs are
+      taken from both offsets so ``lab-<slug>-<job_id>`` and legacy ``lab-<job_id>`` both yield
+      the real id, and so ids that predate the canonical ``%Y%m%d-%H%M%S``-plus-hex shape (which
+      the anchored regex cannot match) still resolve.
+    """
+    from lab.backends.skypilot import parse_cluster_name
+
+    slug: str | None = None
+    candidates: list[str] = []
+    # `lab-…` is *embedded*, not anchored: SkyPilot's Vast adapter labels a rental
+    # `sky-lab-<cluster>-<suffix>`, and the existing Vast pass matches by substring for exactly
+    # that reason. Anchoring here would have made every Vast rental unattributable.
+    for match in re.finditer(r"lab-[a-z0-9-]+", identifier.lower()):
+        parts = match.group(0)[len("lab-") :].split("-")
+        for end in range(len(parts), 0, -1):
+            parsed = parse_cluster_name("lab-" + "-".join(parts[:end]))
+            if parsed is not None:
+                slug = slug or parsed.project
+                if parsed.job_id not in candidates:
+                    candidates.append(parsed.job_id)
+                break
+        for start in (0, 1):
+            for end in range(len(parts), start, -1):
+                cand = "-".join(parts[start:end])
+                if cand and cand not in candidates:
+                    candidates.append(cand)
+    return slug, candidates
 
 
 def orphan_key(field: str, item: Any) -> str:
@@ -1101,6 +1146,17 @@ class Lab:
             list_vast_instances,
         )
 
+        if apply:
+            # Refuse to destroy machines when the client provably cannot read the result of doing
+            # so. `--apply`'s entire value is the report it prints afterwards; under version skew
+            # that report is anti-correlated with reality (incident 2026-08-20: seven destroys
+            # reported as failures, all seven droplets actually gone, exit 0). The dry-run pass is
+            # deliberately NOT blocked — reading state stays useful, and refusing to look would
+            # hide leaks. The remedy is one command and is carried in the error's message.
+            from lab._skycompat import require_compatible_sky
+
+            require_compatible_sky()
+
         vast_pass = "ran"
         try:
             instances = list_vast_instances()
@@ -1112,17 +1168,87 @@ class Lab:
 
         unsupervised: list[dict[str, str]] = []
         running_clusters: dict[str, str] = {}
+        # Every name a live job's machine might be wearing, not just the one we would mint for it
+        # today. `cluster_name_for` gained a project slug, so a job launched before that change is
+        # still running under `lab-<job_id>`; matching only the current shape would classify its
+        # live machine as an orphan and destroy it — the very failure this work exists to prevent.
+        # The name recorded at launch is authoritative when present; the two computed shapes cover
+        # a runtime file that was lost. Kept separate from `running_clusters` because ghosts are
+        # reported per job, and an unmatched *alias* is not a ghost.
+        protected: dict[str, str] = {}
         for j in self.list_jobs():
             if j.status in _TERMINAL_STATES:
                 continue
             cluster = cluster_name_for(j.job_id)
+            runtime = self.store.read_runtime(j.job_id)
             if j.backend.provisioner == "skypilot":
                 age = (now() - (j.started_at or j.created_at)).total_seconds()
-                pid = self.store.read_runtime(j.job_id).get("runner_pid")
-                if age > UNSUPERVISED_GRACE_S and not pid_alive(pid):
+                if age > UNSUPERVISED_GRACE_S and not pid_alive(runtime.get("runner_pid")):
                     unsupervised.append({"job_id": j.job_id, "cluster": cluster})
                     continue  # dead supervisor -> the cluster is NOT protected
             running_clusters[cluster] = j.job_id
+            aliases = {cluster, f"lab-{j.job_id}"}
+            if recorded := runtime.get("cluster"):
+                aliases.add(str(recorded))
+            for alias in aliases:
+                protected[alias] = j.job_id
+
+        me = local_project()
+        other_projects: list[dict[str, Any]] = []
+        unattributed: list[str] = []
+
+        def _ours_only(
+            pass_name: str, items: list[Any], identify: Callable[[Any], str]
+        ) -> list[Any]:
+            """Drop every resource this project cannot *prove* it owns.
+
+            This inverts the predicate that caused the 2026-08-20 incident. The old test was
+            "named ``lab-*`` and not in **this repo's** job store => orphan => destroy", which
+            treats absence of evidence as evidence of orphanhood on a destructive path — and the
+            evidence it consults is project-scoped while the cloud account is machine-global, so
+            every other lab project's *running* clusters qualified.
+
+            Ownership now comes from :mod:`lab.attribution`, which reads the user-global,
+            project-tagged sources. Three outcomes, only one of which may be destroyed:
+
+            * owned by us          -> kept, and destroyed if `--apply`
+            * owned by someone else-> ``other_projects``, never destroyed, even if it looks leaked
+              (a genuinely leaked foreign cluster is cleaned up by running reconcile from *that*
+              project, which is the only place that can tell leaked from live)
+            * unattributable       -> ``unattributed``, never destroyed. Same treatment
+              ``gcp_unmatched`` already had, now applied to every pass.
+            """
+            from lab.backends.skypilot import project_slug
+
+            kept: list[Any] = []
+            my_slug = project_slug(me) if me else None
+            read = {id(item): _lab_identity(identify(item)) for item in items}
+            candidates = {c for _, cands in read.values() for c in cands}
+            attributions = attribute_jobs(candidates) if candidates else {}
+            for item in items:
+                ident = identify(item)
+                slug, cands = read[id(item)]
+                if slug is not None:
+                    # Stamped on the resource itself: no lookup can contradict it.
+                    owner = me if slug == my_slug else slug
+                else:
+                    owner = next(
+                        (
+                            attributions[c].project
+                            for c in cands
+                            if c in attributions and attributions[c].known
+                        ),
+                        None,
+                    )
+                if owner is None:
+                    unattributed.append(ident)
+                elif owner != me:
+                    other_projects.append(
+                        {"pass": pass_name, "resource": ident, "project": owner}
+                    )
+                else:
+                    kept.append(item)
+            return kept
 
         orphans: list[dict[str, Any]] = []
         matched_clusters: set[str] = set()
@@ -1130,15 +1256,58 @@ class Lab:
             label = _instance_label(inst)
             if "lab-" not in label:
                 continue  # not ours — leave it alone
-            matched = next((c for c in running_clusters if c.lower() in label), None)
+            matched = next((c for c in protected if c.lower() in label), None)
             if matched is not None:
                 matched_clusters.add(matched)
                 continue
             orphans.append({"id": inst.get("id"), "label": label})
+        orphans = _ours_only("orphans", orphans, lambda o: str(o["label"]))
 
         def _approved(field: str, item: Any) -> bool:
             """Whether this resource is inside the approved set (all of them when unfiltered)."""
             return only is None or orphan_key(field, item) in only
+
+        destroy_outcomes: list[dict[str, Any]] = []
+
+        def _unconfirmed(pass_name: str, resource: Any, exc: BaseException) -> None:
+            """Record a destroy whose success could not be confirmed, and say so on stderr.
+
+            A destroy has *three* outcomes, not two, and the third is the one that must reach the
+            operator. On 2026-08-20 seven ``sky.down`` calls raised while the server had in fact
+            destroyed all seven machines: the exceptions were swallowed by a bare ``print`` and
+            the report read ``sky_destroyed: []`` with exit 0, so the operator was told nothing
+            had happened. Classification lives in :mod:`lab._skycompat` because the decisive
+            signal — a response the client cannot decode — is a SkyPilot version-skew symptom.
+
+            stderr, not stdout: stdout carries only JSON, which callers parse (CLAUDE.md §9).
+            The handlers this replaces printed to stdout, so a failed destroy also made the
+            report unparseable.
+            """
+            # local import: keeps the sky-version machinery out of the module import path.
+            from lab._skycompat import classify_sky_error
+
+            name = resource if isinstance(resource, str) else (
+                resource.get("name") or resource.get("id") or resource.get("label")
+            )
+            verdict = classify_sky_error(exc)
+            destroy_outcomes.append(
+                {
+                    "pass": pass_name,
+                    "resource": name,
+                    # Three values, and the distinction matters: `undecodable_response` means the
+                    # server almost certainly DID destroy the resource (sky unpickles the
+                    # server-side entrypoint before it reads the result, so a reply that cannot be
+                    # decoded is still a reply), `failed` means sky refused before acting, and
+                    # `unknown` means genuinely undetermined.
+                    "outcome": verdict.outcome,
+                    "detail": verdict.detail,
+                    "error": str(exc),
+                }
+            )
+            print(
+                f"[lab] reconcile {pass_name} {name}: {verdict.outcome} — {verdict.detail}",
+                file=sys.stderr,
+            )
 
         destroyed: list[int] = []
         if apply and orphans:
@@ -1153,11 +1322,14 @@ class Lab:
                     client.destroy_instance(id=int(inst_id))
                     destroyed.append(int(inst_id))
                 except Exception as e:  # noqa: BLE001
-                    print(f"[lab] reconcile destroy {inst_id} failed: {e}")
+                    _unconfirmed("orphans", orph, e)
 
-        ghosts = sorted(running_clusters.keys() - matched_clusters)
+        matched_jobs = {protected[c] for c in matched_clusters if c in protected}
+        ghosts = sorted(c for c, jid in running_clusters.items() if jid not in matched_jobs)
 
-        sky_orphans = self._sky_status_orphans(set(running_clusters))
+        sky_orphans = _ours_only(
+            "sky_orphans", self._sky_status_orphans(set(protected)), str
+        )
         sky_destroyed: list[str] = []
         if apply and sky_orphans:
             import sky
@@ -1169,7 +1341,7 @@ class Lab:
                     sky.get(sky.down(cl))
                     sky_destroyed.append(cl)
                 except Exception as e:  # noqa: BLE001
-                    print(f"[lab] reconcile sky.down {cl} failed: {e}")
+                    _unconfirmed("sky_orphans", cl, e)
 
         # DO block-volume pass (best-effort): sky.down deletes the volume with its droplet, but a
         # partial teardown can leave a detached `lab-*` volume that the instance passes above can't
@@ -1185,7 +1357,11 @@ class Lab:
         except Exception:  # noqa: BLE001 — DO not configured/unavailable: skip the volume pass
             volumes = None
         if volumes is not None:
-            do_volume_orphans = _find_do_volume_orphans(volumes, set(running_clusters))
+            do_volume_orphans = _ours_only(
+                "do_volume_orphans",
+                _find_do_volume_orphans(volumes, set(protected)),
+                lambda v: str(v.get("name") or v.get("id")),
+            )
             if apply and do_volume_orphans:
                 from lab.backends.skypilot import _get_do_client
 
@@ -1198,7 +1374,7 @@ class Lab:
                         client.volumes.delete(volume_id=vol_id)
                         do_volumes_destroyed.append(vol_id)
                     except Exception as e:  # noqa: BLE001
-                        print(f"[lab] reconcile delete volume {vol_id} failed: {e}")
+                        _unconfirmed("do_volume_orphans", vol, e)
 
         # GCP pass (best-effort): out-of-band instance + unattached-disk sweep via the compute
         # API — `sky.status` only sees clusters SkyPilot still tracks, and a GCP persistent disk
@@ -1231,7 +1407,11 @@ class Lab:
 
         gcp_instances, gcp_pass = _gcp_list("instances", list_gcp_instances)
         if gcp_instances is not None:
-            gcp_orphans = _find_gcp_instance_orphans(gcp_instances, set(running_clusters))
+            gcp_orphans = _ours_only(
+                "gcp_orphans",
+                _find_gcp_instance_orphans(gcp_instances, set(protected)),
+                lambda i: str(i["name"]),
+            )
             if apply and gcp_orphans:
                 for inst in gcp_orphans:
                     if not _approved("gcp_orphans", inst):
@@ -1240,11 +1420,15 @@ class Lab:
                         delete_gcp_instance(str(inst["name"]), str(inst["zone"]))
                         gcp_destroyed.append(str(inst["name"]))
                     except Exception as e:  # noqa: BLE001
-                        print(f"[lab] reconcile delete gcp instance {inst['name']} failed: {e}")
+                        _unconfirmed("gcp_orphans", inst, e)
 
         gcp_disks, gcp_disk_pass = _gcp_list("disks", list_gcp_disks)
         if gcp_disks is not None:
-            gcp_disk_orphans = _find_gcp_disk_orphans(gcp_disks, set(running_clusters))
+            gcp_disk_orphans = _ours_only(
+                "gcp_disk_orphans",
+                _find_gcp_disk_orphans(gcp_disks, set(protected)),
+                lambda d: str(d["name"]),
+            )
             if apply and gcp_disk_orphans:
                 for disk in gcp_disk_orphans:
                     if not _approved("gcp_disk_orphans", disk):
@@ -1253,7 +1437,7 @@ class Lab:
                         delete_gcp_disk(str(disk["name"]), str(disk["zone"]))
                         gcp_disks_destroyed.append(str(disk["name"]))
                     except Exception as e:  # noqa: BLE001
-                        print(f"[lab] reconcile delete gcp disk {disk['name']} failed: {e}")
+                        _unconfirmed("gcp_disk_orphans", disk, e)
 
         return {
             "vast_pass": vast_pass,
@@ -1276,6 +1460,15 @@ class Lab:
             "gcp_destroyed": gcp_destroyed,
             "gcp_disk_orphans": gcp_disk_orphans,
             "gcp_disks_destroyed": gcp_disks_destroyed,
+            # `lab-*` resources this project could not prove it owns. Never destroyed, and
+            # deliberately NOT orphan fields: `--apply` cannot act on them, so exit 3's "re-run
+            # with --apply" would be wrong advice (the reasoning `gcp_unmatched` already used).
+            "other_projects": other_projects,
+            "unattributed": unattributed,
+            # Every destroy that did NOT confirm success, across all passes. Empty on a dry run
+            # (nothing was attempted) and on a fully-confirmed cleanup. Non-empty means the cloud
+            # is in a state this tool cannot vouch for — the CLI exits 5 and says to verify.
+            "destroy_outcomes": destroy_outcomes,
             "applied": apply,
         }
 

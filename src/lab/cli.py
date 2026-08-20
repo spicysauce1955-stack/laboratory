@@ -17,6 +17,9 @@ import typer
 
 from lab import __version__, events
 from lab._util import atomic_write_text, now, parse_duration, wrap_with_extras
+from dataclasses import asdict
+
+from lab._skycompat import SkyVersionSkewError
 from lab.core import (
     Lab,
     LabError,
@@ -887,6 +890,13 @@ def reconcile(
                     _fail(4, f"user declined to destroy {len(doomed)} resource(s)")
                 approved = {orphan_key(field, item) for field, item in doomed}
         report = lab.reconcile(apply=apply, only=approved)
+    except SkyVersionSkewError as e:
+        # Nothing was destroyed. Exit 4 is the existing "refused, cloud untouched" code (declined
+        # prompt / no tty); a skew refusal is the same contract, so wrappers already handle it.
+        # `reason` distinguishes the cause for anyone who cares.
+        typer.echo(f"refusing to destroy anything: {e}", err=True)
+        _emit({"aborted": True, "reason": "sky version skew", "versions": asdict(e.versions)})
+        _fail(4, e)
     except LabError as e:
         _emit({"error": str(e)})
         _fail(2, e)
@@ -903,6 +913,48 @@ def reconcile(
         )
         for name in unmatched:
             typer.echo(f"  {name}", err=True)
+    if foreign := report.get("other_projects"):
+        # Informational, not an alarm: these are almost always another project's *live* jobs.
+        # Printed because the operator needs to see that the account holds lab resources this
+        # sweep deliberately did not consider — silence there is what made destroying them
+        # look reasonable (incident 2026-08-20).
+        owners = sorted({str(f.get("project")) for f in foreign})
+        typer.echo(
+            f"note: {len(foreign)} `lab-*` resource(s) belong to other project(s) "
+            f"({', '.join(owners)}) and were not considered for cleanup. To clean up a leak "
+            "there, run `lab reconcile` from that project — only it can tell leaked from live.",
+            err=True,
+        )
+    if unattributed := report.get("unattributed"):
+        # Same treatment as `gcp_unmatched`, and for the same reason: not `--apply`-able, so
+        # exit 3's "re-run with --apply" would be wrong advice. These are `lab-*` resources that
+        # no *known* job store claims — which on a machine running several lab projects is the
+        # normal state for someone else's live job, not evidence of a leak (incident 2026-08-20).
+        typer.echo(
+            f"warning: {len(unattributed)} `lab-*` resource(s) could not be attributed to a known "
+            "lab job and were NOT considered for cleanup — they may belong to another project on "
+            "this machine. Check before destroying anything by hand:",
+            err=True,
+        )
+        for name in unattributed:
+            typer.echo(f"  {name}", err=True)
+    if unconfirmed := report.get("destroy_outcomes"):
+        # A destroy whose result we could not read is the worst of the three states, because it
+        # reads as either of the other two. Say so, name every one, and exit non-zero — the
+        # incident's operator was told `sky_destroyed: []` and exit 0 while seven machines died.
+        typer.echo(
+            f"warning: {len(unconfirmed)} destroy(s) did not confirm success. An `unknown` "
+            "outcome means the resource may be gone OR may still be billing — verify against the "
+            "cloud provider's own console/API before trusting either answer:",
+            err=True,
+        )
+        for out in unconfirmed:
+            typer.echo(
+                f"  {out.get('pass')}: {out.get('resource')} — {out.get('outcome')}: "
+                f"{out.get('error')}",
+                err=True,
+            )
+        _fail(5, f"{len(unconfirmed)} destroy(s) did not confirm success — verify with the cloud")
     if any(report.get(k) for k in _ORPHAN_FIELDS) and not apply:
         # action required: re-run with --apply
         _fail(3, "orphaned resource(s) found in dry-run — re-run with --apply")

@@ -180,13 +180,25 @@ class _SkyDownFails:
         return x
 
 
-def test_robust_teardown_do_skips_vast_fallback(monkeypatch):
+def test_robust_teardown_do_uses_its_own_fallback_not_vast(monkeypatch):
+    """DO gained a provider-direct fallback (F2); it must still never reach for Vast's."""
     monkeypatch.setattr(
         "lab.backends.skypilot._vast_destroy_matching",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("vast fallback used for DO")),
     )
+    monkeypatch.setattr("lab.backends.skypilot._do_destroy_matching", lambda c: ([42], []))
     out = robust_teardown(_SkyDownFails(), "lab-x", backoffs=(), cloud="do")
-    assert out["status"] == "failed" and out["vast_fallback_used"] is False
+    assert out["status"] == "succeeded"
+    assert out["vast_fallback_used"] is False
+    assert out["do_fallback_used"] is True and out["do_destroyed"] == [42]
+
+
+def test_robust_teardown_do_alarms_when_the_direct_destroy_fails(monkeypatch):
+    monkeypatch.setattr(
+        "lab.backends.skypilot._do_destroy_matching", lambda c: ([], ["droplet lab-x: nope"])
+    )
+    out = robust_teardown(_SkyDownFails(), "lab-x", backoffs=(), cloud="do")
+    assert out["status"] == "failed" and "nope" in out["error"]
 
 
 def test_robust_teardown_vast_uses_fallback(monkeypatch):

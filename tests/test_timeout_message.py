@@ -29,7 +29,7 @@ def test_remote_timeout_reason_carries_wall_and_tears_down(tmp_path: Path, monke
     output.mkdir(parents=True, exist_ok=True)
     (output / TIMEOUT_SENTINEL).write_text("1")
 
-    monkeypatch.setattr(runner_mod, "_wait_terminal", lambda *a, **k: (JobState.failed, True))
+    monkeypatch.setattr(runner_mod, "_wait_terminal", lambda *a, **k: (JobState.failed, True, None))
     monkeypatch.setattr(runner_mod, "_rsync_down", lambda *a, **k: None)
     monkeypatch.setattr(runner_mod, "_resolve_hourly", lambda *a, **k: 0.2)
     monkeypatch.setattr(runner_mod, "_cluster_up", lambda *a, **k: False)

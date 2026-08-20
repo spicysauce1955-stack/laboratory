@@ -38,9 +38,15 @@ def test_map_job_status():
 
 
 def test_cluster_name_for():
-    assert cluster_name_for("20260527-114219-c8e4e5") == "lab-20260527-114219-c8e4e5"
-    assert cluster_name_for("Weird_Name!!") == "lab-weird-name"
-    long = cluster_name_for("x" * 100)
+    # The name now carries the owning project too (see tests/test_cluster_identity.py); pin the
+    # job-id half here by parsing it back rather than by restating the whole format twice.
+    from lab.backends.skypilot import parse_cluster_name
+
+    name = cluster_name_for("20260527-114219-c8e4e5", project="laboratory")
+    assert name == "lab-laboratory-20260527-114219-c8e4e5"
+    assert parse_cluster_name(name).job_id == "20260527-114219-c8e4e5"
+    assert cluster_name_for("Weird_Name!!", project="laboratory") == "lab-laboratory-weird-name"
+    long = cluster_name_for("x" * 100, project="laboratory")
     assert long.startswith("lab-") and len(long) <= 60
 
 
