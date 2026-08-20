@@ -6,6 +6,7 @@ Wired to the local backend by default; structured JSON output mirrors the MCP §
 from __future__ import annotations
 
 import json
+import errno
 import os
 import sys
 import traceback
@@ -746,9 +747,19 @@ def wait(
     )
     all_terminal = summary["all_terminal"]
     teardown_leaks = summary["teardown_leaks"]
+    teardown_unknown = summary.get("teardown_unknown") or []
     teardown_unconfirmed = summary["teardown_unconfirmed"]
     _emit(summary)
-    if teardown_unconfirmed and not teardown_leaks:
+    if teardown_unknown:
+        typer.echo(
+            f"[lab] warning: teardown outcome UNKNOWN for {teardown_unknown} — the machine may "
+            "already be gone OR may still be billing, and the client cannot tell which. Verify "
+            "against the provider (`doctl compute droplet list`, `gcloud compute instances list "
+            "--filter=\"name~'^lab-'\"`, `vastai show_instances`), then `lab reconcile --apply "
+            "--yes` if anything remains.",
+            err=True,
+        )
+    if teardown_unconfirmed and not teardown_leaks and not teardown_unknown:
         typer.echo(
             f"[lab] warning: teardown not confirmed for {teardown_unconfirmed} "
             "(status is null, not 'failed') — run `lab reconcile` to be sure no machine or "
@@ -756,17 +767,23 @@ def wait(
             err=True,
         )
     if summary["failed_fast"]:
-        # A confirmed leak outranks the fail-fast signal: exit 3 is the documented URGENT
-        # "a paid machine may still be billing — run `lab reconcile` now" alarm (FR-C2).
-        _fail(
-            3 if teardown_leaks else 4,
-            "fail-fast: teardown leaked" if teardown_leaks else "fail-fast: a job failed/timed out",
-        )
+        # Money outranks the fail-fast signal. Exit 3 is the documented URGENT "a paid machine
+        # may still be billing — run `lab reconcile` now" alarm (FR-C2); exit 6 is the same
+        # concern without the certainty, and it still outranks 4 because an unverified machine
+        # costs the same as a verified one (R10).
+        if teardown_leaks:
+            _fail(3, "fail-fast: teardown leaked")
+        if teardown_unknown:
+            _fail(6, "fail-fast: teardown outcome unknown")
+        _fail(4, "fail-fast: a job failed/timed out")
     if not all_terminal:
         _fail(1, "gave up: --timeout elapsed before all jobs reached a terminal state")
     if teardown_leaks:
         # all terminal but at least one cluster may still be billing
         _fail(3, "teardown leaked on at least one job")
+    if teardown_unknown:
+        # all terminal, nothing confirmed leaked, but at least one outcome is unreadable
+        _fail(6, "teardown outcome unknown on at least one job — verify with the provider")
 
 
 @app.command()
@@ -1388,6 +1405,69 @@ def _last_error_note(call: events.Call | None) -> dict[str, Any] | None:
     return None
 
 
+def _caused_by_broken_pipe(exc: BaseException) -> bool:
+    """Is this ``SystemExit`` really "the reader closed the pipe"?
+
+    Three layers can turn a closed stdout into an exit code and they do not agree. click and
+    typer both have an ``errno.EPIPE`` branch that swaps in a ``PacifyFlushWrapper`` and exits 1 —
+    but for ``--help`` neither of them sees it first. **rich** does: it renders the help through
+    its own Console, and ``rich/console.py::on_broken_pipe`` raises a bare ``SystemExit(1)``
+    (verified against the installed rich, by tracing the real failure rather than reading the
+    code). The only durable evidence is therefore the ``BrokenPipeError`` still sitting in the
+    exception's context chain, which every one of those paths preserves.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen and len(seen) < 6:
+        seen.add(id(cur))
+        if isinstance(cur, BrokenPipeError):
+            return True
+        if isinstance(cur, OSError) and cur.errno == errno.EPIPE:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return type(sys.stdout).__name__ == "PacifyFlushWrapper"  # click/typer's EPIPE branch
+
+
+# Names other tools use for operations this one spells differently. Not typos — click already
+# suggests those by edit distance (`lab stat` -> "Did you mean 'status'?"), and `kill` is nowhere
+# near `cancel`. On 2026-08-19 something reached for `lab kill <job_id>` 19 times across 13 jobs
+# after a failure burst; every attempt exited 2 with no suggestion, and none of those 13 jobs was
+# ever cancelled through the tool. Suggest only — never dispatch: each of these maps onto a
+# destructive operation, and silently reinterpreting one would be worse than the gap it closes.
+_COMMAND_SYNONYMS = {
+    "kill": "cancel",
+    "stop": "cancel",
+    "abort": "cancel",
+    "terminate": "cancel",
+    "rm": "cancel",
+    "delete": "cancel",
+    "ps": "list",
+    "jobs": "list",
+    "tail": "logs",
+    "log": "logs",
+    "ls": "list",
+    "run": "submit",
+}
+
+
+def _synonym_hint(argv: list[str]) -> str | None:
+    """The ``lab <real>`` a mistyped subcommand most likely meant, or ``None``.
+
+    Only the first non-flag token is considered — that is the subcommand position — and only when
+    it is not a real command, so a genuine `lab list` is never second-guessed.
+    """
+    from lab.cli import app as _app  # local: module-level self-reference during import
+
+    real = {c.name for c in typer.main.get_command(_app).commands.values()}  # type: ignore[attr-defined]
+    for token in argv:
+        if token.startswith("-"):
+            continue
+        if token in real:
+            return None
+        return _COMMAND_SYNONYMS.get(token)
+    return None
+
+
 def main(argv: list[str] | None = None) -> None:
     """Console entry point.
 
@@ -1413,6 +1493,15 @@ def main(argv: list[str] | None = None) -> None:
         app(args=argv)
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+        if code == 1 and _caused_by_broken_pipe(e):
+            # `lab submit --help | head -3`: the reader closed the pipe mid-write. click catches
+            # the EPIPE itself and exits 1 (core.py:1102) — so this never arrives as a
+            # BrokenPipeError we could catch, and the exit code depends purely on whether the
+            # caller piped. That is why the same `--help` looked non-deterministic across 31
+            # recorded calls, half of them filed as failures in `lab history` (F6). A reader
+            # walking away is not our failure; every other CLI exits 0.
+            events.finish_current(outcome="ok", exit_code=0, error=None)
+            sys.exit(0)
         # click's own dispatch (`typer/core.py::_main`) catches a Ctrl-C raised *during a
         # command* itself and re-raises it as `Exit(130)` before we ever see a raw
         # KeyboardInterrupt — so the common case arrives here, not in the handler below.
@@ -1433,6 +1522,8 @@ def main(argv: list[str] | None = None) -> None:
             events.begin("cli", "<unparsed>", {"argv": sanitize_argv(sys.argv[1:])})
             if outcome == "error":
                 outcome = "usage_error"
+            if hint := _synonym_hint(list(argv if argv is not None else sys.argv[1:])):
+                typer.echo(f"lab: did you mean `lab {hint}`?", err=True)
     elif outcome == "error":
         note = _last_error_note(call)
         if note is not None:

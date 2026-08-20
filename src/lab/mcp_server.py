@@ -254,7 +254,7 @@ def build_server(lab: Lab) -> FastMCP:
 
     @mcp.tool
     def status(job_id: str) -> dict[str, Any]:
-        """Return a job's state + timing + cost + teardown_status (FR-A2/FR-I2/FR-C2); cheap to poll (FR-G2). teardown_status "failed" is a money alarm: a paid machine may still be running — call reconcile. Scheduler-launched (deferred) jobs are read from the mirrored manifest (mirrored=true; may be a tick stale)."""
+        """Return a job's state + timing + cost + teardown_status (FR-A2/FR-I2/FR-C2); cheap to poll (FR-G2). teardown_status "failed" is a money alarm: a paid machine may still be running — call reconcile. "unknown" means the destroy's outcome could not be read (verify against the provider itself, then reconcile); treat any unrecognised value as "unknown", never as success. Scheduler-launched (deferred) jobs are read from the mirrored manifest (mirrored=true; may be a tick stale)."""
         try:
             view = job_status_view(home, lab.repo, job_id)
         except FileNotFoundError as e:

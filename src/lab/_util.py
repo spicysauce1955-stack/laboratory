@@ -104,13 +104,65 @@ def infer_artifact_type(name: str) -> str:
     return _ARTIFACT_EXT.get(ext, "other")
 
 
-def pid_alive(pid: int | None) -> bool:
-    """Is this pid still running? ``None``/0 is never alive.
+def process_start_time(pid: int | None) -> int | None:
+    """The kernel's start-time for ``pid`` (``/proc/<pid>/stat`` field 22), or ``None``.
+
+    Field 22 is clock ticks since boot, and the kernel guarantees it differs between a process and
+    any later process that reuses its PID — which is exactly the identity :func:`pid_alive` needs
+    and a bare PID cannot supply. Linux-only by construction; everywhere else this returns ``None``
+    and liveness degrades to the PID-only answer.
+
+    Never raises. This feeds leak detection, where a probe that throws is worse than one that
+    shrugs: the caller's fallback is "assume alive", which is the safe direction.
+    """
+    if not pid or pid < 1:
+        return None
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except (OSError, ValueError):
+        return None
+    # comm (field 2) is parenthesised and may itself contain spaces and parens, so split on the
+    # LAST ')' rather than tokenising the whole line.
+    try:
+        tail = stat[stat.rindex(")") + 1 :].split()
+        return int(tail[19])  # field 22 overall = index 19 after pid and comm
+    except (ValueError, IndexError):
+        return None
+
+
+def _is_zombie(pid: int) -> bool:
+    """Has ``pid`` exited but not yet been reaped? Unknown reads as *not* a zombie.
+
+    ``/proc/<pid>/stat`` field 3. The comm field before it is parenthesised and may contain
+    spaces and parens, so the state is taken from after the last ``)``. Any failure to read
+    returns ``False``, which keeps the caller on its conservative "assume alive" path — no
+    ``/proc`` must never mean "everything is dead".
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return stat[stat.rindex(")") + 1 :].split()[0] == "Z"
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def pid_alive(pid: int | None, *, start_time: int | None = None) -> bool:
+    """Is this pid still running — and, when ``start_time`` is given, still the *same* process?
 
     One implementation for the local runner, the skypilot runner and the scheduler tick, which
     each carried a byte-identical private copy — the same reason ``timeout_reason`` lives here.
     ``PermissionError`` means the process exists but belongs to another user, which is still
     alive for our purposes (supervisor liveness, leak detection).
+
+    ``start_time`` closes the PID-reuse blind spot (F4). A supervisor's PID is freed quickly — the
+    short-lived ``lab submit`` parent exits at once, so the child reparents to init and is reaped
+    there — and on a busy machine the number gets recycled. Without an identity check every
+    liveness probe for that job then answers "alive" permanently, silently disabling the
+    dead-supervisor teardown in :meth:`SkyPilotBackend.status`, reconcile's ``unsupervised`` pass
+    and the scheduler watchdog, while the machine bills.
+
+    Absent or unreadable identity means **alive**, deliberately. Runtime files written before this
+    existed carry no start-time, and reporting a live supervisor dead would let reconcile destroy
+    the machine out from under a running job — the 2026-08-20 failure pointing the other way.
     """
     if not pid:
         return False
@@ -119,5 +171,18 @@ def pid_alive(pid: int | None) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
+        return True  # exists, owned by someone else
+    if _is_zombie(pid):
+        # A zombie has *exited*; only its exit status is still held, by a parent that has not
+        # reaped it. `os.kill(pid, 0)` succeeds and the start-time is unchanged, so both checks
+        # above call it alive — for as long as that parent lives. Under a long-lived parent (the
+        # MCP server, `lab sweep`, the scheduler) that is forever, and every self-heal keyed on
+        # supervisor liveness silently stops firing while the machine bills. Verified on this
+        # platform: an unreaped child reads state `Z` with its start-time intact.
+        return False
+    if start_time is None:
         return True
-    return True
+    current = process_start_time(pid)
+    if current is None:
+        return True  # cannot tell -> assume alive, never destroy on a guess
+    return current == start_time

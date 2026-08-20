@@ -38,7 +38,16 @@ def dashboard_rows(lab: Lab, job_ids: list[str] | None = None) -> list[dict[str,
             cost_usd = cost.actual_usd if cost.actual_usd is not None else cost.estimated_usd
         # teardown column: surfaced loudly because a "LEAK" here costs money (FR-C2 leak detection)
         td = m.teardown_status
-        teardown = "LEAK" if td == "failed" else ("ok" if td == "succeeded" else "")
+        # Three states, not two (R10). Anything unrecognised shows as "?" rather than blank:
+        # a value this version does not know about must not read as "nothing to see here".
+        if td == "failed":
+            teardown = "LEAK"
+        elif td == "succeeded":
+            teardown = "ok"
+        elif td is None:
+            teardown = ""
+        else:
+            teardown = "UNKNOWN?"
         rows.append(
             {
                 "job_id": m.job_id,

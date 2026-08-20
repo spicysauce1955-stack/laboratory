@@ -1183,7 +1183,12 @@ class Lab:
             runtime = self.store.read_runtime(j.job_id)
             if j.backend.provisioner == "skypilot":
                 age = (now() - (j.started_at or j.created_at)).total_seconds()
-                if age > UNSUPERVISED_GRACE_S and not pid_alive(runtime.get("runner_pid")):
+                # Identity, not just the PID: a recycled number would report a long-dead
+                # supervisor alive forever and silently disable this whole branch (F4).
+                alive = pid_alive(
+                    runtime.get("runner_pid"), start_time=runtime.get("runner_start_time")
+                )
+                if age > UNSUPERVISED_GRACE_S and not alive:
                     unsupervised.append({"job_id": j.job_id, "cluster": cluster})
                     continue  # dead supervisor -> the cluster is NOT protected
             running_clusters[cluster] = j.job_id
@@ -1439,6 +1444,25 @@ class Lab:
                     except Exception as e:  # noqa: BLE001
                         _unconfirmed("gcp_disk_orphans", disk, e)
 
+        if apply and unsupervised:
+            # Detection without remediation is the actual gap (F3). The dry run already *reports*
+            # these; flipping one to terminal and attempting its teardown used to require someone
+            # running `lab status` on that exact job id, which on an unattended box nobody does.
+            # `--apply` is already the destructive, opted-in path, so finish the job here the same
+            # way `SkyPilotBackend.status()` would. Best-effort: a crash must not abort the sweep,
+            # because the report it produces is the thing the operator acts on.
+            from lab.backends.skypilot import SkyPilotBackend
+
+            for entry in unsupervised:
+                try:
+                    SkyPilotBackend(home=self.home, repo=self.repo).status(entry["job_id"])
+                except Exception as e:  # noqa: BLE001
+                    print(
+                        f"[lab] reconcile could not finalise unsupervised job "
+                        f"{entry['job_id']}: {e}",
+                        file=sys.stderr,
+                    )
+
         return {
             "vast_pass": vast_pass,
             "gcp_pass": gcp_pass,
@@ -1508,6 +1532,15 @@ class Lab:
                 key=lambda m: m.status not in (JobState.failed, JobState.timed_out),
             )
         teardown_leaks = [m.job_id for m in manifests if m.teardown_status == "failed"]
+        # Distinct from both: the destroy ran and its outcome could not be read (R10). Anything
+        # unrecognised lands here too rather than in the all-clear — a value this version does
+        # not know about must never be optimistically read as "succeeded".
+        teardown_unknown = [
+            m.job_id
+            for m in manifests
+            if m.teardown_status is not None
+            and m.teardown_status not in ("succeeded", "failed")
+        ]
         teardown_unconfirmed = [
             m.job_id
             for m in manifests
@@ -1520,6 +1553,7 @@ class Lab:
             "failed_fast": failed_fast,
             "pending": pending,  # still running — and, for remote jobs, still billing
             "teardown_leaks": teardown_leaks,
+            "teardown_unknown": teardown_unknown,
             "teardown_unconfirmed": teardown_unconfirmed,
             "jobs": [
                 {
@@ -1663,12 +1697,21 @@ def job_status_view(home: Path, repo: Path, job_id: str) -> dict[str, Any]:
     state = lab.status(job_id)
     m = store.read_manifest(job_id)  # re-read: status may have just finalized/torn down the job
     return _status_fields(
-        m, state=state.value, mirrored=False, logs_path=store.logs_path(job_id)
+        m,
+        state=state.value,
+        mirrored=False,
+        logs_path=store.logs_path(job_id),
+        runner_exit=store.read_runtime(job_id).get("runner_exit"),
     )
 
 
 def _status_fields(
-    m: JobManifest, *, state: str, mirrored: bool, logs_path: Path | None = None
+    m: JobManifest,
+    *,
+    state: str,
+    mirrored: bool,
+    logs_path: Path | None = None,
+    runner_exit: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     last_line, last_at = tail_last_line(logs_path) if logs_path is not None else (None, None)
     return {
@@ -1687,6 +1730,12 @@ def _status_fields(
             else None
         ),
         "teardown_status": m.teardown_status,  # FR-C2 — "failed" means a box may still bill
+        # How the supervisor actually died, when that could be observed (F5): `{source,
+        # returncode, signal, detail}`. `source: "disappeared"` is a real answer — the kernel no
+        # longer knows — and deliberately distinct from this field being absent, which means
+        # nobody looked. A SIGKILL here is the difference between "the OOM killer took it" and
+        # "the code crashed", which is otherwise unrecoverable after the fact.
+        "runner_exit": runner_exit,
         # Where it actually landed. GCP prices and exhausts per zone, so "which zone" is the
         # difference between a $0.034/hr job and a $0.12/hr one.
         "placement": {
