@@ -123,8 +123,15 @@ class TestTeardownRecordsUnknown:
 
         assert store.read_manifest("t2").teardown_status == "failed"
 
-    def test_success_is_unchanged(self, tmp_path):
+    def test_success_is_unchanged(self, tmp_path, monkeypatch):
+        """A clean `sky.down` whose storage is *verified* gone still records `succeeded`.
+
+        The verification is not optional on DO: since P4-a a clean `sky.down` alone is not proof,
+        so this test has to say what the volume sweep found. Stubbing it to "nothing left" is the
+        success case; leaving it unstubbed would (correctly) yield `unknown`.
+        """
         store = _store_with_job(tmp_path, "t3")
+        monkeypatch.setattr(m, "_do_sweep_leftover_volumes", lambda cluster: ([], []))
 
         class _OkSky:
             def get(self, x):

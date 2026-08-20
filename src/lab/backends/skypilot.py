@@ -459,6 +459,35 @@ def list_do_droplets(client: Any | None = None) -> list[dict[str, Any]]:
     return [dict(d) for d in (droplets or [])]
 
 
+def _do_sweep_leftover_volumes(cluster: str) -> tuple[list[Any], list[str]]:
+    """Delete any block volume still named after ``cluster``. Raises if DO cannot be asked.
+
+    A clean ``sky.down`` is not proof the storage is gone (P4-a, found live 2026-08-20): a job
+    that failed partway through launch recorded ``teardown_status: "succeeded"`` and left a 50 GB
+    detached volume billing for as long as nobody looked. SkyPilot's DO provisioner creates the
+    volume *before* the droplet is fully up, so a launch that dies in between is exactly the case
+    that strands one, and the ``sky.down`` success path never ran the fallback that would remove
+    it.
+
+    Raising rather than returning a failure when the *listing* fails is deliberate: "we could not
+    ask" and "we asked and there is nothing" must not collapse into the same answer. The caller
+    turns the first into ``unknown`` and the second into ``succeeded``.
+    """
+    client = _get_do_client()
+    deleted: list[Any] = []
+    failures: list[str] = []
+    prefix = cluster.lower()
+    for vol in list_do_volumes(client):
+        if not str(vol.get("name", "")).lower().startswith(prefix):
+            continue
+        try:
+            client.volumes.delete(volume_id=str(vol["id"]))
+            deleted.append(vol["id"])
+        except Exception as e:  # noqa: BLE001 — found and un-removable is a real alarm
+            failures.append(f"volume {vol.get('name')}: {type(e).__name__}: {e}")
+    return deleted, failures
+
+
 def _do_destroy_matching(cluster: str) -> tuple[list[Any], list[str]]:
     """Destroy the droplet(s) and block volume(s) belonging to ``cluster``, via the DO API.
 
@@ -1041,13 +1070,28 @@ def robust_teardown(
         events.note("teardown.attempt", cluster=cluster, attempt=attempt)
         try:
             sky_mod.get(sky_mod.down(cluster))
-            return {
+            outcome: dict[str, Any] = {
                 "status": "succeeded",
                 "attempts": attempt,
                 "vast_fallback_used": False,
                 "vast_destroyed": [],
                 "error": None,
             }
+            if cloud == "do":
+                # The droplet is gone; its block volume may not be (P4-a). Only DO needs this —
+                # Vast has no volume concept, and a leaked GCP disk has its own reconcile pass.
+                try:
+                    swept, leftovers = _do_sweep_leftover_volumes(cluster)
+                except Exception as e:  # noqa: BLE001 — could not ask, so we do not know
+                    outcome["status"] = "unknown"
+                    outcome["error"] = f"volume check after sky.down: {type(e).__name__}: {e}"
+                else:
+                    if swept:
+                        outcome["do_volumes_swept"] = swept
+                    if leftovers:
+                        outcome["status"] = "failed"
+                        outcome["error"] = f"volume(s) survived teardown: {'; '.join(leftovers)}"
+            return outcome
         except Exception as e:  # noqa: BLE001
             last_err = f"{type(e).__name__}: {e}"
             # Was the *reply* unreadable rather than the request refused? Under client/server

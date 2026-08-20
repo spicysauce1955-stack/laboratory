@@ -632,7 +632,7 @@ exact command that destroyed seven running jobs that morning — destroyed exact
 belonging to this project and left all 8 `tempotron-capacity` resources alone, naming their owner
 on stderr. Four live jobs were running throughout and were unharmed.
 
-### NEW — P4-a: `teardown_status: "succeeded"` does not mean nothing is billing on DO
+### NEW — P4-a: `teardown_status: "succeeded"` does not mean nothing is billing on DO — FIXED
 
 `severity: medium` · `confirmed live`
 
@@ -647,10 +647,23 @@ This is the same leak class F2 addressed, reached by the opposite route: F2 cove
 (`do_volume_orphans`, exit 3), so it is a detection-latency problem rather than an invisible leak
 — but a "succeeded" teardown that leaves 50 GB billing undermines the same signal R10 was about.
 
-**Proposed fix:** on DO, before recording `succeeded`, list volumes matching the cluster prefix;
-if any remain, delete them (the `_do_destroy_matching` volume half already does exactly this) and
-record `failed`/`unknown` if they cannot be removed. **Test:** a `sky.down` that succeeds while a
-matching volume remains must not record `teardown_status: "succeeded"`.
+**Fixed.** A clean `sky.down` on DO now sweeps volumes still matching the cluster prefix
+(`_do_sweep_leftover_volumes`), and the four outcomes map onto R10's three states:
+
+| after a clean `sky.down` | recorded |
+|---|---|
+| no matching volume | `succeeded` |
+| matching volume(s), deleted | `succeeded` |
+| matching volume(s), delete refused | `failed` — found, known to bill, un-removable |
+| the listing itself failed | `unknown` — the droplet is confirmed gone, the storage is not |
+
+The listing raises rather than returning a failure, deliberately: "we could not ask" and "we asked
+and there is nothing" must not collapse into the same answer. Only DO pays for the check — Vast has
+no volume concept and a leaked GCP disk has its own reconcile pass.
+
+Verified live: a real DO job ran to completion and recorded `teardown_status: succeeded` with no
+droplet and no volume left, confirming the added API call does not degrade the normal path to
+`unknown`. That was the risk worth checking — fakes cannot catch a wrong call signature.
 
 ## Self-review
 
