@@ -35,9 +35,31 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   on the manifest and makes `lab wait` exit 3. **Recovery: `uv run lab reconcile [--apply]`**
   finds orphaned rentals/instances not tied to a running job and destroys them. `--apply` lists
   what it will destroy and **asks**; add `--yes` for unattended use (with no tty it refuses and
-  exits 4 rather than prompting). Only the approved set is destroyed. The GCP passes claim only
-  SkyPilot's real node shape `lab-…-<head|worker>-<uuid8>-<compute|tpu|mig>` — anything else
-  named `lab-*` is listed under `gcp_unmatched`, warned about on stderr, and never destroyed.
+  exits 4 rather than prompting). Only the approved set is destroyed.
+  **Ownership is proved, never assumed (incident 2026-08-20).** "Not in this repo's `runs/`" is
+  *not* evidence of a leak: the cloud account is machine-global while the job store is
+  per-project, and that asymmetry let a `reconcile --apply --yes` run from this repo destroy
+  seven *running* `tempotron-capacity` jobs. A `lab-*` resource is destroyable only when
+  `lab.attribution` can attribute it to **this** project — via the project slug stamped into the
+  cluster name (`lab-<slug>-<job_id>`, `parse_cluster_name`) or the user-global job index
+  `~/.lab/jobs/index.jsonl` (written by `JobStore.create`, ledger fallback for older jobs).
+  Anything owned elsewhere lands in `other_projects`, anything unprovable in `unattributed`;
+  both are reported and **never destroyed** (the treatment `gcp_unmatched` already had). Clean up
+  another project's leak by running reconcile *from that project*. Every destroy now records its
+  outcome in `destroy_outcomes` (`failed` / `unknown` / `undecodable_response`) and the CLI exits
+  **5** when any destroy did not confirm success — a destroy whose result can't be read must
+  never read as "nothing happened". The GCP passes claim only SkyPilot's real node shape
+  `lab-…-<head|worker>-<uuid8>-<compute|tpu|mig>` — anything else named `lab-*` is listed under
+  `gcp_unmatched`, warned about on stderr, and never destroyed. GCP truncates the cluster name to
+  35 chars on the cloud, so name matching there goes through `gcp_name_matches`, not a raw
+  substring test (the project slug pushed the name past that limit).
+- **SkyPilot client/server skew is a hard block on destruction (`lab._skycompat`):** the API
+  server is long-lived and outlives the venv that started it, so upgrading skypilot in one project
+  skews every other project's client. Under skew `sky.get()` cannot unpickle a *successful*
+  reply (it unpickles the server-side entrypoint first), so a completed teardown surfaces as an
+  exception — which is how seven destroys were reported as failures while all seven droplets were
+  really gone. `reconcile(apply=True)` refuses up front (exit 4, structured JSON, remedy named);
+  the dry run and `robust_teardown` still run, since refusing to *look* would hide real leaks.
 - **Deferred scheduling:** `lab register` + `lab queue …` queue jobs (night window / price /
   dependency triggers); an always-on host runs `lab scheduler tick` every 60s (systemd timer,
   `deploy/scheduler/`). Spec: `docs/superpowers/specs/2026-06-10-deferred-scheduling-design.md`.
@@ -121,8 +143,11 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   3/4 remain contract. Guide: `docs/guides/event-logging.md`.
 
 ## Conventions
-- `ruff` (line length 100), `mypy --strict` on `src/lab`. CLI and MCP server are thin shells over
-  the `lab.core.Lab` library — never duplicate logic between them.
+- `ruff check` (line length 100) and `mypy --strict` on `src/lab` are the authoritative gates.
+  **`ruff format` is deliberately NOT used** — it would reformat 73 of 129 existing files and CI has
+  never run it. Do not run it, and do not treat a `ruff format --check` failure as a real one.
+- CLI and MCP server are thin shells over the `lab.core.Lab` library — never duplicate logic
+  between them.
 - **Secrets** never in repo/manifest/logs (FR-J1); manifests record URIs, not keys. Machine-local
   settings (GCP project + service-account key **path**, R2 endpoint/bucket) go in a git-ignored
   `.env` at the repo root, loaded by `lab.env.load_lab_env` at CLI/MCP startup; the committed

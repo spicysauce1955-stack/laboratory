@@ -66,18 +66,22 @@ def test_reconcile_skips_vast_pass_when_sdk_missing(tmp_path, monkeypatch):
     """A GCP-only install (no vastai-sdk) must still run the cloud-agnostic sky.status pass
     instead of hard-failing."""
     lab = Lab(backend=LocalBackend(home=tmp_path, repo=tmp_path), repo=tmp_path, home=tmp_path)
+    # An orphan is only *reported as destroyable* when it is attributable to us, so the fixture
+    # has to name a job this project actually ran (see `_claim_finished`).
+    _claim_finished(lab, LEAKED_NODE_JOB_ID)
+    orphan = f"lab-{LEAKED_NODE_JOB_ID}"
     monkeypatch.setattr(
         "lab.backends.skypilot.list_vast_instances",
         lambda *a, **k: (_ for _ in ()).throw(ImportError("No module named 'vastai_sdk'")),
     )
-    monkeypatch.setattr(Lab, "_sky_status_orphans", lambda self, running_clusters: ["lab-orphan"])
+    monkeypatch.setattr(Lab, "_sky_status_orphans", lambda self, running_clusters: [orphan])
     monkeypatch.setattr("lab.backends.skypilot.list_do_volumes", lambda *a, **k: [])
 
     report = lab.reconcile()
 
     assert report["vast_pass"] == "skipped (vastai-sdk not installed)"
     assert report["orphans"] == [] and report["instances_total"] == 0
-    assert report["sky_orphans"] == ["lab-orphan"]  # the agnostic pass still ran
+    assert report["sky_orphans"] == [orphan]  # the agnostic pass still ran
 
 
 def test_reconcile_still_raises_on_non_import_listing_failure(tmp_path, monkeypatch):
@@ -110,7 +114,8 @@ def test_reconcile_still_raises_on_non_import_listing_failure(tmp_path, monkeypa
 # the job id mangled. That is why the predicate anchors on SkyPilot's node suffix rather than on
 # the job id: the job id is not reliably present in the name at all.
 REAL_NODE = "lab-20260811-144501-c5b340-3dd12990-head-c0h9pkx0-compute"
-LEAKED_NODE = "lab-20260811-182037-cde576-3dd12990-head-4oq7tgke-compute"
+LEAKED_NODE_JOB_ID = "20260811-182037-cde576"
+LEAKED_NODE = f"lab-{LEAKED_NODE_JOB_ID}-3dd12990-head-4oq7tgke-compute"
 REAL_WORKER = "lab-20260811-144501-c5b340-3dd12990-worker-3z8x1v0w-compute"
 REAL_TRUNCATED_NODE = "lab-85-3dd12990-head-c0h9pkx0-compute"  # the over-length fallback shape
 
@@ -177,7 +182,7 @@ def test_list_gcp_instances_parses_aggregated_list():
     out = list_gcp_instances(_Compute(), "proj")
     assert out == [
         {"name": "lab-x-1a2b-head", "zone": "us-central1-a", "status": "RUNNING",
-         "preemptible": False}
+         "preemptible": False, "labels": {}}  # unlabelled instance -> unattributed, never "ours"
     ]
 
 
@@ -341,6 +346,7 @@ def test_robust_teardown_gcp_fallback_failure_is_failed(monkeypatch):
 
 def test_reconcile_gcp_pass_flags_and_destroys_orphans(tmp_path, monkeypatch):
     lab = Lab(backend=LocalBackend(home=tmp_path, repo=tmp_path), repo=tmp_path, home=tmp_path)
+    _claim_finished(lab, LEAKED_NODE_JOB_ID)
     monkeypatch.setattr("lab.backends.skypilot.list_vast_instances", lambda *a, **k: [])
     monkeypatch.setattr(Lab, "_sky_status_orphans", lambda self, running_clusters: [])
     monkeypatch.setattr("lab.backends.skypilot.list_do_volumes", lambda *a, **k: [])
@@ -372,9 +378,28 @@ def test_reconcile_gcp_pass_flags_and_destroys_orphans(tmp_path, monkeypatch):
     assert ("disk", LEAKED_NODE, "us-central1-a") in deleted
 
 
+def _claim_finished(lab, job_id):
+    """Record `job_id` as a finished job of *this* project.
+
+    Since the 2026-08-20 incident a `lab-*` resource is only destroyable when reconcile can prove
+    this project owns it; an id with no record anywhere is `unattributed` and deliberately left
+    alone. So the realistic leak — and what these tests mean by "orphan" — is a job that *was*
+    ours and is no longer running, whose machine or disk outlived it. `JobStore.create` claims the
+    id in the machine-wide index, which is what makes the resource attributable.
+    """
+    from helpers import make_manifest
+
+    lab.store.create(
+        make_manifest(job_id, "python x.py", timeout="1h").model_copy(
+            update={"status": JobState.succeeded}
+        )
+    )
+
+
 def _lab_with_other_passes_clean(tmp_path, monkeypatch):
     """A Lab whose Vast/sky/DO passes are all clean, so only the GCP passes are under test."""
     lab = Lab(backend=LocalBackend(home=tmp_path, repo=tmp_path), repo=tmp_path, home=tmp_path)
+    _claim_finished(lab, LEAKED_NODE_JOB_ID)
     monkeypatch.setattr("lab.backends.skypilot.list_vast_instances", lambda *a, **k: [])
     monkeypatch.setattr(Lab, "_sky_status_orphans", lambda self, running_clusters: [])
     monkeypatch.setattr("lab.backends.skypilot.list_do_volumes", lambda *a, **k: [])
@@ -1189,6 +1214,7 @@ def _gcp_spot_job_whose_box_vanished(tmp_path, monkeypatch, job_id):
     import lab.sky_runner as runner_mod
     from helpers import make_manifest
     from lab._util import now
+    from lab.backends.skypilot import cluster_name_for
     from lab.models import BackendInfo, CostInfo
     from lab.store import JobStore
 
@@ -1204,7 +1230,9 @@ def _gcp_spot_job_whose_box_vanished(tmp_path, monkeypatch, job_id):
     m.resources.cloud = "gcp"
     m.resources.use_spot = True
     store.create(m)
-    store.write_runtime(job_id, runner_pid=1, cluster=f"lab-{job_id}")
+    # The name actually launched under, which the supervisor now trusts over recomputing it.
+    # Must agree with the instance names the tests mock, or the fixture tests nothing.
+    store.write_runtime(job_id, runner_pid=1, cluster=cluster_name_for(job_id))
 
     fake_sky = types.ModuleType("sky")
     monkeypatch.setitem(sys.modules, "sky", fake_sky)
@@ -1222,12 +1250,13 @@ def test_a_non_preempted_spot_failure_is_not_resubmitted(tmp_path, monkeypatch):
     `preempted`, which the scheduler auto-resubmits — so a job that genuinely failed got paid for
     twice. GCE says outright that this VM was not preemptible, and that answer wins."""
     import lab.sky_runner as runner_mod
+    from lab.backends.skypilot import cluster_name_for
 
     store = _gcp_spot_job_whose_box_vanished(tmp_path, monkeypatch, "gp1")
     monkeypatch.setattr(
         "lab.backends.skypilot.list_gcp_instances",
         lambda *a, **k: [
-            {"name": "lab-gp1-head-1a2b3c4d-compute", "zone": "us-central1-a",
+            {"name": f"{cluster_name_for('gp1')}-head-1a2b3c4d-compute", "zone": "us-central1-a",
              "status": "TERMINATED", "preemptible": False}
         ],
     )
@@ -1239,12 +1268,13 @@ def test_a_non_preempted_spot_failure_is_not_resubmitted(tmp_path, monkeypatch):
 
 def test_a_real_preemption_is_confirmed_by_gce_rather_than_inferred(tmp_path, monkeypatch):
     import lab.sky_runner as runner_mod
+    from lab.backends.skypilot import cluster_name_for
 
     store = _gcp_spot_job_whose_box_vanished(tmp_path, monkeypatch, "gp2")
     monkeypatch.setattr(
         "lab.backends.skypilot.list_gcp_instances",
         lambda *a, **k: [
-            {"name": "lab-gp2-head-1a2b3c4d-compute", "zone": "us-central1-a",
+            {"name": f"{cluster_name_for('gp2')}-head-1a2b3c4d-compute", "zone": "us-central1-a",
              "status": "TERMINATED", "preemptible": True}
         ],
     )
@@ -1303,6 +1333,7 @@ def test_a_probed_preemption_survives_the_classifier(tmp_path, monkeypatch):
     `use_spot`, and `use_spot` comes from `launched_spot`, which the adopt path never records — so
     GCE's authoritative answer could be silently discarded and the job come out `failed`."""
     import lab.sky_runner as runner_mod
+    from lab.backends.skypilot import cluster_name_for
 
     store = _gcp_spot_job_whose_box_vanished(tmp_path, monkeypatch, "gp4")
     # launched_spot absent AND the manifest not marked spot: the classifier would infer `failed`.
@@ -1313,7 +1344,7 @@ def test_a_probed_preemption_survives_the_classifier(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "lab.backends.skypilot.list_gcp_instances",
         lambda *a, **k: [
-            {"name": "lab-gp4-head-1a2b3c4d-compute", "zone": "us-central1-a",
+            {"name": f"{cluster_name_for('gp4')}-head-1a2b3c4d-compute", "zone": "us-central1-a",
              "status": "TERMINATED", "preemptible": True}
         ],
     )

@@ -451,7 +451,11 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
     job_id = job_dir.name
     install_log_redaction(store.logs_path(job_id))  # scrub secrets before any SkyPilot output
     manifest = store.read_manifest(job_id)
-    cluster = cluster_name_for(job_id)
+    # Prefer the name recorded at launch over recomputing it. `cluster_name_for` now stamps a
+    # project slug, so recomputing would invent a *different* name for any job launched by an
+    # older release or from another project directory — and on the adopt path that means
+    # supervising, and tearing down, the wrong (or no) machine.
+    cluster = str(store.read_runtime(job_id).get("cluster") or cluster_name_for(job_id))
     cloud = manifest.resources.cloud or "vast"
 
     call = events.begin(
