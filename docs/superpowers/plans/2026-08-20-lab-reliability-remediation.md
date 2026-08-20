@@ -296,7 +296,7 @@ git add src/lab/sky_runner.py tests/test_cluster_loss.py
 git commit -m "fix(supervisor): end the wait when the cluster is definitively gone"
 ```
 
-#### Task 2: `lab cancel` must not report terminal before teardown lands (R9)
+#### Task 2: `lab cancel` must not report terminal before teardown lands (R9) — DONE `4c36c24`
 
 **Files:**
 - Modify: `src/lab/backends/skypilot.py:1379-1402` (`cancel`)
@@ -399,7 +399,7 @@ git add src/lab/backends/skypilot.py tests/test_cancel_teardown.py
 git commit -m "fix(cancel): tear down before declaring the job cancelled"
 ```
 
-#### Task 3: DO-direct teardown fallback (R14 / F2)
+#### Task 3: DO-direct teardown fallback (R14 / F2) — DONE `4c36c24`
 
 **Files:**
 - Modify: `src/lab/backends/skypilot.py` (`robust_teardown`)
@@ -476,6 +476,12 @@ git commit -m "feat(teardown): DO-direct fallback when SkyPilot loses the cluste
 ```
 
 ---
+
+> **Phase 1 note (2026-08-20).** Implementing Task 3 surfaced a hazard worth keeping: this dev box
+> has `doctl` configured, so an unstubbed DO call in a test does **not** fail — it silently
+> enumerates the live account. The DO fallback's first test run did exactly that. `tests/conftest.py`
+> now has an autouse fixture refusing to build a real DO client unless a test patches it
+> deliberately. Any future provider-direct fallback should get the same guard before its first run.
 
 ### Phase 2 — Leak-net integrity
 
