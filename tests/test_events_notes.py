@@ -384,7 +384,7 @@ def test_supervisor_success_opens_with_job_id_ref_and_no_trace(
     monkeypatch.setitem(sys.modules, "sky", fake_sky)
     monkeypatch.setattr(fake_sky, "launch", lambda *a, **k: None, raising=False)
     monkeypatch.setattr(
-        runner_mod, "_wait_terminal", lambda *a, **k: (JobState.succeeded, True)
+        runner_mod, "_wait_terminal", lambda *a, **k: (JobState.succeeded, True, None)
     )
     monkeypatch.setattr(runner_mod, "_rsync_down", lambda *a, **k: None)
     monkeypatch.setattr(runner_mod, "tear_down_and_record", lambda *a, **k: True)

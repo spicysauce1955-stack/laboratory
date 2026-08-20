@@ -1105,7 +1105,9 @@ def test_run_job_gcp_preemption_does_not_flag_teardown_failed(tmp_path, monkeypa
     monkeypatch.setitem(sys.modules, "sky", fake_sky)
     monkeypatch.setattr(fake_sky, "tail_logs", lambda *a, **k: None, raising=False)
     # Cluster vanished mid-run without a terminal state -> classifier infers preemption.
-    monkeypatch.setattr(runner_mod, "_wait_terminal", lambda *a, **k: (JobState.failed, False))
+    monkeypatch.setattr(
+        runner_mod, "_wait_terminal", lambda *a, **k: (JobState.failed, False, None)
+    )
     monkeypatch.setattr(runner_mod, "_cluster_up", lambda *a, **k: False)
     monkeypatch.setattr(runner_mod, "_rsync_down", lambda *a, **k: None)
     monkeypatch.setattr(runner_mod, "tear_down_and_record", lambda *a, **k: True)
@@ -1237,7 +1239,9 @@ def _gcp_spot_job_whose_box_vanished(tmp_path, monkeypatch, job_id):
     fake_sky = types.ModuleType("sky")
     monkeypatch.setitem(sys.modules, "sky", fake_sky)
     monkeypatch.setattr(fake_sky, "tail_logs", lambda *a, **k: None, raising=False)
-    monkeypatch.setattr(runner_mod, "_wait_terminal", lambda *a, **k: (JobState.failed, False))
+    monkeypatch.setattr(
+        runner_mod, "_wait_terminal", lambda *a, **k: (JobState.failed, False, None)
+    )
     monkeypatch.setattr(runner_mod, "_cluster_up", lambda *a, **k: False)
     monkeypatch.setattr(runner_mod, "_rsync_down", lambda *a, **k: None)
     monkeypatch.setattr(runner_mod, "tear_down_and_record", lambda *a, **k: True)

@@ -66,7 +66,7 @@ def test_wait_terminal_fires_heartbeat(monkeypatch):
     monkeypatch.setattr(sky_runner.time, "sleep", lambda _s: None)  # no real waiting
     beats = {"n": 0}
 
-    final, reached = sky_runner._wait_terminal(
+    final, reached, _lost = sky_runner._wait_terminal(
         _FakeSky(),
         "lab-x",
         1,
