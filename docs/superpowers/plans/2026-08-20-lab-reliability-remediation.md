@@ -148,7 +148,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ### Phase 1 — Cost safety (highest value)
 
-#### Task 1: The supervisor must notice its machine is gone (R8)
+#### Task 1: The supervisor must notice its machine is gone (R8) — DONE `0822fae`
 
 **Files:**
 - Modify: `src/lab/sky_runner.py:63-106` (`_wait_terminal`)
@@ -482,6 +482,15 @@ git commit -m "feat(teardown): DO-direct fallback when SkyPilot loses the cluste
 > enumerates the live account. The DO fallback's first test run did exactly that. `tests/conftest.py`
 > now has an autouse fixture refusing to build a real DO client unless a test patches it
 > deliberately. Any future provider-direct fallback should get the same guard before its first run.
+
+> **Task 1 correction (2026-08-20).** The plan said to gate on
+> `classify_sky_error(...).outcome == "failed"`. That is **wrong on its own**: `_skycompat`'s
+> `_DEFINITE_FAILURES` also holds `ApiServerConnectionError`, `PermissionDeniedError`,
+> `APIVersionMismatchError` and others. Those are correct verdicts about a *destroy call* that
+> never left the client, but they are not evidence that a remote machine has gone away — gating on
+> them would fail a healthy job on a local API-server restart and abandon a still-billing box, R8
+> inverted. The shipped gate requires **both** a definitive refusal *and* `ClusterDoesNotExist` in
+> the exception chain. Anything reusing that classifier for "is the machine gone?" must do the same.
 
 ### Phase 2 — Leak-net integrity
 
