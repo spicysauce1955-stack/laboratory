@@ -197,3 +197,109 @@ class TestOtherCloudsUnaffected:
 
         assert out.get("do_fallback_used") is not True
         assert out["status"] == "succeeded"
+
+
+# ---------------------------------------------------------------------------
+# P4-a: a successful `sky.down` is not proof the storage is gone.
+# ---------------------------------------------------------------------------
+
+
+class _OkSky:
+    """A `sky.down` that returns cleanly, so no fallback ever runs."""
+
+    def get(self, x):
+        return x
+
+    def down(self, cluster):
+        return None
+
+
+class TestSuccessfulTeardownStillVerifiesTheVolume:
+    """Found live on 2026-08-20, and only findable live.
+
+    A job that failed partway through launch recorded ``teardown_status: "succeeded"`` and left a
+    50 GB detached block volume behind -- still present and still billing seventeen minutes later.
+    ``sky.down`` returned cleanly, so the DO-direct fallback that removes the volume alongside the
+    droplet never ran, and nothing else looked.
+
+    The volume is created *before* the droplet is fully up, so a launch that dies partway is
+    precisely the case that strands one. This is the same leak F2 covers, reached from the opposite
+    side: F2 is ``sky.down`` failing, this is ``sky.down`` succeeding and being incomplete.
+    """
+
+    def test_a_leftover_volume_is_removed_after_a_clean_sky_down(self, monkeypatch):
+        client = _patch(
+            monkeypatch,
+            _Client(volumes=[{"id": "vol-1", "name": VOLUME, "droplet_ids": []}]),
+        )
+
+        out = m.robust_teardown(_OkSky(), CLUSTER, cloud="do", backoffs=(0,))
+
+        assert client.volumes.deleted == ["vol-1"]
+        assert out["status"] == "succeeded"
+
+    def test_a_leftover_volume_that_will_not_delete_is_a_real_alarm(self, monkeypatch):
+        """We found it, we know it is billing, and we could not remove it: that is `failed`."""
+        _patch(
+            monkeypatch,
+            _Client(
+                volumes=[{"id": "vol-1", "name": VOLUME, "droplet_ids": []}],
+                volume_error=RuntimeError("attached volume cannot be deleted"),
+            ),
+        )
+
+        out = m.robust_teardown(_OkSky(), CLUSTER, cloud="do", backoffs=(0,))
+
+        assert out["status"] == "failed"
+
+    def test_an_unverifiable_volume_state_is_unknown_not_success(self, monkeypatch):
+        """The droplet is confirmed gone; the storage is not. That is exactly `unknown` (R10)."""
+
+        def _unreachable(*a, **k):
+            raise RuntimeError("401 Unauthorized")
+
+        monkeypatch.setattr(m, "_get_do_client", _unreachable)
+
+        out = m.robust_teardown(_OkSky(), CLUSTER, cloud="do", backoffs=(0,))
+
+        assert out["status"] == "unknown"
+
+    def test_nothing_left_over_is_plain_success(self, monkeypatch):
+        client = _patch(monkeypatch, _Client(volumes=[]))
+
+        out = m.robust_teardown(_OkSky(), CLUSTER, cloud="do", backoffs=(0,))
+
+        assert out["status"] == "succeeded"
+        assert client.volumes.deleted == []
+
+    def test_another_projects_volume_is_never_touched(self, monkeypatch):
+        client = _patch(
+            monkeypatch,
+            _Client(
+                volumes=[
+                    {"id": "mine", "name": VOLUME, "droplet_ids": []},
+                    {
+                        "id": "theirs",
+                        "name": "lab-tempotron-capacity-20260820-124800-05befa-abc-head",
+                        "droplet_ids": [],
+                    },
+                ]
+            ),
+        )
+
+        m.robust_teardown(_OkSky(), CLUSTER, cloud="do", backoffs=(0,))
+
+        assert client.volumes.deleted == ["mine"]
+
+    @pytest.mark.parametrize("cloud", ["vast", "gcp"])
+    def test_other_clouds_do_not_pay_for_the_check(self, monkeypatch, cloud):
+        """Vast has no block volumes and GCP disks have their own reconcile pass."""
+
+        def _boom(*a, **k):
+            raise AssertionError(f"DO client built for a {cloud} teardown")
+
+        monkeypatch.setattr(m, "_get_do_client", _boom)
+
+        assert m.robust_teardown(_OkSky(), CLUSTER, cloud=cloud, backoffs=(0,))["status"] == (
+            "succeeded"
+        )
