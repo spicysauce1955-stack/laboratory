@@ -38,6 +38,26 @@ def _isolate_event_ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_cloud_clients(monkeypatch):
+    """No test may reach a real provider API by *omission*.
+
+    This dev box has doctl configured, so an unpatched DO call in a test does not fail — it
+    quietly enumerates the live account, and the code under test here is teardown code whose job
+    is to destroy things. A test that forgets to stub the client should break loudly rather than
+    reach production; tests that legitimately need a client monkeypatch it themselves, and their
+    patch (applied later) wins over this one.
+    """
+
+    def _refuse(*a, **k):
+        raise AssertionError(
+            "a test tried to build a real DigitalOcean client — monkeypatch "
+            "lab.backends.skypilot._get_do_client in this test"
+        )
+
+    monkeypatch.setattr("lab.backends.skypilot._get_do_client", _refuse)
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_sky_versions(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
     """Pin the SkyPilot client/server version check to "compatible" by default.
 

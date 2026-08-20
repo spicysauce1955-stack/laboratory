@@ -435,6 +435,58 @@ def do_volume_orphans(
     return orphans
 
 
+def list_do_droplets(client: Any | None = None) -> list[dict[str, Any]]:
+    """Every DO droplet on the account as plain dicts. Raises if the client or listing fails —
+    a leak-detection caller must never read an API error as "nothing is running"."""
+    if client is None:
+        client = _get_do_client()
+    resp = client.droplets.list(per_page=200)
+    droplets = resp.get("droplets", []) if isinstance(resp, dict) else resp
+    return [dict(d) for d in (droplets or [])]
+
+
+def _do_destroy_matching(cluster: str) -> tuple[list[Any], list[str]]:
+    """Destroy the droplet(s) and block volume(s) belonging to ``cluster``, via the DO API.
+
+    The provider-direct fallback DigitalOcean was missing while Vast and GCP both had one (F2).
+    It matters most in exactly the case SkyPilot cannot help with: its registry has lost the
+    cluster (``ClusterDoesNotExist``) but the droplet is alive and billing.
+
+    Two resources, not one. SkyPilot's DO provisioner attaches a block volume named after the
+    cluster, and destroying the droplet alone leaves it behind — detached, invisible to every
+    instance-level pass, and still charged for. That residue is what the 2026-08-20 sweep found.
+
+    Matching is ``name.startswith(cluster)``, which is exact enough to be safe here: DO does not
+    truncate instance names (unlike GCP — see :func:`gcp_name_matches`), and the cluster name now
+    carries the owning project, so another project's droplet cannot share this prefix. Returns
+    ``(destroyed_ids, failures)``; finding nothing is success, since nothing is billing.
+    """
+    client = _get_do_client()
+    destroyed: list[Any] = []
+    failures: list[str] = []
+    prefix = cluster.lower()
+
+    for d in list_do_droplets(client):
+        if not str(d.get("name", "")).lower().startswith(prefix):
+            continue
+        try:
+            client.droplets.destroy(droplet_id=int(d["id"]))
+            destroyed.append(int(d["id"]))
+        except Exception as e:  # noqa: BLE001 — a box we found and could not kill must alarm
+            failures.append(f"droplet {d.get('name')}: {type(e).__name__}: {e}")
+
+    for v in list_do_volumes(client):
+        if not str(v.get("name", "")).lower().startswith(prefix):
+            continue
+        try:
+            client.volumes.delete(volume_id=str(v["id"]))
+            destroyed.append(v["id"])
+        except Exception as e:  # noqa: BLE001
+            failures.append(f"volume {v.get('name')}: {type(e).__name__}: {e}")
+
+    return destroyed, failures
+
+
 class GcpNotConfigured(RuntimeError):
     """GCP isn't set up on this machine: the provider extra isn't installed, there are no
     application-default credentials, or no project is selected.
@@ -947,8 +999,8 @@ def robust_teardown(
     provider API timeout) used to leak rentals — the cluster kept billing while we marked the
     job ``failed`` and moved on. We now retry sky.down with exponential backoff, then bypass
     SkyPilot's local registry entirely and ask the provider itself to destroy any instance
-    matching the cluster name (vastai-sdk on Vast, the compute API on GCP; DO has no direct
-    channel and reports the failure).
+    matching the cluster name: vastai-sdk on Vast, the compute API on GCP, and the DO API on
+    DigitalOcean (droplet plus the block volume SkyPilot attaches to it).
 
     Returns a structured outcome suitable for persistence on the manifest:
 
@@ -1021,8 +1073,40 @@ def robust_teardown(
                 "gcp_destroyed": [],
                 "error": f"sky.down: {last_err}; gcp-direct: {type(e).__name__}: {e}",
             }
+    if cloud == "do":
+        # Talk to DigitalOcean directly — droplet first, then the block volume SkyPilot attaches
+        # alongside it, which outlives the droplet and keeps billing if left (F2).
+        print(f"[lab] sky.down exhausted for {cluster}; falling back to do-direct destroy")
+        try:
+            do_destroyed, do_failures = _do_destroy_matching(cluster)
+            events.note("teardown.fallback", cluster=cluster, via="do", ok=not do_failures)
+            return {
+                # Destroyed-or-none-found are both safe. Found-and-failed-to-destroy is not.
+                "status": "failed" if do_failures else "succeeded",
+                "attempts": len(delays),
+                "vast_fallback_used": False,
+                "vast_destroyed": [],
+                "do_fallback_used": True,
+                "do_destroyed": do_destroyed,  # report what DID die even when we alarm
+                "error": (
+                    f"sky.down: {last_err}; do-direct: {'; '.join(do_failures)}"
+                    if do_failures
+                    else last_err
+                ),
+            }
+        except Exception as e:  # noqa: BLE001 — an unreachable DO API is not "nothing is running"
+            events.note("teardown.fallback", cluster=cluster, via="do", ok=False)
+            return {
+                "status": "failed",
+                "attempts": len(delays),
+                "vast_fallback_used": False,
+                "vast_destroyed": [],
+                "do_fallback_used": True,
+                "do_destroyed": [],
+                "error": f"sky.down: {last_err}; do-direct: {type(e).__name__}: {e}",
+            }
     if cloud != "vast":
-        # No provider-direct fallback for this cloud (DO); sky.down + autostop + the poweroff
+        # No provider-direct fallback for this cloud; sky.down + autostop + the poweroff
         # backstop + `lab reconcile` (sky.status pass) are the safety net. Report the failure.
         return {
             "status": "failed",
@@ -1359,11 +1443,21 @@ class SkyPilotBackend:
                 except Exception as e:  # noqa: BLE001 — the alarm must survive a crashed attempt
                     print(f"[lab] teardown attempt for dead-supervisor job {job_id} crashed: {e}")
                     self.store.update_manifest(job_id, teardown_status="failed")
+                # Attribute the outcome honestly. A job whose cancel was interrupted is
+                # `cancelled` -- someone asked for it; calling that a crash would misreport a
+                # deliberate act and, worse, make a cancel indistinguishable from the supervisor
+                # failure this branch exists to catch.
+                cancelling = bool(rt.get("cancelling"))
                 return self.store.update_manifest(
                     job_id,
-                    status=JobState.failed,
+                    status=JobState.cancelled if cancelling else JobState.failed,
                     ended_at=now(),
-                    end_reason="supervisor exited without recording status",
+                    end_reason=(
+                        "cancelled by user (teardown completed by recovery after the cancel "
+                        "was interrupted)"
+                        if cancelling
+                        else "supervisor exited without recording status"
+                    ),
                 ).status
         return m.status
 
@@ -1377,29 +1471,45 @@ class SkyPilotBackend:
         return lines[-tail:] if tail else lines
 
     def cancel(self, job_id: str) -> JobState:
+        """Stop the job and release its machine, recording the terminal status **last**.
+
+        Ordering is the whole point (R9, incident 2026-08-20). This used to write
+        ``status=cancelled`` first and then do the slow part; seven cancels were killed by an
+        impatient caller mid-``robust_teardown`` and each left a manifest reading ``cancelled``
+        with ``teardown_status: None`` -- terminal, so ``lab wait`` was satisfied and every
+        dashboard went quiet, while the machine may well have still been billing.
+
+        Now the *intent* is recorded in ``_runtime.json`` up front and the manifest stays
+        non-terminal until teardown has actually been attempted. An interrupted cancel therefore
+        leaves a job that still looks unfinished -- which is true, and which lets
+        :meth:`status` finish it (its supervisor is already gone, having been SIGTERMed below).
+        """
         m = self.store.read_manifest(job_id)
         if m.status in _TERMINAL:
             return m.status
-        self.store.update_manifest(
-            job_id, status=JobState.cancelled, ended_at=now(), end_reason="cancelled by user"
-        )
+        # Durable before anything slow or killable: this is what tells a later `status()` that
+        # the job was on its way out deliberately, so recovery reports `cancelled` rather than
+        # inventing a crash that never happened.
+        self.store.write_runtime(job_id, cancelling=True)
         rt = self.store.read_runtime(job_id)
         if rt.get("runner_pid"):
             try:
                 os.kill(rt["runner_pid"], signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 pass
+        # The name recorded at launch, not one recomputed today: `cluster_name_for` gained a
+        # project slug, so recomputing can address a different machine than the one we started.
         cluster = rt.get("cluster") or cluster_name_for(job_id)
-        try:
-            import sky
+        import sky
 
+        try:
             sky.get(sky.cancel(cluster, all=True))  # 0.12: RequestId
         except Exception:  # noqa: BLE001 - best-effort; teardown below is what matters
             pass
-        import sky
-
         tear_down_and_record(sky, cluster, self.store, job_id, m.resources.cloud or "vast")
-        return JobState.cancelled
+        return self.store.update_manifest(
+            job_id, status=JobState.cancelled, ended_at=now(), end_reason="cancelled by user"
+        ).status
 
     def collect_artifacts(self, job_id: str, dest: str) -> list[ArtifactRecord]:
         # The supervisor rsyncs the remote run dir into output/ before teardown; read it locally.
