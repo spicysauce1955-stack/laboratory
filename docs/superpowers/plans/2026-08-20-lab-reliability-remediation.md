@@ -696,6 +696,46 @@ shape across all four — mechanism, not weather.
 - `lab.runner` (local backend) and the scheduler's respawn write to `logs.txt` directly and remain
   unstamped.
 
+## Phase 6 — code review of the fixes themselves (2026-08-21)
+
+A high-effort review over the whole session's diff found **nine** defects, **seven of them
+introduced by this incident's own fixes**. Two would have made things worse than the bug being
+repaired, and neither was caught by 1,142 passing tests. Fixed in `8954647`.
+
+The two that mattered most:
+
+- **A finished job recorded as `failed`.** The wall-clock budget anchors to `started_at`, which is
+  stamped before `sky.launch`, so it charges provisioning and remote setup — while the box-side cap
+  wraps only the entrypoint. With the budget spent, the poll loop never ran even once and the
+  function returned `FAILED`. `promote_timeout`/`confirm_success` only downgrade, so a clean success
+  was persisted as a failure, and on spot could be relabelled `preempted` and resubmitted — paying
+  twice for a job that had already succeeded. **The cap bounds how long we wait, never whether we
+  look.**
+- **Machines destroyed outside the approval prompt.** The `unsupervised` remediation added in
+  Phase 2 tears down and finalises, but `unsupervised` was absent from `_ORPHAN_FIELDS`, so it never
+  appeared in the preview and ignored the approved set. With no other orphans the prompt was skipped
+  entirely. A false dead-supervisor reading would then destroy a *live* job — the exact failure this
+  whole effort exists to prevent, reintroduced by its own fix.
+
+Five more fixed: ownership now falls back to this project's own `runs/`; GCP attribution reads the
+labels that survive the 35-char truncation (they were being written and never read, leaving that
+cloud's leak sweep inert); a respawned supervisor clears the stale `runner_exit` that would have
+torn down its live cluster; the skew gate is scoped to the sky pass rather than aborting the
+provider-direct passes too; and being unconfigured for DO no longer downgrades a clean teardown to
+`unknown`.
+
+### Deferred, not dismissed
+
+- **P6-a — `cancel` races its own supervisor.** `cancel` writes `cancelling=True`, SIGTERMs the
+  supervisor, then tears down and records `cancelled` last. The supervisor's SIGTERM handler unwinds
+  into `_teardown_on_abort`, sees no teardown recorded, and tears down too. The loser can stamp
+  `teardown_status="failed"` after the winner wrote `succeeded` — a false leak alarm and `lab wait`
+  exit 3 on a cleanly cancelled job. Money-safe (both destroy), signal-noisy.
+- **P6-b — the DO-direct fallback deletes a still-attached volume.** `droplets.destroy` is
+  asynchronous and does not remove the attached volume, so the immediately-following
+  `volumes.delete` gets a 422; the volume is left billing *and* the teardown alarms. Needs a
+  detach/poll or the destroy-with-associated-resources variant.
+
 ## Self-review
 
 **Coverage:** every register row with status OPEN maps to a task — R8→1, R9→2, R14/F2→3, R10→4,
