@@ -95,7 +95,14 @@ class Scheduler:
         # fresh pid makes `pid_alive` mismatch and report the new supervisor dead at once —
         # which tears down its cluster and fails a live job (F4).
         self.store.write_runtime(
-            job_id, runner_pid=proc.pid, runner_start_time=process_start_time(proc.pid)
+            job_id,
+            runner_pid=proc.pid,
+            runner_start_time=process_start_time(proc.pid),
+            # Clear the *previous* supervisor's exit record. `write_runtime` merges, and
+            # `SkyPilotBackend.status()` reads any `runner_exit` as proof of death — so a stale one
+            # makes the freshly adopted supervisor read as already dead, tearing down its live
+            # cluster and failing a running job on the very next poll.
+            runner_exit=None,
         )
 
     def _teardown(self, cluster: str, job_id: str, cloud: str = "vast") -> bool:

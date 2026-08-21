@@ -1082,7 +1082,13 @@ def robust_teardown(
                 # Vast has no volume concept, and a leaked GCP disk has its own reconcile pass.
                 try:
                     swept, leftovers = _do_sweep_leftover_volumes(cluster)
-                except Exception as e:  # noqa: BLE001 — could not ask, so we do not know
+                except (ImportError, GcpNotConfigured):
+                    # Not set up for DO on this machine at all. That is not the same fact as a
+                    # listing that failed: there is no evidence of a leak, and downgrading a
+                    # teardown SkyPilot actually completed would raise an alarm on the healthy
+                    # path — the false-alarm erosion the three-state work exists to prevent.
+                    pass
+                except Exception as e:  # noqa: BLE001 — configured but unable to answer
                     outcome["status"] = "unknown"
                     outcome["error"] = f"volume check after sky.down: {type(e).__name__}: {e}"
                 else:
