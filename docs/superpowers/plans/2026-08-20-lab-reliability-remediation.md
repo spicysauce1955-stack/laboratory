@@ -665,6 +665,37 @@ Verified live: a real DO job ran to completion and recorded `teardown_status: su
 droplet and no volume left, confirming the added API call does not degrade the normal path to
 `unknown`. That was the risk worth checking — fakes cannot catch a wrong call signature.
 
+## Phase 5 — the second log review (2026-08-21)
+
+Re-reading the logs of four jobs lost overnight found three more defects, all merged in `fa16b51`,
+and all traceable to one fact: **`sky.tail_logs(follow=True)` blocks for the entire run.**
+
+| # | Finding | Sev | Status |
+|---|---|---|---|
+| **P5-a** | The partial-results fetch **never ran while a job was healthy.** `_wait_terminal` is the only caller of `on_heartbeat` and runs *after* `tail_logs`, so the fetch only fired when the box was finished (redundant) or unreachable (impossible). Four jobs finished with empty `output/` despite the experiment fsyncing every result row. | **high** | FIXED |
+| **P5-b** | The local wall-clock cap was anchored to whenever streaming returned rather than to `started_at`, so a 7h cap permitted 703 minutes. The `adopt` branch was always correct; the normal path was not. | high | FIXED |
+| **P5-c** | The job log had no timestamps — which is why dating any of the above required counting 326 failure lines against a 60s heartbeat. | medium | FIXED |
+
+**Proof for P5-a, worth keeping:** the job that *succeeded* streamed its whole 4.5-hour run and
+logged **zero** heartbeat attempts. The four that were lost show streamed output stopping two lines
+into the experiment, immediately followed by `ssh: Network is unreachable`; their first-ever
+heartbeat happened after connectivity was gone, and all 46 attempts failed with SSH 255. Identical
+shape across all four — mechanism, not weather.
+
+**Ruled out by checking:** the remote run dir is correct (`build_task` sets `LAB_RUN_DIR`,
+`build_run_script` creates it, the succeeded job writes there), so nothing in `skypilot.py` changed.
+
+### Still open after Phase 5
+
+- **`tail_logs` is unbounded.** The budget is anchored correctly now, so a supervisor cannot grant
+  itself a second full timeout — but a hang inside that call still traps it. Needs the watchdog
+  treatment `provision_with_watchdog` already gives `stream_and_get`.
+- **The delivery gap.** Everything here is on `main`. `tempotron-capacity` pins `laboratory @
+  v0.6.2` and none of it reaches the running experiments until a release is tagged and that pin
+  moves. This gap is now larger than the original incident.
+- `lab.runner` (local backend) and the scheduler's respawn write to `logs.txt` directly and remain
+  unstamped.
+
 ## Self-review
 
 **Coverage:** every register row with status OPEN maps to a task — R8→1, R9→2, R14/F2→3, R10→4,
