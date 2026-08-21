@@ -18,9 +18,6 @@ import typer
 
 from lab import __version__, events
 from lab._util import atomic_write_text, now, parse_duration, wrap_with_extras
-from dataclasses import asdict
-
-from lab._skycompat import SkyVersionSkewError
 from lab.core import (
     Lab,
     LabError,
@@ -809,6 +806,11 @@ _ORPHAN_FIELDS = (
     "gcp_orphans",  # GCE instances via the compute API
     "gcp_disk_orphans",  # unattached GCE persistent disks
     "do_volume_orphans",  # detached DO block volumes
+    # Destructive since the remediation added 2026-08-21: `--apply` tears these down and finalises
+    # them. Anything `--apply` destroys must appear in the confirmation preview and must make a dry
+    # run say "action required" — leaving it out meant a bare `lab reconcile --apply` with no other
+    # orphans skipped the prompt and still killed machines.
+    "unsupervised",
 )
 # Deliberately NOT here: `gcp_unmatched` — `lab-*` GCE names that do not match our cluster-node
 # shape. It is advisory (something in this project is named like us but is not ours to destroy),
@@ -823,7 +825,7 @@ def _describe_orphan(item: Any) -> str:
     """
     if not isinstance(item, dict):
         return str(item)
-    name = item.get("name") or item.get("label") or item.get("id")
+    name = item.get("name") or item.get("label") or item.get("cluster") or item.get("id")
     extra = [str(v) for v in (item.get("zone") or item.get("region"), item.get("status")) if v]
     if item.get("label") and item.get("id") is not None:
         extra.insert(0, f"id={item['id']}")
@@ -907,13 +909,6 @@ def reconcile(
                     _fail(4, f"user declined to destroy {len(doomed)} resource(s)")
                 approved = {orphan_key(field, item) for field, item in doomed}
         report = lab.reconcile(apply=apply, only=approved)
-    except SkyVersionSkewError as e:
-        # Nothing was destroyed. Exit 4 is the existing "refused, cloud untouched" code (declined
-        # prompt / no tty); a skew refusal is the same contract, so wrappers already handle it.
-        # `reason` distinguishes the cause for anyone who cares.
-        typer.echo(f"refusing to destroy anything: {e}", err=True)
-        _emit({"aborted": True, "reason": "sky version skew", "versions": asdict(e.versions)})
-        _fail(4, e)
     except LabError as e:
         _emit({"error": str(e)})
         _fail(2, e)

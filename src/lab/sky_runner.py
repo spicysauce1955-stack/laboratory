@@ -180,7 +180,15 @@ def _wait_terminal(
     last_beat = time.time()
     reached = False
     lost_reason: str | None = None
-    while time.time() < deadline:
+    # `while` would skip the body entirely on an exhausted budget, leaving `name` unset and
+    # returning `map_job_status("FAILED")` — recording a job that had *already finished* as a
+    # failure, which `promote_timeout`/`confirm_success` can only downgrade, never repair. The
+    # budget is anchored to `started_at` and so charges provisioning and remote setup, while the
+    # box-side cap wraps only the entrypoint, so arriving here with nothing left is ordinary.
+    # The cap bounds how long we *wait*, never whether we bother to look.
+    first = True
+    while first or time.time() < deadline:
+        first = False
         try:
             name = _job_status_name(sky_mod, cluster, sky_job_id)
         except Exception as e:  # noqa: BLE001

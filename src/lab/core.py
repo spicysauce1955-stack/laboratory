@@ -80,6 +80,23 @@ def _new_job_id() -> str:
     return f"{now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
 
 
+def _gcp_identity(resource: dict[str, Any]) -> str:
+    """A GCE resource's identity for attribution — from its labels when they are there.
+
+    GCP truncates the cluster name to 35 characters on the cloud, which shears the job id off the
+    end of a slugged name (``lab-laboratory-20260820-ef-…``). Attributing from the name alone
+    therefore failed for *every* GCP resource, so each one landed in ``unattributed`` and could
+    never be destroyed — the leak sweep for that cloud was inert. The ``lab-project``/``lab-job-id``
+    labels are written at launch precisely because they survive truncation; prefer them and fall
+    back to the name for resources that predate them.
+    """
+    labels = resource.get("labels") or {}
+    project, job_id = labels.get("lab-project"), labels.get("lab-job-id")
+    if project and job_id:
+        return f"lab-{project}-{job_id}"
+    return str(resource.get("name", ""))
+
+
 def _lab_identity(identifier: str) -> tuple[str | None, list[str]]:
     """Read a provider's resource identifier as ``(stamped project slug, candidate job ids)``.
 
@@ -132,7 +149,10 @@ def orphan_key(field: str, item: Any) -> str:
     preference rather than by a single key.
     """
     if isinstance(item, dict):
-        ident = item.get("name") or item.get("id") or item.get("label")
+        # `unsupervised` entries are `{job_id, cluster}` — neither `name` nor `id`. Without
+        # `job_id` here every entry keys as `unsupervised:None`, so approving one would approve
+        # the lot.
+        ident = item.get("name") or item.get("id") or item.get("label") or item.get("job_id")
         return f"{field}:{ident}"
     return f"{field}:{item}"
 
@@ -1146,16 +1166,18 @@ class Lab:
             list_vast_instances,
         )
 
-        if apply:
-            # Refuse to destroy machines when the client provably cannot read the result of doing
-            # so. `--apply`'s entire value is the report it prints afterwards; under version skew
-            # that report is anti-correlated with reality (incident 2026-08-20: seven destroys
-            # reported as failures, all seven droplets actually gone, exit 0). The dry-run pass is
-            # deliberately NOT blocked — reading state stays useful, and refusing to look would
-            # hide leaks. The remedy is one command and is carried in the error's message.
-            from lab._skycompat import require_compatible_sky
+        # Refuse to *destroy through SkyPilot* when the client provably cannot read the result:
+        # under version skew that report is anti-correlated with reality (incident 2026-08-20 —
+        # seven destroys reported as failures, all seven droplets actually gone, exit 0).
+        #
+        # Scoped to the sky pass alone, not the whole sweep. The Vast, DO-volume and GCP passes
+        # talk straight to their providers and are unaffected by a skewed sky client; aborting
+        # them too meant the emergency leak-stopping command refused to destroy anything at all
+        # exactly when the local API server is unhealthy, which is when leaks are likeliest.
+        from lab._skycompat import sky_versions
 
-            require_compatible_sky()
+        sky_ok = sky_versions().compatible
+        sky_pass = "ran" if sky_ok else "skipped (client/server version skew)"
 
         vast_pass = "ran"
         try:
@@ -1227,6 +1249,13 @@ class Lab:
 
             kept: list[Any] = []
             my_slug = project_slug(me) if me else None
+            # This project's own job store is the most authoritative source there is for its own
+            # jobs, and it was not consulted: attribution used only the machine-wide index (written
+            # from 2026-08-20 onward) and the event ledger (retention-bounded, and switched off
+            # entirely by LAB_EVENTS=0). A cluster leaked by a job submitted before this release
+            # was therefore permanently unattributable, and `--apply` silently refused to clean it
+            # up. A job in our own runs/ is ours by definition.
+            ours_locally = {j.job_id for j in self.list_jobs()}
             read = {id(item): _lab_identity(identify(item)) for item in items}
             candidates = {c for _, cands in read.values() for c in cands}
             attributions = attribute_jobs(candidates) if candidates else {}
@@ -1236,6 +1265,8 @@ class Lab:
                 if slug is not None:
                     # Stamped on the resource itself: no lookup can contradict it.
                     owner = me if slug == my_slug else slug
+                elif any(c in ours_locally for c in cands):
+                    owner = me
                 else:
                     owner = next(
                         (
@@ -1332,8 +1363,10 @@ class Lab:
         matched_jobs = {protected[c] for c in matched_clusters if c in protected}
         ghosts = sorted(c for c, jid in running_clusters.items() if jid not in matched_jobs)
 
-        sky_orphans = _ours_only(
-            "sky_orphans", self._sky_status_orphans(set(protected)), str
+        sky_orphans = (
+            _ours_only("sky_orphans", self._sky_status_orphans(set(protected)), str)
+            if sky_ok
+            else []
         )
         sky_destroyed: list[str] = []
         if apply and sky_orphans:
@@ -1415,7 +1448,7 @@ class Lab:
             gcp_orphans = _ours_only(
                 "gcp_orphans",
                 _find_gcp_instance_orphans(gcp_instances, set(protected)),
-                lambda i: str(i["name"]),
+                _gcp_identity,
             )
             if apply and gcp_orphans:
                 for inst in gcp_orphans:
@@ -1432,7 +1465,7 @@ class Lab:
             gcp_disk_orphans = _ours_only(
                 "gcp_disk_orphans",
                 _find_gcp_disk_orphans(gcp_disks, set(protected)),
-                lambda d: str(d["name"]),
+                _gcp_identity,
             )
             if apply and gcp_disk_orphans:
                 for disk in gcp_disk_orphans:
@@ -1454,6 +1487,8 @@ class Lab:
             from lab.backends.skypilot import SkyPilotBackend
 
             for entry in unsupervised:
+                if not _approved("unsupervised", entry):
+                    continue  # not in the set the operator confirmed
                 try:
                     SkyPilotBackend(home=self.home, repo=self.repo).status(entry["job_id"])
                 except Exception as e:  # noqa: BLE001
@@ -1465,6 +1500,9 @@ class Lab:
 
         return {
             "vast_pass": vast_pass,
+            # "ran" or why it did not — a skewed client cannot read a destroy's result, so the
+            # sky pass stands down while the provider-direct passes carry on.
+            "sky_pass": sky_pass,
             "gcp_pass": gcp_pass,
             "gcp_disk_pass": gcp_disk_pass,
             # Which project the two passes above actually swept — ambient from ADC, and possibly

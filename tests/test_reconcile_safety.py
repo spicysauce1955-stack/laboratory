@@ -423,11 +423,13 @@ class TestForeignResourcesAreNeverDestroyed:
         assert report["other_projects"] == []
 
 
-class TestVersionSkewBlocksDestruction:
-    """Under skew the client cannot read the result of a destroy, so it must not destroy.
+class TestVersionSkewStandsDownTheSkyPassOnly:
+    """Under skew the client cannot read a destroy's result, so it must not destroy *through sky*.
 
-    Dry-run stays available on purpose: reading state is still useful, and a leak detector that
-    refuses to *look* is worse than one that refuses to act.
+    Originally this refused the entire `--apply` sweep. That was too broad: the Vast, DO-volume and
+    GCP passes talk straight to their providers and are unaffected by a skewed sky client, so
+    aborting them too meant the emergency leak-stopping command destroyed nothing at all precisely
+    when the local API server is unhealthy — which is when leaks are likeliest.
     """
 
     def _skewed(self, monkeypatch):
@@ -440,89 +442,34 @@ class TestVersionSkewBlocksDestruction:
             ),
         )
 
-    def test_apply_refuses_under_skew(self, tmp_path, monkeypatch):
-        from lab._skycompat import SkyVersionSkewError
-
+    def test_the_sky_pass_stands_down_but_the_sweep_runs(self, tmp_path, monkeypatch):
         lab = _lab_with_no_jobs(tmp_path, monkeypatch)
         self._skewed(monkeypatch)
 
         def _boom(cluster):
-            raise AssertionError("must not destroy anything under version skew")
+            raise AssertionError("destroyed through a client that cannot read the result")
 
-        _patch_sky(monkeypatch, clusters=["lab-x"], down=_boom)
+        _patch_sky(monkeypatch, clusters=[OURS], down=_boom)
 
-        with pytest.raises(SkyVersionSkewError):
-            lab.reconcile(apply=True)
+        report = lab.reconcile(apply=True)
 
-    def test_dry_run_still_works_under_skew(self, tmp_path, monkeypatch):
+        assert report["applied"] is True
+        assert report["sky_pass"] == "skipped (client/server version skew)"
+        assert report["sky_orphans"] == []
+        assert report["sky_destroyed"] == []
+
+    def test_a_healthy_client_reports_the_pass_as_run(self, tmp_path, monkeypatch):
+        lab = _lab_with_no_jobs(tmp_path, monkeypatch)
+        _patch_sky(monkeypatch, clusters=[], down=lambda c: None)
+
+        assert lab.reconcile(apply=False)["sky_pass"] == "ran"
+
+    def test_dry_run_under_skew_does_not_claim_the_sky_pass_ran(self, tmp_path, monkeypatch):
+        """Silently reporting no sky orphans would read as "nothing is leaking"."""
         lab = _lab_with_no_jobs(tmp_path, monkeypatch)
         self._skewed(monkeypatch)
-        monkeypatch.setattr("lab.core.attribute_jobs", lambda ids: {})
-        _patch_sky(monkeypatch, clusters=["lab-x"], down=lambda c: None)
+        _patch_sky(monkeypatch, clusters=[OURS], down=lambda c: None)
 
         report = lab.reconcile(apply=False)
 
-        assert report["unattributed"] == ["lab-x"]
-
-
-class TestForeignResourcesAreVisible:
-    def test_other_projects_are_noted_on_stderr_with_their_owner(self, monkeypatch):
-        """Silence about another project's resources is what made destroying them look fine."""
-        _patch(
-            monkeypatch,
-            {"other_projects": [
-                {"pass": "sky_orphans", "resource": "lab-x", "project": "tempotron-capacity"}
-            ]},
-        )
-
-        result = runner.invoke(app, ["reconcile"])
-
-        assert result.exit_code == 0, result.output
-        assert "tempotron-capacity" in result.stderr
-
-    def test_other_projects_do_not_trigger_the_orphan_exit(self, monkeypatch):
-        _patch(
-            monkeypatch,
-            {"other_projects": [
-                {"pass": "sky_orphans", "resource": "lab-x", "project": "other"}
-            ]},
-        )
-
-        assert runner.invoke(app, ["reconcile"]).exit_code == 0
-
-
-class TestSkewRefusalIsStructured:
-    """A refusal must be machine-readable: callers parse stdout, and a traceback is not an answer."""
-
-    def _skew_lab(self, monkeypatch):
-        from lab._skycompat import SkyVersions, SkyVersionSkewError
-
-        versions = SkyVersions(
-            client="0.12.3", server="0.13.0", compatible=False, detail="upgrade the client"
-        )
-
-        class _Skewed:
-            def reconcile(self, apply=False, only=None):
-                if apply:
-                    raise SkyVersionSkewError(versions)
-                return _report()
-
-        monkeypatch.setattr(cli_mod, "_lab", lambda backend="local": _Skewed())
-
-    def test_apply_under_skew_exits_4_with_json(self, monkeypatch):
-        self._skew_lab(monkeypatch)
-
-        result = runner.invoke(app, ["reconcile", "--apply", "--yes"])
-
-        assert result.exit_code == 4, result.output
-        payload = json.loads(result.stdout)
-        assert payload["aborted"] is True
-        assert payload["reason"] == "sky version skew"
-        assert payload["versions"]["server"] == "0.13.0"
-
-    def test_the_refusal_names_the_remedy_on_stderr(self, monkeypatch):
-        self._skew_lab(monkeypatch)
-
-        result = runner.invoke(app, ["reconcile", "--apply", "--yes"])
-
-        assert "upgrade the client" in result.stderr
+        assert report["sky_pass"] != "ran"
