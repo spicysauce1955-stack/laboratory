@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from types import FrameType
 from typing import Any
@@ -95,6 +96,37 @@ def _cluster_lost_reason(exc: BaseException) -> str | None:
     return None
 
 
+WALL_CLOCK_GRACE_S = 300.0
+"""Slack over the requested timeout before the *local* backstop gives up.
+
+The box enforces the real cap itself (``timeout --kill-after``), deliberately, so it survives the
+supervisor dying. This grace covers the gap between the remote kill and the supervisor observing
+it — it is not a second budget.
+"""
+
+
+def remaining_wall_budget(timeout: str | None, started: datetime | None) -> float:
+    """Local wall-clock budget still owed to a job that started at ``started``.
+
+    Anchored to the job's *start*, never to "now", which is the whole point. The previous code
+    computed ``max_wait = timeout + 300`` immediately before the poll loop — but the unbounded
+    ``sky.tail_logs(..., follow=True)`` sits in front of that line and blocks for essentially the
+    entire run. The budget therefore did not begin until streaming returned, making the effective
+    local bound roughly *twice* the requested timeout, and unbounded whenever ``tail_logs`` itself
+    hung. On 2026-08-20 four jobs with a 7h timeout ran 703 minutes on that arithmetic and were
+    stopped by an external watchdog rather than by the lab.
+
+    Returns ``0.0`` once the cap is spent — a blown cap must never hand out more time — and the
+    full budget when ``started`` is unknown, which is the only safe reading of a malformed
+    manifest (refusing to wait at all would abandon a live machine).
+    """
+    total = (parse_duration(timeout) or 3600.0) + WALL_CLOCK_GRACE_S
+    if started is None:
+        return total
+    spent = duration_seconds(started, now()) or 0.0
+    return max(0.0, total - spent)
+
+
 def _wait_terminal(
     sky_mod: Any,
     cluster: str,
@@ -125,7 +157,11 @@ def _wait_terminal(
     """
     deadline = time.time() + max_wait
     name: str | None = None
-    since_beat = 0.0
+    # Real elapsed time, not accumulated nominal sleep. `since_beat += poll_s` made the heartbeat
+    # fire every N *iterations*; when polls block — during the 2026-08-20 outage each took about a
+    # minute — the partial-results fetch drifted to many minutes apart while still claiming a
+    # 60-second cadence.
+    last_beat = time.time()
     reached = False
     lost_reason: str | None = None
     while time.time() < deadline:
@@ -148,9 +184,8 @@ def _wait_terminal(
             break
         time.sleep(poll_s)
         if heartbeat_s and on_heartbeat is not None:
-            since_beat += poll_s
-            if since_beat >= heartbeat_s:
-                since_beat = 0.0
+            if time.time() - last_beat >= heartbeat_s:
+                last_beat = time.time()
                 try:
                     on_heartbeat()
                 except Exception as e:  # noqa: BLE001
@@ -744,17 +779,21 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                 sky_job_id = None  # match any job in the cluster queue
 
             # Wait for the run to actually finish before fetching artifacts / tearing down.
+            # `tail_logs` blocks for the whole run and has no timeout of its own, so the time it
+            # spends is charged against the same budget as the poll loop below — see
+            # `remaining_wall_budget`. Charging only the loop is what let four jobs run 703
+            # minutes against a 7h cap on 2026-08-20.
             try:
                 sky.tail_logs(cluster, sky_job_id, follow=True)  # streams run logs; blocks till done
             except Exception as e:  # noqa: BLE001
                 print(f"[lab] tail_logs issue: {e}")
 
-            if not adopt:
-                max_wait = (parse_duration(manifest.resources.timeout) or 3600) + 300
-            else:
-                total = (parse_duration(manifest.resources.timeout) or 3600) + 300
-                elapsed = duration_seconds(started, now()) or 0.0
-                max_wait = max(60.0, total - elapsed)
+            max_wait = remaining_wall_budget(manifest.resources.timeout, started)
+            if max_wait <= 0:
+                print(
+                    "[lab] wall-clock cap already spent when streaming returned — not waiting "
+                    "further; the box enforces the cap itself and this is only the backstop"
+                )
 
             def _heartbeat() -> None:
                 # Best-effort: pull partial results so a late/failed teardown can't lose them (§6c).
