@@ -63,7 +63,12 @@ def test_wait_terminal_fires_heartbeat(monkeypatch):
             name = "RUNNING" if polls["n"] < 7 else "SUCCEEDED"
             return [{"job_id": 1, "status": _Status(name)}]
 
-    monkeypatch.setattr(sky_runner.time, "sleep", lambda _s: None)  # no real waiting
+    # The heartbeat cadence is *elapsed seconds*, not a poll count: when a poll blocks, counting
+    # iterations lets the partial-results fetch drift far apart while still claiming its interval
+    # (2026-08-20 — four jobs finished with empty output dirs). So the fake clock has to advance.
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(sky_runner.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(sky_runner.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
     beats = {"n": 0}
 
     final, reached, _lost = sky_runner._wait_terminal(
@@ -79,7 +84,7 @@ def test_wait_terminal_fires_heartbeat(monkeypatch):
 
     assert final == JobState.succeeded
     assert reached is True  # broke on SUCCEEDED, not the deadline
-    # 6 RUNNING polls before terminal, heartbeat every 3 polls -> fired at poll 3 and 6.
+    # 6 RUNNING polls at 1s each before terminal, heartbeat every 3s -> fires twice.
     assert beats["n"] == 2
 
 

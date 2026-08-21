@@ -1702,6 +1702,7 @@ def job_status_view(home: Path, repo: Path, job_id: str) -> dict[str, Any]:
         mirrored=False,
         logs_path=store.logs_path(job_id),
         runner_exit=store.read_runtime(job_id).get("runner_exit"),
+        partials=store.read_runtime(job_id).get("partials"),
     )
 
 
@@ -1712,6 +1713,7 @@ def _status_fields(
     mirrored: bool,
     logs_path: Path | None = None,
     runner_exit: dict[str, Any] | None = None,
+    partials: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     last_line, last_at = tail_last_line(logs_path) if logs_path is not None else (None, None)
     return {
@@ -1736,6 +1738,12 @@ def _status_fields(
         # nobody looked. A SIGKILL here is the difference between "the OOM killer took it" and
         # "the code crashed", which is otherwise unrecoverable after the fact.
         "runner_exit": runner_exit,
+        # Whether partial results are actually being retrieved mid-run (2026-08-20: four jobs
+        # finished with empty output dirs and nothing said so). Distinguishes delivering
+        # (`delivered`, growing `files_total`) from reachable-but-empty (`ok` climbing,
+        # `files_total: 0`) from unreachable (`consecutive_failures` climbing with a reason) —
+        # three states that used to look identical, namely silent.
+        "partials": partials,
         # Where it actually landed. GCP prices and exhausts per zone, so "which zone" is the
         # difference between a $0.034/hr job and a $0.12/hr one.
         "placement": {

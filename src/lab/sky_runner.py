@@ -10,12 +10,17 @@ Entry point:  python -m lab.sky_runner <job_dir>
 from __future__ import annotations
 
 import argparse
+import contextvars
 import os
+import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import FrameType
 from typing import Any
@@ -49,6 +54,18 @@ from lab.store import JobStore
 
 _TERMINAL_NAMES = {"SUCCEEDED", "FAILED", "FAILED_SETUP", "FAILED_DRIVER", "CANCELLED"}
 HEARTBEAT_S = 60.0  # how often the supervisor rsyncs partial results down mid-run (§6c)
+RSYNC_TIMEOUT_S = 180.0  # hard cap on one partial-results rsync
+# How often a still-broken partial-results fetch re-warns. 46 identical lines over 11.7 h
+# (2026-08-20) were indistinguishable from each other; a stateful warning at this cadence is
+# something an operator can actually spot in the log.
+PARTIALS_REWARN_S = 900.0
+# Grace before an *empty* (as opposed to failing) fetch is worth complaining about mid-run: the
+# remote run dir is genuinely empty while `uv sync` builds the environment, which took ~5 min on
+# the 2026-08-20 boxes. The final fetch ignores this — by then empty means empty.
+PARTIALS_EMPTY_GRACE_S = 600.0
+# How long teardown will wait for an in-flight fetch. Destroying the box is cost-critical
+# (FR-C2); the fetch is best-effort, so it loses this race by design.
+PARTIALS_STOP_GRACE_S = 10.0
 
 
 def _rec_field(rec: Any, key: str) -> Any:
@@ -95,6 +112,37 @@ def _cluster_lost_reason(exc: BaseException) -> str | None:
     return None
 
 
+WALL_CLOCK_GRACE_S = 300.0
+"""Slack over the requested timeout before the *local* backstop gives up.
+
+The box enforces the real cap itself (``timeout --kill-after``), deliberately, so it survives the
+supervisor dying. This grace covers the gap between the remote kill and the supervisor observing
+it — it is not a second budget.
+"""
+
+
+def remaining_wall_budget(timeout: str | None, started: datetime | None) -> float:
+    """Local wall-clock budget still owed to a job that started at ``started``.
+
+    Anchored to the job's *start*, never to "now", which is the whole point. The previous code
+    computed ``max_wait = timeout + 300`` immediately before the poll loop — but the unbounded
+    ``sky.tail_logs(..., follow=True)`` sits in front of that line and blocks for essentially the
+    entire run. The budget therefore did not begin until streaming returned, making the effective
+    local bound roughly *twice* the requested timeout, and unbounded whenever ``tail_logs`` itself
+    hung. On 2026-08-20 four jobs with a 7h timeout ran 703 minutes on that arithmetic and were
+    stopped by an external watchdog rather than by the lab.
+
+    Returns ``0.0`` once the cap is spent — a blown cap must never hand out more time — and the
+    full budget when ``started`` is unknown, which is the only safe reading of a malformed
+    manifest (refusing to wait at all would abandon a live machine).
+    """
+    total = (parse_duration(timeout) or 3600.0) + WALL_CLOCK_GRACE_S
+    if started is None:
+        return total
+    spent = duration_seconds(started, now()) or 0.0
+    return max(0.0, total - spent)
+
+
 def _wait_terminal(
     sky_mod: Any,
     cluster: str,
@@ -125,7 +173,11 @@ def _wait_terminal(
     """
     deadline = time.time() + max_wait
     name: str | None = None
-    since_beat = 0.0
+    # Real elapsed time, not accumulated nominal sleep. `since_beat += poll_s` made the heartbeat
+    # fire every N *iterations*; when polls block — during the 2026-08-20 outage each took about a
+    # minute — the partial-results fetch drifted to many minutes apart while still claiming a
+    # 60-second cadence.
+    last_beat = time.time()
     reached = False
     lost_reason: str | None = None
     while time.time() < deadline:
@@ -148,9 +200,8 @@ def _wait_terminal(
             break
         time.sleep(poll_s)
         if heartbeat_s and on_heartbeat is not None:
-            since_beat += poll_s
-            if since_beat >= heartbeat_s:
-                since_beat = 0.0
+            if time.time() - last_beat >= heartbeat_s:
+                last_beat = time.time()
                 try:
                     on_heartbeat()
                 except Exception as e:  # noqa: BLE001
@@ -199,13 +250,292 @@ def _any_up(recs: Any) -> bool:
     return False
 
 
-def _rsync_down(cluster: str, remote_dir: str, local_dir: Path) -> None:
-    local_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["rsync", "-az", f"{cluster}:{remote_dir}/", f"{local_dir}/"],
-        check=True,
-        timeout=180,
+@dataclass(frozen=True)
+class RsyncStats:
+    """What one ``_rsync_down`` actually moved. ``files == 0`` is a real, and quiet, answer."""
+
+    files: int
+    bytes: int
+
+
+_STATS_FILES_RE = re.compile(r"Number of regular files transferred:\s*([\d,._ ]+)")
+_STATS_BYTES_RE = re.compile(r"Total transferred file size:\s*([\d,._ ]+)")
+
+
+def _stats_int(text: str, pattern: re.Pattern[str]) -> int:
+    """Pull one ``--stats`` counter out, digits only — rsync groups thousands per locale."""
+    m = pattern.search(text)
+    if m is None:
+        return 0
+    digits = "".join(c for c in m.group(1) if c.isdigit())
+    return int(digits) if digits else 0
+
+
+def parse_rsync_stats(stdout: str) -> RsyncStats:
+    """Parse ``rsync --stats`` output. Unparseable output reads as zero, never as an error —
+    this number is a *report*, and a report that raises would turn observability into an outage."""
+    return RsyncStats(
+        files=_stats_int(stdout, _STATS_FILES_RE),
+        bytes=_stats_int(stdout, _STATS_BYTES_RE),
     )
+
+
+def _rsync_down(cluster: str, remote_dir: str, local_dir: Path) -> RsyncStats:
+    """Pull the remote run dir down, returning what was transferred.
+
+    ``--stats`` (and the captured stdout that makes it usable) exists because of 2026-08-20: an
+    rsync that copies **nothing** exits 0, so "the safety net is working" and "the safety net is
+    delivering an empty directory" were the same observation. Capturing output also keeps ssh's
+    three-lines-per-failure transport noise out of the job log — ~326 such lines on that night —
+    and hands the real reason to the caller via ``CalledProcessError.stderr`` instead.
+    """
+    local_dir.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        ["rsync", "-az", "--stats", f"{cluster}:{remote_dir}/", f"{local_dir}/"],
+        check=True,
+        timeout=RSYNC_TIMEOUT_S,
+        capture_output=True,
+        text=True,
+    )
+    return parse_rsync_stats(proc.stdout or "")
+
+
+def _rsync_error_text(e: BaseException) -> str:
+    """One-line reason for a failed rsync, preferring ssh's own words over the exit code.
+
+    ``CalledProcessError`` stringifies to "returned non-zero exit status 255", which is what the
+    46 useless heartbeat lines of 2026-08-20 said. The cause — ``Network is unreachable`` — was
+    on stderr, three lines above, and now travels with the error instead.
+    """
+    detail = ""
+    raw = getattr(e, "stderr", None)
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    if isinstance(raw, str):
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        if lines:
+            detail = f" ({lines[0]})"
+    return f"{type(e).__name__}: {e}{detail}"[:300]
+
+
+class PartialsFetcher:
+    """Pulls partial results off the box during the run, and keeps a durable record of whether
+    that is actually working (§6c).
+
+    It replaces a heartbeat that lost 4 jobs' worth of results on 2026-08-20 by failing in two
+    ways at once.
+
+    **It never ran while it could have worked.** ``sky.tail_logs(follow=True)`` blocks until the
+    remote job is terminal, and ``_wait_terminal`` — the only caller of the old ``on_heartbeat``
+    — runs after it. Job ``20260820-200053-530f1a`` streamed 16152 s to
+    ``Job finished (status: SUCCEEDED)`` with zero heartbeat lines in its log: across 4.5 healthy
+    hours the heartbeat fired **not once**, and its files came from the single post-wait rsync.
+    The four lost jobs show the mirror image — their log stream ends two lines into the
+    experiment, immediately followed by ``ssh: … Network is unreachable``, and every one of the
+    46 heartbeats that followed exited 255. ``tail_logs`` returning *is* the loss event, so a
+    fetch that starts there is a fetch that never overlaps a healthy box. This one runs on its
+    own thread, started before ``tail_logs`` and stopped after the wait.
+
+    **A fetch that delivered nothing looked exactly like one that did.** ``rsync`` exits 0 having
+    copied zero files; success printed nothing; failure printed one unstructured line among 1597.
+    Every attempt now updates ``partials`` in ``_runtime.json`` (attempts / ok / failed /
+    consecutive failures / files / bytes / last success / last delivery / last error), and the
+    log gets a *stateful* warning on escalation rather than one indistinguishable line per beat.
+
+    Cadence is real elapsed time. ``_wait_terminal``'s ``since_beat += poll_s`` counts the nominal
+    sleep: once ssh started failing, each poll took ~149 s of retries rather than 10 s, so 278
+    polls yielded 46 beats — one every ~15 minutes against a nominal 60 s. Its ``on_heartbeat``
+    hook still points here (a second, redundant trigger costs nothing and is skipped when a fetch
+    is already in flight), but the thread is what holds the interval.
+    """
+
+    def __init__(self, cluster: str, store: JobStore, job_id: str) -> None:
+        self._cluster = cluster
+        self._store = store
+        self._job_id = job_id
+        self._lock = threading.Lock()  # one rsync into `output/` at a time
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._closed = False
+        self._started_at = time.monotonic()
+        self._last_warn = 0.0
+        self._health = "unknown"
+        self._state: dict[str, Any] = {
+            "attempts": 0,
+            "ok": 0,
+            "failed": 0,
+            "consecutive_failures": 0,
+            "files_total": 0,
+            "bytes_total": 0,
+            "last_attempt_at": None,
+            "last_ok_at": None,
+            "last_delivery_at": None,
+            "last_error": None,
+            "delivered": False,
+        }
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def start(self) -> None:
+        """Begin fetching in the background. Idempotent."""
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        # Carry the ambient events context across the thread boundary: `events.note` reads a
+        # ContextVar, which a plain Thread would not inherit, and the whole point of noting a
+        # stall is that it lands in the supervisor's ledger record.
+        ctx = contextvars.copy_context()
+        self._thread = threading.Thread(
+            target=ctx.run, args=(self._loop,), name=f"lab-partials-{self._job_id}", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop fetching before teardown. Idempotent, and never blocks teardown for long.
+
+        A fetch already in flight is given a short grace period and then abandoned: the thread is
+        a daemon and its work is best-effort, whereas destroying the machine is cost-critical
+        (FR-C2). ``_closed`` keeps an abandoned fetch from writing ``_runtime.json`` underneath
+        the ``runner_exit`` record that follows.
+        """
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=PARTIALS_STOP_GRACE_S)
+            if thread.is_alive():
+                print("[lab] partial-results fetch still in flight at teardown; abandoning it")
+        self._closed = True
+
+    def _loop(self) -> None:
+        while not self._stop.wait(HEARTBEAT_S):
+            self.beat()
+
+    # -- fetching ----------------------------------------------------------
+
+    def beat(self) -> None:
+        """One best-effort fetch. Never raises — the caller is a supervisor, not a client."""
+        if self._stop.is_set() or not self._lock.acquire(blocking=False):
+            return  # already fetching; a second rsync into the same dir helps nobody
+        try:
+            self._fetch("heartbeat")
+        finally:
+            self._lock.release()
+
+    def final(self) -> None:
+        """The post-wait fetch — the one that actually delivered on 2026-08-20.
+
+        Recorded in the same place as the heartbeats so that "everything arrived at the end" and
+        "nothing ever arrived" are distinguishable states instead of both being silence.
+
+        The lock wait is bounded and then ignored: this fetch is the authoritative one and must
+        not be skipped because an abandoned background rsync still holds the lock, but neither
+        may it stall teardown indefinitely. ``_rsync_down``'s own ``timeout`` caps that wait.
+        """
+        acquired = self._lock.acquire(timeout=RSYNC_TIMEOUT_S)
+        try:
+            self._closed = False
+            self._fetch("final")
+        finally:
+            if acquired:
+                self._lock.release()
+
+    def _fetch(self, phase: str) -> None:
+        st = self._state
+        st["attempts"] = int(st["attempts"]) + 1
+        st["last_attempt_at"] = now()
+        try:
+            stats = _rsync_down(self._cluster, REMOTE_RUN_DIR, self._store.output_dir(self._job_id))
+        except Exception as e:  # noqa: BLE001 — best-effort by contract; recorded, never fatal
+            st["failed"] = int(st["failed"]) + 1
+            st["consecutive_failures"] = int(st["consecutive_failures"]) + 1
+            st["last_error"] = _rsync_error_text(e)
+            self._publish()
+            self._announce("failing", phase)
+            return
+        st["ok"] = int(st["ok"]) + 1
+        st["consecutive_failures"] = 0
+        st["last_error"] = None
+        st["last_ok_at"] = now()
+        # A monkeypatched-away rsync (several supervisor tests) returns None; treat the transfer
+        # as unknown rather than crashing the supervisor over its own instrumentation.
+        if isinstance(stats, RsyncStats) and stats.files > 0:
+            st["files_total"] = int(st["files_total"]) + stats.files
+            st["bytes_total"] = int(st["bytes_total"]) + stats.bytes
+            st["last_delivery_at"] = st["last_ok_at"]
+            st["delivered"] = True
+            self._publish()
+            self._announce("delivering", phase)
+            return
+        self._publish()
+        self._announce("empty", phase)
+
+    # -- reporting ---------------------------------------------------------
+
+    def _publish(self) -> None:
+        if self._closed:
+            return
+        st = self._state
+        record = {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in st.items()}
+        try:
+            self._store.write_runtime(self._job_id, partials=record)
+        except Exception as e:  # noqa: BLE001 — never let bookkeeping kill the supervisor
+            print(f"[lab] could not record partial-results state: {e}")
+
+    def _announce(self, health: str, phase: str) -> None:
+        """Log on escalation, not per beat.
+
+        46 identical ``heartbeat rsync skipped`` lines were the only warning the operator got,
+        and they were indistinguishable from each other and buried. A line is printed when the
+        health *changes*, and thereafter at most once per :data:`PARTIALS_REWARN_S` while the
+        net is still not delivering — carrying the consequence, not just the errno.
+        """
+        st = self._state
+        elapsed = time.monotonic() - self._started_at
+        if health == "empty" and phase != "final" and elapsed < PARTIALS_EMPTY_GRACE_S:
+            # A remote run dir is legitimately empty while `uv sync` installs the environment —
+            # ~5 minutes on the 2026-08-20 boxes. Warning there would fire on every healthy job,
+            # and an alarm that is usually wrong is an alarm nobody reads (R10). Deliberately
+            # does not touch `_health`/`_last_warn`: staying silent now must not cost the real
+            # warning later. The `partials` record has counted the attempt either way.
+            return
+        changed = health != self._health
+        stale = health != "delivering" and (time.monotonic() - self._last_warn) >= PARTIALS_REWARN_S
+        self._health = health
+        if not (changed or stale):
+            return
+        self._last_warn = time.monotonic()
+        if health == "delivering":
+            print(
+                f"[lab] partial-results fetch delivering: {st['files_total']} file(s), "
+                f"{st['bytes_total']} bytes retrieved so far"
+            )
+            return
+        if health == "failing":
+            why = st["last_error"]
+            got = "nothing has been retrieved" if not st["delivered"] else "partials are stale"
+            print(
+                f"[lab] WARNING: partial-results fetch failing "
+                f"({st['consecutive_failures']} in a row over {elapsed / 60:.0f} min, "
+                f"{phase}) — {got}. {why}"
+            )
+            events.note(
+                "partials.failing",
+                phase=phase,
+                consecutive=st["consecutive_failures"],
+                delivered=st["delivered"],
+                error=why,
+            )
+            return
+        consequence = (
+            "this run produced no output at all"
+            if phase == "final"
+            else "if this box is lost, the run is lost with it"
+        )
+        print(
+            f"[lab] WARNING: partial-results fetch copied nothing from {REMOTE_RUN_DIR} "
+            f"({st['attempts']} attempt(s) over {elapsed / 60:.0f} min) — {consequence}"
+        )
+        events.note("partials.empty", phase=phase, attempts=st["attempts"])
 
 
 def _hourly_cost(handle: Any) -> float | None:
@@ -679,6 +1009,11 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         # stays true no matter how the try grows.
         lost_reason: str | None = None
 
+        # The partial-results net (§6c). Constructed before the try so that every exit path —
+        # including the provision-failure branches, which return straight to teardown — can stop
+        # it in the `finally` below.
+        partials = PartialsFetcher(cluster, store, job_id)
+
         try:
             if not adopt:
                 memo = CapacityMemo.for_home(store.home)
@@ -744,29 +1079,41 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                 sky_job_id = None  # match any job in the cluster queue
 
             # Wait for the run to actually finish before fetching artifacts / tearing down.
+            # `tail_logs` blocks for the whole run and has no timeout of its own. That single
+            # fact caused both defects fixed here, so both comments belong together:
+            #
+            #   * the wall-clock budget must charge the time it spends, or the cap is anchored to
+            #     whenever streaming happens to return — which let four jobs run 703 minutes
+            #     against a 7h cap on 2026-08-20 (see `remaining_wall_budget`);
+            #   * the partial-results fetch must start BEFORE it, because until now nothing
+            #     fetched until it returned — by which time the box is either finished (the fetch
+            #     is redundant) or unreachable (the fetch is impossible). Those same four jobs
+            #     each lost ~6h of fsynced result rows to that ordering (see `PartialsFetcher`).
+            partials.start()
             try:
                 sky.tail_logs(cluster, sky_job_id, follow=True)  # streams run logs; blocks till done
             except Exception as e:  # noqa: BLE001
                 print(f"[lab] tail_logs issue: {e}")
 
-            if not adopt:
-                max_wait = (parse_duration(manifest.resources.timeout) or 3600) + 300
-            else:
-                total = (parse_duration(manifest.resources.timeout) or 3600) + 300
-                elapsed = duration_seconds(started, now()) or 0.0
-                max_wait = max(60.0, total - elapsed)
+            max_wait = remaining_wall_budget(manifest.resources.timeout, started)
+            if max_wait <= 0:
+                print(
+                    "[lab] wall-clock cap already spent when streaming returned — not waiting "
+                    "further; the box enforces the cap itself and this is only the backstop"
+                )
 
-            def _heartbeat() -> None:
-                # Best-effort: pull partial results so a late/failed teardown can't lose them (§6c).
-                _rsync_down(cluster, REMOTE_RUN_DIR, store.output_dir(job_id))
-
+            # `PartialsFetcher.beat` is a no-op while its own thread is mid-fetch, so wiring the
+            # poll loop's heartbeat to it is a free second trigger, not a duplicate rsync. The
+            # thread is what actually holds the interval: `_wait_terminal` accumulates the
+            # *nominal* `poll_s`, which on 2026-08-20 drifted 60s-nominal beats out to ~15 min
+            # apart once each poll started spending ~149s in ssh retries.
             raw_final, reached_terminal, lost_reason = _wait_terminal(
                 sky,
                 cluster,
                 sky_job_id,
                 max_wait,
                 heartbeat_s=HEARTBEAT_S,
-                on_heartbeat=_heartbeat,
+                on_heartbeat=partials.beat,
             )
             final = raw_final
         except ProvisionTimeout:
@@ -799,6 +1146,11 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             )
             tear_down_and_record(sky, cluster, store, job_id, cloud)
             return 1
+        finally:
+            # Every path out of the block above leads to teardown, and nothing may still be
+            # rsyncing into `output/` while the machine is being destroyed. Cheap and idempotent
+            # when the fetcher was never started (the pre-launch failure branches).
+            partials.stop()
 
         if lost_reason is not None:
             # The cluster vanished mid-run (R8). Nothing left to fetch over ssh, and nothing for
@@ -817,10 +1169,10 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             tear_down_and_record(sky, cluster, store, job_id, cloud)
             return 1
 
-        try:
-            _rsync_down(cluster, REMOTE_RUN_DIR, store.output_dir(job_id))
-        except Exception as e:  # noqa: BLE001
-            print(f"[lab] artifact rsync failed: {e}")
+        # The post-wait fetch. Goes through the fetcher so it lands in the same `partials` record:
+        # "everything arrived at the end" (the succeeded 2026-08-20 job) and "nothing ever
+        # arrived" (the four lost ones) must not both look like silence.
+        partials.final()
 
         final = promote_timeout(final, store.output_dir(job_id))  # failed -> timed_out if sentinel
         final = confirm_success(final, store.output_dir(job_id))  # succeeded only if .lab_success present
