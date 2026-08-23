@@ -791,6 +791,70 @@ _GCP_FAILURE_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
 )
 
 
+# `end_reason` is stored as `reason[:300]`. Both numbers live here so the composer below can
+# reason about the budget it is actually writing into.
+END_REASON_CAP = 300
+# What the provider's own words are guaranteed, no matter how much advice we want to give. A
+# hint is a guess about the cause; the provider's message is evidence of it, and on 2026-08-23
+# five DO failures kept the guess and lost the evidence.
+_PROVIDER_TEXT_FLOOR = 150
+
+# Boilerplate SkyPilot prefixes every ResourcesUnavailableError with. It is identical on every
+# such failure, so it carries no information while costing ~110 of the 300 characters — the
+# distinguishing part ("Failed to acquire resources in all zones in nyc1 for {DO(...)}") sits
+# behind it and was what actually got cut.
+_SKY_BOILERPLATE = (
+    "Failed to provision all possible launchable resources.",
+    "Relax the task's resource requirements:",
+    "To keep retrying until the cluster is up, use the `--retry-until-up` flag.",
+)
+
+
+def _compose_reason(hint: str, generic: str) -> str:
+    """Join a diagnosis to the provider's message without letting either erase the other.
+
+    The diagnosis leads (see :func:`provision_failure_reason`) but is trimmed if it would leave
+    the provider less than :data:`_PROVIDER_TEXT_FLOOR` characters of the cap. Sky's invariant
+    boilerplate is dropped first, which usually makes trimming unnecessary.
+    """
+    for phrase in _SKY_BOILERPLATE:
+        generic = generic.replace(phrase, "")
+    generic = " ".join(generic.split())  # collapse the gaps the removals leave
+
+    sep = " — "
+    room = END_REASON_CAP - len(sep) - min(len(generic), _PROVIDER_TEXT_FLOOR)
+    if len(hint) > room > 0:
+        hint = hint[: room - 1].rstrip(" ,;:.") + "…"
+    return f"{hint}{sep}{generic}"
+
+
+# DigitalOcean, diagnosed from its error text the way GCP already is. Markers are taken from a
+# real failed run's log, never from recollection: guessing a provider's wording produces a table
+# that silently never matches, which is indistinguishable from having no table at all.
+_DO_FAILURE_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        # Observed 2026-08-23 on all five failures, ~2-3s per region across nyc1/2/3 + sfo1/2/3.
+        # Refusal that fast, in every region at once, is an account-level "no" rather than real
+        # capacity scarcity — and the account already had 8 droplets up.
+        ("acquire resources in all zones", "resourcesunavailableerror"),
+        "DO refused this size in every region tried, which is usually an account limit rather "
+        "than capacity: check your droplet limit and vCPU quota in the DO console",
+    ),
+)
+
+
+def _do_failure_hint(text: str) -> str:
+    """Diagnose a DigitalOcean provision failure from its error text (pure)."""
+    low = text.lower()
+    for markers, hint in _DO_FAILURE_HINTS:
+        if any(m in low for m in markers):
+            return hint
+    return (
+        "if this is a DigitalOcean setup issue, check `sky check` shows DO enabled (doctl token "
+        "at ~/.config/doctl/config.yaml) and your DO droplet limit and vCPU quota cover the size"
+    )
+
+
 def _gcp_failure_hint(text: str) -> str:
     """Diagnose a GCP provision failure from its error text (pure).
 
@@ -854,15 +918,18 @@ def provision_failure_reason(generic: str, cloud: str) -> str:
     meant it was reliably cut off — observed live on a GPU launch whose real cause,
     ``Quota 'GPUS_ALL_REGIONS' exceeded``, never reached the manifest at all. Leading with it means
     the one sentence worth reading is the one that survives.
+
+    **But leading is not the same as crowding out.** Going first was then enough to lose the other
+    half: on 2026-08-23 five DO failures stored an identical 300 characters of advice and truncated
+    away the provider's own words, leaving no way to tell an account limit from real capacity even
+    with the manifests in hand. :func:`_compose_reason` now guarantees the provider text a floor of
+    the budget and drops sky's invariant boilerplate to make room, so both halves survive: a guess
+    about the cause, and the evidence for it.
     """
     if cloud == "do":
-        return (
-            "if this is a DigitalOcean setup issue, check `sky check` shows DO enabled "
-            f"(doctl token at ~/.config/doctl/config.yaml) and your DO vCPU quota covers the size "
-            f"— {generic}"
-        )
+        return _compose_reason(_do_failure_hint(generic), generic)
     if cloud == "gcp":
-        return f"{_gcp_failure_hint(generic)} — {generic}"
+        return _compose_reason(_gcp_failure_hint(generic), generic)
     if cloud == "vast":
         bal = vast_balance()
         if bal is not None and bal <= 0:
