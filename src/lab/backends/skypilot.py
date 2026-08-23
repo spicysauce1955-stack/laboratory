@@ -61,9 +61,55 @@ DEFAULT_PROVISION_TIMEOUT_MIN = 8
 PROVISION_TIMEOUT_MIN_BY_CLOUD = {"vast": 8, "do": 12, "gcp": 20}
 
 
-def provision_timeout_min(cloud: str | None) -> int:
-    """Minutes to allow for provisioning on a cloud (pure)."""
-    return PROVISION_TIMEOUT_MIN_BY_CLOUD.get(cloud or "vast", DEFAULT_PROVISION_TIMEOUT_MIN)
+# Pinning a region (or zone) narrows the optimizer to one region's offers, and provisioning slows
+# down accordingly: measured 2026-08-23, unpinned vast launches reached UP in 66-209s while the one
+# `--region "Sweden, SE, EU"` launch took 526s — past the 480s the unpinned budget would allow. Only
+# the clouds whose budget is spent *waiting on one host* need this; see below for why GCP does not.
+PINNED_PROVISION_TIMEOUT_MIN = 15
+
+
+def provision_timeout_min(cloud: str | None, *, pinned: bool = False) -> int:
+    """Minutes to allow for provisioning on a cloud (pure).
+
+    ``pinned`` says a region or zone was pinned, which buys a longer budget on the clouds that
+    wait on a single host. It never *shortens* one: GCP's 20 minutes pay for the optimizer's
+    zone-by-zone failover walk, and pinning makes that walk shorter, not longer.
+    """
+    base = PROVISION_TIMEOUT_MIN_BY_CLOUD.get(cloud or "vast", DEFAULT_PROVISION_TIMEOUT_MIN)
+    return max(base, PINNED_PROVISION_TIMEOUT_MIN) if pinned else base
+
+
+# How far above the calibrated budget an explicit --provision-timeout has to be before it is worth
+# a word. A timeout is not a deadline you hope to avoid — on a dead offer it is exactly what you
+# will pay, every time. 2x rather than something rounder because the case that cost 60 minutes on
+# 2026-08-23 (20m against vast's 8m budget) sits exactly on 2.5x and would not have said a word.
+_WASTEFUL_TIMEOUT_RATIO = 2.0
+
+
+def wasteful_provision_timeout_warning(
+    provision_s: float | None, cloud: str | None, *, pinned: bool = False
+) -> str | None:
+    """Warn about an override far above what this cloud actually needs, else ``None`` (pure).
+
+    On 2026-08-23 three Vast jobs each burned the full ``--provision-timeout 20m`` discovering a
+    dead offer — 60 minutes — on a cloud where a healthy host reaches UP in under four. The flag
+    looked like cheap insurance; it was the price of every dead offer.
+
+    Silent when a region is pinned, since that legitimately needs the room. Advisory only: it must
+    never shorten what the caller asked for, because a timeout that quietly disagreed with the flag
+    would be a worse surprise than the one it is warning about.
+    """
+    if provision_s is None:
+        return None
+    budget_min = provision_timeout_min(cloud, pinned=pinned)
+    if pinned or provision_s <= budget_min * 60 * _WASTEFUL_TIMEOUT_RATIO:
+        return None
+    return (
+        f"[lab] NOTE: --provision-timeout is {provision_s / 60:.0f}m, well over the ~{budget_min}m "
+        f"a healthy {cloud or 'vast'} host needs. A dead offer costs you the WHOLE {provision_s / 60:.0f}m "
+        f"before it is given up on, so this is the price of every bad offer, not a safety margin. "
+        f"Lower it (or drop the flag) unless you are pinning a region."
+    )
 # Teardown retry budget: ~3.5 min total (first attempt + 5 retries spaced 5/15/30/60/120 s).
 # Long enough to ride out a transient DNS/API hiccup; short enough that a cluster that's
 # genuinely stuck still gets nuked via the vast-sdk fallback in well under 5 minutes.
@@ -459,7 +505,19 @@ def list_do_droplets(client: Any | None = None) -> list[dict[str, Any]]:
     return [dict(d) for d in (droplets or [])]
 
 
-def _do_sweep_leftover_volumes(cluster: str) -> tuple[list[Any], list[str]]:
+# DO detaches a block volume from a destroyed droplet *asynchronously*, so a delete issued the
+# instant `sky.down` returns can be refused for a volume that is seconds away from deletable.
+# DO's wording, verbatim from the 2026-08-23 manifest that alarmed.
+_VOLUME_DETACH_MARKER = "attached volume cannot be deleted"
+# Measured live that day, not guessed: job 20260823-093644-873c9d ended at 12:07:24Z, its volume
+# still listed `attached` at 12:07:37 and was gone by 12:07:58. ~60s of ladder covers that with
+# room to spare, and costs nothing on the common path where the first delete is accepted.
+_VOLUME_DETACH_BACKOFFS = (5, 10, 15, 30)
+
+
+def _do_sweep_leftover_volumes(
+    cluster: str, *, backoffs: tuple[int, ...] = _VOLUME_DETACH_BACKOFFS
+) -> tuple[list[Any], list[str]]:
     """Delete any block volume still named after ``cluster``. Raises if DO cannot be asked.
 
     A clean ``sky.down`` is not proof the storage is gone (P4-a, found live 2026-08-20): a job
@@ -472,19 +530,57 @@ def _do_sweep_leftover_volumes(cluster: str) -> tuple[list[Any], list[str]]:
     Raising rather than returning a failure when the *listing* fails is deliberate: "we could not
     ask" and "we asked and there is nothing" must not collapse into the same answer. The caller
     turns the first into ``unknown`` and the second into ``succeeded``.
+
+    The delete is retried while DO says the volume is still attached (2026-08-23). Deleting once
+    and alarming turned that detach race into ``teardown_status: "failed"`` on a job that had
+    **succeeded**, sending ``lab wait`` to exit 3 over a volume DO removed moments later — the
+    false alarm this alarm cannot afford, since its whole value is being rare enough to believe
+    (R10). Only that message is waited on: a permission error or a bad request alarms on the first
+    attempt rather than after a minute of pointless sleeping.
+
+    Each pass **re-lists**. A volume that vanished counts as success just as much as one we
+    deleted ourselves — which is what actually settled the 2026-08-23 case, where something other
+    than this function removed the volume while we were reporting it as a leak.
+
+    Waiting here is cheap by construction: this only runs after ``sky.down`` succeeded, so the
+    droplet — the expensive half — is already destroyed and the ladder delays nothing that bills.
+    That is also why the ladder is not shortened for the abort path (``_ABORT_TEARDOWN_BACKOFFS``,
+    50s, where a SIGKILL may follow the signal that got us here): if the sweep is killed mid-wait
+    the volume is left for ``lab reconcile``'s ``do_volume_orphans`` pass, which is a better
+    outcome than the false alarm that racing produced.
     """
     client = _get_do_client()
     deleted: list[Any] = []
     failures: list[str] = []
     prefix = cluster.lower()
-    for vol in list_do_volumes(client):
-        if not str(vol.get("name", "")).lower().startswith(prefix):
-            continue
-        try:
-            client.volumes.delete(volume_id=str(vol["id"]))
-            deleted.append(vol["id"])
-        except Exception as e:  # noqa: BLE001 — found and un-removable is a real alarm
-            failures.append(f"volume {vol.get('name')}: {type(e).__name__}: {e}")
+    for delay in (0, *backoffs):
+        if delay:
+            time.sleep(delay)
+        matching = [
+            v for v in list_do_volumes(client)
+            if str(v.get("name", "")).lower().startswith(prefix)
+        ]
+        if not matching:
+            return deleted, []  # nothing named like ours is left, so nothing is billing
+        detaching: list[str] = []
+        terminal: list[str] = []
+        for vol in matching:
+            try:
+                client.volumes.delete(volume_id=str(vol["id"]))
+                deleted.append(vol["id"])
+            except Exception as e:  # noqa: BLE001 — found and un-removable is a real alarm
+                entry = f"volume {vol.get('name')}: {type(e).__name__}: {e}"
+                (detaching if _VOLUME_DETACH_MARKER in entry.lower() else terminal).append(entry)
+        failures = terminal + detaching
+        if not failures:
+            return deleted, []
+        if not detaching:
+            return deleted, terminal  # nothing here is waiting on a detach; waiting cannot help
+        # Partitioned rather than all-or-nothing: with two volumes under one cluster prefix, a
+        # sibling failing for an unrelated reason used to abandon the ladder and report the
+        # still-detaching volume as survived — re-creating the false alarm this exists to remove.
+        # A terminal failure means we will alarm regardless, but the detaching one still gets its
+        # chance, so only the volumes that genuinely did not go are named.
     return deleted, failures
 
 

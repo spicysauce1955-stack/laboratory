@@ -4,6 +4,59 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning is 
 breaks the surface in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md); MINOR may, and says so
 with a **BREAKING** entry and an upgrade note.
 
+## v0.8.0 — 2026-08-23
+
+Cost-guardrail and teardown work, from a second read of the 2026-08-23 event ledger.
+
+### BREAKING
+
+- **`lab submit` can now refuse a launch it previously accepted.** With `--price-cap` on Vast, the
+  cheapest matching live offer is checked *before* anything is rented; if even that offer is above
+  the cap, the submit fails with a `LabError` naming the real price and nothing is provisioned.
+  Previously the cap went only to SkyPilot's optimizer, which prices against a catalog that
+  under-reports Vast ~4x — so a job whose cheapest possible host cost $1.10/hr would happily launch
+  under a `--price-cap 0.85` and bill $1.10.
+  **Upgrade note:** if a submit starts failing with "above --price-cap", the cap was never being
+  honoured before — raise it above the quoted offer price, drop the flag, or use
+  `lab register --max-hourly` to queue until prices fall. A feed that cannot answer (no vastai-sdk,
+  API error, no matching offer) never blocks, so this cannot fail closed on an outage.
+
+### Fixed
+
+- **`--price-cap` did not cap anything on Vast.** Three of nine Vast jobs on 2026-08-23 billed over
+  a `$0.85` cap, two at **2.61x** (`$2.220/hr`); the two that finished cost **$5.50 against an
+  expected ~$1.03**. The cap reached exactly one place — `sky.Resources(max_hourly_cost=)` — and
+  SkyPilot applies it to its own catalog, which this repo already documented as under-reporting
+  Vast ~4x. The lab had been reading the true `dph_total` seconds after boot since v0.5 and never
+  compared it. It does now: `CostInfo` gains `cap_hourly_usd` and `over_cap` (both optional; older
+  manifests still read), an overrun prints once and notes the ledger, and the four `--price-cap`
+  help strings no longer claim to be a ceiling they cannot hold.
+- **A succeeded job was alarmed as a teardown leak.** DigitalOcean detaches a block volume from a
+  destroyed droplet asynchronously, and the volume sweep deleted it immediately and exactly once —
+  so "attached volume cannot be deleted" was recorded as a permanent failure. Job
+  `20260823-093642-0fddf1` succeeded, recorded `teardown_status: "failed"`, and would have sent
+  `lab wait` to exit 3; the volume was gone minutes later and nothing was ever billing. The delete
+  now retries while DO reports the volume still attached (measured window: attached at +13s, gone
+  by +34s), re-listing each pass so a volume that vanished counts as success. Only that message is
+  retried — a permission error still alarms on the first attempt.
+- **A pinned region provisioned slower than its timeout allowed.** Measured across every run on the
+  machine: unpinned Vast reaches UP in 66-209s, but the one `--region`-pinned launch took **526s** —
+  past the 480s default, surviving only because a 20m timeout had been passed by hand. Pinning
+  narrows the optimizer to one region's offers, so pinned launches now get 15m. Unpinned defaults
+  are unchanged; they measure out correctly. GCP is excluded, since its budget pays for a failover
+  walk that pinning shortens.
+
+### Added
+
+- **`--price-cap-strict`** (submit/sweep, CLI + MCP): destroy the machine rather than let it bill
+  above `--price-cap`. **Off by default** — "admission-control and stop-launching, never kill"
+  remains the rule, and it never fires on a price that could not be read.
+- **A warning for a wasteful `--provision-timeout`.** An override at or above 2x the cloud's
+  calibrated budget now says so once: a generous timeout is not a safety margin, it is exactly what
+  every dead offer costs. Three jobs spent 20 minutes each discovering dead Vast offers on
+  2026-08-23. Advisory only — it never shortens what was asked for, and is silent when a region is
+  pinned.
+
 ## v0.7.1 — 2026-08-23
 
 Four defects found by reading the event ledger of the first day of real v0.7.0 use. None cost

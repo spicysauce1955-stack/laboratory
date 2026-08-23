@@ -39,6 +39,7 @@ from lab.backends.skypilot import (
     preempted_teardown_confirmed,
     promote_timeout,
     provision_timeout_min,
+    wasteful_provision_timeout_warning,
     provision_with_watchdog,
     tear_down_and_record,
     vast_balance,
@@ -46,6 +47,7 @@ from lab.backends.skypilot import (
 )
 from lab.models import BackendInfo, CostInfo, JobManifest, JobState
 from lab.placement import CapacityMemo
+from lab.pricing import exceeds_cap, over_cap_warning
 from lab.preemption import classify_terminal
 from lab.redact import install_log_redaction
 from lab.storage import R2Store, r2_enabled
@@ -590,6 +592,30 @@ def resolve_cost(
     from lab.placement import storage_hourly_usd
 
     compute = _resolve_hourly(cluster, handle, cloud)
+    # The comparison the launch path never made. SkyPilot applied the cap to its own catalog,
+    # which under-reports Vast ~4x; `compute` is what the rental actually bills. Compared against
+    # `compute` rather than the storage-inclusive total, because --price-cap is documented as a
+    # ceiling on compute $/hr and folding storage in would make the check disagree with the flag.
+    cap = manifest.resources.max_hourly_usd
+    over: bool | None = None  # None = not checked, distinct from False = checked and fine
+    if cap is not None and compute is not None:
+        over = exceeds_cap(compute, cap)
+        if over:
+            # Loud, once. Not a teardown: "admission-control and stop-launching, never kill" is
+            # the rule here, and a job the user is watching should not vanish over price unless
+            # they asked for that (--price-cap-strict).
+            wall = parse_duration(manifest.resources.timeout)
+            print(over_cap_warning(compute, cap, cluster, wall))
+            events.note("price.over_cap", cluster=cluster, actual=compute, cap=cap)
+            # The note alone is not enough here. Notes flush into the record only when the call
+            # ends non-ok, and this path deliberately lets the job RUN ON — so an over-cap job
+            # that succeeds closes "ok" and the note is dropped, losing the record for exactly
+            # the jobs that cost money (two of the three 2026-08-23 overruns finished). `result`
+            # is persisted on every close, so the verdict rides there.
+            if (open_call := events.current()) is not None:
+                open_call.result(
+                    over_cap=True, actual_hourly_usd=compute, cap_hourly_usd=cap
+                )
     storage = storage_hourly_usd(cloud, manifest.resources.disk_size, instance_type)
     total = None if compute is None else compute + storage
     estimated = actual_cost(total, parse_duration(manifest.resources.timeout))
@@ -602,7 +628,39 @@ def resolve_cost(
         storage_hourly_usd=storage,
         hourly_basis=f"{shape} {priced} + {disk}GiB disk ${storage:.4f}/hr",
         estimated_usd=estimated,
+        cap_hourly_usd=cap,
+        over_cap=over,
     )
+
+
+
+def enforce_price_cap(
+    store: JobStore, job_id: str, cluster: str, cloud: str, *, cost: CostInfo, sky_mod: Any
+) -> bool:
+    """Stop a job billing above a strict cap. Returns ``True`` iff it was stopped.
+
+    Fires only on ``price_cap_strict`` **and** a definitive over-cap verdict. An unreadable price
+    is not an overrun, and destroying a machine over a number we could not read is the 2026-08
+    lesson pointing the other way.
+
+    Opt-in by construction: the default path reports and leaves the job alone, because
+    "admission-control and stop-launching, never kill" is the rule everywhere else in this
+    codebase and one flag should not quietly overturn it for everyone.
+    """
+    manifest = store.read_manifest(job_id)
+    if not manifest.resources.price_cap_strict or cost.over_cap is not True:
+        return False
+    actual, cap = cost.compute_hourly_usd, cost.cap_hourly_usd
+    if actual is None or cap is None:  # pragma: no cover — implied by over_cap is True
+        return False
+    reason = (
+        f"price cap: rental bills ${actual:.3f}/hr against --price-cap ${cap:.2f}/hr "
+        f"and --price-cap-strict was set; machine destroyed"
+    )
+    store.update_manifest(job_id, status=JobState.failed, ended_at=now(), end_reason=reason[:300])
+    events.note("price.cap_enforced", cluster=cluster, actual=actual, cap=cap)
+    tear_down_and_record(sky_mod, cluster, store, job_id, cloud)
+    return True
 
 
 def record_capacity_exhaustion(
@@ -1139,10 +1197,16 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                 # stream_and_get blocks until the job is submitted (0.12), i.e. until the host is UP.
                 # Bound it so a dead Vast offer stuck in "loading" can't hang the supervisor forever
                 # (FR-I1). The budget is per-cloud: Vast waits on one host, GCP walks a failover path.
-                provision_s = (
-                    parse_duration(manifest.resources.provision_timeout)
-                    or provision_timeout_min(cloud) * 60
-                )
+                # A pinned region narrows the offer pool and provisioning slows down with it
+                # (measured 2026-08-23: 526s pinned vs a 209s unpinned max), so the budget has to
+                # know which case it is in or it kills healthy pinned hosts.
+                pinned = bool(manifest.resources.region or manifest.resources.zone)
+                explicit_s = parse_duration(manifest.resources.provision_timeout)
+                provision_s = explicit_s or provision_timeout_min(cloud, pinned=pinned) * 60
+                if warning := wasteful_provision_timeout_warning(
+                    explicit_s, cloud, pinned=pinned
+                ):
+                    print(warning)
                 sky_job_id, handle = provision_with_watchdog(sky, request_id, timeout_s=provision_s)
                 # Record cost up-front so a running job already shows it (FR-I2). The host is UP now,
                 # so the Vast rental exists — bill at its real dph_total, not SkyPilot's low catalog
@@ -1174,6 +1238,10 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                         launched_spot=launched_spot,
                     ),
                 )
+                # Only now, with the cost recorded, may a strict cap stop the job — otherwise the
+                # manifest would explain the teardown with a rate it never stored.
+                if enforce_price_cap(store, job_id, cluster, cloud, cost=cost_info, sky_mod=sky):
+                    return 1
             else:
                 # Adopting a running cluster: re-price it, but keep the estimate agreed at launch —
                 # that number was the user's authorisation and must not drift under them.

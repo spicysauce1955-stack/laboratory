@@ -383,6 +383,69 @@ def resolve_backend_profile(
     return "skypilot", resources.model_copy(update=update)
 
 
+def _vast_price_feed() -> Any | None:
+    """The scheduler's live Vast offer feed, or ``None`` if it cannot be constructed.
+
+    A module-level function rather than an inline import so tests have a seam.
+
+    Note that a missing vastai-sdk does **not** come back here as ``None``:
+    ``lab.scheduler.price`` imports nothing from the SDK at module scope (``_get_vast_client`` is
+    function-local), so ``VastPriceFeed()`` always constructs and the missing extra surfaces from
+    ``best_hourly`` instead, where the caller catches it. Both routes fail open; this one is kept
+    for a genuinely unimportable module rather than for the SDK.
+    """
+    try:
+        from lab.scheduler.price import VastPriceFeed
+    except ImportError:
+        return None
+    return VastPriceFeed()
+
+
+def _check_price_cap_admission(
+    cloud: str | None, accelerators: str | None, price_cap: float | None
+) -> None:
+    """Refuse a cap the live offer feed says nothing can meet. Raises :class:`LabError`, else None.
+
+    Vast-only. On DO/GCP SkyPilot's catalog is accurate *for the region actually launched into*,
+    so the optimizer's own enforcement is sound there and a Vast-shaped gate would be wrong.
+
+    Never blocks on doubt. The feed prices the **cheapest matching** offer, so "cheapest > cap" is
+    a definitive negative — nothing on offer can satisfy this cap, and renting anything would be
+    renting something we already know is too expensive. A feed that errors, is absent, or matches
+    no offer says nothing at all and the launch proceeds; that is ``lab doctor``'s rule ("only
+    definitive negatives block") applied to prices.
+
+    This cannot promise the cap will *hold* — the optimizer need not land on the cheapest offer —
+    which is why ``resolve_cost`` still checks the billed rate afterwards. The two are complements,
+    not duplicates.
+    """
+    # `res.cloud` is None for the default cloud, and the default IS Vast — spelled `cloud or
+    # "vast"` at every other site (skypilot.py:1522/:1561/:1895/:1967, sky_runner.py:1134).
+    # Comparing the raw value skipped a bare `lab submit --price-cap ...`, i.e. the exact shape of
+    # the incident this gate exists for.
+    if price_cap is None or (cloud or "vast") != "vast":
+        return
+    feed = _vast_price_feed()
+    if feed is None:
+        return
+    try:
+        best = feed.best_hourly(accelerators)
+    except Exception as e:  # noqa: BLE001 — a feed that cannot answer must never block a launch
+        # Common and benign: vastai-sdk is an optional extra, so this fires on every capped
+        # submit on a machine without it. Say what it means for the cap, not just that it failed.
+        print(
+            f"[lab] no live Vast price feed ({type(e).__name__}), so --price-cap is not "
+            f"pre-checked; SkyPilot's catalog estimate still applies and the billed rate is "
+            f"still checked after boot",
+            file=sys.stderr,
+        )
+        return
+    if best is not None and best > price_cap:
+        from lab.pricing import cap_admission_error
+
+        raise LabError(cap_admission_error(best, price_cap, accelerators))
+
+
 class Lab:
     def __init__(self, backend: Backend, repo: Path, home: Path) -> None:
         self.backend = backend
@@ -429,6 +492,11 @@ class Lab:
         """
         if preflight:
             self.preflight(spec)
+        # Before a job id exists, let alone a manifest or a rental: a cap nothing on offer can
+        # meet is knowable for free, and refusing here costs $0 instead of a provisioned box.
+        _check_price_cap_admission(
+            spec.resources.cloud, spec.resources.accelerators, spec.resources.max_hourly_usd
+        )
         job_id = _new_job_id()
         if code is None:
             try:

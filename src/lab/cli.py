@@ -248,10 +248,11 @@ def submit(
         None, help="hard wall-clock cap, e.g. 2h / 30m / 45s — on overrun the job is killed, the "
         "machine torn down, and the run marked timed_out (FR-I1)"
     ),
-    provision_timeout: str | None = typer.Option(None, "--provision-timeout", help="abort if the host doesn't reach UP in time, e.g. 10m (skypilot; default per-cloud: vast 8m, do 12m, gcp 20m)"),
+    provision_timeout: str | None = typer.Option(None, "--provision-timeout", help="abort if the host doesn't reach UP in time, e.g. 10m (skypilot; default per-cloud: vast 8m, do 12m, gcp 20m; 15m when --region/--zone is pinned)"),
     region: str | None = typer.Option(None, "--region", help="pin the cloud region, e.g. europe-west1 (skypilot; default: the optimizer picks)"),
     zone: str | None = typer.Option(None, "--zone", help="pin the zone, e.g. europe-west1-b (skypilot)"),
-    price_cap: float | None = typer.Option(None, "--price-cap", help="refuse any instance above this compute $/hr — enforced by SkyPilot's optimizer, so the worst case is a ceiling not an estimate"),
+    price_cap: float | None = typer.Option(None, "--price-cap", help="ceiling on compute $/hr, applied by SkyPilot's optimizer against its own catalog estimate — on Vast that catalog under-reports ~4x, so the rental can bill above this"),
+    price_cap_strict: bool = typer.Option(False, "--price-cap-strict", help="destroy the machine if the rental bills above --price-cap (default: warn and keep running)"),
     with_pkg: list[str] = typer.Option(None, "--with", help="extra runtime package(s) for this job (repeatable; layered via uv run --with)"),
     spot: bool = typer.Option(False, "--spot", help="use spot/interruptible instances (skypilot)"),
     no_fallback: bool = typer.Option(
@@ -281,6 +282,7 @@ def submit(
     resources = ResourceRequest(
         cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
         cloud=cloud, region=region, zone=zone, max_hourly_usd=price_cap,
+        price_cap_strict=price_cap_strict,
         timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
         spot_fallback=not no_fallback,
     )
@@ -356,10 +358,11 @@ def sweep(
     disk_size: int | None = typer.Option(None, "--disk-size", help="boot/attached volume size in GB per job (skypilot; DO volume size). cpu backend defaults to 50"),
     accelerators: str | None = typer.Option(None, "--accelerators"),
     timeout: str | None = typer.Option(None, help="wall-clock per job, e.g. 2h"),
-    provision_timeout: str | None = typer.Option(None, "--provision-timeout", help="abort a host that doesn't reach UP in time, e.g. 10m (skypilot; default per-cloud: vast 8m, do 12m, gcp 20m)"),
+    provision_timeout: str | None = typer.Option(None, "--provision-timeout", help="abort a host that doesn't reach UP in time, e.g. 10m (skypilot; default per-cloud: vast 8m, do 12m, gcp 20m; 15m when --region/--zone is pinned)"),
     region: str | None = typer.Option(None, "--region", help="pin the cloud region for every job, e.g. europe-west1 (skypilot)"),
     zone: str | None = typer.Option(None, "--zone", help="pin the zone for every job, e.g. europe-west1-b (skypilot)"),
-    price_cap: float | None = typer.Option(None, "--price-cap", help="refuse any instance above this compute $/hr, per job (enforced by SkyPilot's optimizer)"),
+    price_cap: float | None = typer.Option(None, "--price-cap", help="ceiling on compute $/hr per job, applied against SkyPilot's catalog estimate (Vast rentals can bill above it)"),
+    price_cap_strict: bool = typer.Option(False, "--price-cap-strict", help="destroy the machine if the rental bills above --price-cap (default: warn and keep running)"),
     with_pkg: list[str] = typer.Option(None, "--with", help="extra runtime package(s) per job (repeatable; layered via uv run --with)"),
     spot: bool = typer.Option(False, "--spot", help="use spot/interruptible instances (skypilot)"),
     no_fallback: bool = typer.Option(
@@ -386,6 +389,7 @@ def sweep(
     resources = ResourceRequest(
         cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
         cloud=cloud, region=region, zone=zone, max_hourly_usd=price_cap,
+        price_cap_strict=price_cap_strict,
         timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
         spot_fallback=not no_fallback,
     )
@@ -1045,8 +1049,14 @@ def register(
     zone: str | None = typer.Option(None, "--zone", help="pin the zone, e.g. europe-west1-b"),
     price_cap: float | None = typer.Option(
         None, "--price-cap",
-        help="refuse any instance above this compute $/hr (enforced by SkyPilot's optimizer; "
-             "unlike --max-hourly this is a ceiling, not a wait-until trigger)",
+        help="ceiling on compute $/hr, applied against SkyPilot's catalog estimate (Vast "
+             "rentals can bill above it); unlike --max-hourly this is not a wait-until trigger",
+    ),
+    price_cap_strict: bool = typer.Option(
+        False, "--price-cap-strict",
+        help="destroy the machine if the rental bills above --price-cap (default: warn and keep "
+             "running). Matters most for deferred jobs: they launch unattended, so an unnoticed "
+             "overrun bills longest",
     ),
     timeout: str | None = typer.Option(
         None, help="wall-clock limit per job, e.g. 2h (cost bound, FR-I1)"
@@ -1102,6 +1112,7 @@ def register(
         resources=ResourceRequest(
             cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, cloud=cloud,
             region=region, zone=zone, max_hourly_usd=price_cap,
+            price_cap_strict=price_cap_strict,
             timeout=timeout, use_spot=spot, spot_fallback=not no_fallback,
         ),
         submitted_by="human",
@@ -1149,8 +1160,14 @@ def register_sweep(
     zone: str | None = typer.Option(None, "--zone", help="pin the zone, e.g. europe-west1-b"),
     price_cap: float | None = typer.Option(
         None, "--price-cap",
-        help="refuse any instance above this compute $/hr (enforced by SkyPilot's optimizer; "
-             "unlike --max-hourly this is a ceiling, not a wait-until trigger)",
+        help="ceiling on compute $/hr, applied against SkyPilot's catalog estimate (Vast "
+             "rentals can bill above it); unlike --max-hourly this is not a wait-until trigger",
+    ),
+    price_cap_strict: bool = typer.Option(
+        False, "--price-cap-strict",
+        help="destroy the machine if the rental bills above --price-cap (default: warn and keep "
+             "running). Matters most for deferred jobs: they launch unattended, so an unnoticed "
+             "overrun bills longest",
     ),
     timeout: str | None = typer.Option(
         None, help="wall-clock limit per job, e.g. 2h (cost bound, FR-I1)"
@@ -1205,6 +1222,7 @@ def register_sweep(
     resources = ResourceRequest(
         cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, cloud=cloud,
             region=region, zone=zone, max_hourly_usd=price_cap,
+            price_cap_strict=price_cap_strict,
         timeout=timeout, use_spot=spot, spot_fallback=not no_fallback,
     )
     try:
