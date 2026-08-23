@@ -4,6 +4,74 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning is 
 breaks the surface in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md); MINOR may, and says so
 with a **BREAKING** entry and an upgrade note.
 
+## v0.7.0 — 2026-08-23
+
+The 2026-08-20/21 reliability work. Two live incidents, 22 defects, and a code review that found
+nine more — seven of which the fixes themselves had introduced.
+
+### BREAKING
+
+- **`lab reconcile` no longer destroys a resource it cannot prove it owns.** Its orphan test used
+  to be "named `lab-*` and not in *this repo's* `runs/`", joining machine-global cloud state
+  against a per-project job store. On 2026-08-20 that destroyed **seven running jobs belonging to
+  another project on the same machine**, then reported nothing destroyed and exited 0. Ownership is
+  now proved via a user-global job index (`~/.lab/jobs/index.jsonl`), the project-tagged event
+  ledger, this project's own `runs/`, and the project slug now stamped into cluster names and GCP
+  labels. Anything owned elsewhere is reported under `other_projects`, anything unprovable under
+  `unattributed`; **neither is ever destroyed.**
+  **Upgrade note:** a leak belonging to another project can no longer be cleaned from this one —
+  run `lab reconcile` *from that project*, which is the only place that can tell leaked from live.
+- **New exit codes.** `lab wait` gains **6** (teardown outcome unknown — verify against the
+  provider); `lab reconcile` gains **5** (a destroy did not confirm success). On `lab wait`,
+  3 outranks 6 outranks 4. A caller treating "non-zero" as failure is unaffected; one enumerating
+  codes must learn them.
+- **`teardown_status` gains a third non-null value, `"unknown"`.** Previously the field was chosen
+  by `"succeeded" if succeeded else "failed"`, so an unreadable outcome had to be recorded as an
+  alarm. On 2026-08-20 seven teardowns recorded `failed` while all seven machines had in fact been
+  destroyed — a 100% false-alarm rate on the one signal FR-C2 exists to raise.
+  **Upgrade note:** treat an unrecognised value as `unknown`, never as success.
+- **Cluster names now carry the project:** `lab-<project-slug>-<job_id>`. Legacy `lab-<job_id>`
+  names still parse and are still protected, so clusters launched by an older release are matched
+  and never orphaned by the rename.
+
+### Fixed
+
+- **The supervisor ignored "cluster does not exist".** A job whose machine vanished polled a dead
+  cluster for up to `timeout + 300s` — 65 consecutive definitive answers observed in one log. It
+  now ends the wait on the first one, records `cluster disappeared mid-run`, and tears down.
+  Confirmed live: 22 seconds from droplet destroyed to recorded.
+- **Partial results were never fetched while a job was healthy.** `sky.tail_logs(follow=True)`
+  blocks for the whole run, and the only caller of the heartbeat ran *after* it — so the fetch
+  only ever fired when the box was finished (redundant) or unreachable (impossible). Four jobs
+  finished with empty `output/` despite the experiment fsyncing every result row. The fetch now
+  runs on its own thread started before streaming, and records what it actually transferred.
+- **The local wall-clock cap was anchored to the wrong moment** — computed after `tail_logs`
+  returned, so a 7h cap permitted 703 minutes. It is now anchored to the job's start.
+- **`lab cancel` marked a job terminal before releasing its machine.** An interrupted cancel left
+  `cancelled` with no teardown record — terminal, clean-looking, possibly still billing. Teardown
+  now happens first and the terminal status is written last.
+- **DigitalOcean gained the provider-direct teardown fallback** Vast and GCP already had, and a
+  clean `sky.down` there no longer implies the block volume is gone (a launch that failed partway
+  stranded a 50 GB volume that reported a successful teardown).
+- **A SkyPilot client/server version skew** made a *successful* `sky.down` undecodable, inverting
+  the money alarm in both directions. Detected now, and the sky pass stands down rather than
+  destroying through a client that cannot read the result.
+- **Liveness checks compare process identity, not just the PID** — a recycled PID reported a
+  long-dead supervisor alive forever, silently disabling every self-heal that depends on it. A
+  zombie is no longer read as alive either.
+- **A signalled supervisor labels its own death and tears down its machine** instead of vanishing.
+- **`lab <cmd> --help` exits 0 when its output is piped into a reader that closes early**, and
+  `lab kill` now suggests `lab cancel` — 19 attempts across 13 jobs went unanswered on 2026-08-19.
+
+### Added
+
+- **Timestamps on every line of a job's log**, including third-party ssh and provisioning output.
+  `LAB_LOG_TIMESTAMPS=0` restores the old format.
+- **`lab status` reports `partials`** (whether partial results are actually being retrieved) and
+  **`runner_exit`** (how the supervisor died, where that can be observed — and, where it cannot,
+  that fact with its reason).
+- `lab reconcile` reports `sky_pass`, `other_projects`, `unattributed` and `destroy_outcomes`.
+
 ## v0.6.2 — 2026-08-19
 
 ### Fixed
