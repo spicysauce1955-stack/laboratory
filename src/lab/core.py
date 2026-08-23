@@ -383,6 +383,53 @@ def resolve_backend_profile(
     return "skypilot", resources.model_copy(update=update)
 
 
+def _vast_price_feed() -> Any | None:
+    """The scheduler's live Vast offer feed, or ``None`` when vastai-sdk is not installed.
+
+    A module-level function rather than an inline import so tests have a seam, and so the optional
+    extra stays optional: no feed is not a price verdict.
+    """
+    try:
+        from lab.scheduler.price import VastPriceFeed
+    except ImportError:
+        return None
+    return VastPriceFeed()
+
+
+def _check_price_cap_admission(
+    cloud: str | None, accelerators: str | None, price_cap: float | None
+) -> None:
+    """Refuse a cap the live offer feed says nothing can meet. Raises :class:`LabError`, else None.
+
+    Vast-only. On DO/GCP SkyPilot's catalog is accurate *for the region actually launched into*,
+    so the optimizer's own enforcement is sound there and a Vast-shaped gate would be wrong.
+
+    Never blocks on doubt. The feed prices the **cheapest matching** offer, so "cheapest > cap" is
+    a definitive negative — nothing on offer can satisfy this cap, and renting anything would be
+    renting something we already know is too expensive. A feed that errors, is absent, or matches
+    no offer says nothing at all and the launch proceeds; that is ``lab doctor``'s rule ("only
+    definitive negatives block") applied to prices.
+
+    This cannot promise the cap will *hold* — the optimizer need not land on the cheapest offer —
+    which is why ``resolve_cost`` still checks the billed rate afterwards. The two are complements,
+    not duplicates.
+    """
+    if price_cap is None or cloud != "vast":
+        return
+    feed = _vast_price_feed()
+    if feed is None:
+        return
+    try:
+        best = feed.best_hourly(accelerators)
+    except Exception as e:  # noqa: BLE001 — a feed that cannot answer must never block a launch
+        print(f"[lab] vast price feed unavailable, skipping cap pre-check: {e}", file=sys.stderr)
+        return
+    if best is not None and best > price_cap:
+        from lab.pricing import cap_admission_error
+
+        raise LabError(cap_admission_error(best, price_cap, accelerators))
+
+
 class Lab:
     def __init__(self, backend: Backend, repo: Path, home: Path) -> None:
         self.backend = backend
@@ -429,6 +476,11 @@ class Lab:
         """
         if preflight:
             self.preflight(spec)
+        # Before a job id exists, let alone a manifest or a rental: a cap nothing on offer can
+        # meet is knowable for free, and refusing here costs $0 instead of a provisioned box.
+        _check_price_cap_admission(
+            spec.resources.cloud, spec.resources.accelerators, spec.resources.max_hourly_usd
+        )
         job_id = _new_job_id()
         if code is None:
             try:
