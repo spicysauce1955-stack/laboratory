@@ -243,7 +243,7 @@ def submit(
     memory: str | None = typer.Option(None, help="e.g. 8 or 8+ (GB)"),
     gpus: int | None = typer.Option(None),
     disk_size: int | None = typer.Option(None, "--disk-size", help="boot/attached volume size in GB (skypilot; DO volume size). cpu backend defaults to 50"),
-    accelerators: str | None = typer.Option(None, "--accelerators", help="e.g. RTX_3070:1 (required for Vast)"),
+    accelerators: str | None = typer.Option(None, "--accelerators", help="sky-catalog name, e.g. RTX4090:1 — no underscore (required for Vast)"),
     timeout: str | None = typer.Option(
         None, help="hard wall-clock cap, e.g. 2h / 30m / 45s — on overrun the job is killed, the "
         "machine torn down, and the run marked timed_out (FR-I1)"
@@ -1034,7 +1034,7 @@ def register(
     memory: str | None = typer.Option(None),
     gpus: int | None = typer.Option(None),
     accelerators: str | None = typer.Option(
-        None, "--gpu", "--accelerators", help="e.g. RTX_4090:1"
+        None, "--gpu", "--accelerators", help="sky-catalog name, e.g. RTX4090:1 — no underscore"
     ),
     cloud: str | None = typer.Option(
         None, "--cloud", help="vast | do | gcp (default vast; price/offer triggers are Vast-only)"
@@ -1138,7 +1138,7 @@ def register_sweep(
     memory: str | None = typer.Option(None),
     gpus: int | None = typer.Option(None),
     accelerators: str | None = typer.Option(
-        None, "--gpu", "--accelerators", help="e.g. RTX_4090:1"
+        None, "--gpu", "--accelerators", help="sky-catalog name, e.g. RTX4090:1 — no underscore"
     ),
     cloud: str | None = typer.Option(
         None, "--cloud", help="vast | do | gcp (default vast; price/offer triggers are Vast-only)"
