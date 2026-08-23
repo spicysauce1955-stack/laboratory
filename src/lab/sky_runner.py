@@ -47,6 +47,7 @@ from lab.backends.skypilot import (
 )
 from lab.models import BackendInfo, CostInfo, JobManifest, JobState
 from lab.placement import CapacityMemo
+from lab.pricing import exceeds_cap, over_cap_warning
 from lab.preemption import classify_terminal
 from lab.redact import install_log_redaction
 from lab.storage import R2Store, r2_enabled
@@ -591,6 +592,21 @@ def resolve_cost(
     from lab.placement import storage_hourly_usd
 
     compute = _resolve_hourly(cluster, handle, cloud)
+    # The comparison the launch path never made. SkyPilot applied the cap to its own catalog,
+    # which under-reports Vast ~4x; `compute` is what the rental actually bills. Compared against
+    # `compute` rather than the storage-inclusive total, because --price-cap is documented as a
+    # ceiling on compute $/hr and folding storage in would make the check disagree with the flag.
+    cap = manifest.resources.max_hourly_usd
+    over: bool | None = None  # None = not checked, distinct from False = checked and fine
+    if cap is not None and compute is not None:
+        over = exceeds_cap(compute, cap)
+        if over:
+            # Loud, once. Not a teardown: "admission-control and stop-launching, never kill" is
+            # the rule here, and a job the user is watching should not vanish over price unless
+            # they asked for that (--price-cap-strict).
+            wall = parse_duration(manifest.resources.timeout)
+            print(over_cap_warning(compute, cap, cluster, wall))
+            events.note("price.over_cap", cluster=cluster, actual=compute, cap=cap)
     storage = storage_hourly_usd(cloud, manifest.resources.disk_size, instance_type)
     total = None if compute is None else compute + storage
     estimated = actual_cost(total, parse_duration(manifest.resources.timeout))
@@ -603,6 +619,8 @@ def resolve_cost(
         storage_hourly_usd=storage,
         hourly_basis=f"{shape} {priced} + {disk}GiB disk ${storage:.4f}/hr",
         estimated_usd=estimated,
+        cap_hourly_usd=cap,
+        over_cap=over,
     )
 
 
