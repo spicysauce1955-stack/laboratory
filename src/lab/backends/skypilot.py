@@ -459,7 +459,19 @@ def list_do_droplets(client: Any | None = None) -> list[dict[str, Any]]:
     return [dict(d) for d in (droplets or [])]
 
 
-def _do_sweep_leftover_volumes(cluster: str) -> tuple[list[Any], list[str]]:
+# DO detaches a block volume from a destroyed droplet *asynchronously*, so a delete issued the
+# instant `sky.down` returns can be refused for a volume that is seconds away from deletable.
+# DO's wording, verbatim from the 2026-08-23 manifest that alarmed.
+_VOLUME_DETACH_MARKER = "attached volume cannot be deleted"
+# Measured live that day, not guessed: job 20260823-093644-873c9d ended at 12:07:24Z, its volume
+# still listed `attached` at 12:07:37 and was gone by 12:07:58. ~60s of ladder covers that with
+# room to spare, and costs nothing on the common path where the first delete is accepted.
+_VOLUME_DETACH_BACKOFFS = (5, 10, 15, 30)
+
+
+def _do_sweep_leftover_volumes(
+    cluster: str, *, backoffs: tuple[int, ...] = _VOLUME_DETACH_BACKOFFS
+) -> tuple[list[Any], list[str]]:
     """Delete any block volume still named after ``cluster``. Raises if DO cannot be asked.
 
     A clean ``sky.down`` is not proof the storage is gone (P4-a, found live 2026-08-20): a job
@@ -472,19 +484,49 @@ def _do_sweep_leftover_volumes(cluster: str) -> tuple[list[Any], list[str]]:
     Raising rather than returning a failure when the *listing* fails is deliberate: "we could not
     ask" and "we asked and there is nothing" must not collapse into the same answer. The caller
     turns the first into ``unknown`` and the second into ``succeeded``.
+
+    The delete is retried while DO says the volume is still attached (2026-08-23). Deleting once
+    and alarming turned that detach race into ``teardown_status: "failed"`` on a job that had
+    **succeeded**, sending ``lab wait`` to exit 3 over a volume DO removed moments later — the
+    false alarm this alarm cannot afford, since its whole value is being rare enough to believe
+    (R10). Only that message is waited on: a permission error or a bad request alarms on the first
+    attempt rather than after a minute of pointless sleeping.
+
+    Each pass **re-lists**. A volume that vanished counts as success just as much as one we
+    deleted ourselves — which is what actually settled the 2026-08-23 case, where something other
+    than this function removed the volume while we were reporting it as a leak.
+
+    Waiting here is cheap by construction: this only runs after ``sky.down`` succeeded, so the
+    droplet — the expensive half — is already destroyed and the ladder delays nothing that bills.
+    That is also why the ladder is not shortened for the abort path (``_ABORT_TEARDOWN_BACKOFFS``,
+    50s, where a SIGKILL may follow the signal that got us here): if the sweep is killed mid-wait
+    the volume is left for ``lab reconcile``'s ``do_volume_orphans`` pass, which is a better
+    outcome than the false alarm that racing produced.
     """
     client = _get_do_client()
     deleted: list[Any] = []
     failures: list[str] = []
     prefix = cluster.lower()
-    for vol in list_do_volumes(client):
-        if not str(vol.get("name", "")).lower().startswith(prefix):
-            continue
-        try:
-            client.volumes.delete(volume_id=str(vol["id"]))
-            deleted.append(vol["id"])
-        except Exception as e:  # noqa: BLE001 — found and un-removable is a real alarm
-            failures.append(f"volume {vol.get('name')}: {type(e).__name__}: {e}")
+    for delay in (0, *backoffs):
+        if delay:
+            time.sleep(delay)
+        matching = [
+            v for v in list_do_volumes(client)
+            if str(v.get("name", "")).lower().startswith(prefix)
+        ]
+        if not matching:
+            return deleted, []  # nothing named like ours is left, so nothing is billing
+        failures = []
+        for vol in matching:
+            try:
+                client.volumes.delete(volume_id=str(vol["id"]))
+                deleted.append(vol["id"])
+            except Exception as e:  # noqa: BLE001 — found and un-removable is a real alarm
+                failures.append(f"volume {vol.get('name')}: {type(e).__name__}: {e}")
+        if not failures:
+            return deleted, []
+        if not all(_VOLUME_DETACH_MARKER in f.lower() for f in failures):
+            return deleted, failures  # not the detach race — waiting cannot help
     return deleted, failures
 
 
