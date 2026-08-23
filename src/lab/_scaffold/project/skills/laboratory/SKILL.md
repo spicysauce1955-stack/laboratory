@@ -419,11 +419,19 @@ R2-mirrored manifest, incl. cost) → `lab fetch <job_id>` (artifacts come from 
 - **GPU names: use the sky-catalog form `RTX4090:1`** (no underscore). Vast's own API says
   `RTX_4090` — the price feed translates automatically, but sky's launcher does NOT: an
   underscored name fails with "Catalog does not contain any instances".
-- **Set `--max-hourly` ~2× the cheapest live offer.** Sky picks hosts by its *stale catalog*
-  price; the actual Vast rental often bills 2–6× the cheapest offer. Too-tight caps trigger
-  the post-launch price-verify **rollback loop** (rent → detect over-price → teardown →
-  retry), each cycle costing cents until `--expires`. The real cost bound is
-  `--timeout` × actual hourly, capped by `--max-cost`.
+- **`--price-cap` is checked against real offers now, but is still not a hard ceiling.** Sky
+  picks hosts by its *stale catalog* price, which under-reports Vast ~4×, so on 2026-08-23
+  three of nine jobs billed over a `$0.85` cap (two at 2.61×, `$2.22/hr`). Since v0.8.0 the
+  cheapest **live** offer is checked before renting — an impossible cap now fails the submit
+  for free — and the **billed** rate is compared after boot, printing `PRICE CAP EXCEEDED` and
+  recording `over_cap` on the manifest. The optimizer can still land above the cheapest offer,
+  so add `--price-cap-strict` if you need the box destroyed rather than reported. The real
+  cost bound is `--timeout` × actual hourly, capped by `--max-cost`.
+- **A generous `--provision-timeout` is not a safety margin — it is what every dead offer
+  costs.** ~30% of Vast offers on 2026-08-23 never came up, and each burned the full 20m that
+  had been passed by hand; a healthy unpinned host reaches UP in 66–209s. Leave it unset unless
+  you pin a region (`--region` narrows the pool: the one pinned launch took 526s, and pinned
+  jobs get a 15m default for that reason).
 - **`lab logs` / `lab metrics` do NOT work from the laptop for scheduler-launched jobs**
   (only the manifest is mirrored to R2; they exit 2 with a structured error). Use
   `lab status` + `lab fetch` from the laptop; for live logs, tail them on the scheduler host

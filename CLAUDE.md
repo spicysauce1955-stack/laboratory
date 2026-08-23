@@ -95,10 +95,21 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   optimizer enforces. **Estimates are bands and guardrails check the top** — `get_cost()` on an
   unpinned `Resources` returns the cheapest region's price, which made admission control
   systematically permissive; the ceiling is priced on-demand whenever `spot_fallback` could land
-  there. `CostInfo.hourly_usd` is **compute + storage**; no gcp/do job may inherit SkyPilot's
+  there. **`--price-cap` is checked in three places since v0.8.0**, because SkyPilot alone does not hold
+  it: the cheapest *live* Vast offer gates admission before anything is rented (`lab.core.
+  _check_price_cap_admission`, Vast-only — a feed that cannot answer never blocks), the *billed*
+  `dph_total` is compared after boot and recorded as `CostInfo.over_cap`/`cap_hourly_usd`
+  (three-state: `None` = not checked), and `--price-cap-strict` opts in to destroying a box that
+  bills over. The pure predicates live in **`lab.pricing`** (no sky, no vastai). Sky's own
+  enforcement is against its catalog, which under-reports Vast ~4x — three of nine jobs billed
+  over cap on 2026-08-23, two at 2.61x.
+  `CostInfo.hourly_usd` is **compute + storage**; no gcp/do job may inherit SkyPilot's
   256 GB disk (50 GB cpu, 100 GB GPU — `placement.effective_disk_gb`, applied in **`build_task`**
   because the scheduler launches registrations without calling `resolve_backend_profile`).
-  Provision timeouts are per-cloud (gcp 20m). Diagnostics from these paths go to **stderr**:
+  Provision timeouts are per-cloud (gcp 20m) and **larger when a region/zone is pinned** (15m):
+  pinning narrows the offer pool, and the one pinned launch measured took 526s against a 480s
+  unpinned budget. An explicit `--provision-timeout` at 2x+ the calibrated budget warns — it is
+  what every dead offer costs, not a margin. Diagnostics from these paths go to **stderr**:
   stdout carries only JSON, which callers parse.
 - **Preflight (`lab doctor`, `lab.doctor`):** checks credentials (incl. SkyPilot's daemon, which
   does not inherit `.env`), project, billing, APIs, IAM permissions and quota before a launch

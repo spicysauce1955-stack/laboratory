@@ -19,6 +19,11 @@ upgrade note.
   | `lab wait` | clean | gave up on `--timeout` | bad args | teardown leaked — a paid machine may still be billing | `--fail-fast` tripped | — | teardown outcome **unknown** — verify against the provider |
   | `lab reconcile` | nothing to do | — | error | orphans found in dry-run (re-run with `--apply`) | declined the prompt, or no tty and no `--yes` — **nothing was destroyed** | a destroy did not confirm success | — |
 
+  `lab submit`/`lab sweep` gained a refusal path in v0.8.0: with `--price-cap` on Vast, a cap
+  below the cheapest live offer fails the submit (exit 1) instead of launching a job that
+  would bill over it. A price feed that cannot answer never blocks, so this does not fail
+  closed on a Vast API outage.
+
   On `lab wait`, 3 outranks 6 outranks 4: a *confirmed* leak is the most urgent signal, an
   unverifiable one is still a money signal, and both outrank the fail-fast notice. Exit 5 and 6
   were added in v0.7.0; a caller that treats "non-zero" as failure is unaffected, one that
@@ -37,7 +42,7 @@ upgrade note.
 - **On disk** — the layout of `runs/<job_id>/` and the manifest schema. Field *values* can gain
   members the same way fields can be added: `teardown_status` grew a third non-null value,
   `"unknown"` (v0.7.0), meaning the destroy's outcome could not be read and nothing could verify
-  it. **Treat an unrecognised value as `unknown`, never as success** — that rule is what makes
+  it. `CostInfo` grew `cap_hourly_usd` and `over_cap` (v0.8.0), the cap a job was submitted under and whether the rental honoured it; `over_cap` is three-state, where `null` means the check did not run (no cap, or no price readable) and is not the same as `false`. **Treat an unrecognised value as `unknown`, never as success** — that rule is what makes
   adding one safe. `logs.txt` gained a leading UTC timestamp per line in v0.7.0
   (`LAB_LOG_TIMESTAMPS=0` restores the old format); its *content* has never been frozen, but
   anything parsing it should expect the prefix. A newer lab always reads
