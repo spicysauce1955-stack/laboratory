@@ -182,3 +182,53 @@ class TestStrictModeIsOptIn:
             store, "pcs4", "lab-pcs4", "vast", cost=cost, sky_mod=object()
         ) is False
         assert torn == []
+
+
+class TestTheOverrunSurvivesASuccessfulClose:
+    """An over-cap job that *finishes* must still be findable in `lab history`.
+
+    `events.note` buffers onto the open call and `record.finish` flushes the trace only
+    `if outcome != "ok"` — by design, so successes stay small. But the default price-cap path
+    deliberately does NOT stop the job: it warns and lets it run to completion, so the supervisor
+    closes `ok` and the note is discarded. That loses the record for exactly the jobs that cost
+    money — two of the three 2026-08-23 overruns finished, and they are the $5.50 pair.
+
+    `lab history` / `lab report` is the tool the incident was actually found with, so the verdict
+    has to ride on `result`, which is persisted on every close, not on a note.
+    """
+
+    def _last_close(self):
+        from lab.events import store
+
+        return [r for r in store.iter_records(store.day_files()) if r["phase"] == "close"][-1]
+
+    def test_a_successful_over_cap_job_is_still_in_the_ledger(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("LAB_EVENTS_DIR", str(tmp_path / "events"))
+        monkeypatch.delenv("LAB_EVENTS", raising=False)
+        from lab import events
+
+        call = events.begin("supervisor", "run", {"job_id": "pcl1"})
+        _cost(monkeypatch, 2.220, 0.85)
+        events.finish(call, outcome="ok", exit_code=0)
+
+        close = self._last_close()
+        assert close["outcome"] == "ok"
+        assert close["result"].get("over_cap") is True, (
+            f"an over-cap job that succeeded left no durable record: {close}"
+        )
+        assert close["result"].get("cap_hourly_usd") == 0.85
+        assert close["result"].get("actual_hourly_usd") == pytest.approx(2.220)
+
+    def test_a_job_inside_the_cap_adds_nothing(self, tmp_path, monkeypatch) -> None:
+        """Successes are compacted; a job that behaved must not grow the record."""
+        monkeypatch.setenv("LAB_EVENTS_DIR", str(tmp_path / "events"))
+        monkeypatch.delenv("LAB_EVENTS", raising=False)
+        from lab import events
+
+        call = events.begin("supervisor", "run", {"job_id": "pcl2"})
+        _cost(monkeypatch, 0.736, 0.85)
+        events.finish(call, outcome="ok", exit_code=0)
+
+        assert "over_cap" not in self._last_close()["result"]

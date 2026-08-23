@@ -59,7 +59,9 @@ def _lab(tmp_path: Path) -> Lab:
     return Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
 
 
-def _spec(cap: float | None, cloud: str = "vast", accel: str | None = "RTX4090:1") -> JobSpec:
+def _spec(
+    cap: float | None, cloud: str | None = "vast", accel: str | None = "RTX4090:1"
+) -> JobSpec:
     return JobSpec(
         code_ref="HEAD",
         command=f"{PYTHON} experiments/example_capacity.py",
@@ -89,6 +91,30 @@ class TestAnImpossibleCapIsRefused:
         msg = str(ei.value)
         assert "1.10" in msg and "0.85" in msg
         assert "Nothing was rented" in msg
+
+
+class TestTheDefaultCloudIsVast:
+    """`ResourceRequest.cloud` is None for the default cloud, and the default is Vast.
+
+    Every other site in the codebase spells this `res.cloud or "vast"` (skypilot.py:1522, :1561,
+    :1895, :1967; sky_runner.py:1134). The first cut of the gate compared `cloud != "vast"` and so
+    skipped a bare `lab submit --accelerators RTX4090:1 --price-cap 0.85` entirely — the exact
+    shape of the 2026-08-23 incident — while refusing the explicit `--cloud vast` spelling. Every
+    other test in this file passes `cloud="vast"`, which is precisely why none of them saw it.
+    """
+
+    def test_an_unset_cloud_is_still_gated(self, tmp_path, monkeypatch) -> None:
+        feed = _Feed(1.10)
+        monkeypatch.setattr(core_mod, "_vast_price_feed", lambda: feed)
+
+        with pytest.raises(LabError, match="above --price-cap"):
+            _lab(tmp_path).submit(_spec(0.85, cloud=None), preflight=False)
+
+        assert feed.asked == ["RTX4090:1"]
+
+    def test_an_unset_cloud_with_a_reachable_cap_launches(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(core_mod, "_vast_price_feed", lambda: _Feed(0.62))
+        assert _lab(tmp_path).submit(_spec(0.85, cloud=None), preflight=False)
 
 
 class TestNothingElseBlocks:

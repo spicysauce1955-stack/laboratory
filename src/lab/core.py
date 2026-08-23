@@ -384,10 +384,15 @@ def resolve_backend_profile(
 
 
 def _vast_price_feed() -> Any | None:
-    """The scheduler's live Vast offer feed, or ``None`` when vastai-sdk is not installed.
+    """The scheduler's live Vast offer feed, or ``None`` if it cannot be constructed.
 
-    A module-level function rather than an inline import so tests have a seam, and so the optional
-    extra stays optional: no feed is not a price verdict.
+    A module-level function rather than an inline import so tests have a seam.
+
+    Note that a missing vastai-sdk does **not** come back here as ``None``:
+    ``lab.scheduler.price`` imports nothing from the SDK at module scope (``_get_vast_client`` is
+    function-local), so ``VastPriceFeed()`` always constructs and the missing extra surfaces from
+    ``best_hourly`` instead, where the caller catches it. Both routes fail open; this one is kept
+    for a genuinely unimportable module rather than for the SDK.
     """
     try:
         from lab.scheduler.price import VastPriceFeed
@@ -414,7 +419,11 @@ def _check_price_cap_admission(
     which is why ``resolve_cost`` still checks the billed rate afterwards. The two are complements,
     not duplicates.
     """
-    if price_cap is None or cloud != "vast":
+    # `res.cloud` is None for the default cloud, and the default IS Vast — spelled `cloud or
+    # "vast"` at every other site (skypilot.py:1522/:1561/:1895/:1967, sky_runner.py:1134).
+    # Comparing the raw value skipped a bare `lab submit --price-cap ...`, i.e. the exact shape of
+    # the incident this gate exists for.
+    if price_cap is None or (cloud or "vast") != "vast":
         return
     feed = _vast_price_feed()
     if feed is None:
@@ -422,7 +431,14 @@ def _check_price_cap_admission(
     try:
         best = feed.best_hourly(accelerators)
     except Exception as e:  # noqa: BLE001 — a feed that cannot answer must never block a launch
-        print(f"[lab] vast price feed unavailable, skipping cap pre-check: {e}", file=sys.stderr)
+        # Common and benign: vastai-sdk is an optional extra, so this fires on every capped
+        # submit on a machine without it. Say what it means for the cap, not just that it failed.
+        print(
+            f"[lab] no live Vast price feed ({type(e).__name__}), so --price-cap is not "
+            f"pre-checked; SkyPilot's catalog estimate still applies and the billed rate is "
+            f"still checked after boot",
+            file=sys.stderr,
+        )
         return
     if best is not None and best > price_cap:
         from lab.pricing import cap_admission_error

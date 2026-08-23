@@ -562,17 +562,25 @@ def _do_sweep_leftover_volumes(
         ]
         if not matching:
             return deleted, []  # nothing named like ours is left, so nothing is billing
-        failures = []
+        detaching: list[str] = []
+        terminal: list[str] = []
         for vol in matching:
             try:
                 client.volumes.delete(volume_id=str(vol["id"]))
                 deleted.append(vol["id"])
             except Exception as e:  # noqa: BLE001 — found and un-removable is a real alarm
-                failures.append(f"volume {vol.get('name')}: {type(e).__name__}: {e}")
+                entry = f"volume {vol.get('name')}: {type(e).__name__}: {e}"
+                (detaching if _VOLUME_DETACH_MARKER in entry.lower() else terminal).append(entry)
+        failures = terminal + detaching
         if not failures:
             return deleted, []
-        if not all(_VOLUME_DETACH_MARKER in f.lower() for f in failures):
-            return deleted, failures  # not the detach race — waiting cannot help
+        if not detaching:
+            return deleted, terminal  # nothing here is waiting on a detach; waiting cannot help
+        # Partitioned rather than all-or-nothing: with two volumes under one cluster prefix, a
+        # sibling failing for an unrelated reason used to abandon the ladder and report the
+        # still-detaching volume as survived — re-creating the false alarm this exists to remove.
+        # A terminal failure means we will alarm regardless, but the detaching one still gets its
+        # chance, so only the volumes that genuinely did not go are named.
     return deleted, failures
 
 

@@ -185,3 +185,53 @@ class TestTheListingContractIsUnchanged:
 
         with pytest.raises(RuntimeError, match="unreachable"):
             m._do_sweep_leftover_volumes(CLUSTER)
+
+
+class TestAMixedBatchStillGivesTheDetachItsChance:
+    """One volume's unrelated failure must not abandon another's detach.
+
+    The ladder continued only while *every* failure in a pass carried the detach marker. With two
+    volumes under one cluster prefix — a sibling erroring for any other reason — the loop returned
+    at once with the still-detaching volume listed as survived, re-creating the very false
+    `teardown_status: "failed"` this module exists to remove.
+
+    Both facts have to survive: the real failure alarms, and the volume that was only mid-detach
+    does not.
+    """
+
+    def test_a_sibling_error_does_not_alarm_on_the_detaching_volume(self, monkeypatch, no_sleep):
+        vols = [
+            {"id": "vol-1", "name": VOLUME, "droplet_ids": [1]},
+            {"id": "vol-2", "name": VOLUME + "-b", "droplet_ids": []},
+        ]
+
+        class _Mixed:
+            def __init__(self):
+                self.list_calls = 0
+                self.deleted: list[str] = []
+                self.attempts: dict[str, int] = {}
+                self.vols = list(vols)
+
+            def list(self, **kw):
+                self.list_calls += 1
+                return {"volumes": self.vols}
+
+            def delete(self, volume_id, **kw):
+                n = self.attempts.get(volume_id, 0) + 1
+                self.attempts[volume_id] = n
+                if volume_id == "vol-2":
+                    raise RuntimeError("403 forbidden")  # never resolves
+                if n <= 1:
+                    raise ResourceExistsError(f"(None) {DETACH_MSG}")  # resolves on retry
+                self.deleted.append(volume_id)
+                self.vols = [v for v in self.vols if v["id"] != volume_id]
+
+        _patch(monkeypatch, _Mixed())
+
+        deleted, failures = m._do_sweep_leftover_volumes(CLUSTER)
+
+        assert "vol-1" in deleted, "the detaching volume must still get its retry"
+        assert not any(DETACH_MSG in f for f in failures), (
+            f"a volume that merely needed a retry was reported as survived: {failures}"
+        )
+        assert any("403" in f for f in failures), "the genuinely stuck volume must still alarm"

@@ -59,6 +59,32 @@ class TestTheHelpTextTellsTheTruth:
         )
 
 
+class TestTheMcpDescriptionsTellTheTruthToo:
+    """MCP is the agent-facing surface, and CLAUDE.md calls it the primary one.
+
+    The CLI guard above walks typer `OptionInfo` defaults, so it structurally cannot see MCP tool
+    descriptions — which kept promising "a hard $/hr ceiling on compute enforced by the optimizer"
+    after every CLI string had been corrected.
+    """
+
+    def _mcp_source(self) -> str:
+        from pathlib import Path
+
+        import lab.mcp_server as m
+
+        return Path(m.__file__).read_text()
+
+    def test_no_mcp_tool_promises_a_hard_ceiling(self) -> None:
+        src = self._mcp_source()
+        assert "hard $/hr ceiling" not in src, (
+            "an MCP tool description still promises a ceiling SkyPilot cannot hold on Vast"
+        )
+
+    def test_price_cap_strict_is_discoverable(self) -> None:
+        """A parameter an agent cannot read about is a parameter it will never use."""
+        assert self._mcp_source().count("price_cap_strict=True") >= 2
+
+
 class TestExceedsCap:
     def test_the_real_overrun_is_caught(self) -> None:
         """20260823-101602-f9e849: $2.220/hr against a $0.85 cap."""

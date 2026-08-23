@@ -46,11 +46,15 @@ def over_cap_warning(actual: float, cap: float, cluster: str, timeout_s: float |
     ends with the one command that stops the meter. A warning with no action in it is noise.
     """
     ratio = actual / cap if cap else 0.0
-    projected = (
-        f" At this job's {timeout_s / 3600:.0f}h timeout that is ${actual * timeout_s / 3600:.2f}."
-        if timeout_s
-        else ""
-    )
+    # `:.0f` hours rendered a 30-minute job as "0h" and a 90-minute one as "2h" while the dollar
+    # figure stayed exact — wrong units in the one line whose job is making the size obvious.
+    if timeout_s:
+        span = (
+            f"{timeout_s / 60:.0f}m" if timeout_s < 3600 else f"{timeout_s / 3600:.1f}h".replace(".0h", "h")
+        )
+        projected = f" At this job's {span} timeout that is ${actual * timeout_s / 3600:.2f}."
+    else:
+        projected = ""
     return (
         f"[lab] PRICE CAP EXCEEDED: {cluster} bills ${actual:.3f}/hr against --price-cap "
         f"${cap:.2f}/hr ({ratio:.1f}x).{projected} SkyPilot applies the cap to its own catalog, "

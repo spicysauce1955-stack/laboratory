@@ -607,6 +607,15 @@ def resolve_cost(
             wall = parse_duration(manifest.resources.timeout)
             print(over_cap_warning(compute, cap, cluster, wall))
             events.note("price.over_cap", cluster=cluster, actual=compute, cap=cap)
+            # The note alone is not enough here. Notes flush into the record only when the call
+            # ends non-ok, and this path deliberately lets the job RUN ON — so an over-cap job
+            # that succeeds closes "ok" and the note is dropped, losing the record for exactly
+            # the jobs that cost money (two of the three 2026-08-23 overruns finished). `result`
+            # is persisted on every close, so the verdict rides there.
+            if (open_call := events.current()) is not None:
+                open_call.result(
+                    over_cap=True, actual_hourly_usd=compute, cap_hourly_usd=cap
+                )
     storage = storage_hourly_usd(cloud, manifest.resources.disk_size, instance_type)
     total = None if compute is None else compute + storage
     estimated = actual_cost(total, parse_duration(manifest.resources.timeout))
