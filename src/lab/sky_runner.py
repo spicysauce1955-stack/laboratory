@@ -39,6 +39,7 @@ from lab.backends.skypilot import (
     preempted_teardown_confirmed,
     promote_timeout,
     provision_timeout_min,
+    wasteful_provision_timeout_warning,
     provision_with_watchdog,
     tear_down_and_record,
     vast_balance,
@@ -1139,10 +1140,16 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                 # stream_and_get blocks until the job is submitted (0.12), i.e. until the host is UP.
                 # Bound it so a dead Vast offer stuck in "loading" can't hang the supervisor forever
                 # (FR-I1). The budget is per-cloud: Vast waits on one host, GCP walks a failover path.
-                provision_s = (
-                    parse_duration(manifest.resources.provision_timeout)
-                    or provision_timeout_min(cloud) * 60
-                )
+                # A pinned region narrows the offer pool and provisioning slows down with it
+                # (measured 2026-08-23: 526s pinned vs a 209s unpinned max), so the budget has to
+                # know which case it is in or it kills healthy pinned hosts.
+                pinned = bool(manifest.resources.region or manifest.resources.zone)
+                explicit_s = parse_duration(manifest.resources.provision_timeout)
+                provision_s = explicit_s or provision_timeout_min(cloud, pinned=pinned) * 60
+                if warning := wasteful_provision_timeout_warning(
+                    explicit_s, cloud, pinned=pinned
+                ):
+                    print(warning)
                 sky_job_id, handle = provision_with_watchdog(sky, request_id, timeout_s=provision_s)
                 # Record cost up-front so a running job already shows it (FR-I2). The host is UP now,
                 # so the Vast rental exists — bill at its real dph_total, not SkyPilot's low catalog
