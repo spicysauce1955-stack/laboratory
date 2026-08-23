@@ -809,6 +809,39 @@ def _gcp_failure_hint(text: str) -> str:
     )
 
 
+def _handled_failure_error(store: JobStore, job_id: str) -> dict[str, Any] | None:
+    """The ledger's ``error`` entry for a failure that was *handled* rather than raised.
+
+    ``run_job``'s failure branches catch their exception, write the diagnosis to the manifest's
+    ``end_reason`` and ``return 1``. Nothing raises, so the abort path — the only place that ever
+    called ``events.error_dict`` — is never reached, and eleven failures on 2026-08-23 closed with
+    ``"error": null`` while the reason sat on disk (see
+    ``tests/test_supervisor_failure_reason_in_ledger.py``).
+
+    Reading it back from the manifest keeps one wording for one fact: ``lab history`` and
+    ``lab status`` quote the same string, and a failure branch added later is covered without
+    being told to opt in.
+
+    Shaped like :func:`events.error_dict` so both kinds of close look the same to readers, with
+    ``where`` naming the manifest rather than a frame — there is no traceback to point at, and
+    inventing one would misdescribe a handled return as a crash. Best-effort by contract: a
+    missing or unreadable manifest degrades to ``None``, exactly as before, and must never turn
+    bookkeeping into the thing that kills the supervisor.
+    """
+    try:
+        manifest = store.read_manifest(job_id)
+    except Exception:  # noqa: BLE001 — never let the ledger's own read fail a run
+        return None
+    reason = (manifest.end_reason or "").strip()
+    if not reason:
+        return None
+    return {
+        "type": str(manifest.status.value if manifest.status else "failed"),
+        "message": reason[:2048],
+        "where": f"manifest:{job_id}",
+    }
+
+
 def provision_failure_reason(generic: str, cloud: str) -> str:
     """Enrich a generic provision-failure message per cloud (§8).
 
@@ -1312,7 +1345,10 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         _abort(e, outcome="crash", why=f"supervisor crashed: {type(e).__name__}: {e}")
         raise
     events.finish(
-        call, outcome=("ok" if code == 0 else "error"), exit_code=code,
+        call,
+        outcome=("ok" if code == 0 else "error"),
+        exit_code=code,
+        error=_handled_failure_error(store, job_id) if code != 0 else None,
     )
     return code
 
