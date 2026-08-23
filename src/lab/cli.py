@@ -252,6 +252,7 @@ def submit(
     region: str | None = typer.Option(None, "--region", help="pin the cloud region, e.g. europe-west1 (skypilot; default: the optimizer picks)"),
     zone: str | None = typer.Option(None, "--zone", help="pin the zone, e.g. europe-west1-b (skypilot)"),
     price_cap: float | None = typer.Option(None, "--price-cap", help="ceiling on compute $/hr, applied by SkyPilot's optimizer against its own catalog estimate — on Vast that catalog under-reports ~4x, so the rental can bill above this"),
+    price_cap_strict: bool = typer.Option(False, "--price-cap-strict", help="destroy the machine if the rental bills above --price-cap (default: warn and keep running)"),
     with_pkg: list[str] = typer.Option(None, "--with", help="extra runtime package(s) for this job (repeatable; layered via uv run --with)"),
     spot: bool = typer.Option(False, "--spot", help="use spot/interruptible instances (skypilot)"),
     no_fallback: bool = typer.Option(
@@ -281,6 +282,7 @@ def submit(
     resources = ResourceRequest(
         cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
         cloud=cloud, region=region, zone=zone, max_hourly_usd=price_cap,
+        price_cap_strict=price_cap_strict,
         timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
         spot_fallback=not no_fallback,
     )
@@ -360,6 +362,7 @@ def sweep(
     region: str | None = typer.Option(None, "--region", help="pin the cloud region for every job, e.g. europe-west1 (skypilot)"),
     zone: str | None = typer.Option(None, "--zone", help="pin the zone for every job, e.g. europe-west1-b (skypilot)"),
     price_cap: float | None = typer.Option(None, "--price-cap", help="ceiling on compute $/hr per job, applied against SkyPilot's catalog estimate (Vast rentals can bill above it)"),
+    price_cap_strict: bool = typer.Option(False, "--price-cap-strict", help="destroy the machine if the rental bills above --price-cap (default: warn and keep running)"),
     with_pkg: list[str] = typer.Option(None, "--with", help="extra runtime package(s) per job (repeatable; layered via uv run --with)"),
     spot: bool = typer.Option(False, "--spot", help="use spot/interruptible instances (skypilot)"),
     no_fallback: bool = typer.Option(
@@ -386,6 +389,7 @@ def sweep(
     resources = ResourceRequest(
         cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
         cloud=cloud, region=region, zone=zone, max_hourly_usd=price_cap,
+        price_cap_strict=price_cap_strict,
         timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
         spot_fallback=not no_fallback,
     )

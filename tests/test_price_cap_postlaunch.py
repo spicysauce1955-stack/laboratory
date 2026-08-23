@@ -87,3 +87,98 @@ class TestDetectionNeverKills:
         _cost(monkeypatch, 2.220, 0.85)
 
         assert torn == []
+
+
+class TestStrictModeIsOptIn:
+    """`--price-cap-strict` destroys a rental rather than let it bill over the cap.
+
+    Opt-in on purpose: it deliberately breaks this project's "never kill" rule, so it has to be
+    the user's explicit choice rather than a default that surprises someone mid-run.
+    """
+
+    def test_the_field_actually_exists(self) -> None:
+        """Guard against a vacuous suite. Pydantic here is `extra='ignore'`, so passing an
+        unknown `price_cap_strict=` is silently DROPPED rather than raising — every test below
+        would pass against an unmodified model. Assert the field is real first."""
+        res = ResourceRequest(price_cap_strict=True)
+        assert getattr(res, "price_cap_strict", None) is True
+        assert ResourceRequest().price_cap_strict is False, "must default to off"
+
+    def _store(self, tmp_path, job_id, cap, *, strict):
+        from lab.store import JobStore
+
+        store = JobStore(tmp_path / "runs")
+        m = make_manifest(
+            job_id,
+            "python x.py",
+            resources=ResourceRequest(
+                accelerators="RTX4090:1", timeout="3h",
+                max_hourly_usd=cap, price_cap_strict=strict,
+            ),
+        )
+        store.create(m)
+        return store
+
+    def test_strict_tears_down_and_fails(self, tmp_path, monkeypatch) -> None:
+        from lab.models import JobState
+
+        store = self._store(tmp_path, "pcs1", 0.85, strict=True)
+        torn: list[object] = []
+        monkeypatch.setattr(
+            runner_mod, "tear_down_and_record", lambda *a, **k: (torn.append(a), True)[1]
+        )
+        cost = _cost(monkeypatch, 2.220, 0.85, strict=True)
+
+        stopped = runner_mod.enforce_price_cap(
+            store, "pcs1", "lab-pcs1", "vast", cost=cost, sky_mod=object()
+        )
+
+        assert stopped is True
+        assert torn, "the over-cap box must actually be destroyed"
+        m = store.read_manifest("pcs1")
+        assert m.status is JobState.failed
+        assert "price cap" in (m.end_reason or "").lower()
+        assert "2.22" in (m.end_reason or ""), "the reason must carry the rate that triggered it"
+
+    def test_the_default_never_kills(self, tmp_path, monkeypatch) -> None:
+        store = self._store(tmp_path, "pcs2", 0.85, strict=False)
+        torn: list[object] = []
+        monkeypatch.setattr(
+            runner_mod, "tear_down_and_record", lambda *a, **k: (torn.append(a), True)[1]
+        )
+        cost = _cost(monkeypatch, 2.220, 0.85)
+
+        stopped = runner_mod.enforce_price_cap(
+            store, "pcs2", "lab-pcs2", "vast", cost=cost, sky_mod=object()
+        )
+
+        assert stopped is False
+        assert torn == [], "the default must never destroy a running job over price"
+
+    def test_strict_does_not_fire_on_an_unknown_price(self, tmp_path, monkeypatch) -> None:
+        """Never destroy a machine on a number we could not read."""
+        store = self._store(tmp_path, "pcs3", 0.85, strict=True)
+        torn: list[object] = []
+        monkeypatch.setattr(
+            runner_mod, "tear_down_and_record", lambda *a, **k: (torn.append(a), True)[1]
+        )
+        cost = _cost(monkeypatch, None, 0.85, strict=True)
+
+        stopped = runner_mod.enforce_price_cap(
+            store, "pcs3", "lab-pcs3", "vast", cost=cost, sky_mod=object()
+        )
+
+        assert stopped is False and torn == []
+
+    def test_strict_does_not_fire_inside_the_cap(self, tmp_path, monkeypatch) -> None:
+        store = self._store(tmp_path, "pcs4", 0.85, strict=True)
+        torn: list[object] = []
+        monkeypatch.setattr(
+            runner_mod, "tear_down_and_record", lambda *a, **k: (torn.append(a), True)[1]
+        )
+        cost = _cost(monkeypatch, 0.736, 0.85, strict=True)
+
+        assert runner_mod.enforce_price_cap(
+            store, "pcs4", "lab-pcs4", "vast", cost=cost, sky_mod=object()
+        ) is False
+        assert torn == []

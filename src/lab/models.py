@@ -38,6 +38,10 @@ class ResourceRequest(BaseModel):
     # a price *trigger* (Vast-only, a wait-until condition), this is enforced by the optimizer at
     # launch, so the worst case it implies is provable rather than estimated.
     max_hourly_usd: float | None = None
+    # Opt-in: destroy the machine rather than let it bill above `max_hourly_usd`. Off by default
+    # because this project's rule is admission-control and stop-launching, never kill — a running
+    # job vanishing over price has to be something the user asked for.
+    price_cap_strict: bool = False
     timeout: str | None = None  # wall-clock limit, e.g. "2h" (FR-I1)
     provision_timeout: str | None = None  # max time to reach UP, e.g. "10m" (per-cloud default)
     use_spot: bool = False  # opt into spot/interruptible instances (skypilot)

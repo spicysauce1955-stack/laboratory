@@ -624,6 +624,36 @@ def resolve_cost(
     )
 
 
+
+def enforce_price_cap(
+    store: JobStore, job_id: str, cluster: str, cloud: str, *, cost: CostInfo, sky_mod: Any
+) -> bool:
+    """Stop a job billing above a strict cap. Returns ``True`` iff it was stopped.
+
+    Fires only on ``price_cap_strict`` **and** a definitive over-cap verdict. An unreadable price
+    is not an overrun, and destroying a machine over a number we could not read is the 2026-08
+    lesson pointing the other way.
+
+    Opt-in by construction: the default path reports and leaves the job alone, because
+    "admission-control and stop-launching, never kill" is the rule everywhere else in this
+    codebase and one flag should not quietly overturn it for everyone.
+    """
+    manifest = store.read_manifest(job_id)
+    if not manifest.resources.price_cap_strict or cost.over_cap is not True:
+        return False
+    actual, cap = cost.compute_hourly_usd, cost.cap_hourly_usd
+    if actual is None or cap is None:  # pragma: no cover — implied by over_cap is True
+        return False
+    reason = (
+        f"price cap: rental bills ${actual:.3f}/hr against --price-cap ${cap:.2f}/hr "
+        f"and --price-cap-strict was set; machine destroyed"
+    )
+    store.update_manifest(job_id, status=JobState.failed, ended_at=now(), end_reason=reason[:300])
+    events.note("price.cap_enforced", cluster=cluster, actual=actual, cap=cap)
+    tear_down_and_record(sky_mod, cluster, store, job_id, cloud)
+    return True
+
+
 def record_capacity_exhaustion(
     home: Path, manifest: JobManifest, cloud: str, *, error_text: str, log_text: str = ""
 ) -> list[str]:
@@ -1199,6 +1229,10 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                         launched_spot=launched_spot,
                     ),
                 )
+                # Only now, with the cost recorded, may a strict cap stop the job — otherwise the
+                # manifest would explain the teardown with a rate it never stored.
+                if enforce_price_cap(store, job_id, cluster, cloud, cost=cost_info, sky_mod=sky):
+                    return 1
             else:
                 # Adopting a running cluster: re-price it, but keep the estimate agreed at launch —
                 # that number was the user's authorisation and must not drift under them.

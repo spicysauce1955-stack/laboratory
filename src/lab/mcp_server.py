@@ -130,6 +130,7 @@ def build_server(lab: Lab) -> FastMCP:
         region: str | None = None,
         zone: str | None = None,
         price_cap: float | None = None,
+        price_cap_strict: bool = False,
         timeout: str | None = None,
         provision_timeout: str | None = None,
         with_pkg: list[str] | None = None,
@@ -143,6 +144,7 @@ def build_server(lab: Lab) -> FastMCP:
         resources = ResourceRequest(
             cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
             cloud=cloud, region=region, zone=zone, max_hourly_usd=price_cap,
+            price_cap_strict=price_cap_strict,
             timeout=timeout, provision_timeout=provision_timeout, use_spot=use_spot,
             spot_fallback=spot_fallback,
         )
@@ -200,6 +202,7 @@ def build_server(lab: Lab) -> FastMCP:
         region: str | None = None,
         zone: str | None = None,
         price_cap: float | None = None,
+        price_cap_strict: bool = False,
         timeout: str | None = None,
         provision_timeout: str | None = None,
         with_pkg: list[str] | None = None,
@@ -219,6 +222,7 @@ def build_server(lab: Lab) -> FastMCP:
         resources = ResourceRequest(
             cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
             cloud=cloud, region=region, zone=zone, max_hourly_usd=price_cap,
+            price_cap_strict=price_cap_strict,
             timeout=timeout, provision_timeout=provision_timeout, use_spot=use_spot,
             spot_fallback=spot_fallback,
         )
