@@ -251,7 +251,7 @@ def submit(
     provision_timeout: str | None = typer.Option(None, "--provision-timeout", help="abort if the host doesn't reach UP in time, e.g. 10m (skypilot; default per-cloud: vast 8m, do 12m, gcp 20m)"),
     region: str | None = typer.Option(None, "--region", help="pin the cloud region, e.g. europe-west1 (skypilot; default: the optimizer picks)"),
     zone: str | None = typer.Option(None, "--zone", help="pin the zone, e.g. europe-west1-b (skypilot)"),
-    price_cap: float | None = typer.Option(None, "--price-cap", help="refuse any instance above this compute $/hr — enforced by SkyPilot's optimizer, so the worst case is a ceiling not an estimate"),
+    price_cap: float | None = typer.Option(None, "--price-cap", help="ceiling on compute $/hr, applied by SkyPilot's optimizer against its own catalog estimate — on Vast that catalog under-reports ~4x, so the rental can bill above this"),
     with_pkg: list[str] = typer.Option(None, "--with", help="extra runtime package(s) for this job (repeatable; layered via uv run --with)"),
     spot: bool = typer.Option(False, "--spot", help="use spot/interruptible instances (skypilot)"),
     no_fallback: bool = typer.Option(
@@ -359,7 +359,7 @@ def sweep(
     provision_timeout: str | None = typer.Option(None, "--provision-timeout", help="abort a host that doesn't reach UP in time, e.g. 10m (skypilot; default per-cloud: vast 8m, do 12m, gcp 20m)"),
     region: str | None = typer.Option(None, "--region", help="pin the cloud region for every job, e.g. europe-west1 (skypilot)"),
     zone: str | None = typer.Option(None, "--zone", help="pin the zone for every job, e.g. europe-west1-b (skypilot)"),
-    price_cap: float | None = typer.Option(None, "--price-cap", help="refuse any instance above this compute $/hr, per job (enforced by SkyPilot's optimizer)"),
+    price_cap: float | None = typer.Option(None, "--price-cap", help="ceiling on compute $/hr per job, applied against SkyPilot's catalog estimate (Vast rentals can bill above it)"),
     with_pkg: list[str] = typer.Option(None, "--with", help="extra runtime package(s) per job (repeatable; layered via uv run --with)"),
     spot: bool = typer.Option(False, "--spot", help="use spot/interruptible instances (skypilot)"),
     no_fallback: bool = typer.Option(
@@ -1045,8 +1045,8 @@ def register(
     zone: str | None = typer.Option(None, "--zone", help="pin the zone, e.g. europe-west1-b"),
     price_cap: float | None = typer.Option(
         None, "--price-cap",
-        help="refuse any instance above this compute $/hr (enforced by SkyPilot's optimizer; "
-             "unlike --max-hourly this is a ceiling, not a wait-until trigger)",
+        help="ceiling on compute $/hr, applied against SkyPilot's catalog estimate (Vast "
+             "rentals can bill above it); unlike --max-hourly this is not a wait-until trigger",
     ),
     timeout: str | None = typer.Option(
         None, help="wall-clock limit per job, e.g. 2h (cost bound, FR-I1)"
@@ -1149,8 +1149,8 @@ def register_sweep(
     zone: str | None = typer.Option(None, "--zone", help="pin the zone, e.g. europe-west1-b"),
     price_cap: float | None = typer.Option(
         None, "--price-cap",
-        help="refuse any instance above this compute $/hr (enforced by SkyPilot's optimizer; "
-             "unlike --max-hourly this is a ceiling, not a wait-until trigger)",
+        help="ceiling on compute $/hr, applied against SkyPilot's catalog estimate (Vast "
+             "rentals can bill above it); unlike --max-hourly this is not a wait-until trigger",
     ),
     timeout: str | None = typer.Option(
         None, help="wall-clock limit per job, e.g. 2h (cost bound, FR-I1)"
