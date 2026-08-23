@@ -30,7 +30,7 @@ class ResourceRequest(BaseModel):
     gpus: int | None = None
     memory: str | None = None  # e.g. "32GB"
     disk_size: int | None = None  # boot/attached volume size in GB (skypilot; DO volume size)
-    accelerators: str | None = None  # SkyPilot accelerator spec, e.g. "RTX_3070:1" (remote)
+    accelerators: str | None = None  # SkyPilot accelerator spec, sky-catalog name e.g. "RTX4090:1" (remote)
     cloud: str | None = None  # SkyPilot cloud: "vast" (default) | "do" | "gcp"; None -> "vast"
     region: str | None = None  # pin the cloud region, e.g. "europe-west1"; None -> optimizer picks
     zone: str | None = None  # pin the zone, e.g. "europe-west1-b"; implies its region

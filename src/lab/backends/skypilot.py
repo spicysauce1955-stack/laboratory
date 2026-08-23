@@ -1060,13 +1060,21 @@ def robust_teardown(
     ``status == "succeeded"`` means: either sky.down returned, OR the vast SDK fallback ran and
     either destroyed instances or found none matching. ``"failed"`` means even the fallback
     raised — a human needs to check ``vastai show_instances`` (and ``lab reconcile``) NOW.
+
+    Retries stop early on a state a backoff cannot change (``is_retryable_sky_error``) — most
+    often ``ClusterDoesNotExist`` after a launch that was rejected before any cluster was
+    registered. The provider-direct fallback still runs in that case: sky having nothing to
+    destroy is not evidence that the provider has nothing to destroy. ``attempts`` therefore
+    reports the attempts actually made, which is no longer always ``1 + len(backoffs)``.
     """
     last_err: str | None = None
     last_undecodable = False
     delays = (0, *backoffs)  # first try has no delay
+    attempts_made = 0
     for attempt, delay in enumerate(delays, start=1):
         if delay:
             time.sleep(delay)
+        attempts_made = attempt
         events.note("teardown.attempt", cluster=cluster, attempt=attempt)
         try:
             sky_mod.get(sky_mod.down(cluster))
@@ -1104,13 +1112,31 @@ def robust_teardown(
             # version skew `sky.get` cannot unpickle a SUCCESS, so this error very likely sits on
             # top of a teardown that actually happened (incident 2026-08-20). Remembered, not
             # acted on here: a provider-direct fallback below can still settle it outright.
-            from lab._skycompat import classify_sky_error
+            from lab._skycompat import classify_sky_error, is_retryable_sky_error
 
             last_undecodable = classify_sky_error(e).outcome == "undecodable_response"
             print(
                 f"[lab] sky.down attempt {attempt}/{len(delays)} for {cluster} failed: {last_err}"
             )
             events.note("teardown.retry", cluster=cluster, attempt=attempt, error=last_err)
+            if not is_retryable_sky_error(e):
+                # A settled state: the remaining backoffs would sleep ~4 minutes to be told the
+                # same thing again. Stop asking sky — but fall through to the provider-direct
+                # fallback below, which is the half that can still find a live rental (FR-C2).
+                #
+                # Why dropping the retries cannot hide a machine mid-provision: sky registers a
+                # cluster in its state DB *before* provisioning finishes (this is what `sky
+                # status` shows as INIT), so an in-flight launch answers sky.down from the
+                # registry, not with ClusterDoesNotExist. That error therefore means sky never
+                # registered the cluster at all — no provider call was ever made — and the
+                # fallback still asks the provider directly rather than taking sky's word.
+                print(
+                    f"[lab] {type(e).__name__} will not change on retry; skipping the remaining "
+                    f"{len(delays) - attempt} sky.down attempt(s) and going straight to the "
+                    "provider-direct check"
+                )
+                events.note("teardown.unretryable", cluster=cluster, attempt=attempt, error=last_err)
+                break
 
     # SkyPilot teardown didn't take.
     if cloud == "gcp":
@@ -1123,7 +1149,7 @@ def robust_teardown(
                 # Destroyed-or-none-found are both safe. Found-and-failed-to-destroy is not: that
                 # is a live box we know about and could not kill, so it must alarm (FR-C2).
                 "status": "failed" if gcp_failures else "succeeded",
-                "attempts": len(delays),
+                "attempts": attempts_made,
                 "vast_fallback_used": False,
                 "vast_destroyed": [],
                 "gcp_fallback_used": True,
@@ -1139,7 +1165,7 @@ def robust_teardown(
             return {
                 # sky could not tell us and GCP could not either: genuinely unknown (R10).
                 "status": "unknown" if last_undecodable else "failed",
-                "attempts": len(delays),
+                "attempts": attempts_made,
                 "vast_fallback_used": False,
                 "vast_destroyed": [],
                 "gcp_fallback_used": True,
@@ -1156,7 +1182,7 @@ def robust_teardown(
             return {
                 # Destroyed-or-none-found are both safe. Found-and-failed-to-destroy is not.
                 "status": "failed" if do_failures else "succeeded",
-                "attempts": len(delays),
+                "attempts": attempts_made,
                 "vast_fallback_used": False,
                 "vast_destroyed": [],
                 "do_fallback_used": True,
@@ -1172,7 +1198,7 @@ def robust_teardown(
             return {
                 # sky could not tell us and DO could not either: genuinely unknown (R10).
                 "status": "unknown" if last_undecodable else "failed",
-                "attempts": len(delays),
+                "attempts": attempts_made,
                 "vast_fallback_used": False,
                 "vast_destroyed": [],
                 "do_fallback_used": True,
@@ -1187,7 +1213,7 @@ def robust_teardown(
         # the one signal that matters (R10).
         return {
             "status": "unknown" if last_undecodable else "failed",
-            "attempts": len(delays),
+            "attempts": attempts_made,
             "vast_fallback_used": False,
             "vast_destroyed": [],
             "error": last_err,
@@ -1201,7 +1227,7 @@ def robust_teardown(
             # Destroyed-or-none-found are both safe. Found-and-failed-to-destroy is not: that is
             # a live rental we know about and could not kill, so it must alarm (FR-C2).
             "status": "failed" if failures else "succeeded",
-            "attempts": len(delays),
+            "attempts": attempts_made,
             "vast_fallback_used": True,
             "vast_destroyed": destroyed,  # report what DID die even when we alarm
             "error": (
@@ -1215,7 +1241,7 @@ def robust_teardown(
         return {
             # sky could not tell us and Vast could not either: genuinely unknown (R10).
             "status": "unknown" if last_undecodable else "failed",
-            "attempts": len(delays),
+            "attempts": attempts_made,
             "vast_fallback_used": True,
             "vast_destroyed": [],
             "error": f"sky.down: {last_err}; vast-direct: {type(e).__name__}: {e}",

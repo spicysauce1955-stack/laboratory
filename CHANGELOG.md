@@ -4,6 +4,44 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning is 
 breaks the surface in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md); MINOR may, and says so
 with a **BREAKING** entry and an upgrade note.
 
+## v0.7.1 — 2026-08-23
+
+Four defects found by reading the event ledger of the first day of real v0.7.0 use. None cost
+money — every one of that day's fifteen terminal jobs recorded `teardown_status: "succeeded"` —
+but between them they cost a user most of an afternoon, and two of them made the ledger itself
+unable to explain what had gone wrong.
+
+### Fixed
+
+- **`lab --help` advertised a GPU name that cannot provision.** `lab register --help` and
+  `lab register-sweep --help` said `e.g. RTX_4090:1`, `lab submit --help` said `e.g. RTX_3070:1`.
+  Neither exists: sky's vast catalog carries 17 accelerator names and none contains an underscore,
+  the only 4090 spelling being `RTX4090`. Three jobs died at launch with "Catalog does not contain
+  any instances satisfying the request" before the user recovered by trial and error. The
+  underscore *is* real — Vast's own API wants it and the price feed converts into it — but sky's
+  launcher does not, which is what made the trap durable.
+- **Teardown retried errors that retrying cannot fix.** A launch rejected before any cluster was
+  registered left `sky.down` with nothing to find, and `robust_teardown` asked it six more times
+  over four minutes anyway. Eight jobs spent 32 minutes of wall-clock between them being told
+  `ClusterDoesNotExist` repeatedly. Retries now stop on a state a backoff cannot change; the
+  provider-direct fallback still runs, because sky having nothing to destroy is not evidence that
+  the provider has nothing to destroy. `attempts` now reports the attempts actually made instead
+  of always claiming the full ladder.
+- **Handled supervisor failures reached the ledger with `"error": null`.** Eleven of the day's
+  fourteen supervisor runs closed `error: 1` with no reason attached, while the reason sat on the
+  manifest all along. `run_job`'s failure branches catch their exception, write `end_reason` and
+  return, so they never took the abort path that records it — leaving `lab history --failures`
+  able to say only that eleven things failed. The user fell back to polling `lab status` by hand,
+  one job at a time. The close record now carries the manifest's own wording.
+- **Advice crowded out the provider's error.** `end_reason` is capped at 300 characters and the
+  diagnosis leads so it survives — but DO's branch prepended a fixed 158-character string
+  regardless of cause, spending half the budget saying nothing and truncating DigitalOcean's own
+  message to fit. Five DO failures stored identical text, and whether it was an account limit, a
+  size restriction or real capacity was unrecoverable afterwards. The provider's words are now
+  guaranteed a floor of the budget, sky's invariant boilerplate is stripped to make room, and DO
+  is diagnosed from its error text the way GCP already was. This also repairs GCP's fallback hint,
+  which had the same defect at 219 characters.
+
 ## v0.7.0 — 2026-08-23
 
 The 2026-08-20/21 reliability work. Two live incidents, 22 defects, and a code review that found

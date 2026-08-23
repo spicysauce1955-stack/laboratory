@@ -81,6 +81,29 @@ _DEFINITE_FAILURES = frozenset(
     }
 )
 
+# Of those, the ones a backoff cannot help. "Did the call happen" and "could waiting change the
+# answer" are different questions, and only the second one decides whether to retry.
+#
+# Everything here describes a state that is settled for the lifetime of this teardown: a cluster
+# absent from the registry does not appear, a malformed name does not become valid, credentials
+# and policy do not change, and two mismatched sky versions do not converge. Retrying them cost
+# eight jobs four minutes each on 2026-08-23 (see `tests/test_teardown_retry_futility.py`).
+#
+# ``ApiServerConnectionError`` is deliberately absent even though it is a definite failure: a
+# restarting or briefly-unreachable API server is the exact case the backoff exists to ride out.
+_UNRETRYABLE = frozenset(
+    {
+        "ClusterDoesNotExist",
+        "ApiServerAuthenticationError",
+        "APIVersionMismatchError",
+        "APINotSupportedError",
+        "PermissionDeniedError",
+        "UserRequestRejectedByPolicy",
+        "ClusterOwnerIdentityMismatchError",
+        "InvalidClusterNameError",
+    }
+)
+
 # Re-probing a server we could not reach, forever, would make one blip permanently degrade a
 # long-lived supervisor's teardowns to "unknown". Determinate answers are cached for the process
 # lifetime; indeterminate ones expire.
@@ -208,6 +231,23 @@ def classify_sky_error(exc: BaseException) -> SkyErrorVerdict:
         f"{type(exc).__name__}: {exc} — not a recognisable decode failure and not a definitive "
         "refusal, so whether the operation ran is unknown. Verify against the cloud provider.",
     )
+
+
+def is_retryable_sky_error(exc: BaseException) -> bool:
+    """Could trying this ``sky.down`` again plausibly give a different answer?
+
+    ``False`` only for the settled states in :data:`_UNRETRYABLE`; everything else -- transport
+    errors, timeouts, unreachable servers, anything unrecognised -- is ``True``.
+
+    The default direction is deliberate and matches :func:`classify_sky_error`'s: an unrecognised
+    error means we cannot rule out that waiting helps, and one wasted backoff is far cheaper than
+    abandoning a teardown that would have succeeded on the second try. Callers must still run
+    their provider-direct fallback when this says stop -- "sky has nothing to destroy" is not
+    evidence that the provider has nothing to destroy (FR-C2).
+
+    Walks ``__cause__``/``__context__``, since sky re-wraps freely.
+    """
+    return not any(type(link).__name__ in _UNRETRYABLE for link in _chain(exc))
 
 
 # ---------------------------------------------------------------------------
