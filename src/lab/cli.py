@@ -17,6 +17,7 @@ from typing import Any, NoReturn
 import typer
 
 from lab import __version__, events
+from lab import notes as lab_notes
 from lab._util import atomic_write_text, now, parse_duration, wrap_with_extras
 from lab.core import (
     Lab,
@@ -498,6 +499,18 @@ def init(
             f"the current version is beside it as {dest}.new",
             file=sys.stderr,
         )
+    if report.get("skill_changed"):
+        # The one file whose content is *instructions*. A silent refresh is how a capability can
+        # ship and still be recorded as impossible eight days later, so say it out loud — on
+        # stderr, leaving stdout the JSON report a caller parses.
+        moved = report.get("from_version") or "an earlier version"
+        print(
+            f"note: the laboratory skill changed ({moved} -> {report.get('to_version')}). "
+            "Re-read it before your next run — especially "
+            "\"Corrections — things that are no longer true\", which retires advice you may "
+            "still be following.",
+            file=sys.stderr,
+        )
     _emit(report)
     if check and not report["ok"]:
         stale = len(report["created"]) + len(report["refreshed"]) + len(report["merged"])
@@ -521,6 +534,94 @@ def logs(job_id: str, tail: int = typer.Option(100)) -> None:
     """Tail a job's logs (FR-D1)."""
     for line in _lab_for_or_fail(job_id).logs(job_id, tail=tail):
         typer.echo(line)
+
+
+@app.command()
+def note(
+    job_id: str | None = typer.Argument(None, help="the job this is about, if there is one"),
+    text: str = typer.Option(..., "--text", "-m", help="what you concluded, in your own words"),
+    kind: str = typer.Option(
+        "NOTE", "--kind", help=f"one of: {', '.join(lab_notes.KINDS)} (free text is fine too)"
+    ),
+    usd: float | None = typer.Option(None, "--usd", help="dollars this cost, if it cost any"),
+    sweep: str | None = typer.Option(None, "--sweep", help="the sweep this is about"),
+    agent: bool = typer.Option(False, "--agent", help="mark the note as written by an agent"),
+    last: bool = typer.Option(
+        False, "--last",
+        help="attach this note to the most recent failure, so the next run that hits it sees it",
+    ),
+) -> None:
+    """Record what went wrong (or surprised you) next to the run's own logs.
+
+    Files the note in `runs/<job_id>/notes.jsonl` beside `logs.txt` and in a user-global index,
+    so it travels with the run into an export bundle *and* is readable from another project. A
+    note with no job id is still worth writing — a submit that dies before provisioning never
+    gets one, and those are often the notes worth most.
+    """
+    facets: dict[str, Any] = {}
+    home = repo_root() / "runs"
+    if job_id is not None:
+        try:
+            manifest = JobStore(home).read_manifest(job_id)
+            facets = lab_notes.facets_of(manifest)
+        except Exception:  # noqa: BLE001 — annotating an unknown job is still allowed
+            facets = {}
+    # A signature cannot be typed by hand: the ledger masks a message before signing it, so the
+    # key computed from what was printed is not the key the digest groups by. `--last` reads it
+    # back off the ledger, which is what makes the push loop closeable by a person at all.
+    signature = lab_notes.last_failure_signature() if last else None
+    written = lab_notes.write(
+        text=text, job_id=job_id, sweep_id=sweep, kind=kind, usd=usd,
+        author="agent" if agent else "human", facets=facets, home=home,
+        signature=signature,
+    )
+    if written is None:
+        _fail(1, "could not record the note (notes disabled, or the store is unwritable)")
+    _emit({
+        "note_id": written.id,
+        "kind": written.kind,
+        "job_id": written.job_id,
+        "signature": written.signature,
+    })
+
+
+@app.command()
+def notes(
+    job_id: str | None = typer.Argument(None, help="only notes about this job"),
+    kind: str | None = typer.Option(None, "--kind", help="only this kind"),
+    limit: int | None = typer.Option(None, "--limit", "-n", help="most recent N"),
+    fmt: str = typer.Option("json", "--format", help="json | md (a TEAM-LOG table)"),
+    all_projects: bool = typer.Option(False, "--all-projects", help="not just this project"),
+    include_retired: bool = typer.Option(False, "--include-retired", help="show retired notes"),
+    retire: str | None = typer.Option(None, "--retire", help="retire this note id"),
+    reason: str | None = typer.Option(None, "--reason", help="why it is no longer true"),
+) -> None:
+    """Read the notes people left, or retire one that has stopped being true.
+
+    Retiring matters more than it looks: a channel that never retires anything distributes stale
+    advice, which is the failure this whole feature exists to stop.
+    """
+    if retire is not None:
+        if not reason:
+            msg = "--retire needs --reason (what changed, so the next reader knows)"
+            _emit({"error": msg})
+            _fail(2, msg)
+        try:
+            retired = lab_notes.retire(retire, reason=reason)
+        except KeyError:
+            msg = f"unknown note id {retire!r}"
+            _emit({"error": msg})
+            _fail(2, msg)
+        _emit({"note_id": retired.id, "retired": retired.retired})
+        return
+    found = lab_notes.search(
+        project=None if all_projects else lab_notes.local_project_name(),
+        job_id=job_id, kind=kind, limit=limit, include_retired=include_retired,
+    )
+    if fmt == "md":
+        typer.echo(lab_notes.as_markdown(found))
+        return
+    _emit({"notes": [n.to_record() for n in found]})
 
 
 @app.command()
@@ -1548,6 +1649,10 @@ def main(argv: list[str] | None = None) -> None:
             outcome = "usage_error"
         else:
             error = {"type": "Exit", "message": f"exited {code}", "where": None}
+    # Hand the failure to whoever has hit it before. Stderr, so stdout stays parseable JSON, and
+    # only on a signed error — an unsigned one would match every note and become a nag (R10).
+    if outcome != "ok" and (advice := lab_notes.push_for_error(error)) is not None:
+        typer.echo(advice, err=True)
     events.finish_current(outcome=outcome, exit_code=code, error=error)
     sys.exit(code)
 

@@ -44,6 +44,7 @@ from lab.manifest import (
     uv_lock_sha256,
 )
 from lab import events, placement
+from lab import notes as lab_notes
 from lab.metrics import final_values, group_series
 from lab.storage import R2Store, r2_enabled
 from lab.attribution import attribute_jobs, local_project
@@ -1091,6 +1092,13 @@ class Lab:
                     self.store.logs_path(jid).read_text(errors="replace")
                 )
                 files.append("logs.txt")
+            # Notes travel with the run. `runs/` is git-ignored, so the bundle is the only route
+            # a note has into the repo where the result gets written up — which is exactly where
+            # "two near-threshold cells flipped across attempts" needs to be legible.
+            src_notes = lab_notes.job_notes_path(jid, home=self.home)
+            if src_notes.is_file():
+                (jdir / "notes.jsonl").write_text(src_notes.read_text(errors="replace"))
+                files.append("notes.jsonl")
             skipped: list[dict[str, str]] = []
             out = self.store.output_dir(jid)
             if out.exists():
@@ -1798,7 +1806,12 @@ def job_status_view(home: Path, repo: Path, job_id: str) -> dict[str, Any]:
         mirrored = default_queue().read_mirrored(job_id)
         if mirrored is None:
             raise
-        return _status_fields(mirrored, state=mirrored.status.value, mirrored=True)
+        return _status_fields(
+            mirrored,
+            state=mirrored.status.value,
+            mirrored=True,
+            notes=lab_notes.count_for_job(job_id, home=home),
+        )
     lab = Lab(backend=build_backend(m.backend.provisioner, home=home, repo=repo), repo=repo, home=home)
     state = lab.status(job_id)
     m = store.read_manifest(job_id)  # re-read: status may have just finalized/torn down the job
@@ -1809,6 +1822,7 @@ def job_status_view(home: Path, repo: Path, job_id: str) -> dict[str, Any]:
         logs_path=store.logs_path(job_id),
         runner_exit=store.read_runtime(job_id).get("runner_exit"),
         partials=store.read_runtime(job_id).get("partials"),
+        notes=lab_notes.count_for_job(job_id, home=home),
     )
 
 
@@ -1820,6 +1834,7 @@ def _status_fields(
     logs_path: Path | None = None,
     runner_exit: dict[str, Any] | None = None,
     partials: dict[str, Any] | None = None,
+    notes: int = 0,
 ) -> dict[str, Any]:
     last_line, last_at = tail_last_line(logs_path) if logs_path is not None else (None, None)
     return {
@@ -1850,6 +1865,9 @@ def _status_fields(
         # `files_total: 0`) from unreachable (`consecutive_failures` climbing with a reason) —
         # three states that used to look identical, namely silent.
         "partials": partials,
+        # Surfaced here because `status` is where people actually look: a note filed on a job and
+        # visible only in a digest nobody runs is a note nobody reads (2026-08-26 ledger review).
+        "notes": notes,
         # Where it actually landed. GCP prices and exhausts per zone, so "which zone" is the
         # difference between a $0.034/hr job and a $0.12/hr one.
         "placement": {

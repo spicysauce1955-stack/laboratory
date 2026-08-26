@@ -369,6 +369,74 @@ declined **or** there was no tty to ask at (nothing was destroyed).
 Live table of all jobs with state, cost, latest metric, and a **`teardown`**
 column that flags `LEAK` rows loudly. Ctrl-C to exit.
 
+### `uv run lab note` — tell us what went wrong (and tell the next run)
+
+**When something surprises you, write it down here rather than only in your own
+notes.** A note is filed next to the run's own logs and in a user-global index,
+so it reaches two readers a private file cannot:
+
+- **the next run**, which gets the note pushed at it when it hits the same
+  failure — it will never think to go looking;
+- **whoever maintains the lab**, who otherwise never learns that an error
+  message misled you or that a cap did not hold.
+
+```bash
+# about a specific job
+uv run lab note 20260825-163005-b037e0 --kind "BUDGET EVENT" --usd 11.88 \
+    -m "three shards billed \$1.39-2.22/hr against --price-cap 0.85"
+
+# about a submit that never became a job (these are often the best notes)
+uv run lab note --kind GOTCHA \
+    -m "the catalog error blamed price; the real cause was RTX_4090 vs RTX4090:1"
+
+# read them back
+uv run lab notes                        # this project, JSON
+uv run lab notes --all-projects         # everywhere this machine has run jobs
+uv run lab notes <job_id>               # just this job's
+uv run lab notes --format md            # a TEAM-LOG-shaped table you can paste
+```
+
+`--kind` is free text; these are the ones already in use, so a reader can group
+on them: `GOTCHA`, `BUDGET EVENT`, `ROOT CAUSE`, `INCIDENT`, `LESSON`,
+`DEVIATION`, `FEATURE REQUEST`, `NOTE` (default). `--usd` records what it cost,
+which is what makes a note rankable against the others. Add `--agent` when an
+agent rather than a person is writing.
+
+**Write one when:**
+- a cost, duration or price differed from what you were told to expect;
+- an error message pointed at the wrong cause;
+- you worked around the lab rather than with it (a hand-rolled watchdog, a
+  polling loop, manual aggregation) — say what pushed you there;
+- something in *this skill* turned out to be wrong or stale;
+- a result is untrustworthy for a reason the manifest cannot show (a host swap
+  mid-run, a flipped near-threshold cell).
+
+**Where notes go.** `runs/<job_id>/notes.jsonl` beside `logs.txt`, and
+`~/.lab/notes/index.jsonl`. The per-job copy travels into `lab export` bundles,
+so a note explaining a number stays with the number. The index is user-global on
+purpose: notes written while running from one checkout are readable from the repo
+where the write-up happens. Nothing is uploaded anywhere — these are local files.
+Note text goes through the same secret masking as the event ledger (FR-J1), but
+do not paste credentials into one on purpose.
+
+**Retire a note when it stops being true — this matters more than it looks:**
+
+```bash
+uv run lab notes --retire n-19a3f2c1-4b7e --reason "enforced on-box since v0.1.0"
+```
+
+A channel that never retires anything becomes a machine for distributing
+folklore, which is the exact failure it exists to prevent. Retired notes stay
+readable (`--include-retired`) but are never pushed at anyone again. Every note
+records the `lab_version` it was written at, so a note from six releases ago is
+labelled as such when it is shown — treat that as a reason to check it, not to
+obey it.
+
+**When a note is pushed at you**, it appears on stderr under
+`[lab] a previous run left a note on this:`. It is *evidence from a previous
+run*, not doctrine — this skill outranks it, and a note contradicting this skill
+is itself worth a note. If it is simply obsolete, retire it.
+
 ## 5b. Deferred scheduling — `lab register` / `lab queue` / `lab scheduler`
 
 For "run this **tonight** / when a GPU is **cheap** / **after** that job — and let me close
@@ -627,6 +695,23 @@ record artifact **URIs**, never credentials (spec FR-J1).
 - **A `running-or-died` row means the process never closed its call** — killed,
   OOMed, or still running. It is a finding, not a glitch: something ended
   without recording an outcome.
+
+## 9b. Corrections — things that are no longer true
+
+Operational folklore outlives the bug that justified it, and a workaround kept
+past its cause costs real time. Each row below is a rule that was once right.
+**If you are still doing the left-hand column, stop.** If you find another,
+`lab note --kind LESSON` it and this table grows.
+
+| No longer true | What is true now | Since |
+|---|---|---|
+| "The wall-clock cap is unreliable — wrap the command in your own timer, or run an external instance-killer." | `--timeout` is enforced **on the instance** by GNU `timeout`, plus a `poweroff` backstop at wall+margin. It does **not** depend on the local supervisor surviving, so a dead supervisor or a killed watcher does not extend the cap. | v0.1.0 |
+| "Killing a backgrounded `lab wait` orphans the job and unsets its cap." | `lab wait` is a *poller*; the supervisor is detached (`start_new_session`) and the cap lives on the box. Killing a wait loses your notification, not your cost bound. A stale `running` manifest afterwards is a *reporting* gap — `lab status <job>` re-checks liveness and finalizes. | v0.1.0 |
+| "`sweep-aggregate` cannot handle a grid with more than one row per seed (e.g. per-α rows)." | Declare the row identity: `--row-key seed,alpha`. Composite keys are supported, and `--row-key` also retrofits a plan made before the flag existed. | v0.2.1 |
+| "`reconcile --apply` may destroy another project's machines, so run it only when nothing else is live." | Ownership must be **proved** before anything is destroyed; resources belonging to another project land in `other_projects` and unprovable ones in `unattributed`, and neither is ever destroyed. Its own `instances_total` counts *all* rentals on the account, so a non-zero value with empty orphan lists is normal when a sibling job is live. | v0.7.0 |
+| "`teardown_status: failed` means a machine is definitely still billing." | There are three non-null values: `succeeded`, `failed` (a real leak, `wait` exits 3) and `unknown` (the destroy ran and its result could not be read, `wait` exits 6 — verify at the provider). Treat an unrecognised value as `unknown`, never as success. | v0.7.0 |
+| "`lab <cmd> --help` exits non-deterministically, so `--help` rows in `lab history` are noise." | That was `rich` raising on a closed stdout pipe; `--help` exits 0. A `usage_error` row is now a real usage error. | v0.7.0 |
+| "`--price-cap` is a hard ceiling." | **Still not true, and worth knowing exactly how.** SkyPilot applies it to its own catalog, which under-reports Vast ~4x. Since v0.8.0 the cheapest *live* Vast offer is checked before renting (an impossible cap fails the submit for free) and the *billed* rate is compared after boot and recorded as `cost.over_cap`. The optimizer can still land above the cheapest offer, so pass `--price-cap-strict` if the ceiling must hold, and bound real exposure with `--timeout`. | v0.8.0 |
 
 ## 10. Pointers
 

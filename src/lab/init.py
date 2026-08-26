@@ -95,6 +95,11 @@ def _mcp_entry(payload: bytes) -> dict[str, Any]:
     return entry
 
 
+def _is_skill(dest: str) -> bool:
+    """Whether a scaffold path is the skill — the one file whose content is instructions."""
+    return dest.replace("\\", "/").endswith("skills/laboratory/SKILL.md")
+
+
 def scaffold(root: Path, *, check: bool = False) -> dict[str, Any]:
     """Write (or, with ``check``, only report) the scaffold into ``root``.
 
@@ -114,6 +119,13 @@ def scaffold(root: Path, *, check: bool = False) -> dict[str, Any]:
         "merged": [],
         "conflicts": [],
         "unchanged": [],
+        # Which version this project was scaffolded for, and which it is moving to. A refreshed
+        # file nobody re-reads is not delivery: `--row-key` shipped 2026-08-06 and the consuming
+        # project recorded it as impossible on 2026-08-14, with the refreshed skill already on
+        # disk. Naming the delta is what turns a silent refresh into something a reader notices.
+        "from_version": state["lab_version"],
+        "to_version": __version__,
+        "skill_changed": False,
     }
     writes: list[tuple[Path, bytes]] = []
     new_hashes: dict[str, str] = {}
@@ -195,6 +207,12 @@ def scaffold(root: Path, *, check: bool = False) -> dict[str, Any]:
                 body += "\n".join(missing) + "\n"
                 report["merged"].append(entry.dest)
             writes.append((target, body.encode()))
+
+    report["skill_changed"] = any(
+        _is_skill(dest)
+        for key in ("created", "refreshed", "merged", "conflicts")
+        for dest in report[key]
+    )
 
     if check:
         report["ok"] = not (report["created"] or report["refreshed"] or report["merged"])
