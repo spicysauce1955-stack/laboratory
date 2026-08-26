@@ -137,6 +137,29 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   (`LAB_SUBMIT_STAGGER_S`, default 1.5s). `lab export <job|sweep> --to DIR` writes the
   committable provenance bundle (manifests + tables + diffs + index.json). `lab status` shows
   `estimated_running_usd` + `last_log_line`. Grid is optional when `--seeds` is given.
+- **User notes (`lab.notes`):** the channel back from whoever ran the job. `lab note [<job>]
+  -m "..."` writes to `runs/<job_id>/notes.jsonl` (beside `logs.txt`, copied into `lab export`
+  bundles) **and** a user-global `~/.lab/notes/index.jsonl` (`LAB_NOTES_DIR`, `LAB_NOTES=0`);
+  global because the consuming project runs `lab` from one checkout and writes up results in
+  another. Text goes through `lab.events.sanitize` (FR-J1). Retrieval is by what **recurs**, not
+  by job id — the next run has a different one: an error **signature** (`events.stats.signature`,
+  the same key the digest groups by) or the job's facets (entrypoint/cloud/accelerators; a match
+  on cloud alone is refused as noise). A signature **cannot be typed by hand** — the ledger masks
+  the message before signing it — so `--last` reads it off the ledger; without that the push
+  never fires in practice. A matching note is printed to **stderr** when a call fails (stdout
+  stays JSON), never for an unsigned error (`signature(None) == "unknown"` would match
+  everything). **`lab notes --retire <id> --reason ...` is load-bearing:** a channel that never
+  retires becomes a folklore distributor, which is the failure it exists to stop — every note
+  carries its `lab_version` and the push dates a stale one inline. `lab status` shows a `notes`
+  count; `lab notes --format md` emits the consumer's own `TEAM-LOG` row, which is what makes
+  adopting this subtraction rather than one more habit.
+- **Delivery is the other half of a fix.** `lab init` now names the version delta and warns when
+  the **skill** changed, pointing at its `Corrections — things that are no longer true` section.
+  `--row-key seed,alpha` shipped 2026-08-06 and the consumer recorded it as impossible on
+  08-14 with the refreshed skill already on disk; and it still guards a wall-clock cap that has
+  been enforced on the instance (GNU `timeout` + `poweroff` backstop, independent of the local
+  supervisor) since v0.1.0. Retiring folklore is a release task, and notes are where the next
+  batch comes from.
 - **Event ledger (`lab.events`):** every CLI/MCP call writes an open/close pair to
   `~/.lab/events/YYYY-MM-DD.jsonl` (user-global, project-tagged; `LAB_EVENTS_DIR` overrides,
   `LAB_EVENTS=0` disables). Internals call `events.note(...)`, buffered in memory and flushed

@@ -4,6 +4,53 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning is 
 breaks the surface in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md); MINOR may, and says so
 with a **BREAKING** entry and an upgrade note.
 
+## Unreleased
+
+A channel back from the people running the jobs, after a review of seven days of the event
+ledger alongside the consuming project's own campaign logs. Three of the most expensive findings
+in that project's history were written down as prose in *its* repo — a misleading error message,
+a price cap that did not hold, an aggregator that crashed — and none of them ever reached this
+one. The ledger cannot hold them: it records what was called and what came back, never what a
+person concluded.
+
+### Added
+
+- **`lab note` — record what went wrong, where the machine's own record already is.** Files a
+  note in `runs/<job_id>/notes.jsonl` beside `logs.txt` *and* in a user-global index
+  (`~/.lab/notes/index.jsonl`, `LAB_NOTES_DIR` overrides, `LAB_NOTES=0` disables). A note with no
+  job id is still recorded — a submit that dies before provisioning never gets one, and those are
+  often the notes worth most. `--kind` uses the vocabulary already in use (`GOTCHA`,
+  `BUDGET EVENT`, `ROOT CAUSE`, `INCIDENT`, `LESSON`, `DEVIATION`, `FEATURE REQUEST`), `--usd`
+  records what it cost, `--agent` marks the author. Text passes through the ledger's secret
+  masking (FR-J1).
+- **`lab note --last` attaches the note to the most recent failure.** This is what makes the loop
+  usable: the ledger masks an error message *before* signing it, so a signature typed from what
+  the terminal printed is not the signature the digest groups by. Nobody could have written a
+  matching one by hand.
+- **A note is pushed back at the next run that hits the same failure.** Keyed on
+  `lab.events.stats.signature`, the same normalisation `lab report` groups by, so it fires across
+  differing job ids, zones and magnitudes — and on stderr, leaving stdout the JSON a caller
+  parses. Silent unless a signed error matches; an unsigned failure signs as the literal
+  `"unknown"` and is refused outright rather than matching every note.
+- **`lab notes` to read them back, `--format md` to emit a `TEAM-LOG`-shaped table**, and
+  **`lab notes --retire <id> --reason ...`** to mark one no longer true. Retirement is the
+  operation without which this feature becomes the problem it exists to solve: the consuming
+  project still runs a hand-written watchdog against a cap enforced on the box since v0.1.0, and
+  a channel that never retires anything distributes that at scale. Every note records the
+  `lab_version` it was written at and the push dates a note from another version inline, so
+  staleness reads as staleness with nobody curating.
+- **Notes surface where people already look**: a `notes` count on `lab status` (81% of real
+  calls), and `notes.jsonl` inside `lab export` bundles — `runs/` is git-ignored, so the bundle
+  is the only route a note has into the repo where the result gets written up.
+- **`lab init` now says when the *skill* changed**, naming the version delta and pointing at the
+  new "Corrections" section. `--row-key seed,alpha` shipped on 2026-08-06 and was recorded as
+  impossible on 2026-08-14 with the refreshed skill already on disk; a file nobody re-reads is
+  not delivery. The report gains `from_version`, `to_version` and `skill_changed`.
+- **Skill: "Corrections — things that are no longer true."** Seven pieces of retired folklore with
+  the version that retired each, starting with the wall-clock cap: it is enforced on the instance
+  by GNU `timeout` plus a `poweroff` backstop and does **not** depend on the local supervisor
+  surviving, so killing a `lab wait` loses a notification, not a cost bound.
+
 ## v0.8.0 — 2026-08-23
 
 Cost-guardrail and teardown work, from a second read of the 2026-08-23 event ledger.

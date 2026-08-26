@@ -37,6 +37,12 @@ upgrade note.
   still exists and is unchanged — only what `pyproject.toml`'s `[project.scripts]` points at
   moved).
 - **MCP** — tool names, argument names, and the shape of returned JSON.
+- **Notes** — `lab note` / `lab notes`, their flags, and the record shape in
+  `runs/<job_id>/notes.jsonl` and `~/.lab/notes/index.jsonl` (every line carries `v`, currently
+  `1`). The per-job file is part of the `runs/<job_id>/` layout below and is copied into
+  `lab export` bundles. `lab status` gained a `notes` count; like every other field here it is
+  additive, and a caller that ignores it is unaffected. A note whose text cannot be masked is
+  never written silently — the ledger's deny-list applies (FR-J1).
 - **Experiment Contract** — `$LAB_RUN_ID`, `$LAB_RUN_DIR`, `$LAB_SEED`;
   `log_metric(name, value, step)`; `effective_config.json`; non-zero exit on failure.
 - **On disk** — the layout of `runs/<job_id>/` and the manifest schema. Field *values* can gain
@@ -76,3 +82,9 @@ uv run lab init --check  # in CI: fail if the scaffold is stale
 
 Read the CHANGELOG entry for anything marked **BREAKING** before upgrading a project with runs in
 flight.
+
+`lab init` reports `from_version`, `to_version` and `skill_changed`, and prints a stderr note when
+the skill itself moved. Take that note seriously: the skill is the only scaffold file whose content
+is *instructions*, and a capability that ships without being read has not been delivered. Its
+"Corrections — things that are no longer true" section is the fastest way to find a workaround you
+no longer need.
