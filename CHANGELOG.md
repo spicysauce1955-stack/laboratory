@@ -4,7 +4,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning is 
 breaks the surface in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md); MINOR may, and says so
 with a **BREAKING** entry and an upgrade note.
 
-## Unreleased
+## v0.9.0 — 2026-08-26
 
 A channel back from the people running the jobs, after a review of seven days of the event
 ledger alongside the consuming project's own campaign logs. Three of the most expensive findings
