@@ -599,9 +599,14 @@ Create `deploy/scheduler/test_cloud_init_template.sh`:
 
 ```bash
 #!/usr/bin/env bash
-# Render cloud-init.yaml.tmpl with fixture values and check: every placeholder was substituted,
-# the result is valid YAML, and no fixture "secret" leaks anywhere except the write_files block
-# (which is the point — it belongs on the droplet, this just proves nothing ELSE picked it up).
+# Render cloud-init.yaml.tmpl with fixture values and check every fixture value actually
+# appears in the output, and the result is valid YAML.
+#
+# NOT a "grep for leftover ${...}" check: this template uses bare $VAR (not ${VAR}) form, and
+# envsubst substitutes an unset bare $VAR with an EMPTY STRING, not the literal text — so a
+# leftover-braces check would silently pass even if a variable were never exported and every
+# line using it rendered blank. Only checking that each real fixture VALUE shows up in the
+# output actually catches that failure mode.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -617,18 +622,22 @@ OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
 envsubst < cloud-init.yaml.tmpl > "$OUT"
 
-if grep -q '\${' "$OUT"; then
-  echo "FAIL: unsubstituted placeholder(s) left in rendered output:" >&2
-  grep '\${' "$OUT" >&2
-  exit 1
-fi
+fail=0
+for value in "$TAG" "$DROPLET_NAME" "$LAB_R2_ENDPOINT" "$LAB_R2_BUCKET" \
+             "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$VAST_API_KEY"; do
+  grep -qF -- "$value" "$OUT" || {
+    echo "FAIL: fixture value '$value' never appears in rendered output -- envsubst silently dropped it" >&2
+    fail=1
+  }
+done
+[[ "$fail" == "0" ]] || exit 1
 
 python3 -c "import yaml, sys; yaml.safe_load(open(sys.argv[1]))" "$OUT" || {
   echo "FAIL: rendered output is not valid YAML" >&2
   exit 1
 }
 
-echo "OK: template renders to valid, fully-substituted YAML"
+echo "OK: template renders to valid YAML with every fixture value substituted"
 ```
 
 ```bash
@@ -637,22 +646,19 @@ chmod +x deploy/scheduler/test_cloud_init_template.sh
 
 - [ ] **Step 3: Run it to verify it fails first**
 
-Run this against the *empty* file before Step 1's content exists, to prove the check is real —
-skip this if Step 1 and Step 2 were done in the order above (Step 1 already wrote real content).
-Instead, verify the check *would* catch a real mistake: temporarily change one `$TAG` in the
-template to `$TAGX` (a typo), run the script, confirm it does **not** fail (since `$TAGX` is just
-an unmatched env var name to `envsubst`, which passes it through unresolved as literal
-`${TAGX}` only if using the `${VAR}` brace form — this template uses bare `$VAR` form, which
-`envsubst` also passes through literally if the var is unset). Revert the typo. This is a sanity
-check on the test's own effectiveness, not a formal step — do it once, by hand, and move on.
+Prove the check is real before trusting it: temporarily comment out the `export VAST_API_KEY=...`
+line (simulating a variable that was never passed through), run the script, confirm it reports
+the missing-value failure — this is the exact bug class ("a secret silently rendered blank") the
+check exists to catch. Uncomment the line afterward. Do this once, by hand; it is a sanity check
+on the test's own effectiveness, not a formal step to repeat.
 
 Run: `bash deploy/scheduler/test_cloud_init_template.sh`
-Expected (before reverting the induced typo): `FAIL: unsubstituted placeholder(s) left`
+Expected (with `VAST_API_KEY` commented out): `FAIL: fixture value 'fixture-vast-key' never appears in rendered output`
 
-- [ ] **Step 4: Revert the typo and verify it passes**
+- [ ] **Step 4: Restore the export and verify it passes**
 
 Run: `bash deploy/scheduler/test_cloud_init_template.sh`
-Expected: `OK: template renders to valid, fully-substituted YAML`
+Expected: `OK: template renders to valid YAML with every fixture value substituted`
 
 - [ ] **Step 5: Commit**
 
