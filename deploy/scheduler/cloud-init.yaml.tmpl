@@ -1,0 +1,70 @@
+#cloud-config
+# Rendered by deploy/scheduler/deploy.sh via envsubst. Placeholders: $TAG, $DROPLET_NAME,
+# $LAB_R2_ENDPOINT, $LAB_R2_BUCKET, $AWS_ACCESS_KEY_ID, $AWS_SECRET_ACCESS_KEY, $VAST_API_KEY.
+# Runs once, as root, on first boot. No SSH involved anywhere in this file.
+
+hostname: $DROPLET_NAME
+fqdn: $DROPLET_NAME
+prefer_fqdn_over_hostname: false
+
+package_update: true
+packages:
+  - git
+  - rsync
+
+write_files:
+  - path: /etc/lab/scheduler.env
+    owner: root:root
+    permissions: '0600'
+    content: |
+      LAB_R2_ENDPOINT=$LAB_R2_ENDPOINT
+      LAB_R2_BUCKET=$LAB_R2_BUCKET
+      AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+      AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+      VAST_API_KEY=$VAST_API_KEY
+
+runcmd:
+  # Swapfile: skypilot imports are memory-hungry on a 1GB droplet. fstab-persisted so it survives
+  # a reboot (the kill-test in deploy/scheduler/README.md explicitly reboots the droplet).
+  - fallocate -l 2048M /swapfile
+  - chmod 600 /swapfile
+  - mkswap /swapfile
+  - swapon /swapfile
+  - echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+  # uv, installed where every user can run it — the tick runs as `lab`, not root.
+  - 'curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh'
+
+  # Service user, created before anything is installed as it.
+  - useradd --create-home --system --shell /bin/bash lab
+
+  # Vast API key for the service user (sky reads the file; the sdk reads $VAST_API_KEY from env).
+  - install -d -o lab -g lab -m 0700 /home/lab/.config/vastai
+  - 'bash -c "echo \"$VAST_API_KEY\" > /home/lab/.config/vastai/vast_api_key"'
+  - chown lab:lab /home/lab/.config/vastai/vast_api_key
+  - chmod 600 /home/lab/.config/vastai/vast_api_key
+
+  # Install the pinned laboratory release as the `lab` user (puts the entrypoint at
+  # /home/lab/.local/bin/lab — root's uv tool install would land under 0700 /root/.local/bin,
+  # which User=lab in the unit file below cannot execute: 203/EXEC).
+  - >-
+    sudo -u lab -H uv tool install
+    "laboratory[skypilot,r2] @ git+https://github.com/spicysauce1955-stack/laboratory.git@$TAG"
+
+  # Clone the experiment project the scheduler runs jobs against.
+  - install -d -o lab -g lab /opt/tempotron-capacity
+  - sudo -u lab -H git clone https://github.com/spicysauce1955-stack/tempotron-capacity.git /opt/tempotron-capacity
+
+  # Fetch the systemd units FRESH from the pinned tag — never duplicated into this template.
+  # They have not needed any path substitution since v0.5.0 (WorkingDirectory/ExecStart are
+  # already correct for this project in the checked-in files).
+  - >-
+    curl -fsSL
+    https://raw.githubusercontent.com/spicysauce1955-stack/laboratory/$TAG/deploy/scheduler/lab-scheduler.service
+    -o /etc/systemd/system/lab-scheduler.service
+  - >-
+    curl -fsSL
+    https://raw.githubusercontent.com/spicysauce1955-stack/laboratory/$TAG/deploy/scheduler/lab-scheduler.timer
+    -o /etc/systemd/system/lab-scheduler.timer
+  - systemctl daemon-reload
+  - systemctl enable --now lab-scheduler.timer
