@@ -37,7 +37,7 @@ from lab.manifest import git_work_tree, repo_root
 from lab.models import JobSpec, ResourceRequest
 from lab.scheduler.models import Guardrails, RegState, Triggers
 from lab.scheduler.price import PriceFeed
-from lab.scheduler.queue import QueueStore, default_queue
+from lab.scheduler.queue import QueueStore, default_queue, wait_for_queue_drain
 from lab.scheduler.register import parse_expires, parse_window
 from lab.scheduler.register import register as sched_register
 from lab.scheduler.register import register_sweep as sched_register_sweep
@@ -1461,6 +1461,25 @@ def queue_resume() -> None:
     queue = default_queue()
     queue.write_control(queue.read_control().model_copy(update={"paused": False}))
     _emit({"paused": False})
+
+
+@queue_app.command(name="wait-drain")
+def queue_wait_drain(
+    interval: float = typer.Option(10.0, help="seconds between polls"),
+    timeout: str | None = typer.Option(
+        None, help="give up after this long, e.g. '30m' (bare numbers = seconds)"
+    ),
+) -> None:
+    """Block until no registration is launching/launched, or --timeout elapses — the safety gate
+    to run before pausing the queue for a scheduler redeploy (never pause first: pausing stops
+    the sync that would let this ever observe a real drain)."""
+    queue = default_queue()
+    timeout_s = parse_duration(timeout) if timeout else None
+    blocking = wait_for_queue_drain(queue, interval=interval, timeout=timeout_s)
+    if blocking:
+        _emit({"drained": False, "blocking": [r.reg_id for r in blocking]})
+        _fail(1, f"{len(blocking)} registration(s) still in flight after timeout")
+    _emit({"drained": True, "blocking": []})
 
 
 @queue_app.command(name="budget")
