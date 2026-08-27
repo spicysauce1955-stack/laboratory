@@ -1473,8 +1473,11 @@ def queue_wait_drain(
     """Block until no registration is launching/launched, or --timeout elapses — the safety gate
     to run before pausing the queue for a scheduler redeploy (never pause first: pausing stops
     the sync that would let this ever observe a real drain)."""
+    try:
+        timeout_s = parse_duration(timeout)
+    except ValueError as e:
+        raise typer.BadParameter(f"bad --timeout {timeout!r}: {e}") from e
     queue = default_queue()
-    timeout_s = parse_duration(timeout) if timeout else None
     blocking = wait_for_queue_drain(queue, interval=interval, timeout=timeout_s)
     if blocking:
         _emit({"drained": False, "blocking": [r.reg_id for r in blocking]})

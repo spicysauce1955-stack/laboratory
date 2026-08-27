@@ -51,3 +51,12 @@ def test_exits_1_and_names_blockers_on_timeout(tmp_path: Path, monkeypatch) -> N
     data = json.loads(result.output)
     assert data["drained"] is False
     assert data["blocking"] == ["reg-stuck"]
+
+
+def test_bad_timeout_string_is_usage_error(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("LAB_QUEUE_DIR", str(tmp_path / "queue"))
+    LocalQueueStore(tmp_path / "queue")
+
+    result = runner.invoke(app, ["queue", "wait-drain", "--timeout", "2hr"])
+
+    assert result.exit_code == 2
