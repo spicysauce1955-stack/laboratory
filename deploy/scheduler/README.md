@@ -9,10 +9,12 @@ live in R2, so this host can be destroyed and recreated at any time.
 deploy/scheduler/deploy.sh vX.Y.Z
 ```
 
-Builds a new droplet from the pinned tag, verifies it can actually launch a job, then retires the
-old one — an immutable blue-green swap, never an in-place mutation. No SSH involved. Safe to
-re-run: every step before the final delete leaves the previous droplet as a fallback, and a failed
-smoke test rolls back automatically.
+Builds a new droplet from the pinned tag, takes the old one out of service, then proves the new
+one can actually launch a job before permanently deleting the old one — an immutable blue-green
+swap, never an in-place mutation. No SSH involved. Safe to re-run: every step before the final
+delete leaves the previous droplet as a fallback. Most failures roll back automatically, but a
+compound failure (an inconclusive smoke test, or a rollback step itself failing) surfaces with a
+manual-action message instead of self-healing.
 
 Requires `doctl` (authenticated) and the same controller-side secrets the manual steps below
 always needed: `~/.config/vastai/vast_api_key`, `~/.cloudflare/r2.credentials`,
