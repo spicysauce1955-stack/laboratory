@@ -25,6 +25,7 @@ __pycache__/
 
 # Claude worktrees (session isolation)
 .claude/worktrees/
+.worktrees/
 
 # Coverage data — a binary artifact of running the suite; it was committed once by accident
 # and shipped inside the sdist.

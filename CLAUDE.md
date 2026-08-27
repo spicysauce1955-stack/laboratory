@@ -66,6 +66,12 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
 - **Deferred scheduling:** `lab register` + `lab queue …` queue jobs (night window / price /
   dependency triggers); an always-on host runs `lab scheduler tick` every 60s (systemd timer,
   `deploy/scheduler/`). Spec: `docs/superpowers/specs/2026-06-10-deferred-scheduling-design.md`.
+- **Scheduler redeploy:** `deploy/scheduler/deploy.sh vX.Y.Z` — an immutable blue-green droplet
+  swap (build new, verify with a real smoke job, retire old), replacing playground's Ansible role
+  (which drifted for 2.5 months undetected — see `docs/superpowers/specs/
+  2026-08-27-scheduler-deploy-cutover-design.md`). No SSH involved. `lab queue wait-drain` is the
+  safety gate it waits on before pausing the queue — drain **before** pause, never the reverse
+  (pausing stops the sync that would let a drain-wait ever observe real progress).
 - **Fail-closed provenance (FR-B1):** `JobStore.create` rejects any manifest whose `code` can't
   reproduce the run (null SHA, or `git_dirty` without a `diff_ref`) — enforced on create only, so
   legacy manifests still read. A dirty `submit` auto-snapshots the diff+untracked into

@@ -3,6 +3,63 @@
 The scheduler is **stateless**: queue entries, control, bundles, and mirrored job manifests all
 live in R2, so this host can be destroyed and recreated at any time.
 
+## Redeploy (primary path, since 2026-08)
+
+Run `deploy/scheduler/deploy.sh vX.Y.Z --dry-run` **first** — it walks every step's control flow
+and preflight checks without touching any real droplet, R2 bucket, or job, and is the right way to
+sanity-check credentials/arguments before spending anything for real:
+
+```bash
+deploy/scheduler/deploy.sh vX.Y.Z --dry-run   # do this first
+deploy/scheduler/deploy.sh vX.Y.Z             # the real cutover
+```
+
+Builds a new droplet from the pinned tag, takes the old one out of service, then proves the new
+one can actually launch a job before permanently deleting the old one — an immutable blue-green
+swap, never an in-place mutation. No SSH involved. Safe to re-run: every step before the final
+delete leaves the previous droplet as a fallback. Most failures roll back automatically, but a
+compound failure (an inconclusive smoke test, or a rollback step itself failing) surfaces with a
+manual-action message instead of self-healing.
+
+**Hard prerequisite: exactly one droplet tagged `lab-scheduler`.** Preflight refuses to run
+otherwise (0 found = nothing to swap; 2+ found = it won't guess which is live). The droplet
+currently running the scheduler was created by `playground`'s Ansible role, and as of this
+writing nothing in this repo has confirmed it actually carries that tag — the first real run may
+simply refuse until you've checked (`doctl compute droplet list --tag-name lab-scheduler`) and,
+if needed, tagged it (`doctl compute droplet tag <id> --tag-name lab-scheduler`).
+
+**The smoke test spends real money** — step 7 is a real registration that launches a real cloud
+rental via SkyPilot (`--cloud do` by default), not a simulation. Budget for it like any other
+job. If step 1's drain-wait times out, the message names the blocking `reg_id`s; there is no
+"skip drain" flag by design (that would be pausing the queue with jobs mid-flight) — the only way
+past it is to cancel or wait out those registrations by hand (`lab queue cancel <reg_id>` or let
+them finish).
+
+Four env vars tune timeouts and one failure-mode default:
+- `LAB_DEPLOY_DRAIN_TIMEOUT` (default `30m`) — step 1, waiting for in-flight jobs to clear.
+- `LAB_DEPLOY_VERIFY_TIMEOUT_S` (default `1200`) — step 4, waiting for the new droplet's first
+  heartbeat (boot + package installs on a 1 vCPU/1GB droplet is realistically 10+ minutes).
+- `LAB_DEPLOY_SMOKE_TIMEOUT_S` (default `1800`) — step 7, waiting for the smoke job to finish.
+- `LAB_DEPLOY_DELETE_ON_VERIFY_FAIL` (default unset) — step 4, on a verify timeout. The default
+  powers the unconfirmed new droplet off (not delete) so its cloud-init logs stay inspectable via
+  the DO console; set to `1` to auto-delete it instead, which destroys that diagnostic evidence.
+
+If the host will ever run `--cloud gcp` registrations, re-install its GCP service-account key and
+ADC symlink (below, "Google Cloud credentials") on the **new** droplet before the old one is
+deleted (step 8) — cloud-init does not reproduce that credential, only the tool that needs it.
+
+Requires `doctl` (authenticated) and the same controller-side secrets the manual steps below
+always needed: `~/.config/vastai/vast_api_key`, `~/.cloudflare/r2.credentials`,
+`$LAB_R2_ENDPOINT` exported (or set in this repo's git-ignored `.env` — `deploy.sh` fills in
+whichever of `LAB_R2_ENDPOINT`/`LAB_R2_BUCKET` aren't already exported from there, same rule as
+the rest of the lab: real env always wins over the file).
+
+Full design + the two real bugs an adversarial review caught before this shipped:
+`docs/superpowers/specs/2026-08-27-scheduler-deploy-cutover-design.md`.
+
+The sections below (manual provisioning via the `playground` repo, in-place SSH upgrade) are kept
+as reference/fallback — `deploy.sh` is the path to actually use.
+
 ## Provision (playground repo)
 
 Use the playground project's `cloud-digitalocean` backend to create the smallest droplet
@@ -59,8 +116,10 @@ RAW=https://raw.githubusercontent.com/spicysauce1955-stack/laboratory/$TAG/deplo
    Environment=LAB_REPO_DIR=/opt/tempotron-capacity
    ExecStart=/home/lab/.local/bin/lab scheduler tick --backend skypilot
    ```
-   The shipped `ExecStart` is a placeholder pointing at `/root/.local/bin/lab`; with the unit's
-   `User=lab` that is the 203/EXEC failure above. Replace it.
+   As of v0.5.0 the checked-in `ExecStart`/`WorkingDirectory`/`Environment` already point at the
+   right paths for a `tempotron-capacity` deploy — no substitution needed. (This used to require a
+   manual patch; it doesn't anymore. If you're deploying against a *different* experiment project,
+   you still need to edit those three lines by hand.)
 7. `systemctl daemon-reload && systemctl enable --now lab-scheduler.timer`
 
 ### Upgrading the host

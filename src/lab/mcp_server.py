@@ -540,7 +540,10 @@ def build_server(lab: Lab) -> FastMCP:
 
     @mcp.tool
     def queue_list() -> dict[str, Any]:
-        """List deferred registrations: state, job_id, last skip reason, scheduler heartbeat age."""
+        """List deferred registrations: state, job_id, last skip reason, scheduler heartbeat
+        age/host, and heartbeat_paused -- the pause state the *last completed tick* actually
+        observed and acted on (unlike control.paused below, which flips the instant a write
+        lands)."""
         queue = default_queue()
         hb = queue.read_heartbeat()
         age = None
@@ -550,6 +553,9 @@ def build_server(lab: Lab) -> FastMCP:
             age = max(0.0, (now() - datetime.fromisoformat(str(hb["at"]))).total_seconds())
         return {
             "heartbeat_age_s": age,
+            "host": (hb or {}).get("host"),
+            "heartbeat_paused": (hb or {}).get("paused"),
+            "tick_count": (hb or {}).get("tick_count"),
             "control": queue.read_control().model_dump(),
             "entries": [
                 {

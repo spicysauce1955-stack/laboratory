@@ -37,7 +37,7 @@ from lab.manifest import git_work_tree, repo_root
 from lab.models import JobSpec, ResourceRequest
 from lab.scheduler.models import Guardrails, RegState, Triggers
 from lab.scheduler.price import PriceFeed
-from lab.scheduler.queue import QueueStore, default_queue
+from lab.scheduler.queue import QueueStore, default_queue, wait_for_queue_drain
 from lab.scheduler.register import parse_expires, parse_window
 from lab.scheduler.register import register as sched_register
 from lab.scheduler.register import register_sweep as sched_register_sweep
@@ -1355,8 +1355,7 @@ queue_app = typer.Typer(help="Manage deferred registrations (spec §6).", no_arg
 app.add_typer(queue_app, name="queue")
 
 
-def _heartbeat_age_s(queue: QueueStore) -> float | None:
-    hb = queue.read_heartbeat()
+def _heartbeat_age_s(hb: dict[str, Any] | None) -> float | None:
     if not hb or "at" not in hb:
         return None
     at = datetime.fromisoformat(str(hb["at"]))
@@ -1374,12 +1373,19 @@ def _require_entry(queue: QueueStore, reg_id: str) -> None:
 
 @queue_app.command(name="list")
 def queue_list() -> None:
-    """Entries + state + skip reason, plus scheduler heartbeat age (spec §6)."""
+    """Entries + state + skip reason, plus scheduler heartbeat age/pause-ack and which host
+    wrote it. `heartbeat_paused` is what the *last completed tick* actually observed and acted
+    on -- unlike `control.paused` below (which flips the instant a write lands), it's the signal
+    a redeploy cutover needs to confirm the running scheduler has genuinely stopped launching."""
     queue = default_queue()
     entries = queue.list_entries()
+    hb = queue.read_heartbeat()
     _emit(
         {
-            "heartbeat_age_s": _heartbeat_age_s(queue),
+            "heartbeat_age_s": _heartbeat_age_s(hb),
+            "host": (hb or {}).get("host"),
+            "heartbeat_paused": (hb or {}).get("paused"),
+            "tick_count": (hb or {}).get("tick_count"),
             "control": queue.read_control().model_dump(),
             "entries": [
                 {
@@ -1459,6 +1465,28 @@ def queue_resume() -> None:
     queue = default_queue()
     queue.write_control(queue.read_control().model_copy(update={"paused": False}))
     _emit({"paused": False})
+
+
+@queue_app.command(name="wait-drain")
+def queue_wait_drain(
+    interval: float = typer.Option(10.0, help="seconds between polls"),
+    timeout: str | None = typer.Option(
+        None, help="give up after this long, e.g. '30m' (bare numbers = seconds)"
+    ),
+) -> None:
+    """Block until no registration is launching/launched, or --timeout elapses — the safety gate
+    to run before pausing the queue for a scheduler redeploy (never pause first: pausing stops
+    the sync that would let this ever observe a real drain)."""
+    try:
+        timeout_s = parse_duration(timeout)
+    except ValueError as e:
+        raise typer.BadParameter(f"bad --timeout {timeout!r}: {e}") from e
+    queue = default_queue()
+    blocking = wait_for_queue_drain(queue, interval=interval, timeout=timeout_s)
+    if blocking:
+        _emit({"drained": False, "blocking": [r.reg_id for r in blocking]})
+        _fail(1, f"{len(blocking)} registration(s) still in flight after timeout")
+    _emit({"drained": True, "blocking": []})
 
 
 @queue_app.command(name="budget")

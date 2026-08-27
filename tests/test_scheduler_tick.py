@@ -83,7 +83,18 @@ def test_heartbeat_written_even_when_paused(tmp_path: Path):
     assert rep.launched == []
     hb = q.read_heartbeat()
     assert hb is not None and hb["tick_count"] == 1
+    assert hb["paused"] is True
     assert q.get_entry("reg-a").state is RegState.pending  # untouched while paused
+
+
+def test_heartbeat_reports_paused_false_when_unpaused(tmp_path: Path):
+    # A scheduler redeploy polls this to confirm a *completed* tick actually observed the pause
+    # before proceeding -- `control.paused` alone only proves the write landed, not that the
+    # running scheduler (which may be mid-tick, having already read the old value) picked it up.
+    sched, q = make_sched(tmp_path)
+    sched.tick()
+    hb = q.read_heartbeat()
+    assert hb is not None and hb["paused"] is False
 
 
 def test_tick_count_increments(tmp_path: Path):
