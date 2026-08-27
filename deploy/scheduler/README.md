@@ -3,6 +3,27 @@
 The scheduler is **stateless**: queue entries, control, bundles, and mirrored job manifests all
 live in R2, so this host can be destroyed and recreated at any time.
 
+## Redeploy (primary path, since 2026-08)
+
+```bash
+deploy/scheduler/deploy.sh vX.Y.Z
+```
+
+Builds a new droplet from the pinned tag, verifies it can actually launch a job, then retires the
+old one — an immutable blue-green swap, never an in-place mutation. No SSH involved. Safe to
+re-run: every step before the final delete leaves the previous droplet as a fallback, and a failed
+smoke test rolls back automatically.
+
+Requires `doctl` (authenticated) and the same controller-side secrets the manual steps below
+always needed: `~/.config/vastai/vast_api_key`, `~/.cloudflare/r2.credentials`,
+`$LAB_R2_ENDPOINT` exported.
+
+Full design + the two real bugs an adversarial review caught before this shipped:
+`docs/superpowers/specs/2026-08-27-scheduler-deploy-cutover-design.md`.
+
+The sections below (manual provisioning via the `playground` repo, in-place SSH upgrade) are kept
+as reference/fallback — `deploy.sh` is the path to actually use.
+
 ## Provision (playground repo)
 
 Use the playground project's `cloud-digitalocean` backend to create the smallest droplet
@@ -59,8 +80,10 @@ RAW=https://raw.githubusercontent.com/spicysauce1955-stack/laboratory/$TAG/deplo
    Environment=LAB_REPO_DIR=/opt/tempotron-capacity
    ExecStart=/home/lab/.local/bin/lab scheduler tick --backend skypilot
    ```
-   The shipped `ExecStart` is a placeholder pointing at `/root/.local/bin/lab`; with the unit's
-   `User=lab` that is the 203/EXEC failure above. Replace it.
+   As of v0.5.0 the checked-in `ExecStart`/`WorkingDirectory`/`Environment` already point at the
+   right paths for a `tempotron-capacity` deploy — no substitution needed. (This used to require a
+   manual patch; it doesn't anymore. If you're deploying against a *different* experiment project,
+   you still need to edit those three lines by hand.)
 7. `systemctl daemon-reload && systemctl enable --now lab-scheduler.timer`
 
 ### Upgrading the host
