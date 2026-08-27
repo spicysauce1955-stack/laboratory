@@ -36,6 +36,13 @@ upgrade note.
   imported `lab.cli:app` directly instead of going through the console script (`app` itself
   still exists and is unchanged — only what `pyproject.toml`'s `[project.scripts]` points at
   moved).
+
+  `lab ps` / `mcp__lab__ps` (v0.10.0) is new, not a change to an existing command — every
+  non-terminal job on the machine, across every project, not just this repo's `runs/`.
+  `lab reconcile`'s `ghosts` list (shape unchanged, still `list[str]`) gained a same-version
+  sibling field, `ghost_reasons: dict[str, str]`, naming why each entry was flagged; like every
+  additive field here, a caller that ignores it is unaffected. `lab queue list` gained `host`,
+  `heartbeat_paused` and `tick_count`, all additive.
 - **MCP** — tool names, argument names, and the shape of returned JSON.
 - **Notes** — `lab note` / `lab notes`, their flags, and the record shape in
   `runs/<job_id>/notes.jsonl` and `~/.lab/notes/index.jsonl` (every line carries `v`, currently

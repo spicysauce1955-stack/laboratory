@@ -1,6 +1,6 @@
 ---
 name: laboratory
-description: "Run/execute a reproducible ML or compute experiment via the lab runner (MCP tools / `lab` CLI) — in this project this is the right way to actually launch a training/experiment job, not running the script directly. Use when the user wants the work done, not just discussed: run, submit, or kick off an experiment; sweep a grid over hyperparameters/seeds and report which config won; shard a large-seed sweep into independently-bounded per-seed sub-jobs and aggregate one per-cell result (sweep-aggregate / sweep-retry); put a job on a remote GPU (RTX 4090 on Vast.ai via SkyPilot; T4/L4 on GCP) or a cheap remote CPU box (DigitalOcean/GCP, --backend cpu), cap its cost or runtime; REGISTER/schedule an experiment for later — run tonight/off-hours, run when a GPU price drops, run after another job, queue/hold/cancel deferred runs while the laptop is closed; stream live metrics and kill a diverging run early; fetch results/artifacts; reproduce a prior run or verify a result still reproduces (lab confirm); export a committable provenance bundle for the paper (lab export); diagnose a billing/teardown leak ('am I still being charged?', stuck Vast rental, `lab wait` exit 3); or read back the lab's own event ledger — what have I already tried this session, why did that submit/sweep actually fail, which failures keep recurring and what have they cost (lab history / lab report). Triggers: lab submit, lab sweep, lab sweep-aggregate, lab sweep-retry, lab wait, lab confirm, lab export, lab lint, lab register, lab queue, lab scheduler, lab reconcile, lab history, lab report. Skip for merely writing an experiment script or reading saved results."
+description: "Run/execute a reproducible ML or compute experiment via the lab runner (MCP tools / `lab` CLI) — in this project this is the right way to actually launch a training/experiment job, not running the script directly. Use when the user wants the work done, not just discussed: run, submit, or kick off an experiment; sweep a grid over hyperparameters/seeds and report which config won; shard a large-seed sweep into independently-bounded per-seed sub-jobs and aggregate one per-cell result (sweep-aggregate / sweep-retry); put a job on a remote GPU (RTX 4090 on Vast.ai via SkyPilot; T4/L4 on GCP) or a cheap remote CPU box (DigitalOcean/GCP, --backend cpu), cap its cost or runtime; REGISTER/schedule an experiment for later — run tonight/off-hours, run when a GPU price drops, run after another job, queue/hold/cancel deferred runs while the laptop is closed; stream live metrics and kill a diverging run early; fetch results/artifacts; reproduce a prior run or verify a result still reproduces (lab confirm); export a committable provenance bundle for the paper (lab export); diagnose a billing/teardown leak ('am I still being charged?', stuck Vast rental, `lab wait` exit 3); check whether anything is actually running right now, machine-wide, before an action that could disturb a live job (lab ps); or read back the lab's own event ledger — what have I already tried this session, why did that submit/sweep actually fail, which failures keep recurring and what have they cost (lab history / lab report). Triggers: lab submit, lab sweep, lab sweep-aggregate, lab sweep-retry, lab wait, lab confirm, lab export, lab lint, lab register, lab queue, lab scheduler, lab reconcile, lab ps, lab history, lab report. Skip for merely writing an experiment script or reading saved results."
 metadata:
   version: "0.9.0"
   last_updated: "2026-08-19"
@@ -230,9 +230,25 @@ CLI: `uv run lab export <job|sweep_id> --to DIR [--logs]`.
 covering DO/GCP clusters (`sky_orphans`), a DO detached-volume pass, a GCP
 compute-API pass (`lab-*` instances + unattached `lab-*` disks), plus `ghosts`
 and `unsupervised` (running jobs whose supervisor pid is dead — their clusters
-are NOT counted as healthy). Read-only: it never destroys anything — cleanup is
+are NOT counted as healthy). `ghosts` cross-checks every cloud's own SkyPilot
+state, not just Vast rental labels (v0.10.0 — see Corrections below), and each
+entry's cause is named in the additive `ghost_reasons: {cluster: reason}`.
+Read-only: it never destroys anything — cleanup is
 `lab reconcile --apply --yes` at the CLI (only `--apply` is CLI-only; the
 dry-run report is right here).
+
+### `mcp__lab__ps`
+`{}` → `{"jobs": [{job_id, project, status, backend, cloud, supervised, started_at}, ...], "count"}`.
+Every currently non-terminal job on this **machine**, across every project —
+not just this one's `runs/`. `list` only sees this project's own jobs and
+`reconcile` reports leaks, not a plain "what's running" list; neither answers
+"is anything running right now, anywhere on this machine" (v0.10.0, closing a
+real gap: both were checked during an incident and neither surfaced real
+running jobs in a *different* project). `supervised` is `local` (a live local
+supervisor), `starting` (just launched, not yet visible), `unsupervised` (the
+local supervisor died — the job may still be billing with nobody watching it),
+or `n/a` for non-SkyPilot backends. Run this before anything that could
+disturb a live job, not just `reconcile`/`queue list` — see §6.H.
 
 ### `mcp__lab__metrics`
 `{job_id, names?, since_step?}` → `{"series": {name: [{step, value, wall_time}, ...]}}`.
@@ -284,7 +300,7 @@ the local output is empty (e.g. after a fresh clone).
 
 Every MCP tool has a matching CLI command (`uv run lab submit / confirm / sweep /
 sweep-aggregate / sweep-retry / export / lint / status / logs / metrics / fetch /
-cancel / list / history / report`).
+cancel / list / ps / history / report`).
 The `lab` CLI prints JSON mirroring the MCP returns. (`lab submit
 --no-dirty` is the CLI form of `allow_dirty=false` — refuse a dirty tree instead
 of snapshotting it.) Sharded-sweep CLI form:
@@ -577,7 +593,9 @@ see `teardown_status: "failed"` in `lab status`) → `lab reconcile` (dry-run)
 → inspect the orphans → `lab reconcile --apply --yes` to destroy them. The lab
 already retries `sky.down` and falls back to vastai-sdk directly on failure,
 so leaks are rare — but `reconcile` is the operational safety net when even
-that fails.
+that fails. Neither `reconcile` nor `queue list` answers "is anything actually
+running, machine-wide, right now" — `lab ps` does; run it before anything
+that could disturb a live job, especially in a different project's checkout.
 
 ### I. Work out what went wrong (and what keeps going wrong)
 The lab records every call it runs. After a failure:
@@ -712,6 +730,8 @@ past its cause costs real time. Each row below is a rule that was once right.
 | "`teardown_status: failed` means a machine is definitely still billing." | There are three non-null values: `succeeded`, `failed` (a real leak, `wait` exits 3) and `unknown` (the destroy ran and its result could not be read, `wait` exits 6 — verify at the provider). Treat an unrecognised value as `unknown`, never as success. | v0.7.0 |
 | "`lab <cmd> --help` exits non-deterministically, so `--help` rows in `lab history` are noise." | That was `rich` raising on a closed stdout pipe; `--help` exits 0. A `usage_error` row is now a real usage error. | v0.7.0 |
 | "`--price-cap` is a hard ceiling." | **Still not true, and worth knowing exactly how.** SkyPilot applies it to its own catalog, which under-reports Vast ~4x. Since v0.8.0 the cheapest *live* Vast offer is checked before renting (an impossible cap fails the submit for free) and the *billed* rate is compared after boot and recorded as `cost.over_cap`. The optimizer can still land above the cheapest offer, so pass `--price-cap-strict` if the ceiling must hold, and bound real exposure with `--timeout`. | v0.8.0 |
+| "`reconcile`'s `ghosts` list is Vast-only — a healthy DO/GCP job may show up there as a false positive, so don't trust it for those backends." | Ghost detection now cross-checks every cloud's own SkyPilot-tracked state, not just Vast rental labels; a healthy DO/GCP job is no longer misreported. Each entry's cause is named in the additive `ghost_reasons`. | v0.10.0 |
+| "There's no way to see what's actually running right now except `lab list` (this project only) or eyeballing `reconcile`'s rental counts." | `lab ps` / `mcp__lab__ps` gives a project-agnostic, machine-wide "what's running" view — closes a real gap found live, when both of the above were checked during an incident and neither surfaced jobs running in a *different* project. | v0.10.0 |
 
 ## 10. Pointers
 

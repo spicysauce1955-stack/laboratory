@@ -4,6 +4,41 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning is 
 breaks the surface in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md); MINOR may, and says so
 with a **BREAKING** entry and an upgrade note.
 
+## v0.10.0 — 2026-08-27
+
+Two defects surfaced from the same instinct — trust but verify what "leak-free" and "deployed"
+actually mean — plus the mechanism this project's own scheduler host needed to stop drifting.
+
+### Fixed
+
+- **`lab reconcile`'s `ghosts` pass falsely flagged every healthy DO/GCP job.** Ghost detection
+  only ever checked Vast rental labels; a DO or GCP job running exactly as expected had no Vast
+  label to match and was reported as an orphaned "ghost" regardless of its real state. Cross-checks
+  now go through SkyPilot's own tracked cluster state for every cloud, fetched once per
+  `reconcile()` call and shared across passes (an earlier draft fetched it per-branch, which would
+  have doubled reconcile's real API-call cost on every run). Each entry's cause is now named in the
+  additive `ghost_reasons` field; `ghosts` itself is unchanged — its shape is frozen.
+
+### Added
+
+- **`lab ps` / `mcp__lab__ps`** — every non-terminal job on this **machine**, across every
+  project, not just this repo's `runs/`. Neither `lab reconcile` nor `lab queue list` answers "is
+  anything actually running right now, anywhere on this machine": both were checked live on
+  2026-08-27 and neither surfaced real running jobs in a different project's checkout. Walks the
+  user-global job registry (`~/.lab/jobs/index.jsonl`) and reports each job's `supervised` state
+  (`local` / `starting` / `unsupervised` / `n/a`) — the check to run before anything that could
+  disturb a live job.
+- **`deploy/scheduler/deploy.sh`** — an immutable blue-green cutover for the scheduler host,
+  replacing the `playground` repo's Ansible role, which had drifted since it was last applied on
+  2026-06-11 and would have deployed a pre-v0.5.0 layout on its next real run. Builds a new
+  droplet from a pinned release tag via cloud-init (no SSH), proves it through a real registration
+  on the actual scheduler, then retires the old droplet — never mutates a live host in place.
+  `lab queue wait-drain` is the new safe drain gate it polls before pausing; `lab queue list`
+  gains `host`, `heartbeat_paused`, and `tick_count` so a cutover (or anyone else) can tell which
+  droplet is really ticking and whether a *completed* tick has actually observed a pause, not just
+  that the write landed — closing a real TOCTOU gap between draining and pausing that a code
+  review caught before this ever ran against production.
+
 ## v0.9.0 — 2026-08-26
 
 A channel back from the people running the jobs, after a review of seven days of the event

@@ -139,7 +139,9 @@ seconds, destroy it by hand: `vastai destroy_instance <id>`.
 
 If you have multiple projects sharing one Vast account, run `lab reconcile`
 from each repo before `--apply` (a rental tied to a job in repo B looks like
-an orphan from repo A's perspective).
+an orphan from repo A's perspective) — or run `lab ps` first: it's
+project-agnostic and shows every non-terminal job on the machine, wherever
+it was submitted from, without needing to know which repos to check.
 
 ## Notes
 
