@@ -20,7 +20,11 @@
 # possibly-still-ticking new droplet still up, which is the same double-launch race by another
 # path. rollback() re-arms that same safety net (RESUMED=0) for the duration of its own sequence,
 # so a death mid-rollback still gets a resume attempt from the outer trap instead of leaving the
-# queue paused forever with no message.
+# queue paused forever with no message. A third round closed two gaps in that hardening itself:
+# rollback() only clears NEW_DROPLET_CREATED once its own power-off AND delete of the new droplet
+# are BOTH confirmed (never unconditionally -- an unconfirmed teardown must still look "live" to
+# any cleanup() that runs afterward), and cleanup()'s redundant power-off first asks doctl for the
+# new droplet's actual status rather than assuming a repeat power-off call is a harmless no-op.
 set -euo pipefail
 
 TAG="${1:-}"
@@ -68,12 +72,22 @@ cleanup() {
     echo "deploy failed while queue was paused -- recovering safely" >&2
     local safe_to_resume=1
     if (( NEW_DROPLET_CREATED == 1 )); then
-      echo "powering off unproven new droplet ($NEW_DROPLET_ID) before resuming -- avoids two unpaused tickers" >&2
-      if doctl compute droplet-action power-off "$NEW_DROPLET_ID" --wait; then
+      # Don't assume a redundant power-off is a harmless no-op against the real API -- ask first.
+      # An unreadable status is treated the same as "not confirmed off": fall through to the
+      # existing attempt-then-fail-safe path below.
+      local new_status
+      new_status="$(doctl compute droplet get "$NEW_DROPLET_ID" --format Status --no-header 2>/dev/null)" || new_status=""
+      if [[ "$new_status" == "off" ]]; then
+        echo "new droplet ($NEW_DROPLET_ID) already reports status 'off' -- skipping redundant power-off" >&2
         NEW_DROPLET_CREATED=0
       else
-        echo "MANUAL ACTION REQUIRED: could not power off new droplet ($NEW_DROPLET_ID) -- power it off by hand, THEN run 'lab queue resume'. Not auto-resuming while it might still be ticking." >&2
-        safe_to_resume=0
+        echo "powering off unproven new droplet ($NEW_DROPLET_ID) before resuming -- avoids two unpaused tickers" >&2
+        if doctl compute droplet-action power-off "$NEW_DROPLET_ID" --wait; then
+          NEW_DROPLET_CREATED=0
+        else
+          echo "MANUAL ACTION REQUIRED: could not power off new droplet ($NEW_DROPLET_ID) -- power it off by hand, THEN run 'lab queue resume'. Not auto-resuming while it might still be ticking." >&2
+          safe_to_resume=0
+        fi
       fi
     fi
     if (( safe_to_resume == 1 )); then
@@ -198,9 +212,17 @@ rollback() {
   else
     echo "rollback: pause FAILED -- queue may still be resumed with the new droplet ticking, check manually" >&2
   fi
+  # Track power-off/delete success independently -- NEW_DROPLET_CREATED must only be cleared once
+  # BOTH are confirmed, the same way RESUMED is only set on confirmed success, never assumed. If
+  # either fails, leaving the flag set means a later cleanup() (should the script die after this
+  # point) still knows there may be a live droplet to check on, instead of wrongly believing there
+  # is nothing left to worry about.
+  local new_poweroff_ok=1
   if (( NEW_DROPLET_CREATED == 1 )); then
-    doctl compute droplet-action power-off "$NEW_DROPLET_ID" --wait ||
+    if ! doctl compute droplet-action power-off "$NEW_DROPLET_ID" --wait; then
       echo "rollback: power-off of new droplet ($NEW_DROPLET_ID) FAILED -- it may still be ticking, check manually" >&2
+      new_poweroff_ok=0
+    fi
   fi
   doctl compute droplet-action power-on "$OLD_DROPLET_ID" --wait ||
     echo "rollback: power-on of old droplet ($OLD_DROPLET_ID) FAILED -- old droplet may still be off, check manually" >&2
@@ -209,9 +231,21 @@ rollback() {
   else
     echo "rollback: resume FAILED -- queue left paused, MANUAL ACTION REQUIRED: run 'lab queue resume'" >&2
   fi
-  doctl compute droplet delete "$NEW_DROPLET_ID" --force ||
-    echo "rollback: delete of new droplet ($NEW_DROPLET_ID) FAILED -- it may still exist, check manually" >&2
-  NEW_DROPLET_CREATED=0
+  local new_delete_ok=0
+  if (( NEW_DROPLET_CREATED == 1 )); then
+    if doctl compute droplet delete "$NEW_DROPLET_ID" --force; then
+      new_delete_ok=1
+    else
+      echo "rollback: delete of new droplet ($NEW_DROPLET_ID) FAILED -- it may still exist, check manually" >&2
+    fi
+  fi
+  if (( NEW_DROPLET_CREATED == 1 )); then
+    if (( new_poweroff_ok == 1 && new_delete_ok == 1 )); then
+      NEW_DROPLET_CREATED=0
+    else
+      echo "rollback: new droplet ($NEW_DROPLET_ID) teardown NOT fully confirmed (power-off ok=$new_poweroff_ok, delete ok=$new_delete_ok) -- it may still exist; leaving it tracked and flagging for manual verification" >&2
+    fi
+  fi
 }
 
 say "7. smoke test -- one real registration, through the new scheduler"
