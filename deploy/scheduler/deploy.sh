@@ -6,31 +6,36 @@
 #
 # Requires: doctl (authenticated), this repo's own `uv` venv (`uv sync`), and the same
 # controller-side secrets the old Ansible role read: ~/.config/vastai/vast_api_key,
-# ~/.cloudflare/r2.credentials, $LAB_R2_ENDPOINT exported (and optionally $LAB_R2_BUCKET).
+# ~/.cloudflare/r2.credentials, $LAB_R2_ENDPOINT exported (and optionally $LAB_R2_BUCKET) --
+# or set in this repo's git-ignored .env, which is sourced for whichever of those two aren't
+# already exported (real env always wins).
 #
 # See docs/superpowers/specs/2026-08-27-scheduler-deploy-cutover-design.md for the full design
 # and why each step is ordered the way it is (two real bugs were caught and fixed in review:
 # a self-deadlock from pausing before draining, and a double-launch race from deleting the old
-# droplet too early). Two later review rounds hardened the failure/rollback paths further:
+# droplet too early). Several later review rounds hardened the failure/rollback paths further:
 # `doctl compute droplet-action` requires a numeric droplet ID (unlike `droplet create`/`delete`,
 # which accept a name) -- so the new droplet's numeric ID is captured once, right after creation
-# (NEW_DROPLET_ID), and used for every power-off/power-on call. `cleanup()` (the safety net for
-# a script death while the queue is paused) powers the new droplet off before ever auto-resuming,
-# not just rollback() -- otherwise an abort at step 3/4 could resume the queue with an unproven,
-# possibly-still-ticking new droplet still up, which is the same double-launch race by another
-# path. rollback() re-arms that same safety net (RESUMED=0) for the duration of its own sequence,
+# (NEW_DROPLET_ID), and used for every power-off/power-on call, with a name-based fallback lookup
+# (resolve_new_droplet_id) whenever it comes back empty or garbled. `cleanup()` (the safety net
+# for a script death while the queue is paused) powers the new droplet off before ever
+# auto-resuming, not just rollback() -- otherwise an abort at step 3/4 could resume the queue with
+# an unproven, possibly-still-ticking new droplet still up, which is the same double-launch race
+# by another path -- unless the new droplet was already verified alive at step 4
+# (NEW_DROPLET_VERIFIED), in which case it's the intended sole ticker and powering it off would be
+# wrong. rollback() re-arms that same safety net (RESUMED=0) for the duration of its own sequence,
 # so a death mid-rollback still gets a resume attempt from the outer trap instead of leaving the
-# queue paused forever with no message. A third round closed two gaps in that hardening itself:
-# rollback() only clears NEW_DROPLET_CREATED once its own power-off AND delete of the new droplet
-# are BOTH confirmed (never unconditionally -- an unconfirmed teardown must still look "live" to
-# any cleanup() that runs afterward), and cleanup()'s redundant power-off first asks doctl for the
-# new droplet's actual status rather than assuming a repeat power-off call is a harmless no-op.
+# queue paused forever with no message, and only clears NEW_DROPLET_CREATED once its own
+# power-off AND delete of the new droplet are BOTH confirmed (never unconditionally). Every path
+# that leaves a droplet powered off but not deleted prints a LEFTOVER DROPLET warning -- DO bills
+# for powered-off droplets, and nothing else in this project's tooling would ever notice one.
 set -euo pipefail
 
 TAG="${1:-}"
 DRY_RUN="${2:-}"
 [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "usage: $0 vX.Y.Z [--dry-run]" >&2; exit 2; }
 [[ -z "$DRY_RUN" || "$DRY_RUN" == "--dry-run" ]] || { echo "usage: $0 vX.Y.Z [--dry-run]" >&2; exit 2; }
+[[ $# -le 2 ]] || { echo "usage: $0 vX.Y.Z [--dry-run]" >&2; exit 2; }
 
 # Resolve paths from the script's own location, not the invoker's cwd -- running this from a
 # different checkout must not silently operate on the wrong project.
@@ -40,29 +45,70 @@ cd "$REPO_ROOT"
 
 say() { printf '\n=== %s\n' "$1"; }
 run() { if [[ "$DRY_RUN" == "--dry-run" ]]; then echo "[dry-run] $*"; else "$@"; fi; }
-json_field() { python3 -c "import json,sys; print(json.load(sys.stdin).get(sys.argv[1], ''))" "$1"; }
+json_field() { python3 -c "import json,sys; print(json.load(sys.stdin).get(sys.argv[1], ''))" "$1" 2>/dev/null; }
 
 DROPLET_NAME="lab-scheduler-$(date -u +%Y%m%dT%H%M%SZ)"
 REGION="nyc3"
 SIZE="s-1vcpu-1gb"
 DRAIN_TIMEOUT="${LAB_DEPLOY_DRAIN_TIMEOUT:-30m}"
-VERIFY_TIMEOUT_S="${LAB_DEPLOY_VERIFY_TIMEOUT_S:-300}"
+VERIFY_TIMEOUT_S="${LAB_DEPLOY_VERIFY_TIMEOUT_S:-1200}"
 SMOKE_TIMEOUT_S="${LAB_DEPLOY_SMOKE_TIMEOUT_S:-1800}"
+
+# LEFTOVER DROPLET warnings: DO bills for a powered-off droplet, and `lab reconcile`'s DO pass
+# only covers detached volumes, never droplets -- nothing else in this project's tooling would
+# ever flag one. confirmed_off=1 when we just verified/caused the off state ourselves; 0 when the
+# power state is unknown (still likely running, or unreachable to check).
+warn_leftover_droplet() {
+  local id="$1" name="$2" confirmed_off="${3:-0}"
+  if [[ -z "$id" || ! "$id" =~ ^[0-9]+$ ]]; then
+    echo "LEFTOVER DROPLET: could not resolve a numeric ID for '$name' -- search the DO console by name; it may still exist and STILL BE BILLING" >&2
+    return
+  fi
+  if (( confirmed_off == 1 )); then
+    echo "LEFTOVER DROPLET: $id ($name) is powered off but STILL BILLING -- destroy it with 'doctl compute droplet delete $id --force'" >&2
+  else
+    echo "LEFTOVER DROPLET: $id ($name) may still exist and STILL BILLING -- destroy it with 'doctl compute droplet delete $id --force' (check its power state first: 'doctl compute droplet get $id --format Status --no-header')" >&2
+  fi
+}
+
+# Deterministic fallback: NEW_DROPLET_ID may be empty/garbled if `doctl create --wait` errored
+# (an API timeout mid-wait is a normal way this happens) even though the droplet was actually
+# provisioned. DROPLET_NAME is generated once, up front, so it's always recoverable by name --
+# same list+match pattern already used for the old-droplet count-of-1 check below. Returns 1 (and
+# leaves NEW_DROPLET_ID untouched) only when no matching droplet exists at all.
+resolve_new_droplet_id() {
+  [[ "$NEW_DROPLET_ID" =~ ^[0-9]+$ ]] && return 0
+  local matches
+  mapfile -t matches < <(doctl compute droplet list --format ID,Name --no-header 2>/dev/null \
+    | awk -v n="$DROPLET_NAME" '$2==n{print $1}')
+  if (( ${#matches[@]} == 1 )) && [[ "${matches[0]}" =~ ^[0-9]+$ ]]; then
+    NEW_DROPLET_ID="${matches[0]}"
+    echo "resolved new droplet id by name ($DROPLET_NAME): $NEW_DROPLET_ID" >&2
+    return 0
+  fi
+  return 1
+}
 
 # Safety net: if the script dies while the queue is paused and was never resumed (by us or by
 # rollback()), recover to a safe state rather than leaving a stalled ticker for a human to
 # discover hours later. If a new droplet was created but never proven, it is powered off (using
 # its numeric ID) BEFORE the queue is resumed -- otherwise auto-resuming here could put an
 # unproven, possibly-still-ticking droplet into service unpaused, the same race rollback() exists
-# to prevent. Best-effort and idempotent.
+# to prevent. If the new droplet WAS already verified alive (step 4 passed), it is the intended
+# sole ticker and must NOT be powered off -- the old droplet is already off from step 5, so
+# resuming straight away can't reopen the double-ticker race. Best-effort and idempotent.
 RENDERED=""
 PAUSED=0
 RESUMED=0
 NEW_DROPLET_CREATED=0
+NEW_DROPLET_VERIFIED=0
 NEW_DROPLET_ID=""
 CLEANUP_DONE=0
 cleanup() {
-  local rc=$?
+  # An explicit arg (passed by the INT/TERM traps below) always wins over $?: a signal landing
+  # right after a successful command would otherwise see rc=0 here and skip the recovery block
+  # entirely, even though a signal mid-deploy is never actually a success.
+  local rc=${1:-$?}
   # Idempotent: INT/TERM below call this explicitly and then exit, which re-fires the EXIT trap
   # -- without this guard the resume/power-off/rm-f logic would run twice.
   (( CLEANUP_DONE )) && return "$rc"
@@ -72,21 +118,33 @@ cleanup() {
     echo "deploy failed while queue was paused -- recovering safely" >&2
     local safe_to_resume=1
     if (( NEW_DROPLET_CREATED == 1 )); then
-      # Don't assume a redundant power-off is a harmless no-op against the real API -- ask first.
-      # An unreadable status is treated the same as "not confirmed off": fall through to the
-      # existing attempt-then-fail-safe path below.
-      local new_status
-      new_status="$(doctl compute droplet get "$NEW_DROPLET_ID" --format Status --no-header 2>/dev/null)" || new_status=""
-      if [[ "$new_status" == "off" ]]; then
-        echo "new droplet ($NEW_DROPLET_ID) already reports status 'off' -- skipping redundant power-off" >&2
-        NEW_DROPLET_CREATED=0
+      if (( NEW_DROPLET_VERIFIED == 1 )); then
+        echo "new droplet ($NEW_DROPLET_ID) was already verified alive at step 4 -- it's the intended sole ticker; not powering it off before resuming" >&2
+      elif ! resolve_new_droplet_id; then
+        echo "MANUAL ACTION REQUIRED: a new droplet may exist (matching $DROPLET_NAME) but its ID could not be resolved -- check the DO console before resuming. Not auto-resuming." >&2
+        safe_to_resume=0
       else
-        echo "powering off unproven new droplet ($NEW_DROPLET_ID) before resuming -- avoids two unpaused tickers" >&2
-        if doctl compute droplet-action power-off "$NEW_DROPLET_ID" --wait; then
+        # Don't assume a redundant power-off is a harmless no-op against the real API -- ask
+        # first. An unreadable status is treated the same as "not confirmed off": fall through to
+        # the existing attempt-then-fail-safe path below.
+        local new_status
+        new_status="$(doctl compute droplet get "$NEW_DROPLET_ID" --format Status --no-header 2>/dev/null)" || new_status=""
+        if [[ "$new_status" == "off" ]]; then
+          echo "new droplet ($NEW_DROPLET_ID) already reports status 'off' -- skipping redundant power-off" >&2
+          warn_leftover_droplet "$NEW_DROPLET_ID" "$DROPLET_NAME" 1
+          # No behavioral effect below (nothing re-reads this after cleanup() returns -- the
+          # process is exiting) -- kept as a true-state assertion / symmetry with rollback()'s
+          # bookkeeping, in case a future refactor reads it.
           NEW_DROPLET_CREATED=0
         else
-          echo "MANUAL ACTION REQUIRED: could not power off new droplet ($NEW_DROPLET_ID) -- power it off by hand, THEN run 'lab queue resume'. Not auto-resuming while it might still be ticking." >&2
-          safe_to_resume=0
+          echo "powering off unproven new droplet ($NEW_DROPLET_ID) before resuming -- avoids two unpaused tickers" >&2
+          if doctl compute droplet-action power-off "$NEW_DROPLET_ID" --wait; then
+            warn_leftover_droplet "$NEW_DROPLET_ID" "$DROPLET_NAME" 1
+            NEW_DROPLET_CREATED=0  # see comment above
+          else
+            echo "MANUAL ACTION REQUIRED: could not power off new droplet ($NEW_DROPLET_ID) -- power it off by hand, THEN run 'lab queue resume'. Not auto-resuming while it might still be ticking." >&2
+            safe_to_resume=0
+          fi
         fi
       fi
     fi
@@ -104,24 +162,70 @@ trap cleanup EXIT
 # A plain `trap cleanup INT TERM` would run cleanup() but then bash resumes the interrupted
 # script instead of terminating -- a custom signal trap suppresses the default terminate-on-
 # signal behavior unless the handler exits explicitly. Force the exit so Ctrl-C / a TERM actually
-# stops the deploy rather than silently continuing mid-cutover.
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
+# stops the deploy rather than silently continuing mid-cutover. The explicit rc arg (130/143) is
+# what makes cleanup()'s recovery block fire regardless of the interrupted command's own status.
+trap 'cleanup 130; exit 130' INT
+trap 'cleanup 143; exit 143' TERM
 
 say "preflight"
 command -v doctl >/dev/null || { echo "doctl not found on PATH" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "python3 not found on PATH" >&2; exit 1; }
+command -v envsubst >/dev/null || { echo "envsubst not found on PATH" >&2; exit 1; }
 VAST_KEY_FILE="${HOME}/.config/vastai/vast_api_key"
 R2_CRED_FILE="${HOME}/.cloudflare/r2.credentials"
 [[ -f "$VAST_KEY_FILE" ]] || { echo "missing $VAST_KEY_FILE" >&2; exit 1; }
 [[ -f "$R2_CRED_FILE" ]] || { echo "missing $R2_CRED_FILE" >&2; exit 1; }
-[[ -n "${LAB_R2_ENDPOINT:-}" ]] || { echo "LAB_R2_ENDPOINT not set" >&2; exit 1; }
+
+# Fill in LAB_R2_ENDPOINT/LAB_R2_BUCKET from this repo's own .env convention (CLAUDE.md) for
+# whichever of the two aren't already exported -- real env always wins over the file. Every other
+# `lab queue ...` call in this script talks to whatever bucket the caller's shell resolves, so if
+# an operator customized LAB_R2_BUCKET in .env and this script silently defaulted instead, the new
+# droplet would render against one bucket while every safety check here watches another.
+if [[ -f "$REPO_ROOT/.env" ]]; then
+  ENV_FILE_R2_ENDPOINT="$(set -a; source "$REPO_ROOT/.env" 2>/dev/null; set +a; echo "${LAB_R2_ENDPOINT:-}")"
+  ENV_FILE_R2_BUCKET="$(set -a; source "$REPO_ROOT/.env" 2>/dev/null; set +a; echo "${LAB_R2_BUCKET:-}")"
+  : "${LAB_R2_ENDPOINT:=$ENV_FILE_R2_ENDPOINT}"
+  : "${LAB_R2_BUCKET:=$ENV_FILE_R2_BUCKET}"
+fi
+[[ -n "${LAB_R2_ENDPOINT:-}" ]] || { echo "LAB_R2_ENDPOINT not set (exported, or in this repo's .env)" >&2; exit 1; }
 LAB_R2_BUCKET="${LAB_R2_BUCKET:-lab-artifacts}"
+# Export both explicitly: a value filled in from .env above is otherwise just a plain shell
+# variable, invisible to every `uv run lab ...` child process for the rest of this script (they'd
+# silently fall back to their own defaults instead of the operator's real bucket/endpoint).
+export LAB_R2_ENDPOINT LAB_R2_BUCKET
 VAST_API_KEY="$(cat "$VAST_KEY_FILE")"
 AWS_ACCESS_KEY_ID="$(awk -F' *= *' '/aws_access_key_id/{print $2; exit}' "$R2_CRED_FILE")"
 AWS_SECRET_ACCESS_KEY="$(awk -F' *= *' '/aws_secret_access_key/{print $2; exit}' "$R2_CRED_FILE")"
 [[ -n "$AWS_ACCESS_KEY_ID" && -n "$AWS_SECRET_ACCESS_KEY" ]] || {
   echo "could not read aws_access_key_id/aws_secret_access_key from $R2_CRED_FILE" >&2; exit 1; }
+
+# Independently validate that the OLD droplet is actually the live one before anything is
+# touched -- this both catches a bucket mismatch (above) immediately, and confirms there really
+# is a scheduler ticking before the script starts pausing/creating/deleting anything.
+if [[ "$DRY_RUN" == "--dry-run" ]]; then
+  echo "[dry-run] verify 'lab queue list' reports a live host with a plausible heartbeat_age_s"
+else
+  preflight_queue_json="$(uv run lab queue list)" || {
+    echo "preflight: 'lab queue list' failed -- cannot verify the queue/bucket is reachable before touching anything" >&2
+    exit 1
+  }
+  preflight_host="$(echo "$preflight_queue_json" | json_field host)"
+  preflight_age="$(echo "$preflight_queue_json" | json_field heartbeat_age_s)"
+  [[ -n "$preflight_host" && "$preflight_host" != "None" ]] || {
+    echo "preflight: 'lab queue list' returned no host -- either no scheduler has ever reported in, or LAB_R2_ENDPOINT/LAB_R2_BUCKET point at the wrong queue (check .env vs your shell's exported values)" >&2
+    exit 1
+  }
+  if [[ "$preflight_age" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    if ! python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) <= 300 else 1)" "$preflight_age"; then
+      echo "preflight: last heartbeat from '$preflight_host' is ${preflight_age}s old (>300s) -- that doesn't look like a live scheduler; verify LAB_R2_ENDPOINT/LAB_R2_BUCKET match the running host before continuing" >&2
+      exit 1
+    fi
+  else
+    echo "preflight: could not read a numeric heartbeat_age_s from 'lab queue list' (got: '$preflight_age') -- cannot confirm the old droplet is actually live" >&2
+    exit 1
+  fi
+  echo "preflight: queue is live, last heartbeat from '$preflight_host' ${preflight_age}s ago"
+fi
 
 if [[ "$DRY_RUN" == "--dry-run" ]]; then
   OLD_DROPLET_ID="<dry-run-old-id>"
@@ -156,15 +260,28 @@ if [[ "$DRY_RUN" == "--dry-run" ]]; then
   echo "[dry-run] doctl compute droplet create $DROPLET_NAME --region $REGION --size $SIZE --image ubuntu-24-04-x64 --tag-names lab-scheduler --user-data-file $RENDERED --wait --format ID --no-header"
   NEW_DROPLET_ID="<dry-run-new-id>"
 else
+  # Set BEFORE the create call: if `doctl create --wait` returns non-zero after actually
+  # provisioning the droplet (an API timeout mid-wait is a normal way this happens), or the
+  # captured output doesn't parse, the flag must already be set so cleanup()/rollback() know to
+  # check rather than silently resuming with two live tickers.
+  NEW_DROPLET_CREATED=1
   NEW_DROPLET_ID="$(doctl compute droplet create "$DROPLET_NAME" \
     --region "$REGION" --size "$SIZE" --image ubuntu-24-04-x64 \
     --tag-names lab-scheduler --user-data-file "$RENDERED" --wait \
-    --format ID --no-header)"
-  [[ "$NEW_DROPLET_ID" =~ ^[0-9]+$ ]] || {
-    echo "doctl droplet create did not return a numeric droplet ID: '$NEW_DROPLET_ID'" >&2
-    exit 1
-  }
-  NEW_DROPLET_CREATED=1
+    --format ID --no-header)" || true
+  if [[ ! "$NEW_DROPLET_ID" =~ ^[0-9]+$ ]]; then
+    echo "doctl droplet create did not return a numeric droplet ID (got: '$NEW_DROPLET_ID') -- checking by name" >&2
+    if resolve_new_droplet_id; then
+      echo "recovered new droplet id by name: $NEW_DROPLET_ID" >&2
+    else
+      # A failed lookup here does NOT prove nothing was created -- it could just as easily be the
+      # listing call itself having its own transient hiccup. NEW_DROPLET_CREATED deliberately
+      # stays 1 (never confidently cleared on an unresolved lookup) so cleanup() gets another shot
+      # at resolving it; if that also fails, cleanup() blocks the auto-resume rather than guessing.
+      echo "could not resolve $DROPLET_NAME by name either, right now -- leaving NEW_DROPLET_CREATED set for cleanup() to retry; it may or may not actually exist" >&2
+      exit 1
+    fi
+  fi
   echo "new droplet id: $NEW_DROPLET_ID"
 fi
 
@@ -173,19 +290,38 @@ if [[ "$DRY_RUN" != "--dry-run" ]]; then
   deadline=$(( $(date +%s) + VERIFY_TIMEOUT_S ))
   host=""
   while (( $(date +%s) < deadline )); do
-    host="$(uv run lab queue list | json_field host)"
+    # Tolerate one flaky read (matches step 7's pattern) -- one R2 hiccup over a 20-minute
+    # polling window must not discard a freshly built droplet.
+    host="$(uv run lab queue list | json_field host)" || host=""
     [[ "$host" == "$DROPLET_NAME" ]] && break
     sleep 10
   done
   if [[ "$host" != "$DROPLET_NAME" ]]; then
     echo "new droplet never confirmed alive as $DROPLET_NAME (last seen host: ${host:-<none>})" >&2
-    if doctl compute droplet delete "$NEW_DROPLET_ID" --force; then
-      NEW_DROPLET_CREATED=0
+    if [[ "${LAB_DEPLOY_DELETE_ON_VERIFY_FAIL:-0}" == "1" ]]; then
+      if doctl compute droplet delete "$NEW_DROPLET_ID" --force; then
+        NEW_DROPLET_CREATED=0
+      else
+        echo "could not delete unconfirmed new droplet ($NEW_DROPLET_ID) -- it may still be running; cleanup will try to power it off before resuming" >&2
+        warn_leftover_droplet "$NEW_DROPLET_ID" "$DROPLET_NAME" 0
+      fi
     else
-      echo "could not delete unconfirmed new droplet ($NEW_DROPLET_ID) -- it may still be running; cleanup will try to power it off before resuming" >&2
+      # Default: power off rather than destroy -- deleting the only unconfirmed droplet also
+      # destroys the only evidence of what went wrong (no SSH, no other way to read its
+      # cloud-init logs). An operator can inspect it via the DO console before deciding to
+      # destroy it by hand. Opt back into the old delete-on-timeout behavior with
+      # LAB_DEPLOY_DELETE_ON_VERIFY_FAIL=1.
+      if doctl compute droplet-action power-off "$NEW_DROPLET_ID" --wait; then
+        echo "powered off (not deleted) so its cloud-init logs stay inspectable via the DO console -- set LAB_DEPLOY_DELETE_ON_VERIFY_FAIL=1 to auto-delete on a future verify failure instead" >&2
+        warn_leftover_droplet "$NEW_DROPLET_ID" "$DROPLET_NAME" 1
+      else
+        echo "could not power off unconfirmed new droplet ($NEW_DROPLET_ID) either -- check it manually" >&2
+        warn_leftover_droplet "$NEW_DROPLET_ID" "$DROPLET_NAME" 0
+      fi
     fi
     exit 1
   fi
+  NEW_DROPLET_VERIFIED=1
 else
   echo "[dry-run] poll lab queue list until host == $DROPLET_NAME"
 fi
@@ -219,7 +355,10 @@ rollback() {
   # is nothing left to worry about.
   local new_poweroff_ok=1
   if (( NEW_DROPLET_CREATED == 1 )); then
-    if ! doctl compute droplet-action power-off "$NEW_DROPLET_ID" --wait; then
+    if ! resolve_new_droplet_id; then
+      echo "rollback: could not resolve a droplet ID for the new droplet ($DROPLET_NAME) by name -- it may or may not exist; leaving NEW_DROPLET_CREATED set for cleanup() to check" >&2
+      new_poweroff_ok=0
+    elif ! doctl compute droplet-action power-off "$NEW_DROPLET_ID" --wait; then
       echo "rollback: power-off of new droplet ($NEW_DROPLET_ID) FAILED -- it may still be ticking, check manually" >&2
       new_poweroff_ok=0
     fi
@@ -233,10 +372,10 @@ rollback() {
   fi
   local new_delete_ok=0
   if (( NEW_DROPLET_CREATED == 1 )); then
-    if doctl compute droplet delete "$NEW_DROPLET_ID" --force; then
+    if [[ "$NEW_DROPLET_ID" =~ ^[0-9]+$ ]] && doctl compute droplet delete "$NEW_DROPLET_ID" --force; then
       new_delete_ok=1
     else
-      echo "rollback: delete of new droplet ($NEW_DROPLET_ID) FAILED -- it may still exist, check manually" >&2
+      echo "rollback: delete of new droplet ($NEW_DROPLET_ID) FAILED or ID unresolved -- it may still exist, check manually" >&2
     fi
   fi
   if (( NEW_DROPLET_CREATED == 1 )); then
@@ -244,6 +383,7 @@ rollback() {
       NEW_DROPLET_CREATED=0
     else
       echo "rollback: new droplet ($NEW_DROPLET_ID) teardown NOT fully confirmed (power-off ok=$new_poweroff_ok, delete ok=$new_delete_ok) -- it may still exist; leaving it tracked and flagging for manual verification" >&2
+      warn_leftover_droplet "$NEW_DROPLET_ID" "$DROPLET_NAME" "$new_poweroff_ok"
     fi
   fi
 }
@@ -251,7 +391,7 @@ rollback() {
 say "7. smoke test -- one real registration, through the new scheduler"
 if [[ "$DRY_RUN" != "--dry-run" ]]; then
   reg_json="$(uv run lab register -c "uv run experiments/example_capacity.py" \
-    --backend cpu --cloud do --timeout 10m --max-cost 1 --expires +1h)" || {
+    --cloud do --timeout 10m --max-cost 1 --expires +1h)" || {
     echo "smoke registration command failed" >&2; rollback; exit 1; }
   reg_id="$(echo "$reg_json" | json_field reg_id)" || {
     echo "could not parse reg_id from smoke registration output: $reg_json" >&2; rollback; exit 1; }

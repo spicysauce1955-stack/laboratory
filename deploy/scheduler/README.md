@@ -5,8 +5,13 @@ live in R2, so this host can be destroyed and recreated at any time.
 
 ## Redeploy (primary path, since 2026-08)
 
+Run `deploy/scheduler/deploy.sh vX.Y.Z --dry-run` **first** — it walks every step's control flow
+and preflight checks without touching any real droplet, R2 bucket, or job, and is the right way to
+sanity-check credentials/arguments before spending anything for real:
+
 ```bash
-deploy/scheduler/deploy.sh vX.Y.Z
+deploy/scheduler/deploy.sh vX.Y.Z --dry-run   # do this first
+deploy/scheduler/deploy.sh vX.Y.Z             # the real cutover
 ```
 
 Builds a new droplet from the pinned tag, takes the old one out of service, then proves the new
@@ -16,9 +21,35 @@ delete leaves the previous droplet as a fallback. Most failures roll back automa
 compound failure (an inconclusive smoke test, or a rollback step itself failing) surfaces with a
 manual-action message instead of self-healing.
 
+**Hard prerequisite: exactly one droplet tagged `lab-scheduler`.** Preflight refuses to run
+otherwise (0 found = nothing to swap; 2+ found = it won't guess which is live). The droplet
+currently running the scheduler was created by `playground`'s Ansible role, and as of this
+writing nothing in this repo has confirmed it actually carries that tag — the first real run may
+simply refuse until you've checked (`doctl compute droplet list --tag-name lab-scheduler`) and,
+if needed, tagged it (`doctl compute droplet tag <id> --tag-name lab-scheduler`).
+
+**The smoke test spends real money** — step 7 is a real registration that launches a real cloud
+rental via SkyPilot (`--cloud do` by default), not a simulation. Budget for it like any other
+job. If step 1's drain-wait times out, the message names the blocking `reg_id`s; there is no
+"skip drain" flag by design (that would be pausing the queue with jobs mid-flight) — the only way
+past it is to cancel or wait out those registrations by hand (`lab queue cancel <reg_id>` or let
+them finish).
+
+Three env vars tune the two most likely places to time out:
+- `LAB_DEPLOY_DRAIN_TIMEOUT` (default `30m`) — step 1, waiting for in-flight jobs to clear.
+- `LAB_DEPLOY_VERIFY_TIMEOUT_S` (default `1200`) — step 4, waiting for the new droplet's first
+  heartbeat (boot + package installs on a 1 vCPU/1GB droplet is realistically 10+ minutes).
+- `LAB_DEPLOY_SMOKE_TIMEOUT_S` (default `1800`) — step 7, waiting for the smoke job to finish.
+
+If the host will ever run `--cloud gcp` registrations, re-install its GCP service-account key and
+ADC symlink (below, "Google Cloud credentials") on the **new** droplet before the old one is
+deleted (step 8) — cloud-init does not reproduce that credential, only the tool that needs it.
+
 Requires `doctl` (authenticated) and the same controller-side secrets the manual steps below
 always needed: `~/.config/vastai/vast_api_key`, `~/.cloudflare/r2.credentials`,
-`$LAB_R2_ENDPOINT` exported.
+`$LAB_R2_ENDPOINT` exported (or set in this repo's git-ignored `.env` — `deploy.sh` fills in
+whichever of `LAB_R2_ENDPOINT`/`LAB_R2_BUCKET` aren't already exported from there, same rule as
+the rest of the lab: real env always wins over the file).
 
 Full design + the two real bugs an adversarial review caught before this shipped:
 `docs/superpowers/specs/2026-08-27-scheduler-deploy-cutover-design.md`.

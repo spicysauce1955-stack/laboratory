@@ -47,9 +47,13 @@ runcmd:
   # Install the pinned laboratory release as the `lab` user (puts the entrypoint at
   # /home/lab/.local/bin/lab — root's uv tool install would land under 0700 /root/.local/bin,
   # which User=lab in the unit file below cannot execute: 203/EXEC).
+  # `do`/`gcp` are separate pyproject.toml extras from `skypilot` (vast) -- without them a
+  # `--cloud do`/`--cloud gcp` registration can never launch; it just sits in `pending` until
+  # its timeout. GCP additionally needs its own service-account key + ADC symlink re-installed on
+  # this new host (README "Google Cloud credentials" section) -- the extra alone isn't enough.
   - >-
     sudo -u lab -H uv tool install
-    "laboratory[skypilot,r2] @ git+https://github.com/spicysauce1955-stack/laboratory.git@$TAG"
+    "laboratory[skypilot,do,gcp,r2] @ git+https://github.com/spicysauce1955-stack/laboratory.git@$TAG"
 
   # Clone the experiment project the scheduler runs jobs against.
   - install -d -o lab -g lab /opt/tempotron-capacity
