@@ -35,11 +35,14 @@ job. If step 1's drain-wait times out, the message names the blocking `reg_id`s;
 past it is to cancel or wait out those registrations by hand (`lab queue cancel <reg_id>` or let
 them finish).
 
-Three env vars tune the two most likely places to time out:
+Four env vars tune timeouts and one failure-mode default:
 - `LAB_DEPLOY_DRAIN_TIMEOUT` (default `30m`) — step 1, waiting for in-flight jobs to clear.
 - `LAB_DEPLOY_VERIFY_TIMEOUT_S` (default `1200`) — step 4, waiting for the new droplet's first
   heartbeat (boot + package installs on a 1 vCPU/1GB droplet is realistically 10+ minutes).
 - `LAB_DEPLOY_SMOKE_TIMEOUT_S` (default `1800`) — step 7, waiting for the smoke job to finish.
+- `LAB_DEPLOY_DELETE_ON_VERIFY_FAIL` (default unset) — step 4, on a verify timeout. The default
+  powers the unconfirmed new droplet off (not delete) so its cloud-init logs stay inspectable via
+  the DO console; set to `1` to auto-delete it instead, which destroys that diagnostic evidence.
 
 If the host will ever run `--cloud gcp` registrations, re-install its GCP service-account key and
 ADC symlink (below, "Google Cloud credentials") on the **new** droplet before the old one is

@@ -22,8 +22,11 @@
 # auto-resuming, not just rollback() -- otherwise an abort at step 3/4 could resume the queue with
 # an unproven, possibly-still-ticking new droplet still up, which is the same double-launch race
 # by another path -- unless the new droplet was already verified alive at step 4
-# (NEW_DROPLET_VERIFIED), in which case it's the intended sole ticker and powering it off would be
-# wrong. rollback() re-arms that same safety net (RESUMED=0) for the duration of its own sequence,
+# (NEW_DROPLET_VERIFIED) AND the old droplet's own power-off at step 5 is independently confirmed
+# (OLD_DROPLET_OFF), in which case the new droplet is the intended sole ticker and powering it off
+# would be wrong; NEW_DROPLET_VERIFIED alone doesn't prove that, since step 5 is a separate,
+# later, independently-fallible call. rollback() re-arms that same safety net (RESUMED=0,
+# OLD_DROPLET_OFF=0) for the duration of its own sequence,
 # so a death mid-rollback still gets a resume attempt from the outer trap instead of leaving the
 # queue paused forever with no message, and only clears NEW_DROPLET_CREATED once its own
 # power-off AND delete of the new droplet are BOTH confirmed (never unconditionally). Every path
@@ -94,14 +97,19 @@ resolve_new_droplet_id() {
 # discover hours later. If a new droplet was created but never proven, it is powered off (using
 # its numeric ID) BEFORE the queue is resumed -- otherwise auto-resuming here could put an
 # unproven, possibly-still-ticking droplet into service unpaused, the same race rollback() exists
-# to prevent. If the new droplet WAS already verified alive (step 4 passed), it is the intended
-# sole ticker and must NOT be powered off -- the old droplet is already off from step 5, so
-# resuming straight away can't reopen the double-ticker race. Best-effort and idempotent.
+# to prevent. Skipping that power-off is safe ONLY when BOTH NEW_DROPLET_VERIFIED (step 4 passed)
+# AND OLD_DROPLET_OFF (step 5's power-off of the OLD droplet actually succeeded) are true --
+# NEW_DROPLET_VERIFIED alone does not prove the old droplet is off (that's step 5, a separate,
+# later, independently-fallible call): a death between steps 4 and 5 succeeding would otherwise
+# resume with BOTH droplets ticking, the exact double-launch race this trap exists to prevent.
+# Best-effort and idempotent.
 RENDERED=""
 PAUSED=0
 RESUMED=0
 NEW_DROPLET_CREATED=0
 NEW_DROPLET_VERIFIED=0
+NEW_DROPLET_POWERED_OFF=0
+OLD_DROPLET_OFF=0
 NEW_DROPLET_ID=""
 CLEANUP_DONE=0
 cleanup() {
@@ -118,11 +126,20 @@ cleanup() {
     echo "deploy failed while queue was paused -- recovering safely" >&2
     local safe_to_resume=1
     if (( NEW_DROPLET_CREATED == 1 )); then
-      if (( NEW_DROPLET_VERIFIED == 1 )); then
-        echo "new droplet ($NEW_DROPLET_ID) was already verified alive at step 4 -- it's the intended sole ticker; not powering it off before resuming" >&2
+      if (( NEW_DROPLET_VERIFIED == 1 && OLD_DROPLET_OFF == 1 )); then
+        echo "new droplet ($NEW_DROPLET_ID) was already verified alive at step 4 and the old droplet is off (step 5 confirmed) -- it's the intended sole ticker; not powering it off before resuming" >&2
       elif ! resolve_new_droplet_id; then
         echo "MANUAL ACTION REQUIRED: a new droplet may exist (matching $DROPLET_NAME) but its ID could not be resolved -- check the DO console before resuming. Not auto-resuming." >&2
+        warn_leftover_droplet "" "$DROPLET_NAME" 0
         safe_to_resume=0
+      elif (( NEW_DROPLET_POWERED_OFF == 1 )); then
+        # Step 4 already confirmed this power-off itself (we did it) -- trust that over a fresh
+        # API status read, which can be transiently unreadable and would otherwise retry a
+        # power-off the real API rejects with 422 "already powered off", turning a clean exit
+        # into a false MANUAL ACTION alarm and a stalled queue.
+        echo "new droplet ($NEW_DROPLET_ID) was already powered off at step 4 -- skipping redundant power-off" >&2
+        warn_leftover_droplet "$NEW_DROPLET_ID" "$DROPLET_NAME" 1
+        NEW_DROPLET_CREATED=0
       else
         # Don't assume a redundant power-off is a harmless no-op against the real API -- ask
         # first. An unreadable status is treated the same as "not confirmed off": fall through to
@@ -313,6 +330,7 @@ if [[ "$DRY_RUN" != "--dry-run" ]]; then
       # LAB_DEPLOY_DELETE_ON_VERIFY_FAIL=1.
       if doctl compute droplet-action power-off "$NEW_DROPLET_ID" --wait; then
         echo "powered off (not deleted) so its cloud-init logs stay inspectable via the DO console -- set LAB_DEPLOY_DELETE_ON_VERIFY_FAIL=1 to auto-delete on a future verify failure instead" >&2
+        NEW_DROPLET_POWERED_OFF=1
         warn_leftover_droplet "$NEW_DROPLET_ID" "$DROPLET_NAME" 1
       else
         echo "could not power off unconfirmed new droplet ($NEW_DROPLET_ID) either -- check it manually" >&2
@@ -328,6 +346,7 @@ fi
 
 say "5. power off old droplet (reversible, not deleted)"
 run doctl compute droplet-action power-off "$OLD_DROPLET_ID" --wait
+[[ "$DRY_RUN" == "--dry-run" ]] || OLD_DROPLET_OFF=1
 
 say "6. resume -- exactly one unpaused ticker from here on"
 run uv run lab queue resume
@@ -343,6 +362,10 @@ run uv run lab queue resume
 # leaving the queue paused forever with nobody told.
 rollback() {
   echo "rolling back: old droplet resumes service, new droplet is discarded" >&2
+  # Re-arm honestly: rollback is about to power the old droplet back ON, so the invariant
+  # cleanup()'s safety net relies on (OLD_DROPLET_OFF implies the old droplet is actually off)
+  # must not stay stale through a death mid-rollback.
+  OLD_DROPLET_OFF=0
   if uv run lab queue pause; then
     RESUMED=0
   else
@@ -427,6 +450,7 @@ if [[ "$DRY_RUN" != "--dry-run" ]]; then
       # merely powered off, not gone, so a human can still roll back by hand), so there's no
       # urgency forcing a guessed automatic rollback here -- surface it instead.
       echo "smoke registration inconclusive at timeout (last state: ${state:-unknown}) -- not rolling back automatically. Queue is RUNNING with the new droplet ($DROPLET_NAME / $NEW_DROPLET_ID) as its only, unproven ticker -- it may already be launching real jobs. Check 'lab queue show $reg_id' by hand, then either give it more time, or roll back manually: pause the queue, power off $NEW_DROPLET_ID, power on $OLD_DROPLET_ID, resume, delete $NEW_DROPLET_ID." >&2
+      warn_leftover_droplet "$OLD_DROPLET_ID" "old scheduler droplet (pre-cutover)" 1
       exit 1
       ;;
   esac
@@ -435,6 +459,14 @@ else
 fi
 
 say "8. delete old droplet -- only reached after a real smoke success"
-run doctl compute droplet delete "$OLD_DROPLET_ID" --force
+if [[ "$DRY_RUN" == "--dry-run" ]]; then
+  echo "[dry-run] doctl compute droplet delete $OLD_DROPLET_ID --force"
+else
+  if ! doctl compute droplet delete "$OLD_DROPLET_ID" --force; then
+    echo "could not delete old droplet ($OLD_DROPLET_ID) -- the cutover itself succeeded (new droplet is live and proven), only this cleanup step failed" >&2
+    warn_leftover_droplet "$OLD_DROPLET_ID" "old scheduler droplet (pre-cutover)" 1
+    exit 1
+  fi
+fi
 
 say "done -- $DROPLET_NAME is now the scheduler, pinned to $TAG"
