@@ -15,11 +15,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from lab.models import JobManifest
-from lab.scheduler.models import ControlConfig, Registration
+from lab.scheduler.models import ControlConfig, Registration, RegState
 
 
 @runtime_checkable
@@ -174,3 +175,34 @@ def default_queue() -> QueueStore:
     if r2 is not None:
         return r2
     return LocalQueueStore(repo_root() / "queue")
+
+
+_BLOCKING_STATES = frozenset({RegState.launching, RegState.launched})
+
+
+def wait_for_queue_drain(
+    queue: QueueStore, *, interval: float = 10.0, timeout: float | None = None
+) -> list[Registration]:
+    """Block until no registration is `launching`/`launched`, or `timeout` elapses.
+
+    The safety gate a scheduler cutover waits on before pausing the queue: pausing stops
+    `Scheduler._sync`, so a job that finishes after pausing would never be observed reaching
+    terminal — this must run first, while the queue is still unpaused and genuinely draining.
+
+    A registration's `state` already reflects its mirrored job's real terminality (`_sync` keeps
+    them in lock-step while unpaused), so checking `state` alone is sufficient — no separate
+    job-status lookup. A `pending` registration (not yet triggered) is never blocking, regardless
+    of how far in the future its trigger is.
+
+    Returns the still-blocking registrations: empty on a clean drain, non-empty (whatever was
+    still in flight) when `timeout` was hit first. Never raises on timeout — the caller decides
+    what a non-empty result means.
+    """
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    while True:
+        blocking = [r for r in queue.list_entries() if r.state in _BLOCKING_STATES]
+        if not blocking:
+            return []
+        if deadline is not None and time.monotonic() >= deadline:
+            return blocking
+        time.sleep(interval)
