@@ -540,7 +540,7 @@ def build_server(lab: Lab) -> FastMCP:
 
     @mcp.tool
     def queue_list() -> dict[str, Any]:
-        """List deferred registrations: state, job_id, last skip reason, scheduler heartbeat age."""
+        """List deferred registrations: state, job_id, last skip reason, scheduler heartbeat age and host."""
         queue = default_queue()
         hb = queue.read_heartbeat()
         age = None
@@ -550,6 +550,7 @@ def build_server(lab: Lab) -> FastMCP:
             age = max(0.0, (now() - datetime.fromisoformat(str(hb["at"]))).total_seconds())
         return {
             "heartbeat_age_s": age,
+            "host": (hb or {}).get("host"),
             "control": queue.read_control().model_dump(),
             "entries": [
                 {

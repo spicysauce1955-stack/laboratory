@@ -1374,12 +1374,14 @@ def _require_entry(queue: QueueStore, reg_id: str) -> None:
 
 @queue_app.command(name="list")
 def queue_list() -> None:
-    """Entries + state + skip reason, plus scheduler heartbeat age (spec §6)."""
+    """Entries + state + skip reason, plus scheduler heartbeat age and which host wrote it."""
     queue = default_queue()
     entries = queue.list_entries()
+    hb = queue.read_heartbeat()
     _emit(
         {
             "heartbeat_age_s": _heartbeat_age_s(queue),
+            "host": (hb or {}).get("host"),
             "control": queue.read_control().model_dump(),
             "entries": [
                 {

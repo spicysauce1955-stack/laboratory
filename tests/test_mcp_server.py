@@ -339,3 +339,19 @@ def test_submit_unknown_cloud_is_tool_error(tmp_path: Path):
 
     with pytest.raises(ToolError, match="unknown cloud"):
         asyncio.run(go())
+
+
+def test_queue_list_tool_reports_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from lab.scheduler.queue import LocalQueueStore
+
+    monkeypatch.setenv("LAB_QUEUE_DIR", str(tmp_path / "queue"))
+    q = LocalQueueStore(tmp_path / "queue")
+    q.write_heartbeat({"at": "2026-08-27T00:00:00+00:00", "host": "lab-scheduler-new", "tick_count": 1})
+    _, server = _make(tmp_path)
+
+    async def go():
+        async with Client(server) as c:
+            return (await c.call_tool("queue_list", {})).data
+
+    data = asyncio.run(go())
+    assert data["host"] == "lab-scheduler-new"
