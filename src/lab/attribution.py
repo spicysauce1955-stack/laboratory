@@ -383,6 +383,54 @@ def attribute_jobs(job_ids: Iterable[str]) -> dict[str, Attribution]:
     return out
 
 
+@dataclass(frozen=True)
+class KnownJob:
+    """One registry entry, enough to go read that job's own manifest.
+
+    Registry-only (no ledger fallback, unlike :func:`known_job_ids`): a cross-project liveness
+    scan needs ``runs_dir`` to open the owning project's store, and only the registry records
+    one. A job old enough to predate the registry but still genuinely non-terminal today would
+    be a very stale process either way.
+    """
+
+    job_id: str
+    project: str | None
+    runs_dir: Path | None
+    created_at: datetime | None
+
+
+def known_jobs() -> list[KnownJob]:
+    """Every job the registry has heard of, newest record per id, in no particular order.
+
+    This is the machine-wide "what has ever been submitted, and where" list a cross-project
+    liveness check (``lab ps``) starts from: :func:`attribute_jobs` answers "who owns id X" for
+    ids a *caller* already has in hand, but nothing before this let a caller ask "what ids exist
+    at all, across every project on this box, and where do I go read their current status."
+    Never raises; an unreadable registry degrades to an empty list, same posture as everything
+    else here.
+    """
+    out: list[KnownJob] = []
+    try:
+        for record in _registry_index().values():
+            job_id = record.get("job_id")
+            if not isinstance(job_id, str) or not job_id:
+                continue
+            created = record.get("created_at")
+            out.append(
+                KnownJob(
+                    job_id=job_id,
+                    project=_name_of(record.get("project")),
+                    runs_dir=_runs_dir_of(record),
+                    created_at=datetime.fromisoformat(created)
+                    if isinstance(created, str)
+                    else None,
+                )
+            )
+    except Exception as e:  # noqa: BLE001 — advisory, never fatal
+        _debug(f"known_jobs failed: {e}")
+    return out
+
+
 def known_job_ids() -> set[str]:
     """Every job id either source has *heard of*, whether or not it can be attributed.
 

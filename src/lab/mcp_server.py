@@ -401,6 +401,14 @@ def build_server(lab: Lab) -> FastMCP:
             ]
         }
 
+    @mcp.tool(name="ps")
+    def ps() -> dict[str, Any]:
+        """What's running right now, across every project on this machine — the check to run
+        before anything that could disturb a live job. Unlike `list` (this project's own jobs),
+        `ps` walks the machine-wide job registry and reports every currently non-terminal job,
+        wherever it was submitted from."""
+        return _lab().ps()
+
     from lab.scheduler.models import Guardrails, RegState, Triggers
     from lab.scheduler.queue import default_queue
     from lab.scheduler.register import parse_expires, parse_window
