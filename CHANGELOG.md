@@ -4,6 +4,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning is 
 breaks the surface in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md); MINOR may, and says so
 with a **BREAKING** entry and an upgrade note.
 
+## Unreleased
+
+### Added
+
+- `deploy/scheduler/deploy.sh`: redeploy the scheduler droplet via an immutable blue-green swap
+  instead of playground's Ansible role. `lab queue list` gains a `host` field; new `lab queue
+  wait-drain` command.
+
 ## v0.9.0 — 2026-08-26
 
 A channel back from the people running the jobs, after a review of seven days of the event
