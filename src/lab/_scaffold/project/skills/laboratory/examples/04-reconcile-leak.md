@@ -65,15 +65,21 @@ Returns JSON like:
   ],
   "destroyed": [],
   "ghosts": [],
+  "ghost_reasons": {},
   "applied": false
 }
 ```
 
 - `orphans` — Vast.ai rentals labelled `lab-*` with **no matching running
   lab job**. These are the leaks.
-- `ghosts` — running lab jobs whose cluster name does **not appear in any
-  active Vast rental**. The supervisor probably died; the job's manifest is
-  stale. Mark them done with `lab cancel <id>` to clean state.
+- `ghosts` — running lab jobs with no confirmed live cloud resource: a Vast
+  job with no matching rental label, or a DO/GCP job SkyPilot no longer
+  tracks (a DO/GCP job is never flagged when that check itself is
+  unverifiable, e.g. under sky client/server version skew — no signal beats
+  a false one). `ghost_reasons` names why, per cluster. The supervisor
+  probably died; the job's manifest is stale. Mark them done with
+  `lab cancel <id>` to clean state. Advisory only — nothing here is ever
+  destroyed automatically.
 - `instances_total` — sanity check; matches what `vastai show_instances`
   prints.
 

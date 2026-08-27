@@ -36,6 +36,7 @@ def test_tools_registered(tmp_path: Path):
         "list",
         "logs",
         "metrics",
+        "ps",
         "queue_cancel",
         "queue_list",
         "queue_pause",
@@ -103,6 +104,26 @@ def test_submit_status_logs_fetch(tmp_path: Path):
     assert "demo_metric" in mt["series"]
     assert any(a["name"] == "result.json" for a in ft["artifacts"])
     assert ls["jobs"][0]["job_id"] == job_id
+
+
+def test_ps_tool_finds_a_running_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from helpers import make_manifest
+
+    from lab.models import BackendInfo
+
+    monkeypatch.setenv("LAB_JOBS_INDEX_DIR", str(tmp_path / "lab-jobs"))
+    lab, server = _make(tmp_path)
+    m = make_manifest("job-live", "python x.py").model_copy(
+        update={"status": JobState.running, "backend": BackendInfo(provisioner="local")}
+    )
+    lab.store.create(m)
+
+    async def go():
+        async with Client(server) as c:
+            return (await c.call_tool("ps", {})).data
+
+    data = asyncio.run(go())
+    assert [j["job_id"] for j in data["jobs"]] == ["job-live"]
 
 
 def test_submit_accepts_backend_param(tmp_path: Path):

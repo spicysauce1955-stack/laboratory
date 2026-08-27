@@ -73,6 +73,50 @@ def test_registry_hit_attributes_project_and_runs_dir(tmp_path: Path) -> None:
     assert got.known is True
 
 
+def test_known_jobs_lists_every_registry_entry_with_its_runs_dir(tmp_path: Path) -> None:
+    """The cross-project 'what's running' scan (`lab ps`) starts here: every id the registry has
+    ever heard of, plus enough to go read its manifest, regardless of which project it's in."""
+    attribution.record_job("j1", project="proj-a", runs_dir=tmp_path / "a" / "runs", created_at=NOW)
+    attribution.record_job("j2", project="proj-b", runs_dir=tmp_path / "b" / "runs", created_at=NOW)
+    got = {kj.job_id: kj for kj in attribution.known_jobs()}
+    assert set(got) == {"j1", "j2"}
+    assert got["j1"].project == "proj-a"
+    assert got["j1"].runs_dir == (tmp_path / "a" / "runs").resolve()
+    assert got["j1"].created_at == NOW
+
+
+def test_known_jobs_on_an_empty_registry_is_empty() -> None:
+    assert attribution.known_jobs() == []
+
+
+def test_known_jobs_never_raises_on_a_corrupt_registry_line(tmp_path: Path) -> None:
+    attribution.record_job("j1", project="p", runs_dir=tmp_path / "runs", created_at=NOW)
+    with attribution.index_path().open("a", encoding="utf-8") as f:
+        f.write("not json at all\n")
+    ids = {kj.job_id for kj in attribution.known_jobs()}
+    assert ids == {"j1"}
+
+
+def test_known_jobs_skips_one_bad_record_without_dropping_the_rest(tmp_path: Path) -> None:
+    """A single malformed field (valid JSON, unparseable `created_at`) must not abort the whole
+    scan — every record after it in the registry is a real job `lab ps` still needs to see."""
+    attribution.record_job("j1", project="p", runs_dir=tmp_path / "runs", created_at=NOW)
+    with attribution.index_path().open("a", encoding="utf-8") as f:
+        f.write(
+            json.dumps(
+                {"v": 1, "job_id": "j-bad", "project": "p", "runs_dir": str(tmp_path / "runs"),
+                 "created_at": "not-a-real-timestamp"}
+            )
+            + "\n"
+        )
+    attribution.record_job("j3", project="p", runs_dir=tmp_path / "runs", created_at=NOW)
+
+    ids = {kj.job_id for kj in attribution.known_jobs()}
+
+    assert "j3" in ids, "a record after the malformed one must still be seen"
+    assert "j1" in ids
+
+
 def test_record_job_creates_the_index_under_the_env_override(tmp_path: Path) -> None:
     attribution.record_job("j1", project="p", runs_dir=tmp_path / "runs")
     assert attribution.index_path() == tmp_path / "lab-jobs" / "index.jsonl"

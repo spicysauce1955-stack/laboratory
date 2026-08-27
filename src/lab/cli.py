@@ -799,6 +799,17 @@ def list_jobs() -> None:
 
 
 @app.command()
+def ps() -> None:
+    """What's running right now, across every project on this machine (FR-C2 gap fix).
+
+    Unlike `list` (this project's own jobs, terminal or not), `ps` walks the machine-wide job
+    registry and reports every currently non-terminal job it finds, wherever it was submitted
+    from — the check to run before anything that could disturb a live job.
+    """
+    _emit(_lab().ps())
+
+
+@app.command()
 def wait(
     job_ids: list[str] = typer.Argument(None, help="job id(s) to wait for"),
     sweep: str | None = typer.Option(None, "--sweep", help="wait for all jobs in this sweep_id"),

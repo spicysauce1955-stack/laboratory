@@ -256,7 +256,143 @@ def test_reconcile_finds_ghosts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     _patch_empty_sky(monkeypatch)
     report = lab.reconcile(apply=False)
     assert report["orphans"] == []
-    assert report["ghosts"] == [skypilot_mod.cluster_name_for("job-ghost")]
+    cluster = skypilot_mod.cluster_name_for("job-ghost")
+    assert report["ghosts"] == [cluster]  # frozen MCP/CLI shape (docs/COMPATIBILITY.md) — strings
+    assert report["ghost_reasons"][cluster] == "no matching Vast rental label"
+
+
+def _seed_running_do_job(lab: Lab, job_id: str) -> None:
+    """A running job whose manifest says it was launched on DigitalOcean, not Vast."""
+    m = make_manifest(job_id, "python x.py", resources=ResourceRequest(cloud="do"))
+    m.status = JobState.running
+    lab.store.create(m)
+
+
+def _patch_sky_status(monkeypatch: pytest.MonkeyPatch, *, ok: bool, clusters: list[str]) -> None:
+    """A fake ``sky`` module reporting ``clusters`` as live, plus the version-skew gate."""
+    from lab._skycompat import SkyVersions
+
+    fake = types.ModuleType("sky")
+    fake.get = lambda x: x  # type: ignore[attr-defined]
+    fake.status = lambda refresh=None: [{"name": c} for c in clusters]  # type: ignore[attr-defined]
+    fake.down = lambda cluster: cluster  # type: ignore[attr-defined]
+    fake.StatusRefreshMode = types.SimpleNamespace(  # type: ignore[attr-defined]
+        AUTO="AUTO", FORCE="FORCE", NONE="NONE"
+    )
+    monkeypatch.setitem(sys.modules, "sky", fake)
+    monkeypatch.setattr(skypilot_mod, "list_do_volumes", lambda client=None: [])
+    monkeypatch.setattr(
+        "lab._skycompat.sky_versions",
+        lambda **kw: SkyVersions(
+            client="0.13.0", server="0.13.0" if ok else "0.12.3", compatible=ok,
+            detail="ok" if ok else "upgrade the client",
+        ),
+    )
+
+
+def test_reconcile_do_job_confirmed_live_via_sky_is_not_a_ghost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A running DO job is not 'a running local job with no matching Vast rental' — it was never
+    going to have one. Bug found live 2026-08-27: every healthy DO/GCP job was unconditionally
+    reported as a ghost because the ghost pass only ever cross-checked Vast rental labels.
+    """
+    repo = repo_root(Path.cwd())
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
+    _seed_running_do_job(lab, "job-do-alive")
+    cluster = skypilot_mod.cluster_name_for("job-do-alive")
+    monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda: [])
+    _patch_sky_status(monkeypatch, ok=True, clusters=[cluster])
+
+    report = lab.reconcile(apply=False)
+    assert report["ghosts"] == []
+
+
+def test_reconcile_do_job_confirmed_gone_via_sky_is_a_ghost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A DO job SkyPilot no longer tracks at all is a real ghost — the fix must not just silence
+    every DO job unconditionally, it must still catch a genuinely dead one."""
+    repo = repo_root(Path.cwd())
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
+    _seed_running_do_job(lab, "job-do-gone")
+    cluster = skypilot_mod.cluster_name_for("job-do-gone")
+    monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda: [])
+    _patch_sky_status(monkeypatch, ok=True, clusters=[])  # sky tracks nothing for this cluster
+
+    report = lab.reconcile(apply=False)
+    assert report["ghosts"] == [cluster]
+    assert "do" in report["ghost_reasons"][cluster]
+
+
+def test_reconcile_do_job_not_flagged_when_sky_status_is_unverifiable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Under sky client/server version skew the ghost pass has no reliable signal for DO/GCP —
+    it must not fall back to "always ghost" (that's the bug), and must not fall back to "never
+    ghost" by faking a positive match either. It reports nothing rather than guess."""
+    repo = repo_root(Path.cwd())
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
+    _seed_running_do_job(lab, "job-do-unverifiable")
+    monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda: [])
+    _patch_sky_status(monkeypatch, ok=False, clusters=[])
+
+    report = lab.reconcile(apply=False)
+    assert report["ghosts"] == []
+    assert report["sky_pass"] == "skipped (client/server version skew)"
+
+
+def test_reconcile_fetches_sky_status_only_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The ghost pass and the `sky_orphans` pass both need SkyPilot's live cluster state — a
+    second real `sky.status()` round-trip per `reconcile()` call is pure waste, and it's exactly
+    the kind of extra call a test that only stubs `_sky_status_orphans` (not the fetch itself)
+    would silently miss and fall through to the real `sky` module."""
+    repo = repo_root(Path.cwd())
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
+    _seed_running_do_job(lab, "job-do-count")
+    monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda: [])
+    _patch_sky_status(monkeypatch, ok=True, clusters=[])
+
+    calls = {"n": 0}
+    real_status = sys.modules["sky"].status
+
+    def counting_status(refresh=None):
+        calls["n"] += 1
+        return real_status(refresh=refresh)
+
+    sys.modules["sky"].status = counting_status
+
+    lab.reconcile(apply=False)
+
+    assert calls["n"] == 1
+
+
+def test_reconcile_ghost_leaves_a_note_in_the_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A ghost verdict must be explainable from `lab history --full` without reading source or
+    SSHing into a box — not just present in the returned JSON."""
+    monkeypatch.setenv("LAB_EVENTS_DIR", str(tmp_path / "events"))
+    monkeypatch.delenv("LAB_EVENTS", raising=False)
+    from lab import events
+    from lab.events import store as events_store
+
+    repo = repo_root(Path.cwd())
+    lab = Lab(backend=LocalBackend(home=tmp_path / "lab", repo=repo), repo=repo, home=tmp_path / "lab")
+    _seed_running_job(lab, "job-ghost-noted")
+    monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda: [])
+    _patch_empty_sky(monkeypatch)
+
+    call = events.begin("cli", "reconcile", {})
+    lab.reconcile(apply=False)
+    events.finish(call, outcome="error", exit_code=3)
+
+    closes = [r for r in events_store.iter_records(events_store.day_files()) if r["phase"] == "close"]
+    trace = closes[-1]["trace"]
+    ghost_notes = [n for n in trace if n["k"] == "reconcile.ghost"]
+    assert len(ghost_notes) == 1
+    assert ghost_notes[0]["d"]["cluster"] == skypilot_mod.cluster_name_for("job-ghost-noted")
+    assert ghost_notes[0]["d"]["reason"] == "no matching Vast rental label"
 
 
 def test_reconcile_finds_and_destroys_do_volume_orphans(
