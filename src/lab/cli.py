@@ -1355,8 +1355,7 @@ queue_app = typer.Typer(help="Manage deferred registrations (spec §6).", no_arg
 app.add_typer(queue_app, name="queue")
 
 
-def _heartbeat_age_s(queue: QueueStore) -> float | None:
-    hb = queue.read_heartbeat()
+def _heartbeat_age_s(hb: dict[str, Any] | None) -> float | None:
     if not hb or "at" not in hb:
         return None
     at = datetime.fromisoformat(str(hb["at"]))
@@ -1374,14 +1373,19 @@ def _require_entry(queue: QueueStore, reg_id: str) -> None:
 
 @queue_app.command(name="list")
 def queue_list() -> None:
-    """Entries + state + skip reason, plus scheduler heartbeat age and which host wrote it."""
+    """Entries + state + skip reason, plus scheduler heartbeat age/pause-ack and which host
+    wrote it. `heartbeat_paused` is what the *last completed tick* actually observed and acted
+    on -- unlike `control.paused` below (which flips the instant a write lands), it's the signal
+    a redeploy cutover needs to confirm the running scheduler has genuinely stopped launching."""
     queue = default_queue()
     entries = queue.list_entries()
     hb = queue.read_heartbeat()
     _emit(
         {
-            "heartbeat_age_s": _heartbeat_age_s(queue),
+            "heartbeat_age_s": _heartbeat_age_s(hb),
             "host": (hb or {}).get("host"),
+            "heartbeat_paused": (hb or {}).get("paused"),
+            "tick_count": (hb or {}).get("tick_count"),
             "control": queue.read_control().model_dump(),
             "entries": [
                 {

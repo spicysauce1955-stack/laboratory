@@ -4,6 +4,7 @@ queue (docs/superpowers/specs/2026-08-27-scheduler-deploy-cutover-design.md). A 
 lock-step while the queue is unpaused, so checking `state` alone — no separate job-status lookup
 — is sufficient."""
 
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -84,3 +85,57 @@ def test_no_timeout_means_no_timeout_arg_is_required() -> None:
 
     sig = inspect.signature(wait_for_queue_drain)
     assert sig.parameters["timeout"].default is None
+
+
+class _FlakyOnceStore:
+    """Wraps a real store; raises on the first list_entries() call, then delegates."""
+
+    def __init__(self, inner: LocalQueueStore) -> None:
+        self._inner = inner
+        self._calls = 0
+
+    def list_entries(self) -> list[Registration]:
+        self._calls += 1
+        if self._calls == 1:
+            raise ConnectionError("simulated transient R2 read failure")
+        return self._inner.list_entries()
+
+
+def test_tolerates_one_flaky_read(tmp_path: Path) -> None:
+    # A real store (R2QueueStore) has no internal retry -- a single transient network error
+    # during an up-to-30-minute drain wait must not crash the whole cutover before the queue is
+    # even paused.
+    inner = LocalQueueStore(tmp_path / "queue")
+    q = _FlakyOnceStore(inner)
+
+    blocking = wait_for_queue_drain(q, interval=0.01, timeout=1.0)
+
+    assert blocking == []
+
+
+class _AlwaysFailsStore:
+    def list_entries(self) -> list[Registration]:
+        raise ConnectionError("simulated persistent R2 outage")
+
+
+def test_raises_at_timeout_if_no_read_ever_succeeded(tmp_path: Path) -> None:
+    # A queue that was NEVER successfully read must not silently report "drained" -- that would
+    # be reporting a clean drain with zero evidence, right before deploy.sh pauses production.
+    q = _AlwaysFailsStore()
+
+    import pytest
+
+    with pytest.raises(ConnectionError):
+        wait_for_queue_drain(q, interval=0.01, timeout=0.05)
+
+
+def test_does_not_overrun_timeout_when_interval_is_larger(tmp_path: Path) -> None:
+    q = LocalQueueStore(tmp_path / "queue")
+    q.put_entry(_reg("r1", RegState.launched))
+
+    start = time.monotonic()
+    blocking = wait_for_queue_drain(q, interval=100.0, timeout=0.1)
+    elapsed = time.monotonic() - start
+
+    assert {r.reg_id for r in blocking} == {"r1"}
+    assert elapsed < 2.0  # would be ~100s without a deadline-clamped sleep

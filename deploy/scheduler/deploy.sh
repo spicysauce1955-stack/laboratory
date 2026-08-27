@@ -54,6 +54,8 @@ DROPLET_NAME="lab-scheduler-$(date -u +%Y%m%dT%H%M%SZ)"
 REGION="nyc3"
 SIZE="s-1vcpu-1gb"
 DRAIN_TIMEOUT="${LAB_DEPLOY_DRAIN_TIMEOUT:-30m}"
+# 2 tick cycles at the systemd timer's ~60s cadence, plus headroom -- see step 2's comment.
+PAUSE_ACK_TIMEOUT_S="${LAB_DEPLOY_PAUSE_ACK_TIMEOUT_S:-120}"
 VERIFY_TIMEOUT_S="${LAB_DEPLOY_VERIFY_TIMEOUT_S:-1200}"
 SMOKE_TIMEOUT_S="${LAB_DEPLOY_SMOKE_TIMEOUT_S:-1800}"
 
@@ -188,6 +190,7 @@ say "preflight"
 command -v doctl >/dev/null || { echo "doctl not found on PATH" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "python3 not found on PATH" >&2; exit 1; }
 command -v envsubst >/dev/null || { echo "envsubst not found on PATH" >&2; exit 1; }
+command -v base64 >/dev/null || { echo "base64 not found on PATH" >&2; exit 1; }
 VAST_KEY_FILE="${HOME}/.config/vastai/vast_api_key"
 R2_CRED_FILE="${HOME}/.cloudflare/r2.credentials"
 [[ -f "$VAST_KEY_FILE" ]] || { echo "missing $VAST_KEY_FILE" >&2; exit 1; }
@@ -211,6 +214,10 @@ LAB_R2_BUCKET="${LAB_R2_BUCKET:-lab-artifacts}"
 # silently fall back to their own defaults instead of the operator's real bucket/endpoint).
 export LAB_R2_ENDPOINT LAB_R2_BUCKET
 VAST_API_KEY="$(cat "$VAST_KEY_FILE")"
+# base64 alongside the raw value: cloud-init.yaml.tmpl substitutes the raw key into a plain env
+# file line (safe as-is) but the base64 form into a nested-quoted runcmd shell string, where a
+# raw key containing a quote/backtick/dollar/backslash would otherwise break out of the quoting.
+VAST_API_KEY_B64="$(printf '%s' "$VAST_API_KEY" | base64 | tr -d '\n')"
 AWS_ACCESS_KEY_ID="$(awk -F' *= *' '/aws_access_key_id/{print $2; exit}' "$R2_CRED_FILE")"
 AWS_SECRET_ACCESS_KEY="$(awk -F' *= *' '/aws_secret_access_key/{print $2; exit}' "$R2_CRED_FILE")"
 [[ -n "$AWS_ACCESS_KEY_ID" && -n "$AWS_SECRET_ACCESS_KEY" ]] || {
@@ -226,8 +233,10 @@ else
     echo "preflight: 'lab queue list' failed -- cannot verify the queue/bucket is reachable before touching anything" >&2
     exit 1
   }
-  preflight_host="$(echo "$preflight_queue_json" | json_field host)"
-  preflight_age="$(echo "$preflight_queue_json" | json_field heartbeat_age_s)"
+  # `|| fallback`, same as every other json_field call site: an unparsable response must fail
+  # through the diagnostic messages below, not abort here via set -e on a raw parse error.
+  preflight_host="$(echo "$preflight_queue_json" | json_field host)" || preflight_host=""
+  preflight_age="$(echo "$preflight_queue_json" | json_field heartbeat_age_s)" || preflight_age=""
   [[ -n "$preflight_host" && "$preflight_host" != "None" ]] || {
     echo "preflight: 'lab queue list' returned no host -- either no scheduler has ever reported in, or LAB_R2_ENDPOINT/LAB_R2_BUCKET point at the wrong queue (check .env vs your shell's exported values)" >&2
     exit 1
@@ -264,11 +273,40 @@ say "2. pause"
 run uv run lab queue pause
 [[ "$DRY_RUN" == "--dry-run" ]] || PAUSED=1
 
+# `lab queue pause` only writes control.json and returns -- it does not wait for the OLD
+# scheduler (systemd timer, up to ~60s between ticks) to actually observe it. Without this gate,
+# a registration whose trigger becomes eligible in the gap between step 1's drain check and the
+# old scheduler noticing the pause can launch on the OLD droplet, which step 5 then powers off
+# mid-launch -- the same double-launch/orphan race drain-before-pause exists to prevent, just
+# moved a step later. `heartbeat_paused` (unlike `control.paused`, which flips instantly) is what
+# the last *completed* tick actually observed and acted on, so waiting for it to read true proves
+# the old scheduler has genuinely stopped launching, not just that our write landed.
+say "2b. wait for the old scheduler to acknowledge the pause (not just our own write)"
+if [[ "$DRY_RUN" == "--dry-run" ]]; then
+  echo "[dry-run] poll lab queue list until heartbeat_paused == true"
+else
+  pause_ack_deadline=$(( $(date +%s) + PAUSE_ACK_TIMEOUT_S ))
+  hb_paused=""
+  while (( $(date +%s) < pause_ack_deadline )); do
+    # Tolerate one flaky read (matches steps 4/7's pattern) rather than aborting on a single R2
+    # hiccup during what should be a sub-two-minute wait.
+    hb_paused="$(uv run lab queue list | json_field heartbeat_paused)" || hb_paused=""
+    [[ "$hb_paused" == "True" ]] && break
+    sleep 5
+  done
+  if [[ "$hb_paused" != "True" ]]; then
+    echo "old scheduler never confirmed observing the pause within ${PAUSE_ACK_TIMEOUT_S}s (last heartbeat_paused: ${hb_paused:-<none>}) -- it may still be able to launch a job; not proceeding. cleanup will resume the queue." >&2
+    exit 1
+  fi
+  echo "old scheduler confirmed paused"
+fi
+
 say "3. create new droplet"
 RENDERED="$(mktemp)"
 TAG="$TAG" DROPLET_NAME="$DROPLET_NAME" LAB_R2_ENDPOINT="$LAB_R2_ENDPOINT" \
   LAB_R2_BUCKET="$LAB_R2_BUCKET" AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
   AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" VAST_API_KEY="$VAST_API_KEY" \
+  VAST_API_KEY_B64="$VAST_API_KEY_B64" \
   envsubst < "$SCRIPT_DIR/cloud-init.yaml.tmpl" > "$RENDERED"
 # `droplet create` (unlike `droplet-action`) accepts a name, but we need the numeric ID for every
 # later droplet-action call, so capture it directly via --format/--no-header instead of a
@@ -423,37 +461,36 @@ if [[ "$DRY_RUN" != "--dry-run" ]]; then
 
   smoke_deadline=$(( $(date +%s) + SMOKE_TIMEOUT_S ))
   state=""
+  terminal=0
   while (( $(date +%s) < smoke_deadline )); do
     # Tolerate one flaky read (a transient `lab queue show` hiccup mid-poll) rather than aborting
     # the whole script -- only a genuine terminal state should end the loop.
     state="$(uv run lab queue show "$reg_id" | json_field state)" || state=""
+    # The terminal-state list lives here ONLY -- the outcome below dispatches on `terminal` +
+    # whether state==succeeded, rather than re-enumerating failed/expired/cancelled a second
+    # time, so a future RegState addition can't drift the two lists apart.
     case "$state" in
-      succeeded) break ;;
-      failed|expired|cancelled) break ;;
+      succeeded|failed|expired|cancelled) terminal=1; break ;;
     esac
     sleep 15
   done
-  case "$state" in
-    succeeded)
-      echo "smoke registration succeeded"
-      ;;
-    failed|expired|cancelled)
-      echo "smoke registration reached a terminal failure state ($state) -- rolling back" >&2
-      rollback
-      exit 1
-      ;;
-    *)
-      # Inconclusive (still launching/pending, or every poll read was flaky) is NOT a confirmed
-      # failure. By this point step 6 has already resumed the queue, so the real state is: queue
-      # RUNNING, with the new (unproven) droplet as its only ticker -- it may already be
-      # launching real jobs on an unproven host. That's not an emergency (the old droplet is
-      # merely powered off, not gone, so a human can still roll back by hand), so there's no
-      # urgency forcing a guessed automatic rollback here -- surface it instead.
-      echo "smoke registration inconclusive at timeout (last state: ${state:-unknown}) -- not rolling back automatically. Queue is RUNNING with the new droplet ($DROPLET_NAME / $NEW_DROPLET_ID) as its only, unproven ticker -- it may already be launching real jobs. Check 'lab queue show $reg_id' by hand, then either give it more time, or roll back manually: pause the queue, power off $NEW_DROPLET_ID, power on $OLD_DROPLET_ID, resume, delete $NEW_DROPLET_ID." >&2
-      warn_leftover_droplet "$OLD_DROPLET_ID" "old scheduler droplet (pre-cutover)" 1
-      exit 1
-      ;;
-  esac
+  if [[ "$terminal" == "1" && "$state" == "succeeded" ]]; then
+    echo "smoke registration succeeded"
+  elif [[ "$terminal" == "1" ]]; then
+    echo "smoke registration reached a terminal failure state ($state) -- rolling back" >&2
+    rollback
+    exit 1
+  else
+    # Inconclusive (still launching/pending, or every poll read was flaky) is NOT a confirmed
+    # failure. By this point step 6 has already resumed the queue, so the real state is: queue
+    # RUNNING, with the new (unproven) droplet as its only ticker -- it may already be
+    # launching real jobs on an unproven host. That's not an emergency (the old droplet is
+    # merely powered off, not gone, so a human can still roll back by hand), so there's no
+    # urgency forcing a guessed automatic rollback here -- surface it instead.
+    echo "smoke registration inconclusive at timeout (last state: ${state:-unknown}) -- not rolling back automatically. Queue is RUNNING with the new droplet ($DROPLET_NAME / $NEW_DROPLET_ID) as its only, unproven ticker -- it may already be launching real jobs. Check 'lab queue show $reg_id' by hand, then either give it more time, or roll back manually: pause the queue, power off $NEW_DROPLET_ID, power on $OLD_DROPLET_ID, resume, delete $NEW_DROPLET_ID." >&2
+    warn_leftover_droplet "$OLD_DROPLET_ID" "old scheduler droplet (pre-cutover)" 1
+    exit 1
+  fi
 else
   echo "[dry-run] lab register a smoke job, poll lab queue show until succeeded"
 fi

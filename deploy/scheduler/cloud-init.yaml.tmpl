@@ -1,6 +1,7 @@
 #cloud-config
 # Rendered by deploy/scheduler/deploy.sh via envsubst. Placeholders: $TAG, $DROPLET_NAME,
-# $LAB_R2_ENDPOINT, $LAB_R2_BUCKET, $AWS_ACCESS_KEY_ID, $AWS_SECRET_ACCESS_KEY, $VAST_API_KEY.
+# $LAB_R2_ENDPOINT, $LAB_R2_BUCKET, $AWS_ACCESS_KEY_ID, $AWS_SECRET_ACCESS_KEY, $VAST_API_KEY,
+# $VAST_API_KEY_B64 (same value, base64 -- see the runcmd step below for why both exist).
 # Runs once, as root, on first boot. No SSH involved anywhere in this file.
 
 hostname: $DROPLET_NAME
@@ -39,8 +40,13 @@ runcmd:
   - useradd --create-home --system --shell /bin/bash lab
 
   # Vast API key for the service user (sky reads the file; the sdk reads $VAST_API_KEY from env).
+  # Decoded from base64, NOT substituted raw into this nested-quoted shell string: envsubst does
+  # plain text substitution with no awareness of shell/YAML quoting, so a raw key containing a
+  # `"`, `` ` ``, `$`, `\`, or `'` would otherwise break out of the quoting here (real operator
+  # keys are not guaranteed to avoid those). Base64's alphabet has none of them, so it's safe in
+  # any quoting context regardless of what the real key contains.
   - install -d -o lab -g lab -m 0700 /home/lab/.config/vastai
-  - 'bash -c "echo \"$VAST_API_KEY\" > /home/lab/.config/vastai/vast_api_key"'
+  - 'bash -c "echo \"$VAST_API_KEY_B64\" | base64 -d > /home/lab/.config/vastai/vast_api_key"'
   - chown lab:lab /home/lab/.config/vastai/vast_api_key
   - chmod 600 /home/lab/.config/vastai/vast_api_key
 

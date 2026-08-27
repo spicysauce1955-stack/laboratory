@@ -195,14 +195,34 @@ def wait_for_queue_drain(
     of how far in the future its trigger is.
 
     Returns the still-blocking registrations: empty on a clean drain, non-empty (whatever was
-    still in flight) when `timeout` was hit first. Never raises on timeout — the caller decides
-    what a non-empty result means.
+    still in flight) when `timeout` was hit first. Never raises on timeout, as long as at least
+    one read succeeded along the way — the caller decides what a non-empty result means. A single
+    flaky read (a real store like R2QueueStore has no internal retry) is tolerated rather than
+    aborting a wait that can run for up to 30 minutes, the same tolerance used by every other poll
+    this feature adds; a `list_entries()` that never once succeeds re-raises its last error at
+    the deadline instead of silently reporting a clean drain with zero evidence, right before the
+    caller pauses production.
     """
     deadline = time.monotonic() + timeout if timeout is not None else None
+    blocking: list[Registration] = []
+    ever_read = False
+    last_error: Exception | None = None
     while True:
-        blocking = [r for r in queue.list_entries() if r.state in _BLOCKING_STATES]
-        if not blocking:
-            return []
-        if deadline is not None and time.monotonic() >= deadline:
-            return blocking
-        time.sleep(interval)
+        try:
+            entries = queue.list_entries()
+        except Exception as e:  # noqa: BLE001 — tolerated below, re-raised only if never observed
+            last_error = e
+        else:
+            ever_read = True
+            blocking = [r for r in entries if r.state in _BLOCKING_STATES]
+            if not blocking:
+                return []
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if not ever_read and last_error is not None:
+                    raise last_error
+                return blocking
+            time.sleep(max(0.05, min(interval, remaining)))  # never overrun the deadline
+        else:
+            time.sleep(max(0.05, interval))  # guard against a busy-loop on interval<=0

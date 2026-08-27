@@ -355,3 +355,22 @@ def test_queue_list_tool_reports_host(tmp_path: Path, monkeypatch: pytest.Monkey
 
     data = asyncio.run(go())
     assert data["host"] == "lab-scheduler-new"
+
+
+def test_queue_list_tool_reports_heartbeat_paused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from lab.scheduler.queue import LocalQueueStore
+
+    monkeypatch.setenv("LAB_QUEUE_DIR", str(tmp_path / "queue"))
+    q = LocalQueueStore(tmp_path / "queue")
+    q.write_heartbeat(
+        {"at": "2026-08-27T00:00:00+00:00", "host": "h", "tick_count": 5, "paused": True}
+    )
+    _, server = _make(tmp_path)
+
+    async def go():
+        async with Client(server) as c:
+            return (await c.call_tool("queue_list", {})).data
+
+    data = asyncio.run(go())
+    assert data["heartbeat_paused"] is True
+    assert data["tick_count"] == 5

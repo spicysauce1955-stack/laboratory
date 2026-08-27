@@ -142,6 +142,10 @@ class Scheduler:
                 "tick_count": tick_count,
                 "launched": rep.launched,
                 "errors": rep.errors,
+                # `control.paused` alone only proves a write landed, not that a running scheduler
+                # (possibly mid-tick, already past its own `read_control()`) has honored it -- a
+                # cutover confirming this against a *completed* tick's heartbeat is the real ack.
+                "paused": control.paused,
             }
         )
         return rep
