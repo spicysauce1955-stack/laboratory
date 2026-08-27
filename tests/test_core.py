@@ -256,8 +256,9 @@ def test_reconcile_finds_ghosts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     _patch_empty_sky(monkeypatch)
     report = lab.reconcile(apply=False)
     assert report["orphans"] == []
-    assert [g["cluster"] for g in report["ghosts"]] == [skypilot_mod.cluster_name_for("job-ghost")]
-    assert report["ghosts"][0]["reason"] == "no matching Vast rental label"
+    cluster = skypilot_mod.cluster_name_for("job-ghost")
+    assert report["ghosts"] == [cluster]  # frozen MCP/CLI shape (docs/COMPATIBILITY.md) — strings
+    assert report["ghost_reasons"][cluster] == "no matching Vast rental label"
 
 
 def _seed_running_do_job(lab: Lab, job_id: str) -> None:
@@ -320,8 +321,8 @@ def test_reconcile_do_job_confirmed_gone_via_sky_is_a_ghost(
     _patch_sky_status(monkeypatch, ok=True, clusters=[])  # sky tracks nothing for this cluster
 
     report = lab.reconcile(apply=False)
-    assert [g["cluster"] for g in report["ghosts"]] == [cluster]
-    assert "do" in report["ghosts"][0]["reason"]
+    assert report["ghosts"] == [cluster]
+    assert "do" in report["ghost_reasons"][cluster]
 
 
 def test_reconcile_do_job_not_flagged_when_sky_status_is_unverifiable(
@@ -339,6 +340,31 @@ def test_reconcile_do_job_not_flagged_when_sky_status_is_unverifiable(
     report = lab.reconcile(apply=False)
     assert report["ghosts"] == []
     assert report["sky_pass"] == "skipped (client/server version skew)"
+
+
+def test_reconcile_fetches_sky_status_only_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The ghost pass and the `sky_orphans` pass both need SkyPilot's live cluster state — a
+    second real `sky.status()` round-trip per `reconcile()` call is pure waste, and it's exactly
+    the kind of extra call a test that only stubs `_sky_status_orphans` (not the fetch itself)
+    would silently miss and fall through to the real `sky` module."""
+    repo = repo_root(Path.cwd())
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
+    _seed_running_do_job(lab, "job-do-count")
+    monkeypatch.setattr(skypilot_mod, "list_vast_instances", lambda: [])
+    _patch_sky_status(monkeypatch, ok=True, clusters=[])
+
+    calls = {"n": 0}
+    real_status = sys.modules["sky"].status
+
+    def counting_status(refresh=None):
+        calls["n"] += 1
+        return real_status(refresh=refresh)
+
+    sys.modules["sky"].status = counting_status
+
+    lab.reconcile(apply=False)
+
+    assert calls["n"] == 1
 
 
 def test_reconcile_ghost_leaves_a_note_in_the_ledger(

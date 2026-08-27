@@ -97,6 +97,26 @@ def test_known_jobs_never_raises_on_a_corrupt_registry_line(tmp_path: Path) -> N
     assert ids == {"j1"}
 
 
+def test_known_jobs_skips_one_bad_record_without_dropping_the_rest(tmp_path: Path) -> None:
+    """A single malformed field (valid JSON, unparseable `created_at`) must not abort the whole
+    scan — every record after it in the registry is a real job `lab ps` still needs to see."""
+    attribution.record_job("j1", project="p", runs_dir=tmp_path / "runs", created_at=NOW)
+    with attribution.index_path().open("a", encoding="utf-8") as f:
+        f.write(
+            json.dumps(
+                {"v": 1, "job_id": "j-bad", "project": "p", "runs_dir": str(tmp_path / "runs"),
+                 "created_at": "not-a-real-timestamp"}
+            )
+            + "\n"
+        )
+    attribution.record_job("j3", project="p", runs_dir=tmp_path / "runs", created_at=NOW)
+
+    ids = {kj.job_id for kj in attribution.known_jobs()}
+
+    assert "j3" in ids, "a record after the malformed one must still be seen"
+    assert "j1" in ids
+
+
 def test_record_job_creates_the_index_under_the_env_override(tmp_path: Path) -> None:
     attribution.record_job("j1", project="p", runs_dir=tmp_path / "runs")
     assert attribution.index_path() == tmp_path / "lab-jobs" / "index.jsonl"

@@ -74,7 +74,7 @@ def test_reconcile_skips_vast_pass_when_sdk_missing(tmp_path, monkeypatch):
         "lab.backends.skypilot.list_vast_instances",
         lambda *a, **k: (_ for _ in ()).throw(ImportError("No module named 'vastai_sdk'")),
     )
-    monkeypatch.setattr(Lab, "_sky_status_orphans", lambda self, running_clusters: [orphan])
+    monkeypatch.setattr(Lab, "_sky_status_orphans", lambda self, running_clusters, records=None: [orphan])
     monkeypatch.setattr("lab.backends.skypilot.list_do_volumes", lambda *a, **k: [])
 
     report = lab.reconcile()
@@ -348,7 +348,7 @@ def test_reconcile_gcp_pass_flags_and_destroys_orphans(tmp_path, monkeypatch):
     lab = Lab(backend=LocalBackend(home=tmp_path, repo=tmp_path), repo=tmp_path, home=tmp_path)
     _claim_finished(lab, LEAKED_NODE_JOB_ID)
     monkeypatch.setattr("lab.backends.skypilot.list_vast_instances", lambda *a, **k: [])
-    monkeypatch.setattr(Lab, "_sky_status_orphans", lambda self, running_clusters: [])
+    monkeypatch.setattr(Lab, "_sky_status_orphans", lambda self, running_clusters, records=None: [])
     monkeypatch.setattr("lab.backends.skypilot.list_do_volumes", lambda *a, **k: [])
     monkeypatch.setattr(
         "lab.backends.skypilot.list_gcp_instances",
@@ -401,7 +401,7 @@ def _lab_with_other_passes_clean(tmp_path, monkeypatch):
     lab = Lab(backend=LocalBackend(home=tmp_path, repo=tmp_path), repo=tmp_path, home=tmp_path)
     _claim_finished(lab, LEAKED_NODE_JOB_ID)
     monkeypatch.setattr("lab.backends.skypilot.list_vast_instances", lambda *a, **k: [])
-    monkeypatch.setattr(Lab, "_sky_status_orphans", lambda self, running_clusters: [])
+    monkeypatch.setattr(Lab, "_sky_status_orphans", lambda self, running_clusters, records=None: [])
     monkeypatch.setattr("lab.backends.skypilot.list_do_volumes", lambda *a, **k: [])
     return lab
 

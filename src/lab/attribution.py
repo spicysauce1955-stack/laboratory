@@ -411,7 +411,15 @@ def known_jobs() -> list[KnownJob]:
     """
     out: list[KnownJob] = []
     try:
-        for record in _registry_index().values():
+        records = list(_registry_index().values())
+    except Exception as e:  # noqa: BLE001 — advisory, never fatal
+        _debug(f"known_jobs: registry read failed: {e}")
+        return out
+    for record in records:
+        # Per-record, deliberately: one entry with a malformed field (a hand-edited line, a
+        # schema drift) must not abort the scan and silently drop every job recorded after it —
+        # that is exactly the class of gap this function exists to close.
+        try:
             job_id = record.get("job_id")
             if not isinstance(job_id, str) or not job_id:
                 continue
@@ -426,8 +434,8 @@ def known_jobs() -> list[KnownJob]:
                     else None,
                 )
             )
-    except Exception as e:  # noqa: BLE001 — advisory, never fatal
-        _debug(f"known_jobs failed: {e}")
+        except Exception as e:  # noqa: BLE001
+            _debug(f"known_jobs: skipping malformed record: {e}")
     return out
 
 

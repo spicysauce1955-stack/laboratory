@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ from helpers import make_manifest
 from typer.testing import CliRunner
 
 from lab import attribution
+from lab._util import now
 from lab.backends.local import LocalBackend
 from lab.cli import app
 from lab.core import Lab
@@ -36,7 +38,13 @@ def _lab_at(home: Path) -> Lab:
 
 
 def _seed(
-    lab: Lab, job_id: str, *, status: JobState, provisioner: str = "local", pid: int | None = None
+    lab: Lab,
+    job_id: str,
+    *,
+    status: JobState,
+    provisioner: str = "local",
+    pid: int | None = None,
+    started_ago_s: float | None = None,
 ) -> None:
     """Seed a job under ``lab``'s store.
 
@@ -45,9 +53,10 @@ def _seed(
     never has that ambiguity, since each project is a separate ``lab`` invocation from its own
     cwd. Re-recording under ``lab.home.name`` afterwards (last write wins) simulates that.
     """
-    m = make_manifest(job_id, "python x.py").model_copy(
-        update={"status": status, "backend": BackendInfo(provisioner=provisioner)}
-    )
+    update: dict[str, object] = {"status": status, "backend": BackendInfo(provisioner=provisioner)}
+    if started_ago_s is not None:
+        update["started_at"] = now() - timedelta(seconds=started_ago_s)
+    m = make_manifest(job_id, "python x.py").model_copy(update=update)
     lab.store.create(m)
     attribution.record_job(job_id, project=lab.home.name, runs_dir=lab.store.home)
     if pid is not None:
@@ -78,13 +87,36 @@ def test_ps_excludes_terminal_jobs(tmp_path: Path) -> None:
 
 
 def test_ps_flags_a_dead_supervisor_as_unsupervised(tmp_path: Path) -> None:
-    """A running job whose local supervisor pid is gone — the money-alarm case, not just noise."""
+    """A running job whose local supervisor pid is gone, well past the grace window — the
+    money-alarm case, not just noise."""
     lab = _lab_at(tmp_path / "proj")
-    _seed(lab, "job-orphaned", status=JobState.running, provisioner="skypilot", pid=999999999)
+    _seed(
+        lab,
+        "job-orphaned",
+        status=JobState.running,
+        provisioner="skypilot",
+        pid=999999999,
+        started_ago_s=3600.0,
+    )
 
     report = lab.ps()
 
     assert report["jobs"][0]["supervised"] == "unsupervised"
+
+
+def test_ps_does_not_flag_a_fresh_job_as_unsupervised_before_its_pid_is_recorded(
+    tmp_path: Path,
+) -> None:
+    """`reconcile()`'s `unsupervised` check waits out `UNSUPERVISED_GRACE_S` before trusting a
+    dead-pid read, because a just-launched supervisor hasn't written `runner_pid` yet. `ps` must
+    give a freshly-submitted job the same grace, or it false-alarms on exactly the jobs it should
+    be quietest about."""
+    lab = _lab_at(tmp_path / "proj")
+    _seed(lab, "job-just-started", status=JobState.running, provisioner="skypilot", started_ago_s=2.0)
+
+    report = lab.ps()
+
+    assert report["jobs"][0]["supervised"] != "unsupervised"
 
 
 def test_ps_flags_a_live_supervisor_as_local(tmp_path: Path) -> None:

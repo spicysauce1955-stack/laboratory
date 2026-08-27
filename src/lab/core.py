@@ -1072,7 +1072,15 @@ class Lab:
                 alive = pid_alive(
                     runtime.get("runner_pid"), start_time=runtime.get("runner_start_time")
                 )
-                supervised = "local" if alive else "unsupervised"
+                if alive:
+                    supervised = "local"
+                else:
+                    # Same grace `reconcile()`'s `unsupervised` pass gives a dead-pid read: a
+                    # just-launched supervisor hasn't written `runner_pid` yet, and that gap must
+                    # not read as "orphaned" on the command whose whole point is a trustworthy
+                    # answer before touching a live job.
+                    age = (now() - (manifest.started_at or manifest.created_at)).total_seconds()
+                    supervised = "starting" if age <= UNSUPERVISED_GRACE_S else "unsupervised"
             jobs.append(
                 {
                     "job_id": kj.job_id,
@@ -1252,12 +1260,19 @@ class Lab:
         except Exception as e:  # noqa: BLE001
             raise LabError(f"could not query SkyPilot cluster status: {e}") from e
 
-    def _sky_status_orphans(self, running_clusters: set[str]) -> list[str]:
+    def _sky_status_orphans(
+        self, running_clusters: set[str], records: list[Any] | None = None
+    ) -> list[str]:
         """Cloud-agnostic orphan pass: ``lab-*`` clusters SkyPilot still tracks/that are still up
         but are NOT tied to a running local job. Covers DO/GCP (and Vast) via SkyPilot's own state,
-        complementing the Vast-direct scan. Raises :class:`LabError` if the status query fails."""
+        complementing the Vast-direct scan. Raises :class:`LabError` if the status query fails.
+
+        ``records`` lets a caller that already fetched ``sky.status()`` this call (``reconcile``'s
+        ghost pass does) hand the result in instead of paying for a second live round-trip;
+        ``None`` (the default, and what direct callers/tests use) fetches fresh.
+        """
         orphans: list[str] = []
-        for rec in self._sky_status_records() or []:
+        for rec in (records if records is not None else self._sky_status_records()) or []:
             name = rec.get("name") if isinstance(rec, dict) else getattr(rec, "name", None)
             if not name or not str(name).startswith("lab-") or name in running_clusters:
                 continue
@@ -1278,8 +1293,10 @@ class Lab:
 
         - ``orphans``: Vast.ai rentals whose label looks like a lab cluster (``lab-*``) but does
           NOT match any **running** local job — these are very likely leaked rentals.
-        - ``ghosts``: running local jobs whose cluster name does not appear in any active Vast
-          rental label — the supervisor probably died before recording terminal state.
+        - ``ghosts``: running local jobs with no confirmed live cloud resource — a Vast job with
+          no matching rental label, or a DO/GCP job SkyPilot no longer tracks (unverifiable under
+          client/server skew is never reported as a ghost). ``ghost_reasons`` names why, per
+          cluster. Advisory only; nothing here is ever destroyed automatically.
         - ``destroyed``: Vast instance IDs we actually destroyed (only when ``apply=True``).
 
         With ``apply=True``, each orphan is destroyed via the vastai-sdk directly (bypassing
@@ -1510,15 +1527,19 @@ class Lab:
 
         # DO/GCP ground truth for the ghost pass: Vast has the provider-direct rental listing
         # above; DO/GCP have no such API called here, so SkyPilot's own tracked state is the only
-        # signal. `None` means unverifiable (skew) rather than "confirmed gone" — a job on a cloud
-        # we cannot check must not become a false ghost just because it was never going to appear
-        # in Vast's rental list (found live 2026-08-27: every healthy DO job was unconditionally
-        # reported as a ghost for exactly this reason).
+        # signal. Fetched once and handed to `_sky_status_orphans` below too — a second live
+        # `sky.status()` round-trip per reconcile is pure waste, and one worth avoiding since
+        # `sky` talks to a local API server this call is not otherwise gated on. `None` means
+        # unverifiable (skew) rather than "confirmed gone" — a job on a cloud we cannot check must
+        # not become a false ghost just because it was never going to appear in Vast's rental list
+        # (found live 2026-08-27: every healthy DO job was unconditionally reported as a ghost for
+        # exactly this reason).
+        sky_status_recs: list[Any] = self._sky_status_records() if sky_ok else []
         sky_live: set[str] | None = None
         if sky_ok:
             sky_live = {
                 str(name)
-                for rec in self._sky_status_records()
+                for rec in sky_status_recs
                 if (
                     name := (
                         rec.get("name") if isinstance(rec, dict) else getattr(rec, "name", None)
@@ -1526,7 +1547,12 @@ class Lab:
                 )
             }
 
-        ghosts: list[dict[str, Any]] = []
+        # `ghosts` stays `list[str]` — the CLI/MCP JSON shape is frozen at a release
+        # (docs/COMPATIBILITY.md), and this project is unreleased since v0.9.0. The explanation
+        # goes in the additive `ghost_reasons` field below instead of restructuring `ghosts`
+        # itself, and both `events.note` (for `lab history --full`) and the note still carry it.
+        ghosts: list[str] = []
+        ghost_reasons: dict[str, str] = {}
         for cluster, jid in sorted(running_clusters.items()):
             if jid in matched_jobs:
                 continue
@@ -1539,11 +1565,16 @@ class Lab:
                 reason = f"no matching SkyPilot-tracked cluster (cloud={cloud})"
             else:
                 reason = "no matching Vast rental label"
-            ghosts.append({"cluster": cluster, "job_id": jid, "cloud": cloud, "reason": reason})
+            ghosts.append(cluster)
+            ghost_reasons[cluster] = reason
             events.note("reconcile.ghost", cluster=cluster, job_id=jid, cloud=cloud, reason=reason)
 
         sky_orphans = (
-            _ours_only("sky_orphans", self._sky_status_orphans(set(protected)), str)
+            _ours_only(
+                "sky_orphans",
+                self._sky_status_orphans(set(protected), records=sky_status_recs),
+                str,
+            )
             if sky_ok
             else []
         )
@@ -1693,6 +1724,9 @@ class Lab:
             "orphans": orphans,
             "destroyed": destroyed,
             "ghosts": ghosts,
+            # Additive, not a shape change to `ghosts` (frozen MCP/CLI contract, see above):
+            # cluster -> why it was flagged, e.g. "no matching SkyPilot-tracked cluster (cloud=do)".
+            "ghost_reasons": ghost_reasons,
             "sky_orphans": sky_orphans,
             "sky_destroyed": sky_destroyed,
             "do_volume_orphans": do_volume_orphans,
