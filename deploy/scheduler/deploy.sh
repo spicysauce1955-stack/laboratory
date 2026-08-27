@@ -11,12 +11,16 @@
 # See docs/superpowers/specs/2026-08-27-scheduler-deploy-cutover-design.md for the full design
 # and why each step is ordered the way it is (two real bugs were caught and fixed in review:
 # a self-deadlock from pausing before draining, and a double-launch race from deleting the old
-# droplet too early). A later review round hardened the failure/rollback paths: rollback now
-# takes the new (unproven) droplet out of service before resuming the queue rather than after
-# (the same double-launch race, reintroduced in rollback()); every command whose failure could
-# otherwise silently skip rollback under `set -e` is now explicitly handled; and a safety-net
-# trap resumes the queue if the script dies while paused, so a bug never leaves the ticker
-# stalled with nobody watching.
+# droplet too early). Two later review rounds hardened the failure/rollback paths further:
+# `doctl compute droplet-action` requires a numeric droplet ID (unlike `droplet create`/`delete`,
+# which accept a name) -- so the new droplet's numeric ID is captured once, right after creation
+# (NEW_DROPLET_ID), and used for every power-off/power-on call. `cleanup()` (the safety net for
+# a script death while the queue is paused) powers the new droplet off before ever auto-resuming,
+# not just rollback() -- otherwise an abort at step 3/4 could resume the queue with an unproven,
+# possibly-still-ticking new droplet still up, which is the same double-launch race by another
+# path. rollback() re-arms that same safety net (RESUMED=0) for the duration of its own sequence,
+# so a death mid-rollback still gets a resume attempt from the outer trap instead of leaving the
+# queue paused forever with no message.
 set -euo pipefail
 
 TAG="${1:-}"
@@ -42,25 +46,42 @@ VERIFY_TIMEOUT_S="${LAB_DEPLOY_VERIFY_TIMEOUT_S:-300}"
 SMOKE_TIMEOUT_S="${LAB_DEPLOY_SMOKE_TIMEOUT_S:-1800}"
 
 # Safety net: if the script dies while the queue is paused and was never resumed (by us or by
-# rollback()), try to resume it rather than leaving a stalled ticker for a human to discover
-# hours later. Best-effort and idempotent -- harmless if the queue is already running.
+# rollback()), recover to a safe state rather than leaving a stalled ticker for a human to
+# discover hours later. If a new droplet was created but never proven, it is powered off (using
+# its numeric ID) BEFORE the queue is resumed -- otherwise auto-resuming here could put an
+# unproven, possibly-still-ticking droplet into service unpaused, the same race rollback() exists
+# to prevent. Best-effort and idempotent.
 RENDERED=""
 PAUSED=0
 RESUMED=0
+NEW_DROPLET_CREATED=0
+NEW_DROPLET_ID=""
 CLEANUP_DONE=0
 cleanup() {
   local rc=$?
   # Idempotent: INT/TERM below call this explicitly and then exit, which re-fires the EXIT trap
-  # -- without this guard the resume/rm-f logic would run twice.
+  # -- without this guard the resume/power-off/rm-f logic would run twice.
   (( CLEANUP_DONE )) && return "$rc"
   CLEANUP_DONE=1
   [[ -n "$RENDERED" ]] && rm -f "$RENDERED"
   if (( rc != 0 && PAUSED == 1 && RESUMED == 0 )); then
-    echo "deploy failed while queue was paused -- attempting to resume" >&2
-    if uv run lab queue resume; then
-      RESUMED=1
-    else
-      echo "MANUAL ACTION REQUIRED: run 'lab queue resume'" >&2
+    echo "deploy failed while queue was paused -- recovering safely" >&2
+    local safe_to_resume=1
+    if (( NEW_DROPLET_CREATED == 1 )); then
+      echo "powering off unproven new droplet ($NEW_DROPLET_ID) before resuming -- avoids two unpaused tickers" >&2
+      if doctl compute droplet-action power-off "$NEW_DROPLET_ID" --wait; then
+        NEW_DROPLET_CREATED=0
+      else
+        echo "MANUAL ACTION REQUIRED: could not power off new droplet ($NEW_DROPLET_ID) -- power it off by hand, THEN run 'lab queue resume'. Not auto-resuming while it might still be ticking." >&2
+        safe_to_resume=0
+      fi
+    fi
+    if (( safe_to_resume == 1 )); then
+      if uv run lab queue resume; then
+        RESUMED=1
+      else
+        echo "MANUAL ACTION REQUIRED: run 'lab queue resume'" >&2
+      fi
     fi
   fi
   return "$rc"
@@ -114,9 +135,24 @@ TAG="$TAG" DROPLET_NAME="$DROPLET_NAME" LAB_R2_ENDPOINT="$LAB_R2_ENDPOINT" \
   LAB_R2_BUCKET="$LAB_R2_BUCKET" AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
   AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" VAST_API_KEY="$VAST_API_KEY" \
   envsubst < "$SCRIPT_DIR/cloud-init.yaml.tmpl" > "$RENDERED"
-run doctl compute droplet create "$DROPLET_NAME" \
-  --region "$REGION" --size "$SIZE" --image ubuntu-24-04-x64 \
-  --tag-names lab-scheduler --user-data-file "$RENDERED" --wait
+# `droplet create` (unlike `droplet-action`) accepts a name, but we need the numeric ID for every
+# later droplet-action call, so capture it directly via --format/--no-header instead of a
+# separate lookup.
+if [[ "$DRY_RUN" == "--dry-run" ]]; then
+  echo "[dry-run] doctl compute droplet create $DROPLET_NAME --region $REGION --size $SIZE --image ubuntu-24-04-x64 --tag-names lab-scheduler --user-data-file $RENDERED --wait --format ID --no-header"
+  NEW_DROPLET_ID="<dry-run-new-id>"
+else
+  NEW_DROPLET_ID="$(doctl compute droplet create "$DROPLET_NAME" \
+    --region "$REGION" --size "$SIZE" --image ubuntu-24-04-x64 \
+    --tag-names lab-scheduler --user-data-file "$RENDERED" --wait \
+    --format ID --no-header)"
+  [[ "$NEW_DROPLET_ID" =~ ^[0-9]+$ ]] || {
+    echo "doctl droplet create did not return a numeric droplet ID: '$NEW_DROPLET_ID'" >&2
+    exit 1
+  }
+  NEW_DROPLET_CREATED=1
+  echo "new droplet id: $NEW_DROPLET_ID"
+fi
 
 say "4. verify the new droplet's heartbeat (by identity, not just recency -- the old one is still up)"
 if [[ "$DRY_RUN" != "--dry-run" ]]; then
@@ -129,7 +165,11 @@ if [[ "$DRY_RUN" != "--dry-run" ]]; then
   done
   if [[ "$host" != "$DROPLET_NAME" ]]; then
     echo "new droplet never confirmed alive as $DROPLET_NAME (last seen host: ${host:-<none>})" >&2
-    doctl compute droplet delete "$DROPLET_NAME" --force
+    if doctl compute droplet delete "$NEW_DROPLET_ID" --force; then
+      NEW_DROPLET_CREATED=0
+    else
+      echo "could not delete unconfirmed new droplet ($NEW_DROPLET_ID) -- it may still be running; cleanup will try to power it off before resuming" >&2
+    fi
     exit 1
   fi
 else
@@ -145,14 +185,23 @@ run uv run lab queue resume
 
 # Every step here is best-effort: this runs after set -e could otherwise be triggered by any one
 # of them, and aborting rollback() halfway is worse than either endpoint state. New droplet is
-# taken out of service BEFORE the queue resumes -- exactly one unpaused ticker at every instant,
-# same invariant as the forward path.
+# taken out of service (by numeric ID -- `droplet-action` rejects a name) BEFORE the queue
+# resumes -- exactly one unpaused ticker at every instant, same invariant as the forward path.
+# RESUMED is reset to 0 right after rollback's own pause succeeds so the outer cleanup() trap's
+# safety net is re-armed for the duration of this sequence: if the script dies partway through
+# rollback itself (e.g. a hung --wait gets killed), cleanup() still attempts a resume instead of
+# leaving the queue paused forever with nobody told.
 rollback() {
   echo "rolling back: old droplet resumes service, new droplet is discarded" >&2
-  uv run lab queue pause ||
+  if uv run lab queue pause; then
+    RESUMED=0
+  else
     echo "rollback: pause FAILED -- queue may still be resumed with the new droplet ticking, check manually" >&2
-  doctl compute droplet-action power-off "$DROPLET_NAME" --wait ||
-    echo "rollback: power-off of new droplet ($DROPLET_NAME) FAILED -- it may still be ticking, check manually" >&2
+  fi
+  if (( NEW_DROPLET_CREATED == 1 )); then
+    doctl compute droplet-action power-off "$NEW_DROPLET_ID" --wait ||
+      echo "rollback: power-off of new droplet ($NEW_DROPLET_ID) FAILED -- it may still be ticking, check manually" >&2
+  fi
   doctl compute droplet-action power-on "$OLD_DROPLET_ID" --wait ||
     echo "rollback: power-on of old droplet ($OLD_DROPLET_ID) FAILED -- old droplet may still be off, check manually" >&2
   if uv run lab queue resume; then
@@ -160,8 +209,9 @@ rollback() {
   else
     echo "rollback: resume FAILED -- queue left paused, MANUAL ACTION REQUIRED: run 'lab queue resume'" >&2
   fi
-  doctl compute droplet delete "$DROPLET_NAME" --force ||
-    echo "rollback: delete of new droplet ($DROPLET_NAME) FAILED -- it may still exist, check manually" >&2
+  doctl compute droplet delete "$NEW_DROPLET_ID" --force ||
+    echo "rollback: delete of new droplet ($NEW_DROPLET_ID) FAILED -- it may still exist, check manually" >&2
+  NEW_DROPLET_CREATED=0
 }
 
 say "7. smoke test -- one real registration, through the new scheduler"
@@ -197,10 +247,12 @@ if [[ "$DRY_RUN" != "--dry-run" ]]; then
       ;;
     *)
       # Inconclusive (still launching/pending, or every poll read was flaky) is NOT a confirmed
-      # failure -- the queue is already paused with the new droplet as sole ticker, which is a
-      # safe state, so there's no urgency forcing a destructive automatic rollback here. Surface
-      # it to a human instead of guessing.
-      echo "smoke registration inconclusive at timeout (last state: ${state:-unknown}) -- not rolling back automatically. Queue is paused with only the new droplet ($DROPLET_NAME) as ticker. Check 'lab queue show $reg_id' by hand, then either resume (if it just needed more time) or roll back manually." >&2
+      # failure. By this point step 6 has already resumed the queue, so the real state is: queue
+      # RUNNING, with the new (unproven) droplet as its only ticker -- it may already be
+      # launching real jobs on an unproven host. That's not an emergency (the old droplet is
+      # merely powered off, not gone, so a human can still roll back by hand), so there's no
+      # urgency forcing a guessed automatic rollback here -- surface it instead.
+      echo "smoke registration inconclusive at timeout (last state: ${state:-unknown}) -- not rolling back automatically. Queue is RUNNING with the new droplet ($DROPLET_NAME / $NEW_DROPLET_ID) as its only, unproven ticker -- it may already be launching real jobs. Check 'lab queue show $reg_id' by hand, then either give it more time, or roll back manually: pause the queue, power off $NEW_DROPLET_ID, power on $OLD_DROPLET_ID, resume, delete $NEW_DROPLET_ID." >&2
       exit 1
       ;;
   esac
