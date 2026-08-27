@@ -1011,10 +1011,17 @@ for the user to explicitly say to proceed with this task in real time.
 - [ ] **Step 1 (human-gated): Isolated dry run**
 
 Point `deploy.sh` at a throwaway queue and a throwaway droplet — never the production R2 bucket,
-never the real `lab-scheduler` droplet:
+never the real `lab-scheduler` droplet. **`LAB_QUEUE_DIR` does not isolate this** — `deploy.sh` is
+plain bash, not the `lab` Python process, and it never sets `LAB_QUEUE_DIR` for the droplet it
+creates; the new droplet always talks to R2 (its `scheduler.env` carries `LAB_R2_ENDPOINT`/
+`LAB_R2_BUCKET`), and `R2QueueStore`'s key prefix is hardcoded to `queue` regardless of
+`LAB_QUEUE_DIR` (`src/lab/scheduler/r2queue.py:14`). The only lever that actually isolates a real
+run — both the controller-side `lab queue ...` calls `deploy.sh` makes and the secrets baked into
+the new droplet's cloud-init, since `deploy.sh` reads `$LAB_R2_BUCKET` from its own environment —
+is a throwaway `LAB_R2_BUCKET`:
 
 ```bash
-export LAB_QUEUE_DIR=/tmp/lab-scheduler-test-queue   # or a separate R2 prefix, per taste
+export LAB_R2_BUCKET=lab-artifacts-scheduler-test   # a separate bucket, never the production one
 deploy/scheduler/deploy.sh v0.9.0   # or whatever the current latest tag is
 ```
 
