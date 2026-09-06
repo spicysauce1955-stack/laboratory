@@ -101,7 +101,11 @@ class R2Store:
             # incident).
             response = getattr(e, "response", None) or {}
             error = response.get("Error") or {}
-            if "NoSuchKey" in str(e) or error.get("Code") in ("NoSuchKey", "404"):
+            # `Error` itself can be present-but-not-a-dict (a non-AWS S3-compatible provider, or
+            # a genuinely malformed response, returning a bare string) — treat that the same as
+            # "no recognized error code" rather than crashing on `.get("Code")`.
+            error_code = error.get("Code") if isinstance(error, dict) else None
+            if "NoSuchKey" in str(e) or error_code in ("NoSuchKey", "404"):
                 return None
             raise
         return body.decode()

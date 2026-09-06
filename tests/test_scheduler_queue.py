@@ -107,6 +107,29 @@ def test_read_mirrored_partial_manifest_returns_none_instead_of_crashing(tmp_pat
     assert q.read_mirrored("partial") is None
 
 
+def test_read_mirrored_corrupt_bytes_returns_none_instead_of_crashing(tmp_path: Path):
+    """The same crash class as the partial-manifest fix above, one layer deeper: genuinely
+    corrupted (non-UTF-8) bytes on disk raise UnicodeDecodeError out of `Path.read_text()`
+    before `model_validate_json` ever sees them, so a guard that only catches
+    `pydantic.ValidationError` still crashes the caller."""
+    q = LocalQueueStore(tmp_path)
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir(parents=True)
+    (jobs_dir / "corrupt.json").write_bytes(b"\xff\xfe\x00bad-bytes")
+    assert q.read_mirrored("corrupt") is None
+
+
+def test_list_mirrored_skips_corrupt_bytes_instead_of_crashing(tmp_path: Path):
+    """list_mirrored sibling of the corrupt-bytes fix above: one file with non-UTF-8 bytes must
+    be skipped, not take down the whole listing."""
+    q = LocalQueueStore(tmp_path)
+    q.mirror_manifest(make_manifest("good", "python x.py"))
+    jobs_dir = tmp_path / "jobs"
+    (jobs_dir / "corrupt.json").write_bytes(b"\xff\xfe\x00bad-bytes")
+    got = q.list_mirrored()
+    assert [m.job_id for m in got] == ["good"]
+
+
 def test_list_mirrored_skips_partial_manifest_instead_of_crashing(tmp_path: Path):
     """The sibling of the read_mirrored fix above: one corrupt/partial manifest anywhere in the
     mirror must not take down the whole listing — it should be skipped, with the rest of the
