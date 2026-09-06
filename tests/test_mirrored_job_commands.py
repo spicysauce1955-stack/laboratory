@@ -166,6 +166,59 @@ class TestReadOnlyCommandsFallBackToMirror:
         # supervises (see TestMirrorReadNeverTouchesTheRealLocalStore below).
         assert not JobStore(home).manifest_path("jmir-fetch").exists()
 
+    def test_fetch_local_paths_survive_the_temp_store_being_cleaned_up(
+        self, tmp_path, monkeypatch
+    ):
+        """Bug (2026-09-06): `fetch` on a mirror-only job builds its `Lab` over an ephemeral temp
+        `JobStore` (see `_lab_for_mirrored`'s docstring), and that directory is removed via
+        `atexit` at some point after this process eventually exits -- whether or not anything has
+        read the `local_paths` `fetch` just printed. Prove the reported paths do not depend on
+        that temp directory surviving: after `fetch` returns, tear down every `lab-mirror-*` temp
+        dir it could have created (simulating the eventual `atexit` cleanup firing) and confirm
+        the reported paths are still there, under this project's own durable
+        `runs/<job_id>/output/`, with the expected content -- not gone."""
+        import glob
+        import tempfile as _tempfile
+
+        home = _isolate(tmp_path, monkeypatch)
+        _mirror_only(tmp_path, "jmir-durable", artifacts_uri="r2://lab-artifacts/jmir-durable")
+
+        class _FakeR2Store:
+            @staticmethod
+            def from_env() -> "_FakeR2Store":
+                return _FakeR2Store()
+
+            def download_dir(self, prefix: str, local_dir: Path) -> int:
+                local_dir = Path(local_dir)
+                local_dir.mkdir(parents=True, exist_ok=True)
+                (local_dir / "result.txt").write_text("42")
+                return 1
+
+        monkeypatch.setattr("lab.core.r2_enabled", lambda: True)
+        monkeypatch.setattr("lab.core.R2Store", _FakeR2Store)
+
+        result = runner.invoke(app, ["fetch", "jmir-durable"])
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        local_paths = data["local_paths"]
+        assert local_paths, "expected at least one fetched artifact path"
+
+        # Simulate the temp store's `atexit` cleanup firing right now, before anything reads
+        # `local_paths` back -- this is the exact race the bug missed.
+        for d in glob.glob(str(Path(_tempfile.gettempdir()) / "lab-mirror-*")):
+            import shutil as _shutil
+
+            _shutil.rmtree(d, ignore_errors=True)
+
+        for p in local_paths:
+            path = Path(p)
+            assert path.is_relative_to(home), f"{p} is not under the durable runs/ tree"
+            assert path.read_text() == "42"
+        # still never seeded a manifest into the real local store (the safety fix this must
+        # not regress).
+        assert not JobStore(home).manifest_path("jmir-durable").exists()
+
     @pytest.mark.parametrize("command", ["logs", "metrics", "fetch"])
     def test_unknown_everywhere_still_gives_the_original_message(
         self, tmp_path, monkeypatch, command

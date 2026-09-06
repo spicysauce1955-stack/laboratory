@@ -53,20 +53,30 @@ def test_note_records_a_dollar_amount(tmp_path: Path) -> None:
 
 
 def test_note_marks_an_agent_author(tmp_path: Path) -> None:
-    runner.invoke(app, ["note", "--text", "surprised me", "--agent"])
+    """`--agent` is a value-bearing option now (never a boolean flag), so a value-less marker
+    is spelled `--agent=` (empty value via `=`) rather than a bare trailing `--agent` — a bare
+    `--agent` with nothing after it (not even `=`) is rejected, since it would otherwise have to
+    guess whether the next token was its value or an unrelated flag. `--agent=` still records
+    plain `"agent"` as the author, exactly like the old boolean-true behavior."""
+    runner.invoke(app, ["note", "--text", "surprised me", "--agent="])
 
     assert notes.search()[0].author == "agent"
 
 
+def test_note_bare_agent_with_nothing_after_it_is_a_clear_usage_error(tmp_path: Path) -> None:
+    """A trailing `--agent` with no value at all (not even `--agent=`) is exactly the shape that
+    used to swallow the next flag's token silently. It must fail loudly instead."""
+    result = runner.invoke(app, ["note", "--text", "surprised me", "--agent"])
+
+    assert result.exit_code != 0
+
+
 def test_note_agent_with_a_name_is_recorded_as_that_author(tmp_path: Path) -> None:
-    """The actual root cause behind every "note fails on long, detailed text" report on file
-    (ledger forensics 2026-08-26/27): `--agent` marks the note as agent-written and takes no
-    value, but real calls write `--agent claude` / `--agent ws-trainer` as if it named the
-    agent. The stray name then had nowhere to bind — `job_id` was already taken — and click
-    rejected it as an extra argument (`usage_error`, exit 2), regardless of how short or plain
-    the `-m` text was. A long, punctuation-rich, multi-sentence write-up (commas, parentheses,
-    apostrophes — the shape of a real incident note) must succeed here exactly like a short one;
-    length and punctuation were never the cause.
+    """`--agent NAME` now binds `NAME` directly as `--agent`'s own value at parse time — an
+    ordinary, unambiguous option — regardless of the text's length or punctuation. A long,
+    punctuation-rich, multi-sentence write-up (commas, parentheses, apostrophes — the shape of a
+    real incident note) must succeed here exactly like a short one; length and punctuation were
+    never the cause of the old failure mode.
     """
     message = (
         "During today's sweep we noticed something odd (a real gotcha, not a fluke): jobs that "
@@ -89,16 +99,12 @@ def test_note_agent_with_a_name_is_recorded_as_that_author(tmp_path: Path) -> No
     assert written.text == message
 
 
-def test_note_agent_name_before_job_id_swaps_them_back(tmp_path: Path) -> None:
-    """The other stray-token ordering: `--agent <name> <job_id>` (name first, real job id
-    second). `--agent` takes no value, so both `<name>` and `<job_id>` are plain positional
-    tokens on the command line; click fills `job_id` (the first *declared* positional) with
-    whichever one it meets first -- here that's the agent name -- and the real job id lands in
-    `extra_args` instead. Before the fix this recorded job_id="ws-trainer" (not a real job id)
-    and author=<the real job id> (also wrong) -- exactly the live bug report. A real job id
-    always matches `_JOB_ID_SHAPE`; recovering requires swapping the two back, not just
-    recovering the author the way the existing (job-id-first) case does.
-    """
+def test_note_agent_name_before_job_id(tmp_path: Path) -> None:
+    """`--agent <name>` before the job id positional. Since `--agent` now consumes `<name>` as
+    its own value directly at parse time, it never competes with `job_id`'s positional slot at
+    all -- no swap logic is needed, unlike the old boolean-flag design where both tokens were
+    plain positionals and `job_id` (the first *declared* one) greedily absorbed whichever came
+    first on the command line."""
     result = runner.invoke(
         app,
         ["note", "--agent", "ws-trainer", "20260906-101112-abcdef", "-m", "hello"],
@@ -112,14 +118,10 @@ def test_note_agent_name_before_job_id_swaps_them_back(tmp_path: Path) -> None:
 
 
 def test_note_agent_with_a_name_and_no_job_id_is_recorded_as_that_author(tmp_path: Path) -> None:
-    """Same misuse as the test above, but with NO job id at all -- a documented, valid use (a
-    submit that died before provisioning never gets a job id). With no job id, `job_id` is the
-    first positional argument click will fill, so the lone stray `--agent <name>` token binds
-    straight to it instead of landing in the `extra_args` catch-all (which is what let the
-    two-positional case above be recovered). Before the fix this silently recorded a bogus
-    job_id="claude" and reverted `author` to plain "agent" -- no error, no clue anything was
-    wrong. It must instead behave exactly as if `--agent` were a plain boolean flag with no job
-    id given: `author` is the name, and `job_id` is absent.
+    """`--agent <name>` with NO job id at all -- a documented, valid use (a submit that died
+    before provisioning never gets a job id). `--agent` consumes `<name>` as its own value
+    directly, so there is no stray token left over to (mis)bind to `job_id`'s positional slot:
+    `author` is the name, and `job_id` is simply absent, with no special-casing needed.
     """
     result = runner.invoke(
         app, ["note", "--agent", "claude", "-m", "submit died before provisioning"]
@@ -130,6 +132,42 @@ def test_note_agent_with_a_name_and_no_job_id_is_recorded_as_that_author(tmp_pat
     assert written.author == "claude"
     assert written.job_id is None
     assert written.text == "submit died before provisioning"
+
+
+def test_note_agent_boolean_default_keeps_a_non_standard_job_id(tmp_path: Path) -> None:
+    """`lab note <job_id> --agent= -m ...` for a job id that does NOT match the lab's own
+    `_new_job_id()` shape (a short/legacy/test-fixture id) -- the exact live bug: a job id parsed
+    positionally is never touched by `--agent`'s own parsing, whatever shape it has, so it must
+    survive unchanged and `author` must fall back to the plain agent-marker default."""
+    result = runner.invoke(app, ["note", "j-1", "--agent=", "-m", "hello world"])
+
+    assert result.exit_code == 0, result.output
+    written = notes.search()[0]
+    assert written.job_id == "j-1"
+    assert written.author == "agent"
+
+
+def test_note_agent_with_a_name_keeps_a_non_standard_job_id_regardless_of_order(
+    tmp_path: Path,
+) -> None:
+    """`--agent NAME` (value directly on the flag) records NAME as author and leaves a
+    non-standard-shaped job id untouched, whether the job id or `--agent` comes first -- there is
+    no ordering concern left with `--agent` parsed as an ordinary option."""
+    result_job_first = runner.invoke(
+        app, ["note", "j-1", "--agent", "claude", "-m", "hello job-first"]
+    )
+    result_agent_first = runner.invoke(
+        app, ["note", "--agent", "claude", "j-2", "-m", "hello agent-first"]
+    )
+
+    assert result_job_first.exit_code == 0, result_job_first.output
+    assert result_agent_first.exit_code == 0, result_agent_first.output
+    written = notes.search()
+    by_text = {n.text: n for n in written}
+    assert by_text["hello job-first"].job_id == "j-1"
+    assert by_text["hello job-first"].author == "claude"
+    assert by_text["hello agent-first"].job_id == "j-2"
+    assert by_text["hello agent-first"].author == "claude"
 
 
 def test_note_extra_argument_without_agent_is_a_clear_usage_error(tmp_path: Path) -> None:

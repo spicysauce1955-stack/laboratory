@@ -415,8 +415,10 @@ uv run lab notes --format md            # a TEAM-LOG-shaped table you can paste
 `--kind` is free text; these are the ones already in use, so a reader can group
 on them: `GOTCHA`, `BUDGET EVENT`, `ROOT CAUSE`, `INCIDENT`, `LESSON`,
 `DEVIATION`, `FEATURE REQUEST`, `NOTE` (default). `--usd` records what it cost,
-which is what makes a note rankable against the others. Add `--agent` when an
-agent rather than a person is writing.
+which is what makes a note rankable against the others. Add `--agent=` (or
+`--agent=NAME` to name yourself) when an agent rather than a person is
+writing — `--agent` always takes a value now (never a bare, value-less
+trailing flag), so write the `=` even with nothing after it.
 
 **Write one when:**
 - a cost, duration or price differed from what you were told to expect;
