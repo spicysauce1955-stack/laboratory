@@ -3,6 +3,7 @@ be visible to agents — MCP status carries teardown_status, mirrored manifests 
 both shells, and reconcile/wait exist as MCP tools."""
 
 import asyncio
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -210,6 +211,67 @@ def test_mcp_mirrored_job_never_seeds_local_store_or_index(tmp_path: Path, monke
 
     out = asyncio.run(go_reconcile())
     assert out["unsupervised"] == []  # nothing invented from the mirrored read above
+
+
+class _RaisingQueue:
+    """A QueueStore whose `read_mirrored` blows up -- standing in for the separate,
+    still-possible bug (a partial/stub mirrored manifest) that `read_mirrored` is not fully
+    hardened against. Every other method is unused by the code paths under test."""
+
+    def read_mirrored(self, job_id: str):  # noqa: ANN001, ANN201 - test double
+        raise ValueError("stub manifest, missing required field 'run'")
+
+
+@pytest.mark.parametrize("tool_name", ["metrics", "logs", "fetch_artifacts"])
+def test_mcp_crashing_mirror_read_raises_clean_tool_error(tmp_path, monkeypatch, tool_name):
+    """A `read_mirrored` crash must surface as a clean `ToolError` from metrics/logs/
+    fetch_artifacts too -- mirroring the CLI's `_read_mirrored` guard (`cli.py`) -- not an
+    unhandled exception propagating straight out of the tool call."""
+    _, server = _make(tmp_path)
+    monkeypatch.setenv("LAB_QUEUE_DIR", str(tmp_path / "empty-queue"))
+    monkeypatch.setattr("lab.scheduler.queue.default_queue", lambda: _RaisingQueue())
+
+    async def go():
+        async with Client(server) as c:
+            await c.call_tool(tool_name, {"job_id": "flaky-job"})
+
+    with pytest.raises(ToolError, match="not yet available"):
+        asyncio.run(go())
+
+
+def test_mcp_metrics_logs_fetch_clean_up_their_temp_dir(tmp_path, monkeypatch):
+    """The MCP server is long-lived (unlike the CLI, a one-shot process where `atexit` cleanup
+    is fine) -- so the throwaway JobStore temp dir `_lab_for_mirrored` builds for a mirror-only
+    job must be removed synchronously once each call's result is computed, not leaked for the
+    life of the process (worst case: `fetch_artifacts`, which also downloads real R2 bytes into
+    it). Checks all three tools, since their control flow around the temp dir differs."""
+    lab, server = _make(tmp_path)
+    monkeypatch.setenv("LAB_JOBS_INDEX_DIR", str(tmp_path / "lab-jobs"))
+    m = make_manifest("jmir-leak", "python x.py").model_copy(
+        update={"status": JobState.succeeded, "teardown_status": "succeeded"}
+    )
+    _mirrored_queue(tmp_path, monkeypatch, m)
+
+    created: list[Path] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def _tracking_mkdtemp(*args, **kwargs):
+        d = real_mkdtemp(*args, **kwargs)
+        created.append(Path(d))
+        return d
+
+    monkeypatch.setattr("lab.mcp_server.tempfile.mkdtemp", _tracking_mkdtemp)
+
+    async def call(tool_name):
+        async with Client(server) as c:
+            await c.call_tool(tool_name, {"job_id": "jmir-leak"})
+
+    for tool_name in ("metrics", "logs", "fetch_artifacts"):
+        asyncio.run(call(tool_name))
+
+    assert len(created) == 3, created
+    for d in created:
+        assert not d.exists(), f"leaked temp dir: {d}"
 
 
 def test_mcp_reconcile_tool_is_dry_run(tmp_path, monkeypatch):

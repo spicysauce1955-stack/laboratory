@@ -11,6 +11,7 @@ manifest), mirroring the CLI. ``build_server(lab)`` lets tests inject a Lab at a
 
 from __future__ import annotations
 
+import shutil
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -127,14 +128,22 @@ def build_server(lab: Lab) -> FastMCP:
         except FileNotFoundError:
             from lab.scheduler.queue import default_queue  # local import: avoids a module cycle
 
-            mirrored = default_queue().read_mirrored(job_id)
+            try:
+                mirrored = default_queue().read_mirrored(job_id)
+            except Exception as e:  # noqa: BLE001 — a still-landing mirror bug must not crash
+                # this tool call; mirrors the CLI's `_read_mirrored` guard for the same
+                # `read_mirrored` failure mode.
+                raise ToolError(
+                    f"job {job_id!r} manifest not yet available "
+                    f"(mirror read failed: {e}); try again shortly"
+                ) from e
             if mirrored is None:
                 raise ToolError(
                     f"job '{job_id}' not found (locally or in the scheduler mirror)"
                 ) from None
             return mirrored, True
 
-    def _lab_for_mirrored(job_id: str, manifest: JobManifest) -> Lab:
+    def _lab_for_mirrored(job_id: str, manifest: JobManifest) -> tuple[Lab, Path]:
         """A ``Lab`` over the backend that actually ran a job known only via the scheduler
         mirror (not in this project's local ``runs/``).
 
@@ -147,18 +156,30 @@ def build_server(lab: Lab) -> FastMCP:
         the user-global ``~/.lab/jobs/index.jsonl`` ownership ledger (`lab.attribution`), which a
         `reconcile` run from ANY project trusts as proof of local ownership; writing there would
         recreate exactly the false-attribution failure mode CLAUDE.md's 2026-08-20 incident notes
-        describe, just from the read side instead of the destroy side."""
+        describe, just from the read side instead of the destroy side.
+
+        Returns ``(lab, tmp_home)``. Unlike the CLI's equivalent (a short-lived, one-shot
+        process that lets `atexit` sweep this up once at exit), the MCP server stays up
+        serving tool calls indefinitely — an `atexit`-based cleanup here would leak one temp
+        directory (inodes, and for `fetch_artifacts`, real R2-downloaded bytes) per mirrored
+        call for the life of the process. So `tmp_home` is handed back to the caller, which
+        MUST remove it (`shutil.rmtree`) once it is done with the returned `Lab` — see the
+        three tool bodies below, each wrapping its call in `try`/`finally`."""
         tmp_home = Path(tempfile.mkdtemp(prefix=f"lab-mcp-mirror-{job_id}-"))
         JobStore(tmp_home).write_manifest(manifest)
-        return default_lab(home=tmp_home, backend=manifest.backend.provisioner)
+        return default_lab(home=tmp_home, backend=manifest.backend.provisioner), tmp_home
 
-    def _lab_for_any(job_id: str) -> Lab:
+    def _lab_for_any(job_id: str) -> tuple[Lab, Path | None]:
         """`_lab_for`, extended with the mirror fallback for read-only job-scoped tools. Never
-        used by `cancel` (must stay local-only, see `_manifest_or_mirror`)."""
+        used by `cancel` (must stay local-only, see `_manifest_or_mirror`).
+
+        Returns ``(lab, tmp_home)``: ``tmp_home`` is the throwaway directory backing a mirrored
+        job's ``Lab`` (see `_lab_for_mirrored`) and must be cleaned up by the caller once done
+        with ``lab``; it is ``None`` for a locally-known job, which has nothing to clean up."""
         manifest, mirrored = _manifest_or_mirror(job_id)
         if mirrored:
             return _lab_for_mirrored(job_id, manifest)
-        return default_lab(home=home, backend=manifest.backend.provisioner)
+        return default_lab(home=home, backend=manifest.backend.provisioner), None
 
     @mcp.tool
     def submit(
@@ -396,7 +417,14 @@ def build_server(lab: Lab) -> FastMCP:
         (FR-D2). Scheduler-launched (deferred) jobs fall back to the mirrored manifest (spec
         §4.3), matching `status`; since their logs/metrics only live durably on the scheduler
         host, this may legitimately return an empty series rather than an error."""
-        return {"series": _lab_for_any(job_id).metrics(job_id, names=names, since_step=since_step)}
+        the_lab, tmp_home = _lab_for_any(job_id)
+        try:
+            return {"series": the_lab.metrics(job_id, names=names, since_step=since_step)}
+        finally:
+            # The server is long-lived (unlike the CLI's atexit sweep) — a mirrored job's
+            # throwaway JobStore dir must be removed right after this call, not left to leak.
+            if tmp_home is not None:
+                shutil.rmtree(tmp_home, ignore_errors=True)
 
     @mcp.tool
     def logs(job_id: str, tail: int | None = 100) -> dict[str, Any]:
@@ -404,7 +432,12 @@ def build_server(lab: Lab) -> FastMCP:
         fall back to the mirrored manifest (spec §4.3), matching `status`; since their logs only
         live durably on the scheduler host, this may legitimately return an empty list rather
         than an error."""
-        return {"lines": _lab_for_any(job_id).logs(job_id, tail=tail)}
+        the_lab, tmp_home = _lab_for_any(job_id)
+        try:
+            return {"lines": the_lab.logs(job_id, tail=tail)}
+        finally:
+            if tmp_home is not None:
+                shutil.rmtree(tmp_home, ignore_errors=True)
 
     @mcp.tool
     def fetch_artifacts(job_id: str) -> dict[str, Any]:
@@ -412,12 +445,19 @@ def build_server(lab: Lab) -> FastMCP:
         Scheduler-launched (deferred) jobs fall back to the mirrored manifest (spec §4.3),
         matching `status`, and are collected into a temp directory instead of runs/<job_id>/
         (this project's runs/ never supervised them) — populated from R2 when the job's
-        manifest carries an artifacts_uri, empty otherwise."""
-        arts = _lab_for_any(job_id).fetch_artifacts(job_id)
-        return {
-            "local_paths": [a.path for a in arts],
-            "artifacts": [a.model_dump() for a in arts],
-        }
+        manifest carries an artifacts_uri, empty otherwise. That temp directory (and any
+        R2-downloaded bytes in it) is removed once this call's result is computed — the
+        server is long-lived, so it can never wait for process exit to clean up."""
+        the_lab, tmp_home = _lab_for_any(job_id)
+        try:
+            arts = the_lab.fetch_artifacts(job_id)
+            return {
+                "local_paths": [a.path for a in arts],
+                "artifacts": [a.model_dump() for a in arts],
+            }
+        finally:
+            if tmp_home is not None:
+                shutil.rmtree(tmp_home, ignore_errors=True)
 
     @mcp.tool
     def cancel(job_id: str) -> dict[str, Any]:
