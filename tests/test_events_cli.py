@@ -84,6 +84,29 @@ def test_a_bad_flag_records_a_usage_error(_events_dir: Path) -> None:
     assert "--nonexistent-flag" in closed["error"]["message"]
 
 
+def test_a_secret_shaped_bad_option_value_is_masked_in_the_recorded_error(
+    _events_dir: Path,
+) -> None:
+    """Bug 1 (FR-J1): before the fix, `finish()` wrote the captured usage-error message straight
+    to the ledger with no sanitization at all — unlike `params`, which `begin()` already
+    sanitizes. A secret-shaped value that fails click's own `--price-cap` float validation (a
+    live, confirmed repro) must not survive verbatim in `error.message`, even though it was never
+    a valid price cap in the first place."""
+    secret = "AKIAIOSFODNN7EXAMPLEAKIAIOSFODNN7EXAMPLE"
+    proc = _run(
+        "submit", "--command", "true", "--price-cap", secret, env_dir=_events_dir,
+    )
+    assert proc.returncode == 2
+    records = _folded(_events_dir)
+    closed = records[-1]
+    assert closed["outcome"] == "usage_error"
+    assert closed["error"] is not None
+    assert secret not in closed["error"]["message"]
+    from lab.events.sanitize import MASK
+
+    assert MASK in closed["error"]["message"]
+
+
 def test_an_unknown_command_records_a_usage_error_with_sanitized_argv(_events_dir: Path) -> None:
     proc = _run("nosuchcommand", "--token", "s" * 40, env_dir=_events_dir)
     assert proc.returncode == 2

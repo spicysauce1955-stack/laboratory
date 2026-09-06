@@ -67,6 +67,39 @@ def test_an_exception_records_a_crash_with_the_error_and_reraises() -> None:
     assert "test_events_record.py" in closed["error"]["where"]
 
 
+def test_a_secret_shaped_error_message_is_masked_on_the_way_in() -> None:
+    """Bug 1 (FR-J1): `finish()` used to write a caller-supplied `error` dict straight to the
+    ledger with no sanitization at all — unlike `params`, which `begin()` already runs through
+    `sanitize_params`. A secret-shaped string anywhere in `error["message"]` (e.g. a captured
+    click usage-error message, or a raw exception `str()`) must be masked exactly as it already
+    would be under `params`."""
+    from lab.events.sanitize import MASK
+
+    secret = "abcd1234efgh5678ijkl9012mnop3456qrst"
+    call = record_module.begin("cli", "submit", {})
+    record_module.finish(
+        call, outcome="usage_error", exit_code=2,
+        error={"type": "BadParameter", "message": f"'{secret}' is not a valid float", "where": None},
+    )
+    closed = _records()[1]
+    assert secret not in closed["error"]["message"]
+    assert MASK in closed["error"]["message"]
+    # non-secret fields on the error dict are untouched
+    assert closed["error"]["type"] == "BadParameter"
+
+
+def test_an_innocuous_error_message_survives_verbatim() -> None:
+    """The masking added for Bug 1 must not touch ordinary error text with nothing secret-shaped
+    in it — matching the existing crash/error tests that assert `error["message"]` verbatim."""
+    call = record_module.begin("cli", "submit", {})
+    record_module.finish(
+        call, outcome="crash", exit_code=1,
+        error={"type": "RuntimeError", "message": "no capacity in europe-west1", "where": None},
+    )
+    closed = _records()[1]
+    assert closed["error"]["message"] == "no capacity in europe-west1"
+
+
 def test_a_designated_error_type_records_error_not_crash_and_reraises() -> None:
     """The spec: "A ToolError records outcome:'error'; anything else propagating out records
     crash." `record()` must let a caller designate a handled-exception type (what the MCP

@@ -45,6 +45,15 @@ _INLINE_FLAG = re.compile(
     """,
     re.VERBOSE,
 )
+# Flag names treated as "this looks like it holds a secret" by `_mask_flag` below — deliberately
+# narrower than `_SECRET_KEY` (which stays as-is for dict keys in `_walk` and real argv tokens in
+# `_mask_tokens`, both different, less ambiguous contexts). `_SECRET_KEY` includes "auth", which
+# also matches plenty of ordinary, non-secret-bearing flag names that just *mention* auth
+# (`--basic-auth`, `--no-auth`) with nothing secret-shaped following — "auth" alone is too weak a
+# signal once it's being matched against arbitrary prose rather than a known argv key. Word-
+# boundary anchored so "keyword" (one glued-together word, no separator) does not match "key" the
+# way "--api-key" (a real hyphen-separated segment) does.
+_SENSITIVE_FLAG_NAME = re.compile(r"\b(?:key|token|secret|password|credential)\b", re.IGNORECASE)
 # A free-standing word, for the pass that catches a secret with no flag in front of it at all
 # (e.g. "failed with key AKIA... during connect"). Applied only to text `_INLINE_FLAG` did not
 # already consume/mask, via a second, independent sweep — see `_mask_command_line`.
@@ -124,8 +133,20 @@ def _mask_command_line(text: str) -> str:
     """
 
     def _mask_flag(m: re.Match[str]) -> str:
-        flag, sep = m.group(1), m.group(2)
-        return f"{flag}{sep}{MASK}" if _SECRET_KEY.search(flag) else m.group(0)
+        flag, sep, value = m.group(1), m.group(2), m.group(3)
+        # Strip a value's surrounding quotes before judging its shape — `_looks_secret` should
+        # see "abc def ghi", not '"abc def ghi"'. Only mask when there's actual reason to
+        # believe a secret is here: either the value itself is secret-shaped (catches a real
+        # secret behind an unremarkable flag name, e.g. `--seed <token>`), or the flag name is
+        # one of the established sensitive names (catches a short, low-entropy secret —
+        # `--password hunter2` — that `_looks_secret`'s length/entropy bar alone would miss).
+        # Masking on flag name alone unconditionally (the prior behavior) is what over-masked
+        # ordinary prose that merely *mentions* a flag (`--basic-auth flag`, `--keyword search`).
+        quoted = len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]
+        stripped = value[1:-1] if quoted else value
+        if _looks_secret(stripped) or _SENSITIVE_FLAG_NAME.search(flag):
+            return f"{flag}{sep}{MASK}"
+        return m.group(0)
 
     def _mask_word(m: re.Match[str]) -> str:
         word = m.group(0)
