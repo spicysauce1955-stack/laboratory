@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import math
 import re
-import shlex
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -24,6 +23,10 @@ _SECRET_VALUE = (
     re.compile(r"^[A-Za-z0-9+/]{40,}={0,2}$"),  # bare base64 blobs
 )
 _HEXISH = re.compile(r"^[0-9a-f-]+$", re.IGNORECASE)  # commits, cell ids, job ids — not secrets
+# A `--flag=value` or `--flag value` pair anywhere inside a larger string. Matched directly
+# against the raw text (see `_mask_command_line`) rather than by tokenizing it — free text is not
+# shell-quoted, and treating it as if it were is its own bug (below).
+_INLINE_FLAG = re.compile(r"(--?[A-Za-z][\w-]*)(=|\s+)(\S+)")
 
 
 def _entropy(s: str) -> float:
@@ -72,28 +75,61 @@ def _mask_command_line(text: str) -> str:
     MCP's ``command`` argument is the same shape). The flag-aware masking above only ever saw
     separate argv tokens, so a secret hiding as a flag *value* inside one string token — where it
     has spaces around it, so ``_looks_secret`` bails, and ``redact()`` doesn't know the flag name
-    — sailed through unmasked. Tolerant splitting: try ``shlex.split`` (handles quoting), fall
-    back to ``.split()`` on a malformed quote — this must never raise."""
-    try:
-        tokens = shlex.split(text)
-    except ValueError:
-        tokens = text.split()
-    if len(tokens) < 2:
-        return text  # nothing shaped like a multi-token command; leave it as-is
-    return " ".join(_mask_tokens(tokens))
+    — sailed through unmasked.
+
+    Matched directly against ``text`` with a regex, not by ``shlex.split``-ing it into tokens and
+    rejoining: this used to tokenize with ``shlex``, which treats ``'`` and ``"`` as *shell*
+    quoting. Free text is not shell-quoted — a contraction (``it's``, ``wasn't``) or a quoted
+    word is an apostrophe or a quotation mark, not the start of a span to swallow — and an even
+    number of them across a note's text (or one that happens to balance against a later ``'``)
+    made ``shlex.split`` succeed *silently*, stripping the quote characters and gluing everything
+    between them into one token, mangling the text with no error or warning. A regex substitution
+    touches only an actual ``flag=value``/``flag value`` pair it finds and leaves every other
+    character — punctuation, quotes, whitespace — exactly as written. Never raises.
+    """
+
+    def _mask_match(m: re.Match[str]) -> str:
+        flag, sep = m.group(1), m.group(2)
+        return f"{flag}{sep}{MASK}" if _SECRET_KEY.search(flag) else m.group(0)
+
+    return _INLINE_FLAG.sub(_mask_match, text)
+
+
+def _mask_secrets(value: str) -> str:
+    """Secret-masking only, no length cap: the piece of ``_scalar`` a caller whose whole point
+    is holding free text in full (``lab.notes``) needs on its own — the 512-char cap right after
+    this belongs to the ledger's argv/param records, not to a note body."""
+    if _looks_secret(value):
+        return MASK
+    if re.search(r"\s", value):
+        value = _mask_command_line(value)
+    return redact(value)
 
 
 def _scalar(value: Any) -> Any:
     if isinstance(value, str):
-        if _looks_secret(value):
-            return MASK
-        if re.search(r"\s", value):
-            value = _mask_command_line(value)
-        value = redact(value)
+        value = _mask_secrets(value)
         return value[:MAX_STR] + "…" if len(value) > MAX_STR else value
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     return f"<{type(value).__name__}>"
+
+
+def mask_text(value: str) -> str:
+    """Mask likely secrets in free text, with no length cap (FR-J1).
+
+    ``lab note``'s whole purpose is holding a detailed write-up in full — a couple hundred words
+    is the *expected* shape, not an edge case — so the ledger's 512-char cap (meant for a CLI
+    argv value or a params digest, where a diagnostic summary is all that's wanted) must not
+    apply here. A note's text used to go through :func:`sanitize_argv`, which silently truncated
+    it at 512 characters with no warning: 15 of 27 real notes on file were cut this way, several
+    mid-sentence, with nothing in the record to say so (2026-08/09). Never raises: a masking
+    failure must not take the note down with it.
+    """
+    try:
+        return _mask_secrets(value)
+    except Exception:  # noqa: BLE001 — masking must never fail whatever calls this
+        return value
 
 
 def _walk(value: Any, *, key: str | None = None) -> Any:

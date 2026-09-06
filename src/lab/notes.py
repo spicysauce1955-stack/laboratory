@@ -185,14 +185,16 @@ def _now() -> str:
 def _clean(text: str) -> str:
     """Mask secrets in free text before it is durable anywhere (FR-J1).
 
-    Reuses the ledger's deny-list so a note and an argv are masked by one set of rules. Free text
-    is a far larger surface than a command line — a pasted traceback is the expected case — so
-    this runs on the way in, not on the way out.
+    Reuses the ledger's deny-list so a note and an argv are masked by one set of rules — but via
+    ``mask_text``, not ``sanitize_argv``: the latter also caps a value at 512 characters, a limit
+    that belongs to a ledger argv/param record, not to a note body whose whole purpose is holding
+    a detailed write-up in full. Free text is a far larger surface than a command line — a pasted
+    traceback is the expected case — so this runs on the way in, not on the way out.
     """
     try:
-        from lab.events.sanitize import sanitize_argv
+        from lab.events.sanitize import mask_text
 
-        return sanitize_argv([text])[0]
+        return mask_text(text)
     except Exception as e:  # noqa: BLE001 — never fail a note over masking
         debug(f"masking failed: {e}")
         return text

@@ -10,6 +10,8 @@ import errno
 import os
 import sys
 import traceback
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, NoReturn
@@ -550,6 +552,12 @@ def note(
         False, "--last",
         help="attach this note to the most recent failure, so the next run that hits it sees it",
     ),
+    extra_args: list[str] = typer.Argument(
+        default_factory=list,
+        hidden=True,
+        help="(internal) catches a stray token so a real mistake gets a clear error, not a raw "
+        "click parse failure",
+    ),
 ) -> None:
     """Record what went wrong (or surprised you) next to the run's own logs.
 
@@ -558,6 +566,28 @@ def note(
     note with no job id is still worth writing — a submit that dies before provisioning never
     gets one, and those are often the notes worth most.
     """
+    author = "agent" if agent else "human"
+    if extra_args:
+        # `--agent` marks the note as agent-written; it takes no value. But real calls (ledger
+        # forensics, 2026-08-26/27) keep writing `--agent claude` / `--agent ws-trainer` as if it
+        # named the agent — the stray name then has nowhere to bind (job_id is already taken) and
+        # click rejects it as an extra argument. That is the actual root cause behind every
+        # observed "note fails on long, detailed text" report: the text was never the problem,
+        # `--agent <name>` was. When that is exactly what happened — `--agent` given, and exactly
+        # one stray token — treat the token as the agent's name instead of failing: strictly more
+        # informative than the plain `"agent"` this used to record, and it is what every one of
+        # those calls actually meant.
+        if agent and len(extra_args) == 1:
+            author = extra_args[0]
+        else:
+            joined = " ".join(repr(a) for a in extra_args)
+            msg = (
+                f"unexpected extra argument(s): {joined}. If this was meant as the note text, "
+                "pass it with -m/--text (it looks like that flag was left off). --agent takes "
+                "no value, so a name after it only works when it is the one stray token."
+            )
+            _emit({"error": msg})
+            _fail(2, msg)
     facets: dict[str, Any] = {}
     home = repo_root() / "runs"
     if job_id is not None:
@@ -572,7 +602,7 @@ def note(
     signature = lab_notes.last_failure_signature() if last else None
     written = lab_notes.write(
         text=text, job_id=job_id, sweep_id=sweep, kind=kind, usd=usd,
-        author="agent" if agent else "human", facets=facets, home=home,
+        author=author, facets=facets, home=home,
         signature=signature,
     )
     if written is None:
@@ -1622,6 +1652,65 @@ def _synonym_hint(argv: list[str]) -> str | None:
     return None
 
 
+@contextmanager
+def _capturing_usage_errors(sink: list[dict[str, Any]]) -> Iterator[None]:
+    """Recover a click/typer usage error's own message, for the one window it still exists.
+
+    click's dispatch (vendored as ``typer._click``/``typer.core``) catches every
+    ``ClickException`` — unknown command, bad flag, bad type, extra argument — prints it via
+    ``e.show()`` (or, since this project has ``rich`` installed, ``rich_utils.rich_format_error``)
+    and *then* re-raises as a bare ``SystemExit`` carrying only the exit code. By the time that
+    reaches ``main()``'s own ``except SystemExit`` the exception — and therefore its message — is
+    already gone (see ``main``'s docstring re: why ``standalone_mode=False`` isn't the fix
+    either). The only place left to recover it is the formatting call itself: both paths print
+    the same ``e.format_message()``, so wrapping both, for the duration of one ``app()`` call,
+    recovers the message into ``sink`` without changing a single byte of what's printed to
+    stderr — the wrapper always calls straight through to the original after recording.
+    """
+    from typer._click.exceptions import ClickException, UsageError
+
+    def record(exc: ClickException) -> None:
+        if type(exc).__name__ == "NoArgsIsHelpError":
+            return  # its "message" is the whole --help text — rich_format_error skips it too
+        sink.append({"type": type(exc).__name__, "message": exc.format_message(), "where": None})
+
+    orig_exc_show = ClickException.show
+    orig_usage_show = UsageError.show
+
+    def patched_exc_show(self: ClickException, file: Any = None) -> None:
+        record(self)
+        orig_exc_show(self, file)
+
+    def patched_usage_show(self: UsageError, file: Any = None) -> None:
+        record(self)
+        orig_usage_show(self, file)
+
+    orig_rich_format_error = None
+    rich_utils = None
+    if typer.core.HAS_RICH:
+        from typer import rich_utils as _rich_utils
+
+        rich_utils = _rich_utils
+        orig_rich_format_error = rich_utils.rich_format_error
+
+        def patched_rich_format_error(self: ClickException) -> None:
+            record(self)
+            assert orig_rich_format_error is not None
+            orig_rich_format_error(self)
+
+        rich_utils.rich_format_error = patched_rich_format_error  # type: ignore[attr-defined]
+
+    ClickException.show = patched_exc_show  # type: ignore[method-assign]
+    UsageError.show = patched_usage_show  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        ClickException.show = orig_exc_show  # type: ignore[method-assign]
+        UsageError.show = orig_usage_show  # type: ignore[method-assign]
+        if rich_utils is not None and orig_rich_format_error is not None:
+            rich_utils.rich_format_error = orig_rich_format_error  # type: ignore[attr-defined]
+
+
 def main(argv: list[str] | None = None) -> None:
     """Console entry point.
 
@@ -1643,8 +1732,10 @@ def main(argv: list[str] | None = None) -> None:
     reconstruct it after the fact.
     """
     outcome, code, error = "ok", 0, None
+    usage_errors: list[dict[str, Any]] = []
     try:
-        app(args=argv)
+        with _capturing_usage_errors(usage_errors):
+            app(args=argv)
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
         if code == 1 and _caused_by_broken_pipe(e):
@@ -1676,6 +1767,8 @@ def main(argv: list[str] | None = None) -> None:
             events.begin("cli", "<unparsed>", {"argv": sanitize_argv(sys.argv[1:])})
             if outcome == "error":
                 outcome = "usage_error"
+            if usage_errors:
+                error = usage_errors[-1]
             if hint := _synonym_hint(list(argv if argv is not None else sys.argv[1:])):
                 typer.echo(f"lab: did you mean `lab {hint}`?", err=True)
     elif outcome == "error":
@@ -1685,8 +1778,12 @@ def main(argv: list[str] | None = None) -> None:
         elif code == 2:
             # A known command's own option parsing rejected the input (bad flag, bad type) —
             # click's parser raised before the command body ever ran, so no `_fail` call
-            # recorded a reason. The argv already on the open record is the explanation.
+            # recorded a reason. `_capturing_usage_errors` is what makes the argv already on the
+            # open record more than the only explanation: it carries the message click itself
+            # printed (which flag, which value, why) straight into the ledger.
             outcome = "usage_error"
+            if usage_errors:
+                error = usage_errors[-1]
         else:
             error = {"type": "Exit", "message": f"exited {code}", "where": None}
     # Hand the failure to whoever has hit it before. Stderr, so stdout stays parseable JSON, and
