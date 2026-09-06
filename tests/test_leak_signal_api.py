@@ -168,25 +168,59 @@ def test_mcp_mirrored_job_never_seeds_local_store_or_index(tmp_path: Path, monke
     """The safety invariant: reading a mirrored job via metrics/logs/fetch_artifacts must never
     write it into the real local job store or the user-global ownership index -- either of
     which would make `cancel`/`reconcile` treat a job this machine never supervised as if it
-    did (SkyPilot client/server skew makes a cross-machine teardown attempt dangerous)."""
+    did (SkyPilot client/server skew makes a cross-machine teardown attempt dangerous).
+
+    Extended to cover the dangling-`local_paths` fix: `fetch_artifacts` now also copies any
+    R2-recovered files into the real `runs/<job_id>/output/` before its ephemeral mirror
+    JobStore is removed (so the path it returns stays valid, see
+    `test_mcp_fetch_artifacts_survives_temp_cleanup` below). That write must land real files on
+    disk under `runs/<job_id>/` WITHOUT ever writing a `manifest.json` there -- the presence of
+    output files alone must not flip `cancel`/`reconcile` into treating the job as locally
+    supervised."""
     lab, server = _make(tmp_path)
     jobs_index_dir = tmp_path / "lab-jobs"
     monkeypatch.setenv("LAB_JOBS_INDEX_DIR", str(jobs_index_dir))
     m = make_manifest("jmir-safe", "python x.py").model_copy(
-        update={"status": JobState.succeeded, "teardown_status": "succeeded"}
+        update={
+            "status": JobState.succeeded,
+            "teardown_status": "succeeded",
+            "artifacts_uri": "r2://lab-artifacts/jmir-safe",
+        }
     )
     _mirrored_queue(tmp_path, monkeypatch, m)
+
+    class _FakeR2Store:
+        @staticmethod
+        def from_env() -> "_FakeR2Store":
+            return _FakeR2Store()
+
+        def download_dir(self, prefix: str, local_dir: Path) -> int:
+            local_dir = Path(local_dir)
+            local_dir.mkdir(parents=True, exist_ok=True)
+            (local_dir / "result.txt").write_text("42")
+            return 1
+
+    monkeypatch.setattr("lab.core.r2_enabled", lambda: True)
+    monkeypatch.setattr("lab.core.R2Store", _FakeR2Store)
 
     async def go():
         async with Client(server) as c:
             await c.call_tool("metrics", {"job_id": "jmir-safe"})
             await c.call_tool("logs", {"job_id": "jmir-safe"})
-            await c.call_tool("fetch_artifacts", {"job_id": "jmir-safe"})
+            return (await c.call_tool("fetch_artifacts", {"job_id": "jmir-safe"})).data
 
-    asyncio.run(go())
+    out = asyncio.run(go())
 
-    # Real local store: still has no idea this job exists.
+    # The artifact really did land somewhere durable under this project's own runs/.
+    assert out["local_paths"], out
+    real_output = lab.store.output_dir("jmir-safe")
+    assert Path(out["local_paths"][0]) == real_output / "result.txt"
+    assert (real_output / "result.txt").read_text() == "42"
+
+    # Real local store: still has no *manifest* for this job -- only a bare output/ directory
+    # with copied artifact bytes, which `list_job_ids` (keyed on manifest.json) never sees.
     assert "jmir-safe" not in lab.store.list_job_ids()
+    assert not lab.store.manifest_path("jmir-safe").exists()
     with pytest.raises(FileNotFoundError):
         lab.store.read_manifest("jmir-safe")
     # The user-global ownership ledger `reconcile` trusts from any project: untouched too.
@@ -211,6 +245,57 @@ def test_mcp_mirrored_job_never_seeds_local_store_or_index(tmp_path: Path, monke
 
     out = asyncio.run(go_reconcile())
     assert out["unsupervised"] == []  # nothing invented from the mirrored read above
+
+
+def test_mcp_fetch_artifacts_survives_temp_cleanup(tmp_path: Path, monkeypatch):
+    """The dangling-path bug this guards against: `fetch_artifacts` on a mirror-only job used to
+    report `local_paths` pointing into the ephemeral temp `JobStore` `_lab_for_mirrored` builds
+    -- a directory the tool's own `finally` removes before the caller (this test's own `await
+    call_tool(...)`, fully returned) can ever read the file back. Confirms the fix by reading the
+    file's actual content back after the tool call has completely returned, not just checking
+    existence mid-call."""
+    lab, server = _make(tmp_path)
+    monkeypatch.setenv("LAB_JOBS_INDEX_DIR", str(tmp_path / "lab-jobs"))
+    m = make_manifest("jmir-fetch", "python x.py").model_copy(
+        update={
+            "status": JobState.succeeded,
+            "teardown_status": "succeeded",
+            "artifacts_uri": "r2://lab-artifacts/jmir-fetch",
+        }
+    )
+    _mirrored_queue(tmp_path, monkeypatch, m)
+
+    class _FakeR2Store:
+        @staticmethod
+        def from_env() -> "_FakeR2Store":
+            return _FakeR2Store()
+
+        def download_dir(self, prefix: str, local_dir: Path) -> int:
+            local_dir = Path(local_dir)
+            local_dir.mkdir(parents=True, exist_ok=True)
+            (local_dir / "result.txt").write_text("42")
+            return 1
+
+    monkeypatch.setattr("lab.core.r2_enabled", lambda: True)
+    monkeypatch.setattr("lab.core.R2Store", _FakeR2Store)
+
+    async def go():
+        async with Client(server) as c:
+            return (await c.call_tool("fetch_artifacts", {"job_id": "jmir-fetch"})).data
+
+    # By the time `go()` returns, the tool's `finally` has already run `shutil.rmtree` on the
+    # ephemeral mirror temp dir -- exactly the moment the old code's returned paths went stale.
+    out = asyncio.run(go())
+
+    assert out["local_paths"], out
+    for p in out["local_paths"]:
+        path = Path(p)
+        assert "lab-mcp-mirror-" not in str(path), f"still points into the deleted temp dir: {p}"
+        assert path.exists(), f"dangling artifact path (already deleted): {p}"
+
+    result_path = next(p for p in out["local_paths"] if p.endswith("result.txt"))
+    assert Path(result_path).read_text() == "42"  # readable, not just present
+    assert Path(result_path) == lab.store.output_dir("jmir-fetch") / "result.txt"
 
 
 class _RaisingQueue:
