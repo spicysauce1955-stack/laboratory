@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -115,9 +116,22 @@ class R2QueueStore:
             return None
 
     def list_mirrored(self) -> list[JobManifest]:
+        from lab import events
+
         out: list[JobManifest] = []
         for key in sorted(self.store.list_keys(self._k("jobs") + "/")):
             text = self.store.get_text(key)
-            if text is not None:
+            if text is None:
+                continue
+            try:
                 out.append(JobManifest.model_validate_json(text))
+            except ValidationError as e:
+                # Same rationale as read_mirrored: one partial/stale manifest (version skew, a
+                # read racing an in-progress write) must not take down the whole listing. Unlike
+                # read_mirrored this has no single caller waiting on "not yet available", so the
+                # skip is surfaced (stderr + ledger) rather than silent — otherwise a real
+                # corruption could sit invisible behind a listing that just looks one job short.
+                print(f"[lab] skipping unreadable mirrored manifest {key}: {e}", file=sys.stderr)
+                events.note("queue.manifest_corrupt", key=key, error=str(e))
+                continue
         return out
