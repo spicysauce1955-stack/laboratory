@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from pydantic import ValidationError
+
 from lab.models import JobManifest
 from lab.scheduler.models import ControlConfig, Registration, RegState
 
@@ -144,7 +146,15 @@ class LocalQueueStore:
 
     def read_mirrored(self, job_id: str) -> JobManifest | None:
         p = self.root / "jobs" / f"{job_id}.json"
-        return JobManifest.model_validate_json(p.read_text()) if p.exists() else None
+        if not p.exists():
+            return None
+        try:
+            return JobManifest.model_validate_json(p.read_text())
+        except ValidationError:
+            # A partial/stub manifest (e.g. version-skewed scheduler host, or a read racing an
+            # in-progress write) must read as "not yet available", never crash the caller
+            # (2026-09-04 `lab status` incident: 7 required fields missing).
+            return None
 
     def list_mirrored(self) -> list[JobManifest]:
         d = self.root / "jobs"

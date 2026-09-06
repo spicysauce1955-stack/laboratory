@@ -122,3 +122,12 @@ def test_state_update_overwrites():
     q.put_entry(_reg("reg-a"))
     q.put_entry(q.get_entry("reg-a").model_copy(update={"state": RegState.launched}))
     assert q.get_entry("reg-a").state is RegState.launched
+
+
+def test_read_mirrored_partial_manifest_returns_none_instead_of_crashing():
+    """A stub/partial JSON blob in the mirror (e.g. a version-skewed scheduler host, or a read
+    racing an in-progress write) must degrade to "not yet available", never raise an unhandled
+    pydantic ValidationError (2026-09-04 `lab status` incident: 7 required fields missing)."""
+    q, fake = make_q()
+    fake.blobs["queue/jobs/partial.json"] = b'{"job_id": "partial", "mirrored": true}'
+    assert q.read_mirrored("partial") is None
