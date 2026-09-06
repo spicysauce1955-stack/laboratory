@@ -25,8 +25,30 @@ _SECRET_VALUE = (
 _HEXISH = re.compile(r"^[0-9a-f-]+$", re.IGNORECASE)  # commits, cell ids, job ids — not secrets
 # A `--flag=value` or `--flag value` pair anywhere inside a larger string. Matched directly
 # against the raw text (see `_mask_command_line`) rather than by tokenizing it — free text is not
-# shell-quoted, and treating it as if it were is its own bug (below).
-_INLINE_FLAG = re.compile(r"(--?[A-Za-z][\w-]*)(=|\s+)(\S+)")
+# shell-quoted, and treating it as if it were is its own bug (below). Two things a naive
+# `(--?[A-Za-z][\w-]*)(=|\s+)(\S+)` gets wrong, both fixed here:
+#   - no boundary before the dash, so it fires *inside* an ordinary hyphenated word ("pass-key",
+#     "well-authenticated" — the `-key`/`-auth...` tail reads as a flag). `(?<!\w)` requires the
+#     character right before the dash(es) be a non-word character (or start of string), which an
+#     ordinary compound word never has.
+#   - the value is `\S+`, so a quoted multi-word value (`--api-key "abc def ghi"`) only captures
+#     up to the first internal space, leaking the rest. The value alternation tries a balanced
+#     quoted span first (double or single — matched by a plain paired-quote regex, never a
+#     quote-interpreting tokenizer like `shlex`, which is what corrupted prose apostrophes
+#     before) and only falls back to a bare `\S+` token when the value isn't quoted.
+_INLINE_FLAG = re.compile(
+    r"""
+    (?<!\w)                     # boundary: not glued onto a preceding word character
+    (--?[A-Za-z][\w-]*)         # the flag itself, e.g. --api-key, -k
+    (=|\s+)                     # separator: inline '=' or one-or-more whitespace
+    ("[^"]*"|'[^']*'|\S+)       # value: a quoted span as one unit, else a bare token
+    """,
+    re.VERBOSE,
+)
+# A free-standing word, for the pass that catches a secret with no flag in front of it at all
+# (e.g. "failed with key AKIA... during connect"). Applied only to text `_INLINE_FLAG` did not
+# already consume/mask, via a second, independent sweep — see `_mask_command_line`.
+_WORD = re.compile(r"\S+")
 
 
 def _entropy(s: str) -> float:
@@ -72,27 +94,45 @@ def _mask_tokens(tokens: Sequence[str]) -> list[str]:
 def _mask_command_line(text: str) -> str:
     """A single string parameter that is actually a whole command line (the common lab
     invocation: ``lab submit -c "python train.py --hf-token=..."`` puts it in one argv token, and
-    MCP's ``command`` argument is the same shape). The flag-aware masking above only ever saw
-    separate argv tokens, so a secret hiding as a flag *value* inside one string token — where it
-    has spaces around it, so ``_looks_secret`` bails, and ``redact()`` doesn't know the flag name
-    — sailed through unmasked.
+    MCP's ``command`` argument is the same shape), or free-form prose (a ``lab note``) that
+    happens to contain a secret. Two independent passes, because neither alone is a complete
+    masking strategy:
 
-    Matched directly against ``text`` with a regex, not by ``shlex.split``-ing it into tokens and
-    rejoining: this used to tokenize with ``shlex``, which treats ``'`` and ``"`` as *shell*
-    quoting. Free text is not shell-quoted — a contraction (``it's``, ``wasn't``) or a quoted
-    word is an apostrophe or a quotation mark, not the start of a span to swallow — and an even
-    number of them across a note's text (or one that happens to balance against a later ``'``)
-    made ``shlex.split`` succeed *silently*, stripping the quote characters and gluing everything
-    between them into one token, mangling the text with no error or warning. A regex substitution
-    touches only an actual ``flag=value``/``flag value`` pair it finds and leaves every other
-    character — punctuation, quotes, whitespace — exactly as written. Never raises.
+    1. Flag-aware (``_INLINE_FLAG``): masks a ``--flag=value``/``--flag value`` pair — quoted
+       value included, as one unit — when the flag name looks secret-shaped. The flag-aware
+       masking above (``_mask_tokens``) only ever saw separate argv tokens, so a secret hiding as
+       a flag *value* inside one string token — where it has spaces around it, so
+       ``_looks_secret`` bails, and ``redact()`` doesn't know the flag name — sailed through
+       unmasked.
+    2. Free-standing-secret (``_WORD`` + ``_looks_secret``): catches a bare secret-shaped string
+       with no flag in front of it at all — the common shape of pasted error text/tracebacks,
+       which is exactly what ``lab note`` exists to hold. Only pass 1 knows about flags; this
+       pass reuses the same shape/entropy check ``_looks_secret`` applies elsewhere, run
+       word-by-word over whatever pass 1 left behind (a word pass 1 already replaced with
+       ``MASK`` trivially fails this check and is left alone).
+
+    Both passes are matched directly against ``text`` with a regex, not by ``shlex.split``-ing it
+    into tokens and rejoining: this used to tokenize with ``shlex``, which treats ``'`` and ``"``
+    as *shell* quoting. Free text is not shell-quoted — a contraction (``it's``, ``wasn't``) or a
+    quoted word is an apostrophe or a quotation mark, not the start of a span to swallow — and an
+    even number of them across a note's text (or one that happens to balance against a later
+    ``'``) made ``shlex.split`` succeed *silently*, stripping the quote characters and gluing
+    everything between them into one token, mangling the text with no error or warning. A regex
+    substitution touches only an actual ``flag=value``/``flag value`` pair (pass 1) or a single
+    secret-shaped word (pass 2) and leaves every other character — punctuation, quotes,
+    whitespace, ordinary hyphenated words — exactly as written. Never raises.
     """
 
-    def _mask_match(m: re.Match[str]) -> str:
+    def _mask_flag(m: re.Match[str]) -> str:
         flag, sep = m.group(1), m.group(2)
         return f"{flag}{sep}{MASK}" if _SECRET_KEY.search(flag) else m.group(0)
 
-    return _INLINE_FLAG.sub(_mask_match, text)
+    def _mask_word(m: re.Match[str]) -> str:
+        word = m.group(0)
+        return MASK if _looks_secret(word) else word
+
+    text = _INLINE_FLAG.sub(_mask_flag, text)
+    return _WORD.sub(_mask_word, text)
 
 
 def _mask_secrets(value: str) -> str:

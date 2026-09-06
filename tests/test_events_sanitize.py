@@ -123,3 +123,64 @@ def test_mask_text_still_masks_a_secret() -> None:
 
 def test_mask_text_degrades_instead_of_raising() -> None:
     assert mask_text(123) == 123  # type: ignore[arg-type]  # not a string: must not raise
+
+
+def test_mask_text_masks_a_bare_secret_with_no_flag_prefix() -> None:
+    """Bug 1: a secret-shaped string with nothing flag-like in front of it — the ordinary shape
+    of pasted error text/tracebacks, which is exactly what `lab note` exists to hold — must still
+    be masked. A regex that only recognizes `--flag value` shape misses this entirely."""
+    secret = "AKIAIOSFODNN7EXAMPLEXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    out = mask_text(f"Authentication failed with key {secret} during connect")
+    assert secret not in out
+    assert MASK in out
+    assert "Authentication failed with key" in out
+    assert "during connect" in out
+
+
+def test_mask_text_leaves_hyphenated_words_alone() -> None:
+    """Bug 2: no word-boundary anchor before the flag-like token let the regex fire mid-word
+    inside ordinary hyphenated compounds ending in something flag-and-secret-shaped
+    (`pass-key`, `well-authenticated`), corrupting free text and swallowing the next word."""
+    assert (
+        mask_text("we tested the pass-key rotation before shipping")
+        == "we tested the pass-key rotation before shipping"
+    )
+    assert (
+        mask_text("well-authenticated users can proceed")
+        == "well-authenticated users can proceed"
+    )
+
+
+def test_mask_text_masks_a_quoted_multiword_flag_value_completely() -> None:
+    """Bug 3: the value-capture group used to stop at the first whitespace, so a quoted
+    multi-word value after a flag was only partially masked (`--api-key "abc def ghi"` left
+    `def ghi"` in the clear)."""
+    out = mask_text('failed with --api-key "abc def ghi" in the command')
+    assert "abc" not in out
+    assert "def" not in out
+    assert "ghi" not in out
+    assert "--api-key" in out
+    assert "in the command" in out
+
+
+def test_mask_text_leaves_ordinary_prose_with_apostrophes_untouched() -> None:
+    """The regression this whole rewrite exists to prevent: `shlex.split` used to treat prose
+    apostrophes/quotes as shell quoting and silently mangle ordinary text. Confirm plain prose
+    with contractions and hyphenated words survives completely verbatim."""
+    prose = (
+        "it's a re-authorized, non-secret change that wasn't flagged; "
+        "she said \"looks fine\" and we're done"
+    )
+    assert mask_text(prose) == prose
+
+
+def test_mask_text_catches_a_real_secret_bare_and_inside_a_flag() -> None:
+    """A genuinely secret-shaped value must be caught whether it stands alone in free text or
+    is passed as a `--flag=value`."""
+    bare = mask_text(f"got token {SECRET} from the response")
+    assert SECRET not in bare
+    assert MASK in bare
+
+    flagged = mask_text(f"ran with --api-key={SECRET} set")
+    assert SECRET not in flagged
+    assert "--api-key=" in flagged
