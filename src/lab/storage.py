@@ -94,9 +94,22 @@ class R2Store:
         try:
             body: bytes = self._s3.get_object(Bucket=self.bucket, Key=key)["Body"].read()
         except Exception as e:  # noqa: BLE001 — boto raises dynamic ClientError subclasses
-            if "NoSuchKey" in str(e) or getattr(e, "response", {}).get("Error", {}).get(
-                "Code"
-            ) in ("NoSuchKey", "404"):
+            # getattr's default only applies when the attribute is *missing* — a `.response` (or
+            # nested "Error") that is present-but-None (some non-ClientError boto/network
+            # exceptions, or a non-AWS S3-compatible error body) would otherwise crash this
+            # handler with AttributeError instead of the raise below (2026-09-05 `queue list`
+            # incident).
+            response = getattr(e, "response", None) or {}
+            # `.response` itself can be present-but-not-a-dict (a bare string, same class of
+            # non-AWS S3-compatible provider quirk as `Error` below) — treat that the same as
+            # "no recognized error code" rather than crashing on `.get("Error")`.
+            error = response.get("Error") if isinstance(response, dict) else None
+            error = error or {}
+            # `Error` itself can be present-but-not-a-dict (a non-AWS S3-compatible provider, or
+            # a genuinely malformed response, returning a bare string) — treat that the same as
+            # "no recognized error code" rather than crashing on `.get("Code")`.
+            error_code = error.get("Code") if isinstance(error, dict) else None
+            if "NoSuchKey" in str(e) or error_code in ("NoSuchKey", "404"):
                 return None
             raise
         return body.decode()

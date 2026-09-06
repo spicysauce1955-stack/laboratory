@@ -62,9 +62,15 @@ def parse_duration(value: str | float | None) -> float | None:
     s = str(value).strip().lower()
     if not s:
         return None
-    if s[-1] in _UNITS:
-        return float(s[:-1]) * _UNITS[s[-1]]
-    return float(s)
+    try:
+        if s[-1] in _UNITS:
+            return float(s[:-1]) * _UNITS[s[-1]]
+        return float(s)
+    except ValueError:
+        raise ValueError(
+            f"invalid duration {value!r}: expected <n>s / <n>m / <n>h / <n>d, "
+            "or a plain number of seconds"
+        ) from None
 
 
 def atomic_write_text(path: Path, text: str) -> None:

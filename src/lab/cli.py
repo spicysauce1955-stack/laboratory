@@ -5,11 +5,16 @@ Wired to the local backend by default; structured JSON output mirrors the MCP §
 
 from __future__ import annotations
 
+import atexit
 import json
 import errno
 import os
+import shutil
 import sys
+import tempfile
 import traceback
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, NoReturn
@@ -34,7 +39,7 @@ from lab.events import store as events_store
 from lab.events.annotate import digest_of, refs_from
 from lab.events.sanitize import sanitize_argv
 from lab.manifest import git_work_tree, repo_root
-from lab.models import JobSpec, ResourceRequest
+from lab.models import JobManifest, JobSpec, ResourceRequest
 from lab.scheduler.models import Guardrails, RegState, Triggers
 from lab.scheduler.price import PriceFeed
 from lab.scheduler.queue import QueueStore, default_queue, wait_for_queue_drain
@@ -164,15 +169,114 @@ def _lab_for(job_id: str) -> Lab:
 
 
 def _lab_for_or_fail(job_id: str) -> Lab:
-    """`_lab_for`, but a job missing from the local store is a structured error (FR-F3) —
-    scheduler-launched jobs mirror only their manifest, so logs/metrics/fetch live on the
-    scheduler host; `lab status` is the command that reads the mirror."""
+    """`_lab_for`, but a job missing from the local store is a structured error (FR-F3).
+
+    Deliberately does NOT fall back to the scheduler's mirrored manifest the way
+    `_lab_for_mirrored_or_fail` does: this is used by `confirm`, which reaches into a live
+    backend, and cross-machine SkyPilot client/server version skew (`lab._skycompat`) makes
+    acting on a job this machine never locally supervised a real correctness risk, not just an
+    inconvenience — see `cancel`'s own docstring."""
     try:
         return _lab_for(job_id)
     except FileNotFoundError:
         msg = (
             f"unknown job id {job_id!r} — not in local runs/ "
-            "(for scheduler-launched jobs only `lab status` reads the mirrored manifest)"
+            "(for scheduler-launched jobs, `lab status`/`fetch`/`metrics`/`logs` read the "
+            "mirrored manifest; this command does not)"
+        )
+        _emit({"error": msg})
+        _fail(2, msg)
+
+
+class _MirrorReadFailed(Exception):
+    """`default_queue().read_mirrored(...)` raised. Carries the original error's text so every
+    caller can phrase its own "not yet available" message without repeating the try/except that
+    turns a raw crash into that soft message (see `_read_mirrored`)."""
+
+
+def _read_mirrored(job_id: str) -> JobManifest | None:
+    """Read ``job_id`` out of the scheduler's mirrored queue (spec §4.3), or ``None`` if the
+    mirror has nothing for it.
+
+    ``read_mirrored`` can currently raise outright on a partial/stub mirrored manifest (a
+    separate, in-flight fix elsewhere in ``scheduler/queue.py``/``r2queue.py``); that is not this
+    code path's bug to swallow, so it is turned into `_MirrorReadFailed` here, ONCE, rather than
+    every caller wrapping its own try/except around the same `read_mirrored` call
+    (`_read_mirrored_manifest_or_fail` and `_cancel_redirect_message` used to each do this
+    separately, with near-identical degraded messages drifting out of sync).
+    """
+    from lab.scheduler.queue import default_queue
+
+    try:
+        return default_queue().read_mirrored(job_id)
+    except Exception as e:  # noqa: BLE001 — a still-landing mirror bug must not crash callers
+        raise _MirrorReadFailed(str(e)) from e
+
+
+def _read_mirrored_manifest_or_fail(job_id: str) -> JobManifest:
+    """Look up ``job_id`` in the scheduler's mirrored queue (spec §4.3).
+
+    Raises :class:`FileNotFoundError`, like local ``JobStore.read_manifest``, when the mirror
+    has nothing for this job either — so callers can treat "absent everywhere" uniformly.
+    """
+    try:
+        mirrored = _read_mirrored(job_id)
+    except _MirrorReadFailed as e:
+        msg = f"job {job_id!r} manifest not yet available (mirror read failed: {e}); try again shortly"
+        _emit({"error": msg})
+        _fail(2, msg)
+    if mirrored is None:
+        raise FileNotFoundError(job_id)
+    return mirrored
+
+
+def _lab_for_mirrored(job_id: str) -> Lab:
+    """`_lab_for`, but falls back to the scheduler's mirrored manifest (spec §4.3) when the job
+    never ran locally — the same fallback `job_status_view` already uses for `lab status`.
+
+    Used by `logs`/`metrics`/`fetch`: these only read durable/remote state (R2 artifacts, or
+    status the backend itself reports), so building the backend handle from a mirrored
+    manifest's ``backend.provisioner`` is safe in a way that acting via `cancel` is not.
+
+    Every backend's own bookkeeping (e.g. `collect_artifacts`/`status` calling
+    `store.update_manifest`) assumes a local manifest already exists, which is otherwise true for
+    every job this machine has ever touched. A mirror-only job has no such manifest, so it needs
+    one seeded somewhere for that bookkeeping to read/write — but NOT into the real local store:
+    that would make this job completely indistinguishable from one genuinely supervised by this
+    machine, which is exactly what `cancel` (`_lab_for`, reading straight off `runs/`) and
+    `reconcile`'s `unsupervised` pass (`Lab.list_jobs`, same directory) both rely on never being
+    true for a job only ever launched by the scheduler — see `cancel`'s docstring for why acting
+    on one directly is a real correctness risk (SkyPilot client/server skew, `lab._skycompat`),
+    and `reconcile`'s module docstring for why a dead-supervisor `running` job would otherwise be
+    flagged (and, under `--apply`, destroyed) despite running fine under the scheduler's own
+    supervision. So the mirrored manifest is seeded into a throwaway `JobStore` over a fresh temp
+    directory instead: `collect_artifacts`/`status` get a local manifest to update exactly as
+    they expect, and nothing is ever written under `runs/<job_id>/`. The temp directory is
+    cleaned up at process exit (`atexit`) rather than immediately, since the returned `Lab` (and
+    its `.store`) must stay valid for the rest of this one-shot CLI invocation.
+    """
+    home = repo_root() / "runs"
+    store = JobStore(home)
+    try:
+        provisioner = store.read_manifest(job_id).backend.provisioner
+    except FileNotFoundError:
+        mirrored = _read_mirrored_manifest_or_fail(job_id)
+        tmp_home = Path(tempfile.mkdtemp(prefix="lab-mirror-"))
+        atexit.register(shutil.rmtree, tmp_home, ignore_errors=True)
+        JobStore(tmp_home).write_manifest(mirrored)
+        return default_lab(home=tmp_home, backend=mirrored.backend.provisioner)
+    return default_lab(home=home, backend=provisioner)
+
+
+def _lab_for_mirrored_or_fail(job_id: str) -> Lab:
+    """`_lab_for_mirrored`, but a job missing from both local runs/ and the mirror is a
+    structured error (FR-F3)."""
+    try:
+        return _lab_for_mirrored(job_id)
+    except FileNotFoundError:
+        msg = (
+            f"unknown job id {job_id!r} — not in local runs/ and not in the scheduler's "
+            "mirrored queue"
         )
         _emit({"error": msg})
         _fail(2, msg)
@@ -531,8 +635,9 @@ def status(job_id: str) -> None:
 
 @app.command()
 def logs(job_id: str, tail: int = typer.Option(100)) -> None:
-    """Tail a job's logs (FR-D1)."""
-    for line in _lab_for_or_fail(job_id).logs(job_id, tail=tail):
+    """Tail a job's logs (FR-D1); scheduler-launched jobs fall back to the mirrored manifest
+    (spec §4.3), same as `lab status`."""
+    for line in _lab_for_mirrored_or_fail(job_id).logs(job_id, tail=tail):
         typer.echo(line)
 
 
@@ -545,10 +650,24 @@ def note(
     ),
     usd: float | None = typer.Option(None, "--usd", help="dollars this cost, if it cost any"),
     sweep: str | None = typer.Option(None, "--sweep", help="the sweep this is about"),
-    agent: bool = typer.Option(False, "--agent", help="mark the note as written by an agent"),
+    agent: str | None = typer.Option(
+        None,
+        "--agent",
+        help="mark the note as agent-written. Bare `--agent=` (or `--agent=agent`) records "
+        "author \"agent\"; `--agent NAME` / `--agent=NAME` records NAME as the author. A "
+        "value-less `--agent` with nothing after it (not even `=`) is rejected: unlike a plain "
+        "boolean flag, this option always consumes the next token as its value, so `--agent -m "
+        "...` would otherwise silently swallow `-m` — write `--agent=` instead.",
+    ),
     last: bool = typer.Option(
         False, "--last",
         help="attach this note to the most recent failure, so the next run that hits it sees it",
+    ),
+    extra_args: list[str] = typer.Argument(
+        default_factory=list,
+        hidden=True,
+        help="(internal) catches a stray token so a real mistake gets a clear error, not a raw "
+        "click parse failure",
     ),
 ) -> None:
     """Record what went wrong (or surprised you) next to the run's own logs.
@@ -558,6 +677,34 @@ def note(
     note with no job id is still worth writing — a submit that dies before provisioning never
     gets one, and those are often the notes worth most.
     """
+    # `--agent` is parsed as an ordinary value-bearing option, never a boolean flag — so its value
+    # is bound directly by click/typer at parse time and never touches `job_id`'s positional slot
+    # or `extra_args`, regardless of where `--agent`/`--agent NAME` falls on the command line.
+    # There is no shape-based guessing here: `job_id` (and any genuinely stray token) are parsed
+    # exactly as declared.
+    if agent is not None and agent.startswith("-"):
+        # click has no concept of "this option's value looks like it was actually another flag"
+        # — given `--agent -m foo`, it binds `-m` to `--agent` as a plain string and leaves `foo`
+        # dangling. That is a real, silent misparse risk this option's own shape can't rule out,
+        # so catch the one shape a real agent name never has (a leading `-`) and fail loudly
+        # instead of filing a note under a bogus author.
+        msg = (
+            f"--agent got {agent!r}, which looks like another flag rather than an agent name. "
+            "--agent always consumes the next token as its value now (no bare, value-less form "
+            "followed by another flag) — write --agent= for an unnamed agent, or --agent=NAME "
+            "to name it."
+        )
+        _emit({"error": msg})
+        _fail(2, msg)
+    author = "human" if agent is None else ("agent" if agent == "" else agent)
+    if extra_args:
+        joined = " ".join(repr(a) for a in extra_args)
+        msg = (
+            f"unexpected extra argument(s): {joined}. If this was meant as the note text, "
+            "pass it with -m/--text (it looks like that flag was left off)."
+        )
+        _emit({"error": msg})
+        _fail(2, msg)
     facets: dict[str, Any] = {}
     home = repo_root() / "runs"
     if job_id is not None:
@@ -572,7 +719,7 @@ def note(
     signature = lab_notes.last_failure_signature() if last else None
     written = lab_notes.write(
         text=text, job_id=job_id, sweep_id=sweep, kind=kind, usd=usd,
-        author="agent" if agent else "human", facets=facets, home=home,
+        author=author, facets=facets, home=home,
         signature=signature,
     )
     if written is None:
@@ -721,21 +868,112 @@ def metrics(
     name: list[str] = typer.Option(None, "--name", "-n", help="filter to these metric names"),
     since_step: int | None = typer.Option(None, help="only points with step > since_step"),
 ) -> None:
-    """Query a job's incremental metric series (FR-D2 — the early-kill loop)."""
-    _emit({"series": _lab_for_or_fail(job_id).metrics(job_id, names=name or None, since_step=since_step)})
+    """Query a job's incremental metric series (FR-D2 — the early-kill loop); scheduler-launched
+    jobs fall back to the mirrored manifest (spec §4.3), same as `lab status`."""
+    _emit(
+        {"series": _lab_for_mirrored_or_fail(job_id).metrics(job_id, names=name or None, since_step=since_step)}
+    )
 
 
 @app.command()
 def fetch(job_id: str) -> None:
-    """Collect artifacts into runs/<job_id>/; prints local paths (FR-E2)."""
-    arts = _lab_for_or_fail(job_id).fetch_artifacts(job_id)
-    _emit({"local_paths": [a.path for a in arts], "artifacts": [a.model_dump() for a in arts]})
+    """Collect artifacts into runs/<job_id>/; prints local paths (FR-E2). Artifacts live in R2
+    regardless of which machine ran the job, so scheduler-launched jobs fall back to the
+    mirrored manifest (spec §4.3), same as `lab status`.
+
+    A mirror-only job's `Lab` is built over a throwaway temp `JobStore` (see
+    `_lab_for_mirrored`'s docstring), so its artifacts initially land under that temp directory,
+    not this project's own `runs/<job_id>/output/` — and the temp directory is removed via
+    `atexit`, after this process exits. Left alone, the `local_paths` reported here would point
+    into a directory that is gone by the time anything can actually read them back, defeating
+    the point of `fetch`. So any artifact not already under this project's own `runs/` is copied
+    (plain file copy — never `manifest.json`, which is what would make `cancel`/`reconcile`'s
+    unsupervised-job pass start treating this job as locally supervised; see
+    `_lab_for_mirrored`) into the real `runs/<job_id>/output/` before the paths are reported.
+    """
+    arts = _lab_for_mirrored_or_fail(job_id).fetch_artifacts(job_id)
+    real_runs = (repo_root() / "runs").resolve()
+    real_out = real_runs / job_id / "output"
+    local_paths: list[str] = []
+    for a in arts:
+        src = Path(a.path).resolve()
+        if src.is_relative_to(real_runs):
+            # Already durable — this machine actually ran the job locally.
+            local_paths.append(str(src))
+            continue
+        dest = real_out / a.name  # `a.name` is `path`'s slash-path relative to output/
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        local_paths.append(str(dest))
+    _emit({"local_paths": local_paths, "artifacts": [a.model_dump() for a in arts]})
 
 
 @app.command()
 def cancel(job_id: str) -> None:
-    """Cancel a job and tear down its machine (FR-A3, FR-C2)."""
-    _emit({"job_id": job_id, "state": _lab_for_or_fail(job_id).cancel(job_id).value})
+    """Cancel a job and tear down its machine (FR-A3, FR-C2).
+
+    Deliberately does NOT fall back to the mirrored manifest the way `logs`/`metrics`/`fetch`
+    do: cancelling reaches into a live backend from this machine, and cross-machine SkyPilot
+    client/server version skew (`lab._skycompat`) makes acting on a job this machine never
+    locally supervised a real correctness risk. A scheduler-launched job is cancelled by
+    registering the cancellation with the scheduler instead (`lab queue cancel <reg_id>`,
+    applied on its next tick, within 60s) — so a job absent from local `runs/` but present in
+    the mirror gets a redirect to that command instead of a generic "unknown job id".
+    """
+    try:
+        the_lab = _lab_for(job_id)
+    except FileNotFoundError:
+        msg = _cancel_redirect_message(job_id)
+        _emit({"error": msg})
+        _fail(2, msg)
+    _emit({"job_id": job_id, "state": the_lab.cancel(job_id).value})
+
+
+def _cancel_redirect_message(job_id: str) -> str:
+    """The error `cancel` gives for a job absent from local `runs/`: tells apart a job this
+    machine has never heard of at all from one that IS real, just launched elsewhere by the
+    scheduler — which needs `lab queue cancel`, never a local `cancel` attempt (see `cancel`'s
+    docstring). Best-effort: a `read_mirrored` crash on a not-yet-fixed partial manifest (a
+    separate, in-flight fix elsewhere) must not crash `cancel`'s own error path, so it degrades
+    to a plain "could not check" message instead of asserting the job is unknown outright
+    (`_read_mirrored` is where that degradation actually happens — shared with
+    `_read_mirrored_manifest_or_fail`, not reimplemented here). The later `list_entries()` call
+    (finding the matching registration, for a friendlier redirect) gets the same treatment: a
+    transient queue-store error there degrades to the generic "scheduler-launched, reg_id not
+    found" message rather than propagating a raw exception out of `cancel`.
+    """
+    from lab.scheduler.queue import default_queue
+
+    generic = (
+        f"unknown job id {job_id!r} — not in local runs/ and not in the scheduler's mirrored "
+        "queue either (for scheduler-launched jobs, `lab status`/`fetch`/`metrics`/`logs` read "
+        "the mirrored manifest)"
+    )
+    try:
+        mirrored = _read_mirrored(job_id)
+    except _MirrorReadFailed as e:
+        return (
+            f"job {job_id!r} is not in local runs/, and its mirrored manifest could not be read "
+            f"({e}) — try again shortly, or check `lab queue list` for a matching registration"
+        )
+    if mirrored is None:
+        return generic
+    try:
+        reg_id = next(
+            (r.reg_id for r in default_queue().list_entries() if r.job_id == job_id), None
+        )
+    except Exception:  # noqa: BLE001 — a transient queue-store error must not crash `cancel`
+        reg_id = None
+    if reg_id is not None:
+        return (
+            f"job {job_id!r} is scheduler-launched (registration {reg_id!r}) — cancel it with "
+            f"`lab queue cancel {reg_id}` (applied on the scheduler's next tick, within 60s); "
+            "`lab cancel` does not act on jobs this machine never locally supervised"
+        )
+    return (
+        f"job {job_id!r} is scheduler-launched — cancel it via `lab queue cancel` for the "
+        "registration that launched it (its reg_id could not be found in the current queue)"
+    )
 
 
 @app.command(name="sweep-status")
@@ -1621,6 +1859,65 @@ def _synonym_hint(argv: list[str]) -> str | None:
     return None
 
 
+@contextmanager
+def _capturing_usage_errors(sink: list[dict[str, Any]]) -> Iterator[None]:
+    """Recover a click/typer usage error's own message, for the one window it still exists.
+
+    click's dispatch (vendored as ``typer._click``/``typer.core``) catches every
+    ``ClickException`` — unknown command, bad flag, bad type, extra argument — prints it via
+    ``e.show()`` (or, since this project has ``rich`` installed, ``rich_utils.rich_format_error``)
+    and *then* re-raises as a bare ``SystemExit`` carrying only the exit code. By the time that
+    reaches ``main()``'s own ``except SystemExit`` the exception — and therefore its message — is
+    already gone (see ``main``'s docstring re: why ``standalone_mode=False`` isn't the fix
+    either). The only place left to recover it is the formatting call itself: both paths print
+    the same ``e.format_message()``, so wrapping both, for the duration of one ``app()`` call,
+    recovers the message into ``sink`` without changing a single byte of what's printed to
+    stderr — the wrapper always calls straight through to the original after recording.
+    """
+    from typer._click.exceptions import ClickException, UsageError
+
+    def record(exc: ClickException) -> None:
+        if type(exc).__name__ == "NoArgsIsHelpError":
+            return  # its "message" is the whole --help text — rich_format_error skips it too
+        sink.append({"type": type(exc).__name__, "message": exc.format_message(), "where": None})
+
+    orig_exc_show = ClickException.show
+    orig_usage_show = UsageError.show
+
+    def patched_exc_show(self: ClickException, file: Any = None) -> None:
+        record(self)
+        orig_exc_show(self, file)
+
+    def patched_usage_show(self: UsageError, file: Any = None) -> None:
+        record(self)
+        orig_usage_show(self, file)
+
+    orig_rich_format_error = None
+    rich_utils = None
+    if typer.core.HAS_RICH:
+        from typer import rich_utils as _rich_utils
+
+        rich_utils = _rich_utils
+        orig_rich_format_error = rich_utils.rich_format_error
+
+        def patched_rich_format_error(self: ClickException) -> None:
+            record(self)
+            assert orig_rich_format_error is not None
+            orig_rich_format_error(self)
+
+        rich_utils.rich_format_error = patched_rich_format_error  # type: ignore[attr-defined]
+
+    ClickException.show = patched_exc_show  # type: ignore[method-assign]
+    UsageError.show = patched_usage_show  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        ClickException.show = orig_exc_show  # type: ignore[method-assign]
+        UsageError.show = orig_usage_show  # type: ignore[method-assign]
+        if rich_utils is not None and orig_rich_format_error is not None:
+            rich_utils.rich_format_error = orig_rich_format_error  # type: ignore[attr-defined]
+
+
 def main(argv: list[str] | None = None) -> None:
     """Console entry point.
 
@@ -1642,8 +1939,10 @@ def main(argv: list[str] | None = None) -> None:
     reconstruct it after the fact.
     """
     outcome, code, error = "ok", 0, None
+    usage_errors: list[dict[str, Any]] = []
     try:
-        app(args=argv)
+        with _capturing_usage_errors(usage_errors):
+            app(args=argv)
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
         if code == 1 and _caused_by_broken_pipe(e):
@@ -1675,6 +1974,8 @@ def main(argv: list[str] | None = None) -> None:
             events.begin("cli", "<unparsed>", {"argv": sanitize_argv(sys.argv[1:])})
             if outcome == "error":
                 outcome = "usage_error"
+            if usage_errors:
+                error = usage_errors[-1]
             if hint := _synonym_hint(list(argv if argv is not None else sys.argv[1:])):
                 typer.echo(f"lab: did you mean `lab {hint}`?", err=True)
     elif outcome == "error":
@@ -1684,8 +1985,12 @@ def main(argv: list[str] | None = None) -> None:
         elif code == 2:
             # A known command's own option parsing rejected the input (bad flag, bad type) —
             # click's parser raised before the command body ever ran, so no `_fail` call
-            # recorded a reason. The argv already on the open record is the explanation.
+            # recorded a reason. `_capturing_usage_errors` is what makes the argv already on the
+            # open record more than the only explanation: it carries the message click itself
+            # printed (which flag, which value, why) straight into the ledger.
             outcome = "usage_error"
+            if usage_errors:
+                error = usage_errors[-1]
         else:
             error = {"type": "Exit", "message": f"exited {code}", "where": None}
     # Hand the failure to whoever has hit it before. Stderr, so stdout stays parseable JSON, and

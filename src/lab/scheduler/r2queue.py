@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
+
+from pydantic import ValidationError
 
 from lab.models import JobManifest
 from lab.scheduler.models import ControlConfig, Registration
@@ -101,13 +104,38 @@ class R2QueueStore:
         self.store.put_text(self._k("jobs", f"{manifest.job_id}.json"), manifest.model_dump_json())
 
     def read_mirrored(self, job_id: str) -> JobManifest | None:
-        text = self.store.get_text(self._k("jobs", f"{job_id}.json"))
-        return JobManifest.model_validate_json(text) if text else None
+        try:
+            text = self.store.get_text(self._k("jobs", f"{job_id}.json"))
+            if not text:
+                return None
+            return JobManifest.model_validate_json(text)
+        except (ValidationError, UnicodeDecodeError):
+            # A partial/stub manifest (e.g. version-skewed scheduler host, or a read racing an
+            # in-progress write) must read as "not yet available", never crash the caller
+            # (2026-09-04 `lab status` incident: 7 required fields missing). Genuinely corrupted
+            # (non-UTF-8) blob bytes hit the same path via `get_text`'s `.decode()` rather than
+            # pydantic — same degrade applies, so the decode call must sit inside this try too.
+            return None
 
     def list_mirrored(self) -> list[JobManifest]:
+        from lab import events
+
         out: list[JobManifest] = []
         for key in sorted(self.store.list_keys(self._k("jobs") + "/")):
-            text = self.store.get_text(key)
-            if text is not None:
-                out.append(JobManifest.model_validate_json(text))
+            try:
+                text = self.store.get_text(key)
+                if text is None:
+                    continue
+                manifest = JobManifest.model_validate_json(text)
+            except (ValidationError, UnicodeDecodeError) as e:
+                # Same rationale as read_mirrored: one partial/stale manifest (version skew, a
+                # read racing an in-progress write, or genuinely corrupted non-UTF-8 blob bytes
+                # surfacing via `get_text`'s `.decode()`) must not take down the whole listing.
+                # Unlike read_mirrored this has no single caller waiting on "not yet available",
+                # so the skip is surfaced (stderr + ledger) rather than silent — otherwise a real
+                # corruption could sit invisible behind a listing that just looks one job short.
+                print(f"[lab] skipping unreadable mirrored manifest {key}: {e}", file=sys.stderr)
+                events.note("queue.manifest_corrupt", key=key, error=str(e))
+                continue
+            out.append(manifest)
         return out

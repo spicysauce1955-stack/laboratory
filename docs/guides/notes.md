@@ -33,7 +33,9 @@ uv run lab note --last -m "job ids are full timestamps; do not truncate the past
 `--kind` is free text. These are the ones already in use, so a reader can group on them:
 `GOTCHA`, `BUDGET EVENT`, `ROOT CAUSE`, `INCIDENT`, `LESSON`, `DEVIATION`, `FEATURE REQUEST`,
 `NOTE`. `--usd` records what it cost, which is what makes one note rankable against another.
-`--agent` marks an agent as the author, so a reader can weight it.
+`--agent=` (or `--agent=NAME` to name yourself) marks an agent as the author, so a reader can
+weight it. `--agent` always takes a value — write the `=` even with nothing after it; a bare
+trailing `--agent` is rejected rather than silently eating the next flag's token.
 
 **Write one when** a cost or duration differed from what you were told to expect; an error message
 pointed at the wrong cause; you worked around the lab rather than with it (a hand-rolled watchdog,

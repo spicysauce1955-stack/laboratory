@@ -50,6 +50,13 @@ upgrade note.
   `lab export` bundles. `lab status` gained a `notes` count; like every other field here it is
   additive, and a caller that ignores it is unaffected. A note whose text cannot be masked is
   never written silently — the ledger's deny-list applies (FR-J1).
+  **BREAKING (v0.11.0):** `--agent` is no longer a boolean flag — a bare, value-less `--agent`
+  (e.g. `lab note <job_id> --agent -m "..."`) is now a usage error. It takes a value: `--agent=`
+  records author `"agent"` (the old bare-flag behavior), `--agent=NAME` / `--agent NAME` records
+  `NAME` as the author. Three rounds of guessing whether a stray token after `--agent` was really
+  a name or the job id (by shape-matching against today's job-id format) kept finding new
+  misfiles — including silently discarding a real, non-standard-shaped job id. A value-bearing
+  option removes the guessing entirely; the one-character `=` is the migration.
 - **Experiment Contract** — `$LAB_RUN_ID`, `$LAB_RUN_DIR`, `$LAB_SEED`;
   `log_metric(name, value, step)`; `effective_config.json`; non-zero exit on failure.
 - **On disk** — the layout of `runs/<job_id>/` and the manifest schema. Field *values* can gain

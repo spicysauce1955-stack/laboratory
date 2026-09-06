@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from lab.events.sanitize import MASK, sanitize_argv, sanitize_params
+from lab.events.sanitize import MASK, mask_text, sanitize_argv, sanitize_params
 
 SECRET = "abcd1234efgh5678ijkl9012mnop3456qrst"
 
@@ -105,3 +105,176 @@ def test_sanitize_argv_degrades_instead_of_raising() -> None:
     # A non-string token raises AttributeError on .startswith mid-loop. The guard must turn
     # that into a masked result, never an exception escaping into the command.
     assert sanitize_argv(["lab", "submit", 123]) == [MASK]  # type: ignore[list-item]
+
+
+def test_mask_text_has_no_length_cap() -> None:
+    """`mask_text` is what `lab.notes._clean` uses instead of `sanitize_argv`: a note body's
+    whole purpose is holding a detailed write-up in full, so the ledger's 512-char argv/param cap
+    (`test_long_strings_and_lists_are_truncated` above) must not apply to it."""
+    blob = "a b " * 400  # > 512 chars, same shape sanitize_params truncates
+    assert mask_text(blob) == blob
+
+
+def test_mask_text_still_masks_a_secret() -> None:
+    out = mask_text("failed with --api-key=sk-live-abcdef1234567890 in the command")
+    assert "sk-live-abcdef1234567890" not in out
+    assert "--api-key=" in out
+
+
+def test_mask_text_degrades_instead_of_raising() -> None:
+    assert mask_text(123) == 123  # type: ignore[arg-type]  # not a string: must not raise
+
+
+def test_mask_text_masks_a_bare_secret_with_no_flag_prefix() -> None:
+    """Bug 1: a secret-shaped string with nothing flag-like in front of it — the ordinary shape
+    of pasted error text/tracebacks, which is exactly what `lab note` exists to hold — must still
+    be masked. A regex that only recognizes `--flag value` shape misses this entirely."""
+    secret = "AKIAIOSFODNN7EXAMPLEXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    out = mask_text(f"Authentication failed with key {secret} during connect")
+    assert secret not in out
+    assert MASK in out
+    assert "Authentication failed with key" in out
+    assert "during connect" in out
+
+
+def test_mask_text_leaves_hyphenated_words_alone() -> None:
+    """Bug 2: no word-boundary anchor before the flag-like token let the regex fire mid-word
+    inside ordinary hyphenated compounds ending in something flag-and-secret-shaped
+    (`pass-key`, `well-authenticated`), corrupting free text and swallowing the next word."""
+    assert (
+        mask_text("we tested the pass-key rotation before shipping")
+        == "we tested the pass-key rotation before shipping"
+    )
+    assert (
+        mask_text("well-authenticated users can proceed")
+        == "well-authenticated users can proceed"
+    )
+
+
+def test_mask_text_masks_a_quoted_multiword_flag_value_completely() -> None:
+    """Bug 3: the value-capture group used to stop at the first whitespace, so a quoted
+    multi-word value after a flag was only partially masked (`--api-key "abc def ghi"` left
+    `def ghi"` in the clear)."""
+    out = mask_text('failed with --api-key "abc def ghi" in the command')
+    assert "abc" not in out
+    assert "def" not in out
+    assert "ghi" not in out
+    assert "--api-key" in out
+    assert "in the command" in out
+
+
+def test_mask_text_leaves_ordinary_prose_with_apostrophes_untouched() -> None:
+    """The regression this whole rewrite exists to prevent: `shlex.split` used to treat prose
+    apostrophes/quotes as shell quoting and silently mangle ordinary text. Confirm plain prose
+    with contractions and hyphenated words survives completely verbatim."""
+    prose = (
+        "it's a re-authorized, non-secret change that wasn't flagged; "
+        "she said \"looks fine\" and we're done"
+    )
+    assert mask_text(prose) == prose
+
+
+def test_mask_text_does_not_corrupt_prose_that_merely_mentions_a_flag_name() -> None:
+    """Bug 2: `_INLINE_FLAG` used to mask any `--flag value` pair whenever the flag name matched
+    `_SECRET_KEY` at all — including "auth" as a bare substring of an unrelated flag ("basic-
+    auth") or "key" glued inside one unrelated English word ("keyword") — deleting the next word
+    of ordinary prose even though nothing secret-shaped is present."""
+    assert (
+        mask_text("documented the --basic-auth flag; users still hit 401s")
+        == "documented the --basic-auth flag; users still hit 401s"
+    )
+    assert (
+        mask_text("we need a --keyword search here")
+        == "we need a --keyword search here"
+    )
+    assert (
+        mask_text("run with --price-cap 1.40 and see what happens")
+        == "run with --price-cap 1.40 and see what happens"
+    )
+
+
+def test_mask_text_still_masks_real_secrets_after_the_flag_fix() -> None:
+    """The over-masking fix must not weaken real detection: a secret-shaped value is still fully
+    masked whether it rides on a sensitive-named flag (bare or `--flag=`) or stands alone."""
+    # sensitive flag name alone is still enough when the value is short/low-entropy
+    out = mask_text("failed with --api-key=sk-live-abcdef1234567890 in the command")
+    assert "sk-live-abcdef1234567890" not in out
+    assert "--api-key=" in out
+    # a genuinely secret-shaped value is caught even behind an unremarkable flag name
+    out2 = mask_text(f"retry with --seed {SECRET} next time")
+    assert SECRET not in out2
+    assert MASK in out2
+    # bare secret, no flag prefix at all, is still caught by the free-standing pass
+    out3 = mask_text(f"got token {SECRET} from the response")
+    assert SECRET not in out3
+    assert MASK in out3
+
+
+def test_mask_text_masks_a_flag_value_followed_by_a_boolean_flag() -> None:
+    """Bug 1 (secret-leak): the bare-token value alternative used to have no restriction on its
+    own shape, so it would greedily consume a *following* `--flag` as if it were the current
+    flag's value (`--dry-run --api-key ...` matched flag=`--dry-run`, value=`--api-key`,
+    swallowing both). That left `--api-key` consumed as somebody else's value, never itself
+    tried as a flag, so its real value never got independent consideration. Confirmed live:
+    this exact string used to come back completely unchanged, no masking at all."""
+    out = mask_text("ran with --dry-run --api-key sk-live-abcdef1234567890 next")
+    assert "sk-live-abcdef1234567890" not in out
+    assert MASK in out
+    assert "--api-key" in out
+    assert "--dry-run" in out  # the boolean flag itself survives untouched
+
+
+def test_mask_text_masks_two_secrets_separated_by_an_intervening_boolean_flag() -> None:
+    """Adversarial variation on bug 1: a boolean flag sitting *between* two real flag+secret
+    pairs must not eat either secret's flag."""
+    out = mask_text(
+        "ran with --api-key sk-live-abcdef1234567890 --verbose --token tok-zzzzzzzzzzzzzzzz done"
+    )
+    assert "sk-live-abcdef1234567890" not in out
+    assert "tok-zzzzzzzzzzzzzzzz" not in out
+    assert out.count(MASK) == 2
+    assert "--verbose" in out
+    assert "done" in out
+
+
+def test_mask_text_does_not_span_past_a_stray_apostrophe_in_later_prose() -> None:
+    """Bug 2 (corruption): the quoted-value alternative used to allow single quotes as a
+    delimiter with no bound on distance — an opening `'` with no genuine closing partner nearby
+    would backtrack all the way to the next literal `'` anywhere later in the string, even one
+    that's just part of an ordinary contraction, silently deleting real prose in between.
+    Confirmed live: this exact string used to come back with everything from the opening quote
+    to the apostrophe in "it's" replaced by the mask. The secret must still be masked, but the
+    unrelated tail must survive verbatim."""
+    out = mask_text("run with --api-key 'sk-live-abcdef1234567890 and later it's done")
+    assert "sk-live-abcdef1234567890" not in out
+    assert MASK in out
+    assert "and later it's done" in out
+
+
+def test_mask_text_leaves_an_apostrophe_contraction_right_after_a_flag_alone() -> None:
+    """A bare, non-secret, non-sensitive-flag value that happens to be an ordinary contraction
+    must not be mistaken for an opening quote or otherwise mangled — it's just a bare token."""
+    assert (
+        mask_text("run with --reason it's broken") == "run with --reason it's broken"
+    )
+
+
+def test_mask_text_bounds_a_double_quoted_value_even_when_unterminated() -> None:
+    """The double-quoted alternative is still explicitly length-bounded, so an unterminated `"`
+    can't reach an unrelated `"` much later in a long note and swallow everything between."""
+    tail = "word " * 100 + 'and she said "looks fine" at the end'
+    out = mask_text(f'noted --api-key "sk-live-unterminated {tail}')
+    assert "at the end" in out  # the far-away unrelated closing quote's context survives
+    assert MASK in out
+
+
+def test_mask_text_catches_a_real_secret_bare_and_inside_a_flag() -> None:
+    """A genuinely secret-shaped value must be caught whether it stands alone in free text or
+    is passed as a `--flag=value`."""
+    bare = mask_text(f"got token {SECRET} from the response")
+    assert SECRET not in bare
+    assert MASK in bare
+
+    flagged = mask_text(f"ran with --api-key={SECRET} set")
+    assert SECRET not in flagged
+    assert "--api-key=" in flagged

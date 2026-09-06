@@ -117,3 +117,18 @@ def test_status_heartbeat_none_for_mirrored(tmp_path, monkeypatch):
     view = job_status_view(tmp_path, tmp_path, "jh2")
     assert view["mirrored"] is True
     assert view["last_log_line"] is None and view["last_log_at"] is None
+
+
+def test_status_view_survives_a_partial_mirrored_manifest(tmp_path, monkeypatch):
+    """A job absent from the local store falls back to the mirror; if the mirrored blob is a
+    stub JSON missing required JobManifest fields (version-skewed scheduler host, or a read
+    racing an in-progress write), `lab status` must report "not found" like any other unknown
+    job, never crash with an unhandled pydantic ValidationError (2026-09-04 incident)."""
+    qdir = tmp_path / "queue"
+    (qdir / "jobs").mkdir(parents=True)
+    (qdir / "jobs" / "jh3.json").write_text('{"job_id": "jh3", "mirrored": true}')
+    monkeypatch.setenv("LAB_QUEUE_DIR", str(qdir))
+    import pytest
+
+    with pytest.raises(FileNotFoundError):
+        job_status_view(tmp_path, tmp_path, "jh3")

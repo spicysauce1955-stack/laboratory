@@ -11,6 +11,8 @@ manifest), mirroring the CLI. ``build_server(lab)`` lets tests inject a Lab at a
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -114,6 +116,71 @@ def build_server(lab: Lab) -> FastMCP:
     def _lab_for(job_id: str) -> Lab:
         return default_lab(home=home, backend=_require(job_id).backend.provisioner)
 
+    def _manifest_or_mirror(job_id: str) -> tuple[JobManifest, bool]:
+        """Local store first; the scheduler's mirrored manifest second (spec §4.3) — the same
+        fallback ``job_status_view`` already gives ``status``, extended to the other read-only
+        job-scoped tools (metrics/logs/fetch_artifacts) so a deferred job is observable from
+        every read surface, not write-only. Returns ``(manifest, mirrored)``; raises ``ToolError``
+        when the job is in neither place. Deliberately NOT used by ``cancel`` — a job this project
+        never supervised must never look cancellable from here."""
+        try:
+            return store.read_manifest(job_id), False
+        except FileNotFoundError:
+            from lab.scheduler.queue import default_queue  # local import: avoids a module cycle
+
+            try:
+                mirrored = default_queue().read_mirrored(job_id)
+            except Exception as e:  # noqa: BLE001 — a still-landing mirror bug must not crash
+                # this tool call; mirrors the CLI's `_read_mirrored` guard for the same
+                # `read_mirrored` failure mode.
+                raise ToolError(
+                    f"job {job_id!r} manifest not yet available "
+                    f"(mirror read failed: {e}); try again shortly"
+                ) from e
+            if mirrored is None:
+                raise ToolError(
+                    f"job '{job_id}' not found (locally or in the scheduler mirror)"
+                ) from None
+            return mirrored, True
+
+    def _lab_for_mirrored(job_id: str, manifest: JobManifest) -> tuple[Lab, Path]:
+        """A ``Lab`` over the backend that actually ran a job known only via the scheduler
+        mirror (not in this project's local ``runs/``).
+
+        The manifest is loaded into a throwaway ``JobStore`` rooted at a fresh temp directory,
+        live for this call only — never the real ``runs/`` — so a read (logs/metrics/
+        fetch_artifacts) can never leave behind anything ``cancel``/``reconcile`` would later
+        mistake for a job this machine genuinely supervises (SkyPilot client/server skew makes a
+        cross-machine teardown attempt on such a job actively dangerous; see ``lab._skycompat``).
+        Uses ``JobStore.write_manifest``, never ``.create`` — ``create`` also stamps the job into
+        the user-global ``~/.lab/jobs/index.jsonl`` ownership ledger (`lab.attribution`), which a
+        `reconcile` run from ANY project trusts as proof of local ownership; writing there would
+        recreate exactly the false-attribution failure mode CLAUDE.md's 2026-08-20 incident notes
+        describe, just from the read side instead of the destroy side.
+
+        Returns ``(lab, tmp_home)``. Unlike the CLI's equivalent (a short-lived, one-shot
+        process that lets `atexit` sweep this up once at exit), the MCP server stays up
+        serving tool calls indefinitely — an `atexit`-based cleanup here would leak one temp
+        directory (inodes, and for `fetch_artifacts`, real R2-downloaded bytes) per mirrored
+        call for the life of the process. So `tmp_home` is handed back to the caller, which
+        MUST remove it (`shutil.rmtree`) once it is done with the returned `Lab` — see the
+        three tool bodies below, each wrapping its call in `try`/`finally`."""
+        tmp_home = Path(tempfile.mkdtemp(prefix=f"lab-mcp-mirror-{job_id}-"))
+        JobStore(tmp_home).write_manifest(manifest)
+        return default_lab(home=tmp_home, backend=manifest.backend.provisioner), tmp_home
+
+    def _lab_for_any(job_id: str) -> tuple[Lab, Path | None]:
+        """`_lab_for`, extended with the mirror fallback for read-only job-scoped tools. Never
+        used by `cancel` (must stay local-only, see `_manifest_or_mirror`).
+
+        Returns ``(lab, tmp_home)``: ``tmp_home`` is the throwaway directory backing a mirrored
+        job's ``Lab`` (see `_lab_for_mirrored`) and must be cleaned up by the caller once done
+        with ``lab``; it is ``None`` for a locally-known job, which has nothing to clean up."""
+        manifest, mirrored = _manifest_or_mirror(job_id)
+        if mirrored:
+            return _lab_for_mirrored(job_id, manifest)
+        return default_lab(home=home, backend=manifest.backend.provisioner), None
+
     @mcp.tool
     def submit(
         command: str,
@@ -179,6 +246,17 @@ def build_server(lab: Lab) -> FastMCP:
         timeout: float | None = None,
     ) -> dict[str, Any]:
         """Reproducibility gate (FR-B): re-derive a prior result from its pinned provenance and check it still holds. Relaunches run_id fresh (no cache) from its committed commit, then compares the re-run's final metric(s) against the original's snapshot within tolerance -> verdict 'match'|'drift'|'rerun_failed' with per-metric deltas. Raises ToolError for a non-succeeded or dirty producer (no honest result to re-derive) or a missing baseline. metric restricts which metrics are judged (default: all). wait=False submits the re-run and returns {confirm_id, verdict:'pending'}."""
+        # No mirror fallback here (unlike metrics/logs/fetch_artifacts): Lab.confirm() re-reads
+        # run_id's manifest itself (self.manifest(orig_id) inside core.py) to build the relaunch,
+        # and the relaunch is a brand-new job it persists into *this* Lab's real local store —
+        # exactly the kind of write the mirror-read helpers above are built to avoid making up
+        # for a job we don't supervise. Loading run_id into a throwaway JobStore the way
+        # `_lab_for_mirrored` does would make the new, real, billing confirm-run's own manifest
+        # live only in that throwaway dir too (same `self.home` for both), i.e. genuinely
+        # unsupervised the moment this call returns — worse than today's ToolError, not better.
+        # Making confirm mirror-aware without that trap needs `Lab.confirm` itself to accept a
+        # pre-loaded baseline manifest while still writing the new job to the real store, which
+        # is a core.py behavior change beyond a read-only fallback — out of scope here.
         _require(run_id)
         try:
             return _lab_for(run_id).confirm(
@@ -335,25 +413,70 @@ def build_server(lab: Lab) -> FastMCP:
     def metrics(
         job_id: str, names: list[str] | None = None, since_step: int | None = None
     ) -> dict[str, Any]:
-        """Query incremental metric series; returns {series:{name:[{step,value,wall_time}]}} (FR-D2)."""
-        _require(job_id)
-        return {"series": _lab_for(job_id).metrics(job_id, names=names, since_step=since_step)}
+        """Query incremental metric series; returns {series:{name:[{step,value,wall_time}]}}
+        (FR-D2). Scheduler-launched (deferred) jobs fall back to the mirrored manifest (spec
+        §4.3), matching `status`; since their logs/metrics only live durably on the scheduler
+        host, this may legitimately return an empty series rather than an error."""
+        the_lab, tmp_home = _lab_for_any(job_id)
+        try:
+            return {"series": the_lab.metrics(job_id, names=names, since_step=since_step)}
+        finally:
+            # The server is long-lived (unlike the CLI's atexit sweep) — a mirrored job's
+            # throwaway JobStore dir must be removed right after this call, not left to leak.
+            if tmp_home is not None:
+                shutil.rmtree(tmp_home, ignore_errors=True)
 
     @mcp.tool
     def logs(job_id: str, tail: int | None = 100) -> dict[str, Any]:
-        """Tail a job's logs; returns {lines: [...]} (FR-D1)."""
-        _require(job_id)
-        return {"lines": _lab_for(job_id).logs(job_id, tail=tail)}
+        """Tail a job's logs; returns {lines: [...]} (FR-D1). Scheduler-launched (deferred) jobs
+        fall back to the mirrored manifest (spec §4.3), matching `status`; since their logs only
+        live durably on the scheduler host, this may legitimately return an empty list rather
+        than an error."""
+        the_lab, tmp_home = _lab_for_any(job_id)
+        try:
+            return {"lines": the_lab.logs(job_id, tail=tail)}
+        finally:
+            if tmp_home is not None:
+                shutil.rmtree(tmp_home, ignore_errors=True)
 
     @mcp.tool
     def fetch_artifacts(job_id: str) -> dict[str, Any]:
-        """Collect artifacts into runs/<job_id>/; returns {local_paths, artifacts} (FR-E2)."""
-        _require(job_id)
-        arts = _lab_for(job_id).fetch_artifacts(job_id)
-        return {
-            "local_paths": [a.path for a in arts],
-            "artifacts": [a.model_dump() for a in arts],
-        }
+        """Collect artifacts into runs/<job_id>/; returns {local_paths, artifacts} (FR-E2).
+        Scheduler-launched (deferred) jobs fall back to the mirrored manifest (spec §4.3),
+        matching `status`, and are first collected into a throwaway temp directory instead of
+        runs/<job_id>/ (this project's runs/ never supervised them) — populated from R2 when
+        the job's manifest carries an artifacts_uri, empty otherwise. Before that temp
+        directory is removed, any collected files are copied into the real runs/<job_id>/
+        output/ (no manifest.json is written there, so cancel/reconcile still correctly treat
+        the job as not locally supervised) so the returned local_paths remain valid once this
+        call has returned — the server is long-lived and can never rely on process-exit cleanup
+        timing the way the CLI's one-shot `fetch` does."""
+        the_lab, tmp_home = _lab_for_any(job_id)
+        try:
+            arts = the_lab.fetch_artifacts(job_id)
+            if tmp_home is not None and arts:
+                # Mirrored job: `arts[*].path` points into `tmp_home`, which is deleted in the
+                # `finally` below — before the caller ever sees this call's return value. Copy
+                # the bytes into the real, durable runs/<job_id>/output/ first and rewrite the
+                # paths to match. Deliberately a plain file copy, never `store.create`/
+                # `write_manifest`: writing a manifest.json here would make this mirror-only job
+                # look locally supervised to `cancel`/`reconcile` (see `_lab_for_mirrored`).
+                real_out = store.output_dir(job_id)
+                real_out.mkdir(parents=True, exist_ok=True)
+                copied = []
+                for a in arts:
+                    dest = real_out / a.name
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(a.path, dest)
+                    copied.append(a.model_copy(update={"path": str(dest)}))
+                arts = copied
+            return {
+                "local_paths": [a.path for a in arts],
+                "artifacts": [a.model_dump() for a in arts],
+            }
+        finally:
+            if tmp_home is not None:
+                shutil.rmtree(tmp_home, ignore_errors=True)
 
     @mcp.tool
     def cancel(job_id: str) -> dict[str, Any]:

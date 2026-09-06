@@ -69,3 +69,31 @@ def test_queue_list_heartbeat_paused_is_none_with_no_heartbeat_yet(
     data = json.loads(result.output)
     assert data["heartbeat_paused"] is None
     assert data["tick_count"] is None
+
+
+def test_queue_list_never_crashes_with_attributeerror_on_a_flaky_r2_read(monkeypatch) -> None:
+    """2026-09-05 incident: `queue list` crashed with AttributeError('NoneType' object has no
+    attribute 'get') -- traced to R2Store.get_text's exception handler, which called `.get()` on
+    `getattr(e, "response", {})` without accounting for `.response` being present-but-None (not
+    every boto/network exception is a botocore ClientError with a dict response). Root cause is
+    in storage.py; this proves `queue list` itself never surfaces that shape of crash again."""
+    import lab.cli as cli_mod
+    from lab.scheduler.r2queue import R2QueueStore
+    from lab.storage import R2Store
+
+    class _FlakyError(Exception):
+        response = None
+
+    class FlakyClient:
+        def list_objects_v2(self, Bucket: str, Prefix: str, **kw) -> dict:
+            return {"Contents": [], "IsTruncated": False}
+
+        def get_object(self, Bucket: str, Key: str) -> dict:
+            raise _FlakyError("transient network error")
+
+    store = R2Store("https://example.test", "bucket", client=FlakyClient())
+    monkeypatch.setattr(cli_mod, "default_queue", lambda: R2QueueStore(store, prefix="queue"))
+
+    result = runner.invoke(app, ["queue", "list"])
+
+    assert not isinstance(result.exception, AttributeError), result.output

@@ -558,6 +558,17 @@ class Scheduler:
             reg, RegState.launched, reason=None, job_id=job_id, launched_at=self.now_fn()
         )
         rep.launched.append(reg.reg_id)
+        try:
+            # Mirror immediately rather than waiting for the next tick's `_sync` (up to 60s away,
+            # systemd timer): `lab.submit` above already persisted a fully valid JobManifest (all
+            # required fields set) to the local store before returning `job_id`, so there is no
+            # reason the mirror a laptop/MCP caller reads via `read_mirrored` should ever show a
+            # job as `launched` on its entry but absent from the mirror. Best-effort: a failure
+            # here just means the next `_sync` mirrors it instead (spec §5 — a bad write must
+            # never undo an already-successful launch).
+            self.queue.mirror_manifest(self.store.read_manifest(job_id))
+        except Exception as e:  # noqa: BLE001 — mirroring is best-effort visibility, not launch
+            rep.errors.append(f"{reg.reg_id}: initial mirror failed: {e}"[:300])
 
     def _repair_launching(self, reg: Registration, rep: TickReport) -> None:
         """A tick crashed mid-launch (spec §5): decide from evidence, after a grace period."""

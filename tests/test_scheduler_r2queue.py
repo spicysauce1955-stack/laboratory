@@ -4,6 +4,8 @@ import io
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from helpers import make_manifest
 from lab.models import CodeRef, JobSpec
 from lab.scheduler.models import ControlConfig, Guardrails, Registration, RegState
@@ -122,3 +124,80 @@ def test_state_update_overwrites():
     q.put_entry(_reg("reg-a"))
     q.put_entry(q.get_entry("reg-a").model_copy(update={"state": RegState.launched}))
     assert q.get_entry("reg-a").state is RegState.launched
+
+
+def test_read_mirrored_partial_manifest_returns_none_instead_of_crashing():
+    """A stub/partial JSON blob in the mirror (e.g. a version-skewed scheduler host, or a read
+    racing an in-progress write) must degrade to "not yet available", never raise an unhandled
+    pydantic ValidationError (2026-09-04 `lab status` incident: 7 required fields missing)."""
+    q, fake = make_q()
+    fake.blobs["queue/jobs/partial.json"] = b'{"job_id": "partial", "mirrored": true}'
+    assert q.read_mirrored("partial") is None
+
+
+def test_read_mirrored_corrupt_bytes_returns_none_instead_of_crashing():
+    """The same crash class as the partial-manifest fix above, one layer deeper: genuinely
+    corrupted (non-UTF-8) blob bytes raise UnicodeDecodeError out of `R2Store.get_text`'s
+    `.decode()` before `model_validate_json` ever sees the text, so a guard that only catches
+    `pydantic.ValidationError` around the parse call still crashes the caller."""
+    q, fake = make_q()
+    fake.blobs["queue/jobs/corrupt.json"] = b"\xff\xfe\x00bad-bytes"
+    assert q.read_mirrored("corrupt") is None
+
+
+def test_list_mirrored_skips_corrupt_bytes_instead_of_crashing():
+    """list_mirrored sibling of the corrupt-bytes fix above: one blob with non-UTF-8 bytes must
+    be skipped, not take down the whole listing."""
+    q, fake = make_q()
+    q.mirror_manifest(make_manifest("good", "python x.py"))
+    fake.blobs["queue/jobs/corrupt.json"] = b"\xff\xfe\x00bad-bytes"
+    got = q.list_mirrored()
+    assert [m.job_id for m in got] == ["good"]
+
+
+def test_list_mirrored_skips_partial_manifest_instead_of_crashing():
+    """The sibling of the read_mirrored fix above: one corrupt/partial manifest anywhere in the
+    mirror must not take down the whole listing — it should be skipped, with the rest of the
+    jobs still returned (2026-09-06 review: list_mirrored had the same unguarded
+    model_validate_json call read_mirrored was fixed for, but in a loop, so it was worse — one
+    bad file failed every caller's listing, not just that one job's lookup)."""
+    q, fake = make_q()
+    q.mirror_manifest(make_manifest("good", "python x.py"))
+    fake.blobs["queue/jobs/partial.json"] = b'{"job_id": "partial", "mirrored": true}'
+    got = q.list_mirrored()
+    assert [m.job_id for m in got] == ["good"]
+
+
+def test_read_mirrored_permission_error_propagates():
+    """A real, persistent I/O failure from the backing store (bad permissions, a broken
+    connection) is not corruption and must surface, not degrade to "not yet available" —
+    confirms R2QueueStore's guard was never (and must never be) broadened past
+    `(ValidationError, UnicodeDecodeError)` the way LocalQueueStore's briefly was
+    (2026-09-06 review)."""
+    q, fake = make_q()
+
+    def _raise(Bucket: str, Key: str) -> dict:
+        raise PermissionError("permission denied")
+
+    fake.get_object = _raise  # type: ignore[method-assign]
+    with pytest.raises(PermissionError):
+        q.read_mirrored("whatever")
+
+
+def test_list_mirrored_permission_error_propagates():
+    """list_mirrored sibling of the read_mirrored case above: a real I/O failure on one manifest
+    must propagate, not be swallowed as if it were just one skipped/corrupt blob among many."""
+    q, fake = make_q()
+    q.mirror_manifest(make_manifest("good", "python x.py"))
+    fake.blobs["queue/jobs/locked.json"] = b"{}"
+
+    real_get_object = fake.get_object
+
+    def _flaky_get_object(Bucket: str, Key: str) -> dict:
+        if Key.endswith("locked.json"):
+            raise PermissionError("permission denied")
+        return real_get_object(Bucket, Key)
+
+    fake.get_object = _flaky_get_object  # type: ignore[method-assign]
+    with pytest.raises(PermissionError):
+        q.list_mirrored()

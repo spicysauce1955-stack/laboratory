@@ -4,6 +4,67 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning is 
 breaks the surface in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md); MINOR may, and says so
 with a **BREAKING** entry and an upgrade note.
 
+## v0.11.0 — 2026-09-06
+
+A systematic audit of this machine's event ledger and notes store (60 days of `lab history`,
+every job launched in the last 3 days, and the notes index itself) turned up a cluster of real
+bugs, most surfaced only once the actual production data was read rather than guessed at.
+
+### Fixed
+
+- **`lab note` silently truncated or corrupted real notes.** Not a length limit, as first
+  suspected: the note-text sanitizer reused the generic 512-char argv-truncation cap, which had
+  silently cut **15 of 27 real production notes**, several mid-sentence, with no warning anywhere.
+  A separate `shlex`-based secret-masking pass also corrupted ordinary apostrophes/quotes in prose
+  (`"today's"` → `"todays"`). Both replaced with a purpose-built free-text masker (`mask_text`)
+  that has no length cap and never quote-interprets prose.
+- **The masker itself went through several rounds of hardening** once real adversarial input was
+  tried against it: a bare secret with no `--flag=` prefix was going completely unmasked; ordinary
+  hyphenated words (`pass-key`, `well-authenticated`) were getting corrupted by an over-eager
+  flag-shaped match; a quoted multi-word flag value was only half-masked; a boolean flag
+  immediately followed by another flag could swallow the second flag as if it were the first's
+  value, leaving a real secret right after it completely unmasked; and an unmatched quote
+  character could span the mask across unrelated later prose to the next apostrophe in the text.
+  Single-quote value-quoting was dropped entirely (English prose uses apostrophes constantly and
+  `"` almost never) in favor of a length-bounded double-quote match.
+- **`usage_error` ledger events carried no error message**, even though click/typer had already
+  printed a real message to stderr — the exception is discarded before `SystemExit` reaches the
+  ledger writer. Now captured (and, since a rejected option value can itself be secret-shaped,
+  masked the same way note text is) before being written.
+- **A scheduler-launched job's manifest could crash `lab status`/`lab queue list`** instead of
+  degrading gracefully. The scheduler only mirrored a launch on the *next* tick (up to 60s later),
+  leaving a real window where the mirror read hit a partial record; fixed at the write site
+  (mirror immediately after submit) plus broadened read-side guards (a schema-invalid manifest, or
+  genuinely corrupt/undecodable bytes, degrade to "not found" instead of crashing). `R2Store`'s
+  error-shape handling was similarly hardened against a `None`/non-dict `response` or `Error`
+  field, several layers of the same crash class.
+- **`fetch`/`metrics`/`logs` (CLI and MCP) now work on scheduler-launched jobs**, matching the
+  documented workflow ("`lab status` → `lab fetch`, artifacts come from R2") — every one of these
+  calls failed 100% of the time in production before this fix. Getting this right took two more
+  passes: the first fix seeded the job's manifest into the *real* local job store to satisfy the
+  backend's own internal bookkeeping, which silently defeated `cancel`'s deliberate refusal to act
+  on a job this machine never supervised (and would have exposed it to `reconcile`'s unsupervised-
+  job pass) — replaced with an ephemeral, throwaway job store that never touches `runs/<job_id>/`.
+  The second pass found that fetched artifacts were being deleted (temp-directory cleanup) before
+  the reported paths could ever be read — fixed by copying them into the real
+  `runs/<job_id>/output/` (never the manifest) before cleanup. `cancel` deliberately does **not**
+  get the mirror-fallback treatment — it redirects to `lab queue cancel <reg_id>` instead, since a
+  direct cross-machine teardown is a correctness question (SkyPilot API-server version skew), not
+  just a UX gap.
+- **`parse_duration` leaked a bare `float()` parse error** (`could not convert string to float:
+  '3h30'`) on any malformed duration string instead of a clear message.
+- **`lab kill` is now recognized** as a typo for `cancel` (`abort`/`terminate`/`rm`/`delete` already
+  were).
+
+### BREAKING
+
+- **`lab note --agent` is no longer a boolean flag.** A bare, value-less `--agent` is now a usage
+  error; it takes a value (`--agent=` for the old behavior, `--agent=NAME` / `--agent NAME` to name
+  the author). Three rounds of guessing whether a stray token after `--agent` was a name or the job
+  id kept finding new misfiles, including silently discarding a real, non-standard-shaped job id —
+  a value-bearing option removes the guessing entirely. **Upgrade:** any script passing bare
+  `--agent` needs `--agent=` instead; anything using `--agent NAME`/`--agent=NAME` is unaffected.
+
 ## v0.10.0 — 2026-08-27
 
 Two defects surfaced from the same instinct — trust but verify what "leak-free" and "deployed"

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import math
 import re
-import shlex
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -24,6 +23,56 @@ _SECRET_VALUE = (
     re.compile(r"^[A-Za-z0-9+/]{40,}={0,2}$"),  # bare base64 blobs
 )
 _HEXISH = re.compile(r"^[0-9a-f-]+$", re.IGNORECASE)  # commits, cell ids, job ids — not secrets
+# A `--flag=value` or `--flag value` pair anywhere inside a larger string. Matched directly
+# against the raw text (see `_mask_command_line`) rather than by tokenizing it — free text is not
+# shell-quoted, and treating it as if it were is its own bug (below). Naive versions of this get
+# several things wrong; each is fixed here:
+#   - no boundary before the dash, so it fires *inside* an ordinary hyphenated word ("pass-key",
+#     "well-authenticated" — the `-key`/`-auth...` tail reads as a flag). `(?<!\w)` requires the
+#     character right before the dash(es) be a non-word character (or start of string), which an
+#     ordinary compound word never has.
+#   - a bare `\S+` value alternative with no restriction on its own shape will happily match a
+#     *following* `--flag` token as if it were the current flag's value (`--dry-run --api-key ...`
+#     matches flag=`--dry-run`, value=`--api-key`, consuming both in one span). That leaves the
+#     real flag+secret pair never independently tried — the secret sails through unmasked. Fixed
+#     by `(?!-)\S+`: a bare value may not itself start with `-`, so a boolean flag immediately
+#     followed by another flag (nothing real between them) simply fails to match here at all —
+#     correctly, since it isn't a `flag=value` pair — and the scan resumes at the next flag,
+#     giving it its own independent match.
+#   - an *unbounded* quoted-value alternative (`'[^']*'`) has no cap on distance: if the opening
+#     quote has no genuine closing partner nearby, backtracking happily extends the match to the
+#     next literal quote character anywhere later in the string — including an ordinary
+#     apostrophe inside an unrelated contraction many words away, silently deleting real prose in
+#     between. Double quotes carry far less of this risk in ordinary English prose (contractions
+#     never use `"`), so only `"..."` is treated as a genuine quoted value; a `'`-containing value
+#     (an unterminated quote, a contraction) falls through to the bare-token alternative above,
+#     which is bounded by the next whitespace/flag — at worst one word gets swept up, never an
+#     unbounded span. The double-quoted alternative is itself still explicitly bounded in length
+#     (`{0,200}`, no newline) so even a genuinely unterminated `"` can't reach an unrelated `"`
+#     much later in a long note.
+_INLINE_FLAG = re.compile(
+    r"""
+    (?<!\w)                     # boundary: not glued onto a preceding word character
+    (--?[A-Za-z][\w-]*)         # the flag itself, e.g. --api-key, -k
+    (=|\s+)                     # separator: inline '=' or one-or-more whitespace
+    ("[^"\n]{0,200}"|(?!-)\S+)  # value: a bounded double-quoted span as one unit, else a bare
+                                 # token that doesn't itself look like a flag
+    """,
+    re.VERBOSE,
+)
+# Flag names treated as "this looks like it holds a secret" by `_mask_flag` below — deliberately
+# narrower than `_SECRET_KEY` (which stays as-is for dict keys in `_walk` and real argv tokens in
+# `_mask_tokens`, both different, less ambiguous contexts). `_SECRET_KEY` includes "auth", which
+# also matches plenty of ordinary, non-secret-bearing flag names that just *mention* auth
+# (`--basic-auth`, `--no-auth`) with nothing secret-shaped following — "auth" alone is too weak a
+# signal once it's being matched against arbitrary prose rather than a known argv key. Word-
+# boundary anchored so "keyword" (one glued-together word, no separator) does not match "key" the
+# way "--api-key" (a real hyphen-separated segment) does.
+_SENSITIVE_FLAG_NAME = re.compile(r"\b(?:key|token|secret|password|credential)\b", re.IGNORECASE)
+# A free-standing word, for the pass that catches a secret with no flag in front of it at all
+# (e.g. "failed with key AKIA... during connect"). Applied only to text `_INLINE_FLAG` did not
+# already consume/mask, via a second, independent sweep — see `_mask_command_line`.
+_WORD = re.compile(r"\S+")
 
 
 def _entropy(s: str) -> float:
@@ -69,31 +118,97 @@ def _mask_tokens(tokens: Sequence[str]) -> list[str]:
 def _mask_command_line(text: str) -> str:
     """A single string parameter that is actually a whole command line (the common lab
     invocation: ``lab submit -c "python train.py --hf-token=..."`` puts it in one argv token, and
-    MCP's ``command`` argument is the same shape). The flag-aware masking above only ever saw
-    separate argv tokens, so a secret hiding as a flag *value* inside one string token — where it
-    has spaces around it, so ``_looks_secret`` bails, and ``redact()`` doesn't know the flag name
-    — sailed through unmasked. Tolerant splitting: try ``shlex.split`` (handles quoting), fall
-    back to ``.split()`` on a malformed quote — this must never raise."""
-    try:
-        tokens = shlex.split(text)
-    except ValueError:
-        tokens = text.split()
-    if len(tokens) < 2:
-        return text  # nothing shaped like a multi-token command; leave it as-is
-    return " ".join(_mask_tokens(tokens))
+    MCP's ``command`` argument is the same shape), or free-form prose (a ``lab note``) that
+    happens to contain a secret. Two independent passes, because neither alone is a complete
+    masking strategy:
+
+    1. Flag-aware (``_INLINE_FLAG``): masks a ``--flag=value``/``--flag value`` pair — quoted
+       value included, as one unit — when the flag name looks secret-shaped. The flag-aware
+       masking above (``_mask_tokens``) only ever saw separate argv tokens, so a secret hiding as
+       a flag *value* inside one string token — where it has spaces around it, so
+       ``_looks_secret`` bails, and ``redact()`` doesn't know the flag name — sailed through
+       unmasked.
+    2. Free-standing-secret (``_WORD`` + ``_looks_secret``): catches a bare secret-shaped string
+       with no flag in front of it at all — the common shape of pasted error text/tracebacks,
+       which is exactly what ``lab note`` exists to hold. Only pass 1 knows about flags; this
+       pass reuses the same shape/entropy check ``_looks_secret`` applies elsewhere, run
+       word-by-word over whatever pass 1 left behind (a word pass 1 already replaced with
+       ``MASK`` trivially fails this check and is left alone).
+
+    Both passes are matched directly against ``text`` with a regex, not by ``shlex.split``-ing it
+    into tokens and rejoining: this used to tokenize with ``shlex``, which treats ``'`` and ``"``
+    as *shell* quoting. Free text is not shell-quoted — a contraction (``it's``, ``wasn't``) or a
+    quoted word is an apostrophe or a quotation mark, not the start of a span to swallow — and an
+    even number of them across a note's text (or one that happens to balance against a later
+    ``'``) made ``shlex.split`` succeed *silently*, stripping the quote characters and gluing
+    everything between them into one token, mangling the text with no error or warning. A regex
+    substitution touches only an actual ``flag=value``/``flag value`` pair (pass 1) or a single
+    secret-shaped word (pass 2) and leaves every other character — punctuation, quotes,
+    whitespace, ordinary hyphenated words — exactly as written. Never raises.
+    """
+
+    def _mask_flag(m: re.Match[str]) -> str:
+        flag, sep, value = m.group(1), m.group(2), m.group(3)
+        # Strip a value's surrounding quotes before judging its shape — `_looks_secret` should
+        # see "abc def ghi", not '"abc def ghi"'. Only double quotes are ever treated as a
+        # genuine delimiter here (see `_INLINE_FLAG` above) — a single quote in `value` is just
+        # part of a bare token (an unterminated quote, a contraction), never something to strip.
+        # Only mask when there's actual reason to believe a secret is here: either the value
+        # itself is secret-shaped (catches a real secret behind an unremarkable flag name, e.g.
+        # `--seed <token>`), or the flag name is one of the established sensitive names (catches
+        # a short, low-entropy secret — `--password hunter2` — that `_looks_secret`'s
+        # length/entropy bar alone would miss). Masking on flag name alone unconditionally (the
+        # prior behavior) is what over-masked ordinary prose that merely *mentions* a flag
+        # (`--basic-auth flag`, `--keyword search`).
+        quoted = len(value) >= 2 and value[0] == '"' and value[-1] == '"'
+        stripped = value[1:-1] if quoted else value
+        if _looks_secret(stripped) or _SENSITIVE_FLAG_NAME.search(flag):
+            return f"{flag}{sep}{MASK}"
+        return m.group(0)
+
+    def _mask_word(m: re.Match[str]) -> str:
+        word = m.group(0)
+        return MASK if _looks_secret(word) else word
+
+    text = _INLINE_FLAG.sub(_mask_flag, text)
+    return _WORD.sub(_mask_word, text)
+
+
+def _mask_secrets(value: str) -> str:
+    """Secret-masking only, no length cap: the piece of ``_scalar`` a caller whose whole point
+    is holding free text in full (``lab.notes``) needs on its own — the 512-char cap right after
+    this belongs to the ledger's argv/param records, not to a note body."""
+    if _looks_secret(value):
+        return MASK
+    if re.search(r"\s", value):
+        value = _mask_command_line(value)
+    return redact(value)
 
 
 def _scalar(value: Any) -> Any:
     if isinstance(value, str):
-        if _looks_secret(value):
-            return MASK
-        if re.search(r"\s", value):
-            value = _mask_command_line(value)
-        value = redact(value)
+        value = _mask_secrets(value)
         return value[:MAX_STR] + "…" if len(value) > MAX_STR else value
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     return f"<{type(value).__name__}>"
+
+
+def mask_text(value: str) -> str:
+    """Mask likely secrets in free text, with no length cap (FR-J1).
+
+    ``lab note``'s whole purpose is holding a detailed write-up in full — a couple hundred words
+    is the *expected* shape, not an edge case — so the ledger's 512-char cap (meant for a CLI
+    argv value or a params digest, where a diagnostic summary is all that's wanted) must not
+    apply here. A note's text used to go through :func:`sanitize_argv`, which silently truncated
+    it at 512 characters with no warning: 15 of 27 real notes on file were cut this way, several
+    mid-sentence, with nothing in the record to say so (2026-08/09). Never raises: a masking
+    failure must not take the note down with it.
+    """
+    try:
+        return _mask_secrets(value)
+    except Exception:  # noqa: BLE001 — masking must never fail whatever calls this
+        return value
 
 
 def _walk(value: Any, *, key: str | None = None) -> Any:
