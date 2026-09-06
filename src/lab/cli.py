@@ -9,7 +9,6 @@ import atexit
 import json
 import errno
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -642,14 +641,6 @@ def logs(job_id: str, tail: int = typer.Option(100)) -> None:
         typer.echo(line)
 
 
-# A real job id is always `_new_job_id()`'s shape (`YYYYMMDD-HHMMSS-<6 hex>`) — never a
-# plausible agent name. Used by `note` below to catch the one misparse `extra_args` can't: with
-# NO job id given at all, the lone stray `--agent <name>` token has nothing declared before
-# `job_id` to bind to, so click assigns it there directly (positionals fill in declaration
-# order) instead of to the `extra_args` catch-all, which stays empty.
-_JOB_ID_SHAPE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
-
-
 @app.command()
 def note(
     job_id: str | None = typer.Argument(None, help="the job this is about, if there is one"),
@@ -659,7 +650,15 @@ def note(
     ),
     usd: float | None = typer.Option(None, "--usd", help="dollars this cost, if it cost any"),
     sweep: str | None = typer.Option(None, "--sweep", help="the sweep this is about"),
-    agent: bool = typer.Option(False, "--agent", help="mark the note as written by an agent"),
+    agent: str | None = typer.Option(
+        None,
+        "--agent",
+        help="mark the note as agent-written. Bare `--agent=` (or `--agent=agent`) records "
+        "author \"agent\"; `--agent NAME` / `--agent=NAME` records NAME as the author. A "
+        "value-less `--agent` with nothing after it (not even `=`) is rejected: unlike a plain "
+        "boolean flag, this option always consumes the next token as its value, so `--agent -m "
+        "...` would otherwise silently swallow `-m` — write `--agent=` instead.",
+    ),
     last: bool = typer.Option(
         False, "--last",
         help="attach this note to the most recent failure, so the next run that hits it sees it",
@@ -678,48 +677,34 @@ def note(
     note with no job id is still worth writing — a submit that dies before provisioning never
     gets one, and those are often the notes worth most.
     """
-    author = "agent" if agent else "human"
+    # `--agent` is parsed as an ordinary value-bearing option, never a boolean flag — so its value
+    # is bound directly by click/typer at parse time and never touches `job_id`'s positional slot
+    # or `extra_args`, regardless of where `--agent`/`--agent NAME` falls on the command line.
+    # There is no shape-based guessing here: `job_id` (and any genuinely stray token) are parsed
+    # exactly as declared.
+    if agent is not None and agent.startswith("-"):
+        # click has no concept of "this option's value looks like it was actually another flag"
+        # — given `--agent -m foo`, it binds `-m` to `--agent` as a plain string and leaves `foo`
+        # dangling. That is a real, silent misparse risk this option's own shape can't rule out,
+        # so catch the one shape a real agent name never has (a leading `-`) and fail loudly
+        # instead of filing a note under a bogus author.
+        msg = (
+            f"--agent got {agent!r}, which looks like another flag rather than an agent name. "
+            "--agent always consumes the next token as its value now (no bare, value-less form "
+            "followed by another flag) — write --agent= for an unnamed agent, or --agent=NAME "
+            "to name it."
+        )
+        _emit({"error": msg})
+        _fail(2, msg)
+    author = "human" if agent is None else ("agent" if agent == "" else agent)
     if extra_args:
-        # `--agent` marks the note as agent-written; it takes no value. But real calls (ledger
-        # forensics, 2026-08-26/27) keep writing `--agent claude` / `--agent ws-trainer` as if it
-        # named the agent — the stray name then has nowhere to bind (job_id is already taken) and
-        # click rejects it as an extra argument. That is the actual root cause behind every
-        # observed "note fails on long, detailed text" report: the text was never the problem,
-        # `--agent <name>` was. When that is exactly what happened — `--agent` given, and exactly
-        # one stray token — treat the token as the agent's name instead of failing: strictly more
-        # informative than the plain `"agent"` this used to record, and it is what every one of
-        # those calls actually meant.
-        if agent and len(extra_args) == 1:
-            if (
-                job_id is not None
-                and not _JOB_ID_SHAPE.match(job_id)
-                and _JOB_ID_SHAPE.match(extra_args[0])
-            ):
-                # The name-before-job-id ordering: `--agent <name> <job_id>`. `job_id` (the
-                # first declared positional) absorbed the stray agent-name token, and the real
-                # job id — which came second on the command line — landed in `extra_args`
-                # instead. A real job id always matches `_JOB_ID_SHAPE`; the mis-bound token in
-                # `job_id` here does not. Swap them back.
-                author = job_id
-                job_id = extra_args[0]
-            else:
-                author = extra_args[0]
-        else:
-            joined = " ".join(repr(a) for a in extra_args)
-            msg = (
-                f"unexpected extra argument(s): {joined}. If this was meant as the note text, "
-                "pass it with -m/--text (it looks like that flag was left off). --agent takes "
-                "no value, so a name after it only works when it is the one stray token."
-            )
-            _emit({"error": msg})
-            _fail(2, msg)
-    elif agent and job_id is not None and not _JOB_ID_SHAPE.match(job_id):
-        # Same misuse as the `extra_args` case above, one token earlier: no job id was given,
-        # so the lone stray `--agent <name>` token bound straight to `job_id` instead of landing
-        # in `extra_args` (see `_JOB_ID_SHAPE`'s comment). A real job id always matches that
-        # shape; anything else here is the agent's name, mis-parsed as a job id.
-        author = job_id
-        job_id = None
+        joined = " ".join(repr(a) for a in extra_args)
+        msg = (
+            f"unexpected extra argument(s): {joined}. If this was meant as the note text, "
+            "pass it with -m/--text (it looks like that flag was left off)."
+        )
+        _emit({"error": msg})
+        _fail(2, msg)
     facets: dict[str, Any] = {}
     home = repo_root() / "runs"
     if job_id is not None:
@@ -894,9 +879,33 @@ def metrics(
 def fetch(job_id: str) -> None:
     """Collect artifacts into runs/<job_id>/; prints local paths (FR-E2). Artifacts live in R2
     regardless of which machine ran the job, so scheduler-launched jobs fall back to the
-    mirrored manifest (spec §4.3), same as `lab status`."""
+    mirrored manifest (spec §4.3), same as `lab status`.
+
+    A mirror-only job's `Lab` is built over a throwaway temp `JobStore` (see
+    `_lab_for_mirrored`'s docstring), so its artifacts initially land under that temp directory,
+    not this project's own `runs/<job_id>/output/` — and the temp directory is removed via
+    `atexit`, after this process exits. Left alone, the `local_paths` reported here would point
+    into a directory that is gone by the time anything can actually read them back, defeating
+    the point of `fetch`. So any artifact not already under this project's own `runs/` is copied
+    (plain file copy — never `manifest.json`, which is what would make `cancel`/`reconcile`'s
+    unsupervised-job pass start treating this job as locally supervised; see
+    `_lab_for_mirrored`) into the real `runs/<job_id>/output/` before the paths are reported.
+    """
     arts = _lab_for_mirrored_or_fail(job_id).fetch_artifacts(job_id)
-    _emit({"local_paths": [a.path for a in arts], "artifacts": [a.model_dump() for a in arts]})
+    real_runs = (repo_root() / "runs").resolve()
+    real_out = real_runs / job_id / "output"
+    local_paths: list[str] = []
+    for a in arts:
+        src = Path(a.path).resolve()
+        if src.is_relative_to(real_runs):
+            # Already durable — this machine actually ran the job locally.
+            local_paths.append(str(src))
+            continue
+        dest = real_out / a.name  # `a.name` is `path`'s slash-path relative to output/
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        local_paths.append(str(dest))
+    _emit({"local_paths": local_paths, "artifacts": [a.model_dump() for a in arts]})
 
 
 @app.command()
