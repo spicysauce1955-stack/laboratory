@@ -34,7 +34,7 @@ from lab.events import store as events_store
 from lab.events.annotate import digest_of, refs_from
 from lab.events.sanitize import sanitize_argv
 from lab.manifest import git_work_tree, repo_root
-from lab.models import JobSpec, ResourceRequest
+from lab.models import JobManifest, JobSpec, ResourceRequest
 from lab.scheduler.models import Guardrails, RegState, Triggers
 from lab.scheduler.price import PriceFeed
 from lab.scheduler.queue import QueueStore, default_queue, wait_for_queue_drain
@@ -164,15 +164,82 @@ def _lab_for(job_id: str) -> Lab:
 
 
 def _lab_for_or_fail(job_id: str) -> Lab:
-    """`_lab_for`, but a job missing from the local store is a structured error (FR-F3) —
-    scheduler-launched jobs mirror only their manifest, so logs/metrics/fetch live on the
-    scheduler host; `lab status` is the command that reads the mirror."""
+    """`_lab_for`, but a job missing from the local store is a structured error (FR-F3).
+
+    Deliberately does NOT fall back to the scheduler's mirrored manifest the way
+    `_lab_for_mirrored_or_fail` does: this is used by `cancel`, which reaches into a live
+    backend, and cross-machine SkyPilot client/server version skew (`lab._skycompat`) makes
+    acting on a job this machine never locally supervised a real correctness risk, not just an
+    inconvenience — see `cancel`'s own docstring."""
     try:
         return _lab_for(job_id)
     except FileNotFoundError:
         msg = (
             f"unknown job id {job_id!r} — not in local runs/ "
             "(for scheduler-launched jobs only `lab status` reads the mirrored manifest)"
+        )
+        _emit({"error": msg})
+        _fail(2, msg)
+
+
+def _read_mirrored_manifest_or_fail(job_id: str) -> JobManifest:
+    """Look up ``job_id`` in the scheduler's mirrored queue (spec §4.3).
+
+    Raises :class:`FileNotFoundError`, like local ``JobStore.read_manifest``, when the mirror
+    has nothing for this job either — so callers can treat "absent everywhere" uniformly.
+    ``read_mirrored`` can currently raise outright on a partial/stub mirrored manifest (a
+    separate, in-flight fix elsewhere in ``scheduler/queue.py``/``r2queue.py``); that is not this
+    code path's bug to swallow, so it is surfaced as a clear "not yet available" message rather
+    than an unhandled traceback.
+    """
+    from lab.scheduler.queue import default_queue
+
+    try:
+        mirrored = default_queue().read_mirrored(job_id)
+    except Exception as e:  # noqa: BLE001 — a still-landing mirror bug must not crash this path
+        msg = f"job {job_id!r} manifest not yet available (mirror read failed: {e}); try again shortly"
+        _emit({"error": msg})
+        _fail(2, msg)
+    if mirrored is None:
+        raise FileNotFoundError(job_id)
+    return mirrored
+
+
+def _lab_for_mirrored(job_id: str) -> Lab:
+    """`_lab_for`, but falls back to the scheduler's mirrored manifest (spec §4.3) when the job
+    never ran locally — the same fallback `job_status_view` already uses for `lab status`.
+
+    Used by `logs`/`metrics`/`fetch`: these only read durable/remote state (R2 artifacts, or
+    status the backend itself reports), so building the backend handle from a mirrored
+    manifest's ``backend.provisioner`` is safe in a way that acting via `cancel` is not.
+    """
+    home = repo_root() / "runs"
+    store = JobStore(home)
+    try:
+        provisioner = store.read_manifest(job_id).backend.provisioner
+    except FileNotFoundError:
+        mirrored = _read_mirrored_manifest_or_fail(job_id)
+        # Every backend's own bookkeeping (e.g. `collect_artifacts`/`status` calling
+        # `store.update_manifest`) assumes a local manifest exists, which is otherwise true for
+        # every job this machine has ever touched. Seed a local copy so those calls have
+        # something to read/write. `write_manifest`, not `store.create`: this is a read-through
+        # cache of a manifest the scheduler already validated and mirrored, not a new job — it
+        # must skip the fail-closed provenance re-check and must not register this machine as
+        # the job's owner in the machine-wide attribution index.
+        store.write_manifest(mirrored)
+        provisioner = mirrored.backend.provisioner
+    return default_lab(home=home, backend=provisioner)
+
+
+def _lab_for_mirrored_or_fail(job_id: str) -> Lab:
+    """`_lab_for_mirrored`, but a job missing from both local runs/ and the mirror is a
+    structured error (FR-F3)."""
+    try:
+        return _lab_for_mirrored(job_id)
+    except FileNotFoundError:
+        msg = (
+            f"unknown job id {job_id!r} — not in local runs/ and not in the scheduler's "
+            "mirrored queue"
         )
         _emit({"error": msg})
         _fail(2, msg)
@@ -531,8 +598,9 @@ def status(job_id: str) -> None:
 
 @app.command()
 def logs(job_id: str, tail: int = typer.Option(100)) -> None:
-    """Tail a job's logs (FR-D1)."""
-    for line in _lab_for_or_fail(job_id).logs(job_id, tail=tail):
+    """Tail a job's logs (FR-D1); scheduler-launched jobs fall back to the mirrored manifest
+    (spec §4.3), same as `lab status`."""
+    for line in _lab_for_mirrored_or_fail(job_id).logs(job_id, tail=tail):
         typer.echo(line)
 
 
@@ -721,21 +789,78 @@ def metrics(
     name: list[str] = typer.Option(None, "--name", "-n", help="filter to these metric names"),
     since_step: int | None = typer.Option(None, help="only points with step > since_step"),
 ) -> None:
-    """Query a job's incremental metric series (FR-D2 — the early-kill loop)."""
-    _emit({"series": _lab_for_or_fail(job_id).metrics(job_id, names=name or None, since_step=since_step)})
+    """Query a job's incremental metric series (FR-D2 — the early-kill loop); scheduler-launched
+    jobs fall back to the mirrored manifest (spec §4.3), same as `lab status`."""
+    _emit(
+        {"series": _lab_for_mirrored_or_fail(job_id).metrics(job_id, names=name or None, since_step=since_step)}
+    )
 
 
 @app.command()
 def fetch(job_id: str) -> None:
-    """Collect artifacts into runs/<job_id>/; prints local paths (FR-E2)."""
-    arts = _lab_for_or_fail(job_id).fetch_artifacts(job_id)
+    """Collect artifacts into runs/<job_id>/; prints local paths (FR-E2). Artifacts live in R2
+    regardless of which machine ran the job, so scheduler-launched jobs fall back to the
+    mirrored manifest (spec §4.3), same as `lab status`."""
+    arts = _lab_for_mirrored_or_fail(job_id).fetch_artifacts(job_id)
     _emit({"local_paths": [a.path for a in arts], "artifacts": [a.model_dump() for a in arts]})
 
 
 @app.command()
 def cancel(job_id: str) -> None:
-    """Cancel a job and tear down its machine (FR-A3, FR-C2)."""
-    _emit({"job_id": job_id, "state": _lab_for_or_fail(job_id).cancel(job_id).value})
+    """Cancel a job and tear down its machine (FR-A3, FR-C2).
+
+    Deliberately does NOT fall back to the mirrored manifest the way `logs`/`metrics`/`fetch`
+    do: cancelling reaches into a live backend from this machine, and cross-machine SkyPilot
+    client/server version skew (`lab._skycompat`) makes acting on a job this machine never
+    locally supervised a real correctness risk. A scheduler-launched job is cancelled by
+    registering the cancellation with the scheduler instead (`lab queue cancel <reg_id>`,
+    applied on its next tick, within 60s) — so a job absent from local `runs/` but present in
+    the mirror gets a redirect to that command instead of a generic "unknown job id".
+    """
+    try:
+        the_lab = _lab_for(job_id)
+    except FileNotFoundError:
+        msg = _cancel_redirect_message(job_id)
+        _emit({"error": msg})
+        _fail(2, msg)
+    _emit({"job_id": job_id, "state": the_lab.cancel(job_id).value})
+
+
+def _cancel_redirect_message(job_id: str) -> str:
+    """The error `cancel` gives for a job absent from local `runs/`: tells apart a job this
+    machine has never heard of at all from one that IS real, just launched elsewhere by the
+    scheduler — which needs `lab queue cancel`, never a local `cancel` attempt (see `cancel`'s
+    docstring). Best-effort: a `read_mirrored` crash on a not-yet-fixed partial manifest (a
+    separate, in-flight fix elsewhere) must not crash `cancel`'s own error path, so it degrades
+    to a plain "could not check" message instead of asserting the job is unknown outright.
+    """
+    from lab.scheduler.queue import default_queue
+
+    generic = (
+        f"unknown job id {job_id!r} — not in local runs/ "
+        "(for scheduler-launched jobs only `lab status` reads the mirrored manifest)"
+    )
+    queue = default_queue()
+    try:
+        mirrored = queue.read_mirrored(job_id)
+    except Exception as e:  # noqa: BLE001 — a still-landing mirror bug must not crash `cancel`
+        return (
+            f"job {job_id!r} is not in local runs/, and its mirrored manifest could not be read "
+            f"({e}) — try again shortly, or check `lab queue list` for a matching registration"
+        )
+    if mirrored is None:
+        return generic
+    reg_id = next((r.reg_id for r in queue.list_entries() if r.job_id == job_id), None)
+    if reg_id is not None:
+        return (
+            f"job {job_id!r} is scheduler-launched (registration {reg_id!r}) — cancel it with "
+            f"`lab queue cancel {reg_id}` (applied on the scheduler's next tick, within 60s); "
+            "`lab cancel` does not act on jobs this machine never locally supervised"
+        )
+    return (
+        f"job {job_id!r} is scheduler-launched — cancel it via `lab queue cancel` for the "
+        "registration that launched it (its reg_id could not be found in the current queue)"
+    )
 
 
 @app.command(name="sweep-status")
