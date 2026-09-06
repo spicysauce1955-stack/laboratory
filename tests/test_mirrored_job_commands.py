@@ -14,13 +14,13 @@ this machine never locally supervised a real correctness risk. It gets a specifi
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 from helpers import PYTHON, make_manifest
 from typer.testing import CliRunner
 
 from lab.cli import app
-from lab.metrics import log_metric
 from lab.models import CodeRef, JobSpec, JobState
 from lab.scheduler.models import Guardrails, Registration, RegState, Triggers
 from lab.scheduler.queue import LocalQueueStore
@@ -83,38 +83,58 @@ class _RaisingQueue:
 
 
 class TestReadOnlyCommandsFallBackToMirror:
-    def test_logs_reads_a_mirror_only_job(self, tmp_path, monkeypatch):
+    def test_logs_does_not_error_on_a_mirror_only_job(self, tmp_path, monkeypatch):
+        """A job this machine never supervised has no local `logs.txt` anywhere it could read
+        one from -- the scheduler only ever uploads `output/` to R2 (`sky_runner.py`'s
+        `r2.upload_dir(store.output_dir(job_id), ...)`), never `logs.txt`, which sits beside it.
+        The fix here is that this no longer errors "unknown job id" the way it did before the
+        mirror fallback existed -- it resolves the job and returns (empty) logs cleanly, and
+        (see TestMirrorReadNeverTouchesTheRealLocalStore) never creates a local manifest."""
         home = _isolate(tmp_path, monkeypatch)
         _mirror_only(tmp_path, "jmir-logs")
-        logs_path = JobStore(home).logs_path("jmir-logs")
-        logs_path.parent.mkdir(parents=True)
-        logs_path.write_text("line one\nline two\n")
 
         result = runner.invoke(app, ["logs", "jmir-logs"])
 
         assert result.exit_code == 0, result.output
-        assert "line one" in result.output
-        assert "line two" in result.output
+        assert result.output.strip() == ""
+        assert not JobStore(home).manifest_path("jmir-logs").exists()
 
-    def test_metrics_reads_a_mirror_only_job(self, tmp_path, monkeypatch):
+    def test_metrics_does_not_error_on_a_mirror_only_job(self, tmp_path, monkeypatch):
+        """Same reasoning as the `logs` case above: no local `metrics.jsonl` exists anywhere
+        this machine can see for a job it never ran, so the correct behaviour is an empty,
+        successful result -- not an error, and not a seeded local manifest."""
         home = _isolate(tmp_path, monkeypatch)
         _mirror_only(tmp_path, "jmir-metrics")
-        out_dir = JobStore(home).output_dir("jmir-metrics")
-        out_dir.mkdir(parents=True)
-        log_metric("accuracy", 0.9, 1, run_dir=out_dir)
 
         result = runner.invoke(app, ["metrics", "jmir-metrics"])
 
         assert result.exit_code == 0, result.output
         data = json.loads(result.output)
-        assert data["series"]["accuracy"][0]["value"] == 0.9
+        assert data["series"] == {}
+        assert not JobStore(home).manifest_path("jmir-metrics").exists()
 
-    def test_fetch_reads_a_mirror_only_job(self, tmp_path, monkeypatch):
+    def test_fetch_recovers_artifacts_from_r2_for_a_mirror_only_job(self, tmp_path, monkeypatch):
+        """Unlike logs/metrics, artifacts genuinely do have a cross-machine recovery path: R2
+        (module docstring; `Lab.fetch_artifacts`'s own fallback). Simulate that path instead of
+        (as before the fix) placing the file directly under this machine's own `runs/` -- which
+        would only be true if this machine were the one that actually ran the job, not what
+        "mirror-only" means."""
         home = _isolate(tmp_path, monkeypatch)
-        _mirror_only(tmp_path, "jmir-fetch")
-        out_dir = JobStore(home).output_dir("jmir-fetch")
-        out_dir.mkdir(parents=True)
-        (out_dir / "result.txt").write_text("42")
+        _mirror_only(tmp_path, "jmir-fetch", artifacts_uri="r2://lab-artifacts/jmir-fetch")
+
+        class _FakeR2Store:
+            @staticmethod
+            def from_env() -> "_FakeR2Store":
+                return _FakeR2Store()
+
+            def download_dir(self, prefix: str, local_dir: Path) -> int:
+                local_dir = Path(local_dir)
+                local_dir.mkdir(parents=True, exist_ok=True)
+                (local_dir / "result.txt").write_text("42")
+                return 1
+
+        monkeypatch.setattr("lab.core.r2_enabled", lambda: True)
+        monkeypatch.setattr("lab.core.R2Store", _FakeR2Store)
 
         result = runner.invoke(app, ["fetch", "jmir-fetch"])
 
@@ -122,8 +142,11 @@ class TestReadOnlyCommandsFallBackToMirror:
         data = json.loads(result.output)
         assert any(a["name"] == "result.txt" for a in data["artifacts"])
         # `collect_artifacts` calls `store.update_manifest`, which needs a local manifest to
-        # exist -- confirms the mirrored manifest was seeded locally, not merely bypassed.
-        assert JobStore(home).read_manifest("jmir-fetch").job_id == "jmir-fetch"
+        # exist -- it gets one from an ephemeral, throwaway JobStore (see `_lab_for_mirrored`),
+        # never the real local store. A mirror-only job must stay invisible to `runs/`, or
+        # `cancel`/`reconcile` could no longer tell it apart from one this machine actually
+        # supervises (see TestMirrorReadNeverTouchesTheRealLocalStore below).
+        assert not JobStore(home).manifest_path("jmir-fetch").exists()
 
     @pytest.mark.parametrize("command", ["logs", "metrics", "fetch"])
     def test_unknown_everywhere_still_gives_the_original_message(
@@ -203,3 +226,91 @@ class TestCancelRedirectsInsteadOfActing:
 
         assert result.exit_code == 2
         assert "could not be read" in result.output
+
+
+# ---------------------------------------------------------------------------
+# safety regression: a read-only mirror-fallback must never create anything
+# that looks like a locally-supervised job -- the bug where `fetch`/`logs`/
+# `metrics` seeded the mirrored manifest into the REAL local store, letting a
+# later `cancel` on the same job bypass its own mirror-redirect safety check
+# and letting `reconcile`'s `unsupervised` pass see (and, under `--apply`,
+# destroy) a job that is actually running fine under the scheduler.
+# ---------------------------------------------------------------------------
+
+
+class TestMirrorReadNeverTouchesTheRealLocalStore:
+    def test_cancel_still_redirects_after_the_job_was_fetched_logged_and_metriced(
+        self, tmp_path, monkeypatch
+    ):
+        home = _isolate(tmp_path, monkeypatch)
+        _mirror_only(tmp_path, "jmir-safety")
+        LocalQueueStore(tmp_path / "queue").put_entry(_reg("reg-safety", "jmir-safety"))
+
+        for command in ("fetch", "logs", "metrics"):
+            touched = runner.invoke(app, [command, "jmir-safety"])
+            assert touched.exit_code == 0, touched.output
+            # none of the three read-only commands may seed the real local store
+            assert not JobStore(home).manifest_path("jmir-safety").exists()
+
+        cancel_result = runner.invoke(app, ["cancel", "jmir-safety"])
+
+        assert cancel_result.exit_code == 2
+        assert "lab queue cancel reg-safety" in cancel_result.output
+        # cancel never proceeded to a real teardown attempt (which would have needed -- and
+        # left behind -- a local manifest to act on)
+        assert not JobStore(home).manifest_path("jmir-safety").exists()
+
+    def test_reconcile_unsupervised_pass_ignores_a_job_only_touched_via_fetch(
+        self, tmp_path, monkeypatch
+    ):
+        from datetime import timedelta
+
+        from lab._util import now
+        from lab.backends.local import LocalBackend
+        from lab.backends.skypilot import GcpNotConfigured
+        from lab.core import Lab
+        from lab.models import BackendInfo
+        from test_leak_blindspots import _patch_empty_sky
+
+        home = _isolate(tmp_path, monkeypatch)
+        _mirror_only(
+            tmp_path,
+            "jmir-recon",
+            status=JobState.running,
+            started_at=now() - timedelta(hours=1),
+            backend=BackendInfo(provisioner="skypilot"),
+        )
+
+        for command in ("fetch", "logs", "metrics"):
+            touched = runner.invoke(app, [command, "jmir-recon"])
+            assert touched.exit_code == 0, touched.output
+        assert not JobStore(home).manifest_path("jmir-recon").exists()
+
+        lab = Lab(backend=LocalBackend(home=home, repo=home.parent), repo=home.parent, home=home)
+        monkeypatch.setattr("lab.backends.skypilot.list_vast_instances", lambda *a, **k: [])
+        _patch_empty_sky(monkeypatch)
+        monkeypatch.setattr("lab.backends.skypilot.list_do_volumes", lambda *a, **k: [])
+
+        def _not_configured(*a: object, **k: object) -> list[dict[str, Any]]:
+            raise GcpNotConfigured("gcp extra not installed in this test environment")
+
+        monkeypatch.setattr("lab.backends.skypilot.list_gcp_instances", _not_configured)
+        monkeypatch.setattr("lab.backends.skypilot.list_gcp_disks", _not_configured)
+
+        report = lab.reconcile()
+
+        assert report["unsupervised"] == []
+
+    def test_confirm_error_message_names_what_actually_works(self, tmp_path, monkeypatch):
+        """Bug 3: the stale message used to say only `lab status` reads the mirrored manifest --
+        no longer true now that `fetch`/`metrics`/`logs` do too (`confirm` itself still doesn't,
+        deliberately, same as `cancel`)."""
+        _isolate(tmp_path, monkeypatch)
+
+        result = runner.invoke(app, ["confirm", "nope"])
+
+        assert result.exit_code == 2
+        assert "fetch" in result.output
+        assert "metrics" in result.output
+        assert "logs" in result.output
+        assert "status" in result.output
