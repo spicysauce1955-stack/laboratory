@@ -443,14 +443,33 @@ def build_server(lab: Lab) -> FastMCP:
     def fetch_artifacts(job_id: str) -> dict[str, Any]:
         """Collect artifacts into runs/<job_id>/; returns {local_paths, artifacts} (FR-E2).
         Scheduler-launched (deferred) jobs fall back to the mirrored manifest (spec §4.3),
-        matching `status`, and are collected into a temp directory instead of runs/<job_id>/
-        (this project's runs/ never supervised them) — populated from R2 when the job's
-        manifest carries an artifacts_uri, empty otherwise. That temp directory (and any
-        R2-downloaded bytes in it) is removed once this call's result is computed — the
-        server is long-lived, so it can never wait for process exit to clean up."""
+        matching `status`, and are first collected into a throwaway temp directory instead of
+        runs/<job_id>/ (this project's runs/ never supervised them) — populated from R2 when
+        the job's manifest carries an artifacts_uri, empty otherwise. Before that temp
+        directory is removed, any collected files are copied into the real runs/<job_id>/
+        output/ (no manifest.json is written there, so cancel/reconcile still correctly treat
+        the job as not locally supervised) so the returned local_paths remain valid once this
+        call has returned — the server is long-lived and can never rely on process-exit cleanup
+        timing the way the CLI's one-shot `fetch` does."""
         the_lab, tmp_home = _lab_for_any(job_id)
         try:
             arts = the_lab.fetch_artifacts(job_id)
+            if tmp_home is not None and arts:
+                # Mirrored job: `arts[*].path` points into `tmp_home`, which is deleted in the
+                # `finally` below — before the caller ever sees this call's return value. Copy
+                # the bytes into the real, durable runs/<job_id>/output/ first and rewrite the
+                # paths to match. Deliberately a plain file copy, never `store.create`/
+                # `write_manifest`: writing a manifest.json here would make this mirror-only job
+                # look locally supervised to `cancel`/`reconcile` (see `_lab_for_mirrored`).
+                real_out = store.output_dir(job_id)
+                real_out.mkdir(parents=True, exist_ok=True)
+                copied = []
+                for a in arts:
+                    dest = real_out / a.name
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(a.path, dest)
+                    copied.append(a.model_copy(update={"path": str(dest)}))
+                arts = copied
             return {
                 "local_paths": [a.path for a in arts],
                 "artifacts": [a.model_dump() for a in arts],
