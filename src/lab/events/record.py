@@ -20,7 +20,7 @@ from typing import Any
 from lab import __version__
 from lab._util import now
 from lab.events import store
-from lab.events.sanitize import sanitize_params
+from lab.events.sanitize import mask_text, sanitize_params
 
 RING = 200
 _current: ContextVar["Call | None"] = ContextVar("lab_events_current", default=None)
@@ -74,6 +74,31 @@ def error_dict(exc: BaseException) -> dict[str, Any]:
         where = f"{tb.tb_frame.f_code.co_filename}:{tb.tb_lineno}"
         tb = tb.tb_next
     return {"type": type(exc).__name__, "message": str(exc)[:2048], "where": where}
+
+
+def _sanitize_error(error: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Mask secret-shaped text in a captured error's message before it reaches the ledger — the
+    same FR-J1 rule ``begin()`` already applies to ``params`` via ``sanitize_params``. ``message``
+    is free text (an exception's ``str()``, or a usage error's ``format_message()`` captured by
+    the CLI's ``_capturing_usage_errors``), never argv, so ``mask_text`` — the prose-shaped
+    masker ``lab.notes`` also uses — is the right tool here, not ``sanitize_argv``. Before this,
+    ``error`` was the one field written to the ledger with no sanitization at all, so a
+    secret-shaped value that failed a flag's own validation (e.g. ``--price-cap AKIA...``,
+    rejected by click's float parser) sailed straight into ``error.message`` verbatim even
+    though the sibling ``params.argv`` field masked it correctly. Never raises: a masking
+    failure must not take the record with it."""
+    if error is None:
+        return None
+    message = error.get("message")
+    if not isinstance(message, str):
+        return error
+    try:
+        masked = mask_text(message)
+    except Exception:  # noqa: BLE001 — masking must never fail a command
+        return error
+    if masked == message:
+        return error
+    return {**error, "message": masked}
 
 
 class Call:
@@ -148,7 +173,7 @@ def finish(
         "duration_ms": int((ended - call.started).total_seconds() * 1000),
         "refs": call._refs,
         "result": call._result,
-        "error": error,
+        "error": _sanitize_error(error),
     }
     if outcome != "ok" and call.notes:
         record_["trace"] = list(call.notes)

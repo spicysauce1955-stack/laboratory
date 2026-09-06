@@ -174,6 +174,42 @@ def test_mask_text_leaves_ordinary_prose_with_apostrophes_untouched() -> None:
     assert mask_text(prose) == prose
 
 
+def test_mask_text_does_not_corrupt_prose_that_merely_mentions_a_flag_name() -> None:
+    """Bug 2: `_INLINE_FLAG` used to mask any `--flag value` pair whenever the flag name matched
+    `_SECRET_KEY` at all — including "auth" as a bare substring of an unrelated flag ("basic-
+    auth") or "key" glued inside one unrelated English word ("keyword") — deleting the next word
+    of ordinary prose even though nothing secret-shaped is present."""
+    assert (
+        mask_text("documented the --basic-auth flag; users still hit 401s")
+        == "documented the --basic-auth flag; users still hit 401s"
+    )
+    assert (
+        mask_text("we need a --keyword search here")
+        == "we need a --keyword search here"
+    )
+    assert (
+        mask_text("run with --price-cap 1.40 and see what happens")
+        == "run with --price-cap 1.40 and see what happens"
+    )
+
+
+def test_mask_text_still_masks_real_secrets_after_the_flag_fix() -> None:
+    """The over-masking fix must not weaken real detection: a secret-shaped value is still fully
+    masked whether it rides on a sensitive-named flag (bare or `--flag=`) or stands alone."""
+    # sensitive flag name alone is still enough when the value is short/low-entropy
+    out = mask_text("failed with --api-key=sk-live-abcdef1234567890 in the command")
+    assert "sk-live-abcdef1234567890" not in out
+    assert "--api-key=" in out
+    # a genuinely secret-shaped value is caught even behind an unremarkable flag name
+    out2 = mask_text(f"retry with --seed {SECRET} next time")
+    assert SECRET not in out2
+    assert MASK in out2
+    # bare secret, no flag prefix at all, is still caught by the free-standing pass
+    out3 = mask_text(f"got token {SECRET} from the response")
+    assert SECRET not in out3
+    assert MASK in out3
+
+
 def test_mask_text_catches_a_real_secret_bare_and_inside_a_flag() -> None:
     """A genuinely secret-shaped value must be caught whether it stands alone in free text or
     is passed as a `--flag=value`."""
