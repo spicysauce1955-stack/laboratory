@@ -94,3 +94,14 @@ def test_manifest_mirror(tmp_path: Path):
 def test_get_entry_missing_raises(tmp_path: Path):
     with pytest.raises(FileNotFoundError):
         LocalQueueStore(tmp_path).get_entry("reg-nope")
+
+
+def test_read_mirrored_partial_manifest_returns_none_instead_of_crashing(tmp_path: Path):
+    """A stub/partial JSON blob in the mirror (e.g. a version-skewed scheduler host, or a read
+    racing an in-progress write) must degrade to "not yet available", never raise an unhandled
+    pydantic ValidationError (2026-09-04 `lab status` incident: 7 required fields missing)."""
+    q = LocalQueueStore(tmp_path)
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir(parents=True)
+    (jobs_dir / "partial.json").write_text('{"job_id": "partial", "mirrored": true}')
+    assert q.read_mirrored("partial") is None

@@ -140,6 +140,29 @@ def test_no_triggers_launches_immediately(tmp_path: Path):
     assert wait_terminal(backend, e.job_id).value == "succeeded"
 
 
+def test_launch_mirrors_a_valid_manifest_immediately(tmp_path: Path):
+    """The mirror a laptop/MCP caller reads via `read_mirrored` must exist and already be a
+    fully valid JobManifest the instant a registration is marked `launched` -- not only after the
+    *next* tick's `_sync` (up to 60s away, systemd timer). Closes the crash/gap window where
+    `lab status` on a scheduler-launched job saw no mirror (or, historically, a partial one)
+    right after launch (2026-09-04 incident)."""
+    sched, q = make_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a")
+    rep = sched.tick()
+    assert rep.launched == ["reg-a"]
+    e = q.get_entry("reg-a")
+    assert e.job_id is not None
+    mirrored = q.read_mirrored(e.job_id)
+    assert mirrored is not None
+    assert mirrored.job_id == e.job_id
+    # All fields JobManifest requires are already set -- round-tripping through read_mirrored
+    # (a strict JobManifest parse) is itself the proof; assert a couple explicitly for clarity.
+    assert mirrored.created_at is not None
+    assert mirrored.submitted_by is not None
+    assert mirrored.resources is not None
+    assert mirrored.backend is not None
+
+
 def test_not_before_gates(tmp_path: Path):
     clock = FakeClock()
     sched, q = make_sched(tmp_path, clock)
