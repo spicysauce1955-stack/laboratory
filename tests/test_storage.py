@@ -22,6 +22,28 @@ class _ErrorKeyIsNoneError(Exception):
         self.response = {"Error": None}
 
 
+class _ErrorKeyIsBareStringError(Exception):
+    """Some non-AWS S3-compatible provider (or a genuinely malformed response) may put a bare
+    string under "Error" instead of the AWS-shaped {"Code": ..., "Message": ...} dict -- a naive
+    `.get("Code")` on that string crashes with AttributeError instead of reaching the `raise`
+    below (the same crash class the None-response and None-Error fixes closed, one layer
+    deeper)."""
+
+    def __init__(self) -> None:
+        super().__init__("weird error shape")
+        self.response = {"Error": "AccessDenied"}
+
+
+def test_get_text_reraises_when_error_is_a_bare_string_instead_of_crashing():
+    class Client:
+        def get_object(self, Bucket: str, Key: str) -> dict:
+            raise _ErrorKeyIsBareStringError()
+
+    store = R2Store("https://example.test", "bucket", client=Client())
+    with pytest.raises(_ErrorKeyIsBareStringError):
+        store.get_text("some/key")
+
+
 def test_get_text_reraises_a_response_less_error_instead_of_crashing():
     class Client:
         def get_object(self, Bucket: str, Key: str) -> dict:

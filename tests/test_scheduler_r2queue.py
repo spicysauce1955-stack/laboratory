@@ -133,6 +133,26 @@ def test_read_mirrored_partial_manifest_returns_none_instead_of_crashing():
     assert q.read_mirrored("partial") is None
 
 
+def test_read_mirrored_corrupt_bytes_returns_none_instead_of_crashing():
+    """The same crash class as the partial-manifest fix above, one layer deeper: genuinely
+    corrupted (non-UTF-8) blob bytes raise UnicodeDecodeError out of `R2Store.get_text`'s
+    `.decode()` before `model_validate_json` ever sees the text, so a guard that only catches
+    `pydantic.ValidationError` around the parse call still crashes the caller."""
+    q, fake = make_q()
+    fake.blobs["queue/jobs/corrupt.json"] = b"\xff\xfe\x00bad-bytes"
+    assert q.read_mirrored("corrupt") is None
+
+
+def test_list_mirrored_skips_corrupt_bytes_instead_of_crashing():
+    """list_mirrored sibling of the corrupt-bytes fix above: one blob with non-UTF-8 bytes must
+    be skipped, not take down the whole listing."""
+    q, fake = make_q()
+    q.mirror_manifest(make_manifest("good", "python x.py"))
+    fake.blobs["queue/jobs/corrupt.json"] = b"\xff\xfe\x00bad-bytes"
+    got = q.list_mirrored()
+    assert [m.job_id for m in got] == ["good"]
+
+
 def test_list_mirrored_skips_partial_manifest_instead_of_crashing():
     """The sibling of the read_mirrored fix above: one corrupt/partial manifest anywhere in the
     mirror must not take down the whole listing — it should be skipped, with the rest of the
