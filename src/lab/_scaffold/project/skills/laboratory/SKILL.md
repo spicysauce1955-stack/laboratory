@@ -518,11 +518,12 @@ R2-mirrored manifest, incl. cost) → `lab fetch <job_id>` (artifacts come from 
   had been passed by hand; a healthy unpinned host reaches UP in 66–209s. Leave it unset unless
   you pin a region (`--region` narrows the pool: the one pinned launch took 526s, and pinned
   jobs get a 15m default for that reason).
-- **`lab logs` / `lab metrics` do NOT work from the laptop for scheduler-launched jobs**
-  (only the manifest is mirrored to R2; they exit 2 with a structured error). Use
-  `lab status` + `lab fetch` from the laptop; for live logs, tail them on the scheduler host
-  itself (`ssh <scheduler-host> sudo tail /opt/<your-project>/runs/<job_id>/logs.txt`, where
-  `/opt/<your-project>` is wherever its checkout lives — see the host runbook).
+- **`lab fetch` / `lab metrics` / `lab logs` work from the laptop for scheduler-launched jobs**
+  (v0.11.0 — see Corrections below): they fall back to the mirrored manifest the same way
+  `lab status` already did. `lab wait` does **not** get this treatment yet — it still only
+  checks the local job store, so `lab wait <scheduler-launched-job-id>` fails immediately even
+  though `lab status` on the same id succeeds. `lab cancel` deliberately still refuses a
+  mirror-only job outright (see next bullet) rather than reaching cross-machine.
 - **Cancel applies on the next tick** (≤60s), including killing an already-launched job.
 - **Mirror lag:** `teardown_status` may read `null` from the laptop for a tick or two after
   success; the scheduler host's manifest is authoritative, `lab reconcile` is ground truth.
@@ -734,6 +735,9 @@ past its cause costs real time. Each row below is a rule that was once right.
 | "`--price-cap` is a hard ceiling." | **Still not true, and worth knowing exactly how.** SkyPilot applies it to its own catalog, which under-reports Vast ~4x. Since v0.8.0 the cheapest *live* Vast offer is checked before renting (an impossible cap fails the submit for free) and the *billed* rate is compared after boot and recorded as `cost.over_cap`. The optimizer can still land above the cheapest offer, so pass `--price-cap-strict` if the ceiling must hold, and bound real exposure with `--timeout`. | v0.8.0 |
 | "`reconcile`'s `ghosts` list is Vast-only — a healthy DO/GCP job may show up there as a false positive, so don't trust it for those backends." | Ghost detection now cross-checks every cloud's own SkyPilot-tracked state, not just Vast rental labels; a healthy DO/GCP job is no longer misreported. Each entry's cause is named in the additive `ghost_reasons`. | v0.10.0 |
 | "There's no way to see what's actually running right now except `lab list` (this project only) or eyeballing `reconcile`'s rental counts." | `lab ps` / `mcp__lab__ps` gives a project-agnostic, machine-wide "what's running" view — closes a real gap found live, when both of the above were checked during an incident and neither surfaced jobs running in a *different* project. | v0.10.0 |
+| "`lab fetch`/`lab metrics`/`lab logs` don't work from the laptop for scheduler-launched jobs — only `lab status` reads the mirror." | The three now fall back to the mirrored manifest too (built over an ephemeral job store, never the real local one, so `cancel`/`reconcile` still correctly treat the job as not locally supervised). `lab wait` is the one command still local-only — that's a real, undocumented-until-now gap, not a design choice. | v0.11.0 |
+| "Keep `lab note` messages short — long or punctuation-heavy text fails or gets mangled." | Two real bugs, now fixed: the note sanitizer was silently truncating anything over 512 characters (an argv-length cap that should never have applied to note bodies), and a `shlex`-based masking pass was corrupting ordinary apostrophes/quotes in prose. A long, punctuation-rich note now round-trips exactly as written. | v0.11.0 |
+| "`--agent` marks a note as agent-written; it takes no value." | `--agent` is now a real value-bearing option: `--agent=` for the old bare behavior, `--agent=NAME`/`--agent NAME` to name the author. A bare, value-less `--agent` (no `=`) is now a usage error — this is the one **breaking** change in v0.11.0. | v0.11.0 |
 
 ## 10. Pointers
 
