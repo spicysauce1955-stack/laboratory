@@ -89,6 +89,28 @@ def test_note_agent_with_a_name_is_recorded_as_that_author(tmp_path: Path) -> No
     assert written.text == message
 
 
+def test_note_agent_name_before_job_id_swaps_them_back(tmp_path: Path) -> None:
+    """The other stray-token ordering: `--agent <name> <job_id>` (name first, real job id
+    second). `--agent` takes no value, so both `<name>` and `<job_id>` are plain positional
+    tokens on the command line; click fills `job_id` (the first *declared* positional) with
+    whichever one it meets first -- here that's the agent name -- and the real job id lands in
+    `extra_args` instead. Before the fix this recorded job_id="ws-trainer" (not a real job id)
+    and author=<the real job id> (also wrong) -- exactly the live bug report. A real job id
+    always matches `_JOB_ID_SHAPE`; recovering requires swapping the two back, not just
+    recovering the author the way the existing (job-id-first) case does.
+    """
+    result = runner.invoke(
+        app,
+        ["note", "--agent", "ws-trainer", "20260906-101112-abcdef", "-m", "hello"],
+    )
+
+    assert result.exit_code == 0, result.output
+    written = notes.search()[0]
+    assert written.author == "ws-trainer"
+    assert written.job_id == "20260906-101112-abcdef"
+    assert written.text == "hello"
+
+
 def test_note_agent_with_a_name_and_no_job_id_is_recorded_as_that_author(tmp_path: Path) -> None:
     """Same misuse as the test above, but with NO job id at all -- a documented, valid use (a
     submit that died before provisioning never gets a job id). With no job id, `job_id` is the
