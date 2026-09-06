@@ -89,6 +89,27 @@ def test_note_agent_with_a_name_is_recorded_as_that_author(tmp_path: Path) -> No
     assert written.text == message
 
 
+def test_note_agent_with_a_name_and_no_job_id_is_recorded_as_that_author(tmp_path: Path) -> None:
+    """Same misuse as the test above, but with NO job id at all -- a documented, valid use (a
+    submit that died before provisioning never gets a job id). With no job id, `job_id` is the
+    first positional argument click will fill, so the lone stray `--agent <name>` token binds
+    straight to it instead of landing in the `extra_args` catch-all (which is what let the
+    two-positional case above be recovered). Before the fix this silently recorded a bogus
+    job_id="claude" and reverted `author` to plain "agent" -- no error, no clue anything was
+    wrong. It must instead behave exactly as if `--agent` were a plain boolean flag with no job
+    id given: `author` is the name, and `job_id` is absent.
+    """
+    result = runner.invoke(
+        app, ["note", "--agent", "claude", "-m", "submit died before provisioning"]
+    )
+
+    assert result.exit_code == 0, result.output
+    written = notes.search()[0]
+    assert written.author == "claude"
+    assert written.job_id is None
+    assert written.text == "submit died before provisioning"
+
+
 def test_note_extra_argument_without_agent_is_a_clear_usage_error(tmp_path: Path) -> None:
     """A stray positional that is *not* the `--agent <name>` misuse (the flag was never given)
     is a genuine mistake — most often `-m`/`--text` left off entirely. This must still fail, but

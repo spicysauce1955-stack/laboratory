@@ -5,10 +5,14 @@ Wired to the local backend by default; structured JSON output mirrors the MCP §
 
 from __future__ import annotations
 
+import atexit
 import json
 import errno
 import os
+import re
+import shutil
 import sys
+import tempfile
 import traceback
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -169,7 +173,7 @@ def _lab_for_or_fail(job_id: str) -> Lab:
     """`_lab_for`, but a job missing from the local store is a structured error (FR-F3).
 
     Deliberately does NOT fall back to the scheduler's mirrored manifest the way
-    `_lab_for_mirrored_or_fail` does: this is used by `cancel`, which reaches into a live
+    `_lab_for_mirrored_or_fail` does: this is used by `confirm`, which reaches into a live
     backend, and cross-machine SkyPilot client/server version skew (`lab._skycompat`) makes
     acting on a job this machine never locally supervised a real correctness risk, not just an
     inconvenience — see `cancel`'s own docstring."""
@@ -178,10 +182,36 @@ def _lab_for_or_fail(job_id: str) -> Lab:
     except FileNotFoundError:
         msg = (
             f"unknown job id {job_id!r} — not in local runs/ "
-            "(for scheduler-launched jobs only `lab status` reads the mirrored manifest)"
+            "(for scheduler-launched jobs, `lab status`/`fetch`/`metrics`/`logs` read the "
+            "mirrored manifest; this command does not)"
         )
         _emit({"error": msg})
         _fail(2, msg)
+
+
+class _MirrorReadFailed(Exception):
+    """`default_queue().read_mirrored(...)` raised. Carries the original error's text so every
+    caller can phrase its own "not yet available" message without repeating the try/except that
+    turns a raw crash into that soft message (see `_read_mirrored`)."""
+
+
+def _read_mirrored(job_id: str) -> JobManifest | None:
+    """Read ``job_id`` out of the scheduler's mirrored queue (spec §4.3), or ``None`` if the
+    mirror has nothing for it.
+
+    ``read_mirrored`` can currently raise outright on a partial/stub mirrored manifest (a
+    separate, in-flight fix elsewhere in ``scheduler/queue.py``/``r2queue.py``); that is not this
+    code path's bug to swallow, so it is turned into `_MirrorReadFailed` here, ONCE, rather than
+    every caller wrapping its own try/except around the same `read_mirrored` call
+    (`_read_mirrored_manifest_or_fail` and `_cancel_redirect_message` used to each do this
+    separately, with near-identical degraded messages drifting out of sync).
+    """
+    from lab.scheduler.queue import default_queue
+
+    try:
+        return default_queue().read_mirrored(job_id)
+    except Exception as e:  # noqa: BLE001 — a still-landing mirror bug must not crash callers
+        raise _MirrorReadFailed(str(e)) from e
 
 
 def _read_mirrored_manifest_or_fail(job_id: str) -> JobManifest:
@@ -189,16 +219,10 @@ def _read_mirrored_manifest_or_fail(job_id: str) -> JobManifest:
 
     Raises :class:`FileNotFoundError`, like local ``JobStore.read_manifest``, when the mirror
     has nothing for this job either — so callers can treat "absent everywhere" uniformly.
-    ``read_mirrored`` can currently raise outright on a partial/stub mirrored manifest (a
-    separate, in-flight fix elsewhere in ``scheduler/queue.py``/``r2queue.py``); that is not this
-    code path's bug to swallow, so it is surfaced as a clear "not yet available" message rather
-    than an unhandled traceback.
     """
-    from lab.scheduler.queue import default_queue
-
     try:
-        mirrored = default_queue().read_mirrored(job_id)
-    except Exception as e:  # noqa: BLE001 — a still-landing mirror bug must not crash this path
+        mirrored = _read_mirrored(job_id)
+    except _MirrorReadFailed as e:
         msg = f"job {job_id!r} manifest not yet available (mirror read failed: {e}); try again shortly"
         _emit({"error": msg})
         _fail(2, msg)
@@ -214,6 +238,23 @@ def _lab_for_mirrored(job_id: str) -> Lab:
     Used by `logs`/`metrics`/`fetch`: these only read durable/remote state (R2 artifacts, or
     status the backend itself reports), so building the backend handle from a mirrored
     manifest's ``backend.provisioner`` is safe in a way that acting via `cancel` is not.
+
+    Every backend's own bookkeeping (e.g. `collect_artifacts`/`status` calling
+    `store.update_manifest`) assumes a local manifest already exists, which is otherwise true for
+    every job this machine has ever touched. A mirror-only job has no such manifest, so it needs
+    one seeded somewhere for that bookkeeping to read/write — but NOT into the real local store:
+    that would make this job completely indistinguishable from one genuinely supervised by this
+    machine, which is exactly what `cancel` (`_lab_for`, reading straight off `runs/`) and
+    `reconcile`'s `unsupervised` pass (`Lab.list_jobs`, same directory) both rely on never being
+    true for a job only ever launched by the scheduler — see `cancel`'s docstring for why acting
+    on one directly is a real correctness risk (SkyPilot client/server skew, `lab._skycompat`),
+    and `reconcile`'s module docstring for why a dead-supervisor `running` job would otherwise be
+    flagged (and, under `--apply`, destroyed) despite running fine under the scheduler's own
+    supervision. So the mirrored manifest is seeded into a throwaway `JobStore` over a fresh temp
+    directory instead: `collect_artifacts`/`status` get a local manifest to update exactly as
+    they expect, and nothing is ever written under `runs/<job_id>/`. The temp directory is
+    cleaned up at process exit (`atexit`) rather than immediately, since the returned `Lab` (and
+    its `.store`) must stay valid for the rest of this one-shot CLI invocation.
     """
     home = repo_root() / "runs"
     store = JobStore(home)
@@ -221,15 +262,10 @@ def _lab_for_mirrored(job_id: str) -> Lab:
         provisioner = store.read_manifest(job_id).backend.provisioner
     except FileNotFoundError:
         mirrored = _read_mirrored_manifest_or_fail(job_id)
-        # Every backend's own bookkeeping (e.g. `collect_artifacts`/`status` calling
-        # `store.update_manifest`) assumes a local manifest exists, which is otherwise true for
-        # every job this machine has ever touched. Seed a local copy so those calls have
-        # something to read/write. `write_manifest`, not `store.create`: this is a read-through
-        # cache of a manifest the scheduler already validated and mirrored, not a new job — it
-        # must skip the fail-closed provenance re-check and must not register this machine as
-        # the job's owner in the machine-wide attribution index.
-        store.write_manifest(mirrored)
-        provisioner = mirrored.backend.provisioner
+        tmp_home = Path(tempfile.mkdtemp(prefix="lab-mirror-"))
+        atexit.register(shutil.rmtree, tmp_home, ignore_errors=True)
+        JobStore(tmp_home).write_manifest(mirrored)
+        return default_lab(home=tmp_home, backend=mirrored.backend.provisioner)
     return default_lab(home=home, backend=provisioner)
 
 
@@ -606,6 +642,14 @@ def logs(job_id: str, tail: int = typer.Option(100)) -> None:
         typer.echo(line)
 
 
+# A real job id is always `_new_job_id()`'s shape (`YYYYMMDD-HHMMSS-<6 hex>`) — never a
+# plausible agent name. Used by `note` below to catch the one misparse `extra_args` can't: with
+# NO job id given at all, the lone stray `--agent <name>` token has nothing declared before
+# `job_id` to bind to, so click assigns it there directly (positionals fill in declaration
+# order) instead of to the `extra_args` catch-all, which stays empty.
+_JOB_ID_SHAPE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
+
+
 @app.command()
 def note(
     job_id: str | None = typer.Argument(None, help="the job this is about, if there is one"),
@@ -656,6 +700,13 @@ def note(
             )
             _emit({"error": msg})
             _fail(2, msg)
+    elif agent and job_id is not None and not _JOB_ID_SHAPE.match(job_id):
+        # Same misuse as the `extra_args` case above, one token earlier: no job id was given,
+        # so the lone stray `--agent <name>` token bound straight to `job_id` instead of landing
+        # in `extra_args` (see `_JOB_ID_SHAPE`'s comment). A real job id always matches that
+        # shape; anything else here is the agent's name, mis-parsed as a job id.
+        author = job_id
+        job_id = None
     facets: dict[str, Any] = {}
     home = repo_root() / "runs"
     if job_id is not None:
@@ -862,25 +913,29 @@ def _cancel_redirect_message(job_id: str) -> str:
     scheduler — which needs `lab queue cancel`, never a local `cancel` attempt (see `cancel`'s
     docstring). Best-effort: a `read_mirrored` crash on a not-yet-fixed partial manifest (a
     separate, in-flight fix elsewhere) must not crash `cancel`'s own error path, so it degrades
-    to a plain "could not check" message instead of asserting the job is unknown outright.
+    to a plain "could not check" message instead of asserting the job is unknown outright
+    (`_read_mirrored` is where that degradation actually happens — shared with
+    `_read_mirrored_manifest_or_fail`, not reimplemented here).
     """
     from lab.scheduler.queue import default_queue
 
     generic = (
-        f"unknown job id {job_id!r} — not in local runs/ "
-        "(for scheduler-launched jobs only `lab status` reads the mirrored manifest)"
+        f"unknown job id {job_id!r} — not in local runs/ and not in the scheduler's mirrored "
+        "queue either (for scheduler-launched jobs, `lab status`/`fetch`/`metrics`/`logs` read "
+        "the mirrored manifest)"
     )
-    queue = default_queue()
     try:
-        mirrored = queue.read_mirrored(job_id)
-    except Exception as e:  # noqa: BLE001 — a still-landing mirror bug must not crash `cancel`
+        mirrored = _read_mirrored(job_id)
+    except _MirrorReadFailed as e:
         return (
             f"job {job_id!r} is not in local runs/, and its mirrored manifest could not be read "
             f"({e}) — try again shortly, or check `lab queue list` for a matching registration"
         )
     if mirrored is None:
         return generic
-    reg_id = next((r.reg_id for r in queue.list_entries() if r.job_id == job_id), None)
+    reg_id = next(
+        (r.reg_id for r in default_queue().list_entries() if r.job_id == job_id), None
+    )
     if reg_id is not None:
         return (
             f"job {job_id!r} is scheduler-launched (registration {reg_id!r}) — cancel it with "
