@@ -100,7 +100,11 @@ class R2Store:
             # handler with AttributeError instead of the raise below (2026-09-05 `queue list`
             # incident).
             response = getattr(e, "response", None) or {}
-            error = response.get("Error") or {}
+            # `.response` itself can be present-but-not-a-dict (a bare string, same class of
+            # non-AWS S3-compatible provider quirk as `Error` below) — treat that the same as
+            # "no recognized error code" rather than crashing on `.get("Error")`.
+            error = response.get("Error") if isinstance(response, dict) else None
+            error = error or {}
             # `Error` itself can be present-but-not-a-dict (a non-AWS S3-compatible provider, or
             # a genuinely malformed response, returning a bare string) — treat that the same as
             # "no recognized error code" rather than crashing on `.get("Code")`.

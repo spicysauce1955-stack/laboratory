@@ -142,3 +142,46 @@ def test_list_mirrored_skips_partial_manifest_instead_of_crashing(tmp_path: Path
     (jobs_dir / "partial.json").write_text('{"job_id": "partial", "mirrored": true}')
     got = q.list_mirrored()
     assert [m.job_id for m in got] == ["good"]
+
+
+def test_read_mirrored_permission_error_propagates(tmp_path: Path, monkeypatch):
+    """The `OSError` broadening (since narrowed) was too wide: `PermissionError` (bad
+    permissions, disk-full, a stale mount) is a real, persistent I/O failure, not corruption, and
+    must surface rather than silently degrade to "not yet available" forever — which would make
+    every `lab status`/`fetch`/`metrics`/`logs` call quietly report "try again shortly" with zero
+    signal that the real cause is an OS-level problem (2026-09-06 review)."""
+    q = LocalQueueStore(tmp_path)
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir(parents=True)
+    (jobs_dir / "locked.json").write_text('{"job_id": "locked"}')
+
+    real_read_text = Path.read_text
+
+    def _flaky_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == "locked.json":
+            raise PermissionError("permission denied")
+        return real_read_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", _flaky_read_text)
+    with pytest.raises(PermissionError):
+        q.read_mirrored("locked")
+
+
+def test_list_mirrored_permission_error_propagates(tmp_path: Path, monkeypatch):
+    """list_mirrored sibling of the read_mirrored fix above: a real I/O failure on one manifest
+    must propagate, not be swallowed as if it were just one skipped/corrupt file among many."""
+    q = LocalQueueStore(tmp_path)
+    q.mirror_manifest(make_manifest("good", "python x.py"))
+    jobs_dir = tmp_path / "jobs"
+    (jobs_dir / "locked.json").write_text('{"job_id": "locked"}')
+
+    real_read_text = Path.read_text
+
+    def _flaky_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == "locked.json":
+            raise PermissionError("permission denied")
+        return real_read_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", _flaky_read_text)
+    with pytest.raises(PermissionError):
+        q.list_mirrored()

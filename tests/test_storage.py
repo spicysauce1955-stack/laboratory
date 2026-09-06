@@ -34,6 +34,18 @@ class _ErrorKeyIsBareStringError(Exception):
         self.response = {"Error": "AccessDenied"}
 
 
+class _ResponseIsBareStringError(Exception):
+    """A third layer of the same crash class: `.response` can be present-but-truthy while not
+    being a dict at all (a bare string), which `getattr(e, "response", None) or {}` doesn't catch
+    -- `or {}` only kicks in when `.response` is falsy/missing, so a non-dict-but-truthy
+    `.response` still reaches `.get("Error")` and crashes with AttributeError instead of the
+    `raise` below (2026-09-06 review, one layer deeper than the Error-is-bare-string fix)."""
+
+    def __init__(self) -> None:
+        super().__init__("weird error shape")
+        self.response = "not a dict at all"
+
+
 def test_get_text_reraises_when_error_is_a_bare_string_instead_of_crashing():
     class Client:
         def get_object(self, Bucket: str, Key: str) -> dict:
@@ -41,6 +53,16 @@ def test_get_text_reraises_when_error_is_a_bare_string_instead_of_crashing():
 
     store = R2Store("https://example.test", "bucket", client=Client())
     with pytest.raises(_ErrorKeyIsBareStringError):
+        store.get_text("some/key")
+
+
+def test_get_text_reraises_when_response_is_a_bare_string_instead_of_crashing():
+    class Client:
+        def get_object(self, Bucket: str, Key: str) -> dict:
+            raise _ResponseIsBareStringError()
+
+    store = R2Store("https://example.test", "bucket", client=Client())
+    with pytest.raises(_ResponseIsBareStringError):
         store.get_text("some/key")
 
 
