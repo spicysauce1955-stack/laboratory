@@ -73,10 +73,15 @@ def test_a_bad_flag_records_a_usage_error(_events_dir: Path) -> None:
     opened, closed = records[-2], records[-1]
     assert closed["outcome"] == "usage_error"
     assert closed["exit_code"] == 2
-    # click never got the chance to hand us its "no such option" message (it prints and exits 2
-    # entirely inside its own dispatch, standalone) — the sanitized argv already on the open
-    # record is what tells a reader what was actually typed.
+    # the sanitized argv already on the open record is what tells a reader what was typed...
     assert opened["params"]["argv"] == ["list", "--nonexistent-flag"]
+    # ...and `_capturing_usage_errors` recovers click's own message (which flag, why) from the
+    # one place it still exists (the formatting call click makes right before discarding the
+    # exception into a bare `SystemExit`), so a `usage_error` row is diagnosable without
+    # re-running the exact original command.
+    assert closed["error"] is not None
+    assert closed["error"]["type"] == "NoSuchOption"
+    assert "--nonexistent-flag" in closed["error"]["message"]
 
 
 def test_an_unknown_command_records_a_usage_error_with_sanitized_argv(_events_dir: Path) -> None:
@@ -87,6 +92,11 @@ def test_an_unknown_command_records_a_usage_error_with_sanitized_argv(_events_di
     assert opened["action"] == "<unparsed>"
     assert closed["outcome"] == "usage_error"
     assert "…REDACTED…" in opened["params"]["argv"]
+    # No call was ever open here (parsing never reached the group callback), yet the message is
+    # still recovered — captured at the click-dispatch level, independent of the ledger call.
+    assert closed["error"] is not None
+    assert closed["error"]["type"] == "UsageError"
+    assert "nosuchcommand" in closed["error"]["message"]
 
 
 def test_the_cause_behind_typer_exit_becomes_the_recorded_error(

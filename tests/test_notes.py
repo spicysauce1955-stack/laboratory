@@ -72,6 +72,34 @@ def test_note_masks_a_secret_pasted_into_its_text(tmp_path: Path) -> None:
     assert "sk-live-abcdef1234567890" not in notes.search()[0].text
 
 
+def test_a_long_detailed_note_is_not_truncated(tmp_path: Path) -> None:
+    """`_clean` used to mask a note's text with `sanitize_argv`, which caps *any* string at 512
+    characters — a limit meant for a CLI argv value or a params digest in the ledger, silently
+    reused for a note body whose whole purpose is holding a detailed write-up in full (real
+    forensic evidence: 15 of 27 notes on file were cut this way, several mid-sentence, with
+    nothing in the record to say so). A couple hundred words, with the ordinary punctuation of a
+    real incident write-up, must come back exactly as written."""
+    text = (
+        "During today's sweep we noticed something odd (a real gotcha, not a fluke): jobs that "
+        "used the 'cpu' backend on DigitalOcean kept failing with a 422 from the provisioner, "
+        "and it wasn't obvious why at first, but after digging through the SkyPilot logs, "
+        "checking the account's resource limits, and comparing against a few other fresh "
+        "accounts, we found the actual cause -- a brand-new DO account is capped at a much "
+        "smaller instance tier by default, so requesting anything above 4 vCPUs (or a volume "
+        "bigger than 50GB) gets rejected outright, no matter how the request is phrased. "
+        "Fixing this required dropping the defaults, and it's worth remembering that 'it worked "
+        "once' does not mean 'it will always work,' especially across accounts of different "
+        "ages and quotas."
+    )
+    assert len(text) > 512
+
+    notes.write(text=text)
+
+    written = notes.search()[0].text
+    assert written == text
+    assert not written.endswith("…")
+
+
 def test_a_note_is_never_lost_to_an_unwritable_store(tmp_path: Path) -> None:
     """Best-effort like the ledger: a note that cannot be filed must not fail the command."""
     runs = tmp_path / "runs"

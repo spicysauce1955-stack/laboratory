@@ -58,6 +58,49 @@ def test_note_marks_an_agent_author(tmp_path: Path) -> None:
     assert notes.search()[0].author == "agent"
 
 
+def test_note_agent_with_a_name_is_recorded_as_that_author(tmp_path: Path) -> None:
+    """The actual root cause behind every "note fails on long, detailed text" report on file
+    (ledger forensics 2026-08-26/27): `--agent` marks the note as agent-written and takes no
+    value, but real calls write `--agent claude` / `--agent ws-trainer` as if it named the
+    agent. The stray name then had nowhere to bind — `job_id` was already taken — and click
+    rejected it as an extra argument (`usage_error`, exit 2), regardless of how short or plain
+    the `-m` text was. A long, punctuation-rich, multi-sentence write-up (commas, parentheses,
+    apostrophes — the shape of a real incident note) must succeed here exactly like a short one;
+    length and punctuation were never the cause.
+    """
+    message = (
+        "During today's sweep we noticed something odd (a real gotcha, not a fluke): jobs that "
+        "used the 'cpu' backend on DigitalOcean kept failing with a 422 from the provisioner, "
+        "and it wasn't obvious why at first, but after digging through the SkyPilot logs, "
+        "checking the account's resource limits, and comparing against a few other fresh "
+        "accounts, we found the actual cause -- a brand-new DO account is capped at a much "
+        "smaller instance tier by default, so requesting anything above 4 vCPUs (or a volume "
+        "bigger than 50GB) gets rejected outright, no matter how the request is phrased."
+    )
+
+    result = runner.invoke(
+        app,
+        ["note", "j-1", "--kind", "GOTCHA", "--agent", "ws-trainer", "-m", message],
+    )
+
+    assert result.exit_code == 0, result.output
+    written = notes.search()[0]
+    assert written.author == "ws-trainer"
+    assert written.text == message
+
+
+def test_note_extra_argument_without_agent_is_a_clear_usage_error(tmp_path: Path) -> None:
+    """A stray positional that is *not* the `--agent <name>` misuse (the flag was never given)
+    is a genuine mistake — most often `-m`/`--text` left off entirely. This must still fail, but
+    with a specific, actionable message naming the stray token, not a bare `usage_error` with no
+    explanation of what was wrong."""
+    result = runner.invoke(app, ["note", "j-1", "stray-token", "-m", "the real message"])
+
+    assert result.exit_code != 0
+    assert "stray-token" in result.output
+    assert "-m/--text" in result.output
+
+
 # --------------------------------------------------------------------------- lab notes
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from lab.events.sanitize import MASK, sanitize_argv, sanitize_params
+from lab.events.sanitize import MASK, mask_text, sanitize_argv, sanitize_params
 
 SECRET = "abcd1234efgh5678ijkl9012mnop3456qrst"
 
@@ -105,3 +105,21 @@ def test_sanitize_argv_degrades_instead_of_raising() -> None:
     # A non-string token raises AttributeError on .startswith mid-loop. The guard must turn
     # that into a masked result, never an exception escaping into the command.
     assert sanitize_argv(["lab", "submit", 123]) == [MASK]  # type: ignore[list-item]
+
+
+def test_mask_text_has_no_length_cap() -> None:
+    """`mask_text` is what `lab.notes._clean` uses instead of `sanitize_argv`: a note body's
+    whole purpose is holding a detailed write-up in full, so the ledger's 512-char argv/param cap
+    (`test_long_strings_and_lists_are_truncated` above) must not apply to it."""
+    blob = "a b " * 400  # > 512 chars, same shape sanitize_params truncates
+    assert mask_text(blob) == blob
+
+
+def test_mask_text_still_masks_a_secret() -> None:
+    out = mask_text("failed with --api-key=sk-live-abcdef1234567890 in the command")
+    assert "sk-live-abcdef1234567890" not in out
+    assert "--api-key=" in out
+
+
+def test_mask_text_degrades_instead_of_raising() -> None:
+    assert mask_text(123) == 123  # type: ignore[arg-type]  # not a string: must not raise
