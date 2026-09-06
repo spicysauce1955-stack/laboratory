@@ -210,6 +210,64 @@ def test_mask_text_still_masks_real_secrets_after_the_flag_fix() -> None:
     assert MASK in out3
 
 
+def test_mask_text_masks_a_flag_value_followed_by_a_boolean_flag() -> None:
+    """Bug 1 (secret-leak): the bare-token value alternative used to have no restriction on its
+    own shape, so it would greedily consume a *following* `--flag` as if it were the current
+    flag's value (`--dry-run --api-key ...` matched flag=`--dry-run`, value=`--api-key`,
+    swallowing both). That left `--api-key` consumed as somebody else's value, never itself
+    tried as a flag, so its real value never got independent consideration. Confirmed live:
+    this exact string used to come back completely unchanged, no masking at all."""
+    out = mask_text("ran with --dry-run --api-key sk-live-abcdef1234567890 next")
+    assert "sk-live-abcdef1234567890" not in out
+    assert MASK in out
+    assert "--api-key" in out
+    assert "--dry-run" in out  # the boolean flag itself survives untouched
+
+
+def test_mask_text_masks_two_secrets_separated_by_an_intervening_boolean_flag() -> None:
+    """Adversarial variation on bug 1: a boolean flag sitting *between* two real flag+secret
+    pairs must not eat either secret's flag."""
+    out = mask_text(
+        "ran with --api-key sk-live-abcdef1234567890 --verbose --token tok-zzzzzzzzzzzzzzzz done"
+    )
+    assert "sk-live-abcdef1234567890" not in out
+    assert "tok-zzzzzzzzzzzzzzzz" not in out
+    assert out.count(MASK) == 2
+    assert "--verbose" in out
+    assert "done" in out
+
+
+def test_mask_text_does_not_span_past_a_stray_apostrophe_in_later_prose() -> None:
+    """Bug 2 (corruption): the quoted-value alternative used to allow single quotes as a
+    delimiter with no bound on distance — an opening `'` with no genuine closing partner nearby
+    would backtrack all the way to the next literal `'` anywhere later in the string, even one
+    that's just part of an ordinary contraction, silently deleting real prose in between.
+    Confirmed live: this exact string used to come back with everything from the opening quote
+    to the apostrophe in "it's" replaced by the mask. The secret must still be masked, but the
+    unrelated tail must survive verbatim."""
+    out = mask_text("run with --api-key 'sk-live-abcdef1234567890 and later it's done")
+    assert "sk-live-abcdef1234567890" not in out
+    assert MASK in out
+    assert "and later it's done" in out
+
+
+def test_mask_text_leaves_an_apostrophe_contraction_right_after_a_flag_alone() -> None:
+    """A bare, non-secret, non-sensitive-flag value that happens to be an ordinary contraction
+    must not be mistaken for an opening quote or otherwise mangled — it's just a bare token."""
+    assert (
+        mask_text("run with --reason it's broken") == "run with --reason it's broken"
+    )
+
+
+def test_mask_text_bounds_a_double_quoted_value_even_when_unterminated() -> None:
+    """The double-quoted alternative is still explicitly length-bounded, so an unterminated `"`
+    can't reach an unrelated `"` much later in a long note and swallow everything between."""
+    tail = "word " * 100 + 'and she said "looks fine" at the end'
+    out = mask_text(f'noted --api-key "sk-live-unterminated {tail}')
+    assert "at the end" in out  # the far-away unrelated closing quote's context survives
+    assert MASK in out
+
+
 def test_mask_text_catches_a_real_secret_bare_and_inside_a_flag() -> None:
     """A genuinely secret-shaped value must be caught whether it stands alone in free text or
     is passed as a `--flag=value`."""
