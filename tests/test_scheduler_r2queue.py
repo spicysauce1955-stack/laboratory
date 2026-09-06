@@ -4,6 +4,8 @@ import io
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from helpers import make_manifest
 from lab.models import CodeRef, JobSpec
 from lab.scheduler.models import ControlConfig, Guardrails, Registration, RegState
@@ -164,3 +166,38 @@ def test_list_mirrored_skips_partial_manifest_instead_of_crashing():
     fake.blobs["queue/jobs/partial.json"] = b'{"job_id": "partial", "mirrored": true}'
     got = q.list_mirrored()
     assert [m.job_id for m in got] == ["good"]
+
+
+def test_read_mirrored_permission_error_propagates():
+    """A real, persistent I/O failure from the backing store (bad permissions, a broken
+    connection) is not corruption and must surface, not degrade to "not yet available" —
+    confirms R2QueueStore's guard was never (and must never be) broadened past
+    `(ValidationError, UnicodeDecodeError)` the way LocalQueueStore's briefly was
+    (2026-09-06 review)."""
+    q, fake = make_q()
+
+    def _raise(Bucket: str, Key: str) -> dict:
+        raise PermissionError("permission denied")
+
+    fake.get_object = _raise  # type: ignore[method-assign]
+    with pytest.raises(PermissionError):
+        q.read_mirrored("whatever")
+
+
+def test_list_mirrored_permission_error_propagates():
+    """list_mirrored sibling of the read_mirrored case above: a real I/O failure on one manifest
+    must propagate, not be swallowed as if it were just one skipped/corrupt blob among many."""
+    q, fake = make_q()
+    q.mirror_manifest(make_manifest("good", "python x.py"))
+    fake.blobs["queue/jobs/locked.json"] = b"{}"
+
+    real_get_object = fake.get_object
+
+    def _flaky_get_object(Bucket: str, Key: str) -> dict:
+        if Key.endswith("locked.json"):
+            raise PermissionError("permission denied")
+        return real_get_object(Bucket, Key)
+
+    fake.get_object = _flaky_get_object  # type: ignore[method-assign]
+    with pytest.raises(PermissionError):
+        q.list_mirrored()

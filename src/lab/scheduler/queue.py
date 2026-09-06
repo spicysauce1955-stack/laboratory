@@ -151,12 +151,16 @@ class LocalQueueStore:
             return None
         try:
             return JobManifest.model_validate_json(p.read_text())
-        except (ValidationError, UnicodeDecodeError, OSError):
+        except (ValidationError, UnicodeDecodeError):
             # A partial/stub manifest (e.g. version-skewed scheduler host, or a read racing an
             # in-progress write) must read as "not yet available", never crash the caller
             # (2026-09-04 `lab status` incident: 7 required fields missing). Genuinely corrupted
-            # bytes (non-UTF-8) or a race with an in-progress write hit the same code path via
-            # `read_text()`/`OSError` rather than pydantic — same degrade applies.
+            # (non-UTF-8) bytes hit the same path via `read_text()` rather than pydantic — same
+            # degrade applies. A bare `OSError` (PermissionError, disk-full, a stale mount) is
+            # deliberately NOT caught here: those are real, persistent I/O failures, not
+            # corruption, and must surface rather than read as "not yet available" forever
+            # (would otherwise make every `lab status`/`fetch`/`metrics`/`logs` call silently
+            # report "try again shortly" with zero signal of the real cause).
             return None
 
     def list_mirrored(self) -> list[JobManifest]:
@@ -169,13 +173,16 @@ class LocalQueueStore:
         for p in sorted(d.glob("*.json")):
             try:
                 out.append(JobManifest.model_validate_json(p.read_text()))
-            except (ValidationError, UnicodeDecodeError, OSError) as e:
+            except (ValidationError, UnicodeDecodeError) as e:
                 # Same rationale as read_mirrored: one partial/stale manifest (version skew, a
                 # read racing an in-progress write, or genuinely corrupted non-UTF-8 bytes) must
                 # not take down the whole listing. Unlike read_mirrored this has no single caller
                 # waiting on "not yet available", so the skip is surfaced (stderr + ledger)
                 # rather than silent — otherwise a real corruption could sit invisible behind a
-                # listing that just looks one job short.
+                # listing that just looks one job short. A bare `OSError` is deliberately NOT
+                # caught here either, for the same reason as read_mirrored: it's a real,
+                # persistent I/O failure, not corruption, and must propagate rather than be
+                # skipped as just-one-manifest-short.
                 print(f"[lab] skipping unreadable mirrored manifest {p}: {e}", file=sys.stderr)
                 events.note("queue.manifest_corrupt", key=str(p), error=str(e))
                 continue
