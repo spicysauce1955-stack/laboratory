@@ -11,6 +11,7 @@ manifest), mirroring the CLI. ``build_server(lab)`` lets tests inject a Lab at a
 
 from __future__ import annotations
 
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -114,6 +115,51 @@ def build_server(lab: Lab) -> FastMCP:
     def _lab_for(job_id: str) -> Lab:
         return default_lab(home=home, backend=_require(job_id).backend.provisioner)
 
+    def _manifest_or_mirror(job_id: str) -> tuple[JobManifest, bool]:
+        """Local store first; the scheduler's mirrored manifest second (spec §4.3) — the same
+        fallback ``job_status_view`` already gives ``status``, extended to the other read-only
+        job-scoped tools (metrics/logs/fetch_artifacts) so a deferred job is observable from
+        every read surface, not write-only. Returns ``(manifest, mirrored)``; raises ``ToolError``
+        when the job is in neither place. Deliberately NOT used by ``cancel`` — a job this project
+        never supervised must never look cancellable from here."""
+        try:
+            return store.read_manifest(job_id), False
+        except FileNotFoundError:
+            from lab.scheduler.queue import default_queue  # local import: avoids a module cycle
+
+            mirrored = default_queue().read_mirrored(job_id)
+            if mirrored is None:
+                raise ToolError(
+                    f"job '{job_id}' not found (locally or in the scheduler mirror)"
+                ) from None
+            return mirrored, True
+
+    def _lab_for_mirrored(job_id: str, manifest: JobManifest) -> Lab:
+        """A ``Lab`` over the backend that actually ran a job known only via the scheduler
+        mirror (not in this project's local ``runs/``).
+
+        The manifest is loaded into a throwaway ``JobStore`` rooted at a fresh temp directory,
+        live for this call only — never the real ``runs/`` — so a read (logs/metrics/
+        fetch_artifacts) can never leave behind anything ``cancel``/``reconcile`` would later
+        mistake for a job this machine genuinely supervises (SkyPilot client/server skew makes a
+        cross-machine teardown attempt on such a job actively dangerous; see ``lab._skycompat``).
+        Uses ``JobStore.write_manifest``, never ``.create`` — ``create`` also stamps the job into
+        the user-global ``~/.lab/jobs/index.jsonl`` ownership ledger (`lab.attribution`), which a
+        `reconcile` run from ANY project trusts as proof of local ownership; writing there would
+        recreate exactly the false-attribution failure mode CLAUDE.md's 2026-08-20 incident notes
+        describe, just from the read side instead of the destroy side."""
+        tmp_home = Path(tempfile.mkdtemp(prefix=f"lab-mcp-mirror-{job_id}-"))
+        JobStore(tmp_home).write_manifest(manifest)
+        return default_lab(home=tmp_home, backend=manifest.backend.provisioner)
+
+    def _lab_for_any(job_id: str) -> Lab:
+        """`_lab_for`, extended with the mirror fallback for read-only job-scoped tools. Never
+        used by `cancel` (must stay local-only, see `_manifest_or_mirror`)."""
+        manifest, mirrored = _manifest_or_mirror(job_id)
+        if mirrored:
+            return _lab_for_mirrored(job_id, manifest)
+        return default_lab(home=home, backend=manifest.backend.provisioner)
+
     @mcp.tool
     def submit(
         command: str,
@@ -179,6 +225,17 @@ def build_server(lab: Lab) -> FastMCP:
         timeout: float | None = None,
     ) -> dict[str, Any]:
         """Reproducibility gate (FR-B): re-derive a prior result from its pinned provenance and check it still holds. Relaunches run_id fresh (no cache) from its committed commit, then compares the re-run's final metric(s) against the original's snapshot within tolerance -> verdict 'match'|'drift'|'rerun_failed' with per-metric deltas. Raises ToolError for a non-succeeded or dirty producer (no honest result to re-derive) or a missing baseline. metric restricts which metrics are judged (default: all). wait=False submits the re-run and returns {confirm_id, verdict:'pending'}."""
+        # No mirror fallback here (unlike metrics/logs/fetch_artifacts): Lab.confirm() re-reads
+        # run_id's manifest itself (self.manifest(orig_id) inside core.py) to build the relaunch,
+        # and the relaunch is a brand-new job it persists into *this* Lab's real local store —
+        # exactly the kind of write the mirror-read helpers above are built to avoid making up
+        # for a job we don't supervise. Loading run_id into a throwaway JobStore the way
+        # `_lab_for_mirrored` does would make the new, real, billing confirm-run's own manifest
+        # live only in that throwaway dir too (same `self.home` for both), i.e. genuinely
+        # unsupervised the moment this call returns — worse than today's ToolError, not better.
+        # Making confirm mirror-aware without that trap needs `Lab.confirm` itself to accept a
+        # pre-loaded baseline manifest while still writing the new job to the real store, which
+        # is a core.py behavior change beyond a read-only fallback — out of scope here.
         _require(run_id)
         try:
             return _lab_for(run_id).confirm(
@@ -335,21 +392,28 @@ def build_server(lab: Lab) -> FastMCP:
     def metrics(
         job_id: str, names: list[str] | None = None, since_step: int | None = None
     ) -> dict[str, Any]:
-        """Query incremental metric series; returns {series:{name:[{step,value,wall_time}]}} (FR-D2)."""
-        _require(job_id)
-        return {"series": _lab_for(job_id).metrics(job_id, names=names, since_step=since_step)}
+        """Query incremental metric series; returns {series:{name:[{step,value,wall_time}]}}
+        (FR-D2). Scheduler-launched (deferred) jobs fall back to the mirrored manifest (spec
+        §4.3), matching `status`; since their logs/metrics only live durably on the scheduler
+        host, this may legitimately return an empty series rather than an error."""
+        return {"series": _lab_for_any(job_id).metrics(job_id, names=names, since_step=since_step)}
 
     @mcp.tool
     def logs(job_id: str, tail: int | None = 100) -> dict[str, Any]:
-        """Tail a job's logs; returns {lines: [...]} (FR-D1)."""
-        _require(job_id)
-        return {"lines": _lab_for(job_id).logs(job_id, tail=tail)}
+        """Tail a job's logs; returns {lines: [...]} (FR-D1). Scheduler-launched (deferred) jobs
+        fall back to the mirrored manifest (spec §4.3), matching `status`; since their logs only
+        live durably on the scheduler host, this may legitimately return an empty list rather
+        than an error."""
+        return {"lines": _lab_for_any(job_id).logs(job_id, tail=tail)}
 
     @mcp.tool
     def fetch_artifacts(job_id: str) -> dict[str, Any]:
-        """Collect artifacts into runs/<job_id>/; returns {local_paths, artifacts} (FR-E2)."""
-        _require(job_id)
-        arts = _lab_for(job_id).fetch_artifacts(job_id)
+        """Collect artifacts into runs/<job_id>/; returns {local_paths, artifacts} (FR-E2).
+        Scheduler-launched (deferred) jobs fall back to the mirrored manifest (spec §4.3),
+        matching `status`, and are collected into a temp directory instead of runs/<job_id>/
+        (this project's runs/ never supervised them) — populated from R2 when the job's
+        manifest carries an artifacts_uri, empty otherwise."""
+        arts = _lab_for_any(job_id).fetch_artifacts(job_id)
         return {
             "local_paths": [a.path for a in arts],
             "artifacts": [a.model_dump() for a in arts],

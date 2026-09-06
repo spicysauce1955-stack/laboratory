@@ -137,6 +137,81 @@ def test_mcp_status_reads_mirrored_manifest(tmp_path, monkeypatch):
     assert out["state"] == "running" and out["mirrored"] is True
 
 
+def test_mcp_metrics_logs_fetch_read_mirrored_manifest(tmp_path: Path, monkeypatch):
+    """A scheduler-launched job (mirrored only, never in this project's local runs/) must be
+    observable via metrics/logs/fetch_artifacts too, not just `status` -- the code-review gap
+    this test guards against."""
+    lab, server = _make(tmp_path)
+    monkeypatch.setenv("LAB_JOBS_INDEX_DIR", str(tmp_path / "lab-jobs"))  # isolate from ~/.lab
+    m = make_manifest("jmir-rw", "python x.py").model_copy(
+        update={"status": JobState.succeeded, "teardown_status": "succeeded"}
+    )
+    _mirrored_queue(tmp_path, monkeypatch, m)
+
+    async def go():
+        async with Client(server) as c:
+            mt = (await c.call_tool("metrics", {"job_id": "jmir-rw"})).data
+            lg = (await c.call_tool("logs", {"job_id": "jmir-rw"})).data
+            ft = (await c.call_tool("fetch_artifacts", {"job_id": "jmir-rw"})).data
+            return mt, lg, ft
+
+    mt, lg, ft = asyncio.run(go())
+    # No local supervision ever happened for this job, so there is nothing real to report --
+    # the point is that these calls succeed instead of raising ToolError("not found").
+    assert mt == {"series": {}}
+    assert isinstance(lg["lines"], list)
+    assert ft == {"local_paths": [], "artifacts": []}
+
+
+def test_mcp_mirrored_job_never_seeds_local_store_or_index(tmp_path: Path, monkeypatch):
+    """The safety invariant: reading a mirrored job via metrics/logs/fetch_artifacts must never
+    write it into the real local job store or the user-global ownership index -- either of
+    which would make `cancel`/`reconcile` treat a job this machine never supervised as if it
+    did (SkyPilot client/server skew makes a cross-machine teardown attempt dangerous)."""
+    lab, server = _make(tmp_path)
+    jobs_index_dir = tmp_path / "lab-jobs"
+    monkeypatch.setenv("LAB_JOBS_INDEX_DIR", str(jobs_index_dir))
+    m = make_manifest("jmir-safe", "python x.py").model_copy(
+        update={"status": JobState.succeeded, "teardown_status": "succeeded"}
+    )
+    _mirrored_queue(tmp_path, monkeypatch, m)
+
+    async def go():
+        async with Client(server) as c:
+            await c.call_tool("metrics", {"job_id": "jmir-safe"})
+            await c.call_tool("logs", {"job_id": "jmir-safe"})
+            await c.call_tool("fetch_artifacts", {"job_id": "jmir-safe"})
+
+    asyncio.run(go())
+
+    # Real local store: still has no idea this job exists.
+    assert "jmir-safe" not in lab.store.list_job_ids()
+    with pytest.raises(FileNotFoundError):
+        lab.store.read_manifest("jmir-safe")
+    # The user-global ownership ledger `reconcile` trusts from any project: untouched too.
+    assert not (jobs_index_dir / "index.jsonl").exists()
+
+    # cancel and reconcile still correctly refuse to treat it as locally supervised.
+    async def go_cancel():
+        async with Client(server) as c:
+            await c.call_tool("cancel", {"job_id": "jmir-safe"})
+
+    with pytest.raises(ToolError, match="not found"):
+        asyncio.run(go_cancel())
+
+    def _fake_reconcile(self, *, apply=False):
+        return {"orphans": [], "sky_orphans": [], "unsupervised": [], "applied": apply}
+
+    monkeypatch.setattr(Lab, "reconcile", _fake_reconcile)
+
+    async def go_reconcile():
+        async with Client(server) as c:
+            return (await c.call_tool("reconcile", {})).data
+
+    out = asyncio.run(go_reconcile())
+    assert out["unsupervised"] == []  # nothing invented from the mirrored read above
+
+
 def test_mcp_reconcile_tool_is_dry_run(tmp_path, monkeypatch):
     lab, server = _make(tmp_path)
     seen: list = []
