@@ -43,6 +43,20 @@ def test_parse_duration_units():
     assert parse_duration("") is None
 
 
+def test_parse_duration_malformed_raises_clear_error():
+    """A bad duration string must raise a clear, actionable ``ValueError`` naming the expected
+    grammar — not the bare ``could not convert string to float: '...'`` that a fallthrough
+    ``float(s)`` produces. Confirmed production incident 2026-09-04 (``'3h30'`` from a typo)
+    plus an ISO-date-shaped ``--since`` value reproducing the identical crash shape."""
+    import pytest
+
+    for bad in ["3h30", "2026-08-23", "not-a-duration"]:
+        with pytest.raises(ValueError, match=r"invalid duration") as exc_info:
+            parse_duration(bad)
+        assert bad in str(exc_info.value)
+        assert "could not convert" not in str(exc_info.value)
+
+
 def test_infer_artifact_type():
     assert infer_artifact_type("fig.png") == "figure"
     assert infer_artifact_type("data.csv") == "table"
