@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -157,10 +158,25 @@ class LocalQueueStore:
             return None
 
     def list_mirrored(self) -> list[JobManifest]:
+        from lab import events
+
         d = self.root / "jobs"
         if not d.exists():
             return []
-        return [JobManifest.model_validate_json(p.read_text()) for p in sorted(d.glob("*.json"))]
+        out: list[JobManifest] = []
+        for p in sorted(d.glob("*.json")):
+            try:
+                out.append(JobManifest.model_validate_json(p.read_text()))
+            except ValidationError as e:
+                # Same rationale as read_mirrored: one partial/stale manifest (version skew, a
+                # read racing an in-progress write) must not take down the whole listing. Unlike
+                # read_mirrored this has no single caller waiting on "not yet available", so the
+                # skip is surfaced (stderr + ledger) rather than silent — otherwise a real
+                # corruption could sit invisible behind a listing that just looks one job short.
+                print(f"[lab] skipping unreadable mirrored manifest {p}: {e}", file=sys.stderr)
+                events.note("queue.manifest_corrupt", key=str(p), error=str(e))
+                continue
+        return out
 
     @staticmethod
     def _atomic_write(path: Path, text: str) -> None:

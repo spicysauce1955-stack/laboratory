@@ -131,3 +131,16 @@ def test_read_mirrored_partial_manifest_returns_none_instead_of_crashing():
     q, fake = make_q()
     fake.blobs["queue/jobs/partial.json"] = b'{"job_id": "partial", "mirrored": true}'
     assert q.read_mirrored("partial") is None
+
+
+def test_list_mirrored_skips_partial_manifest_instead_of_crashing():
+    """The sibling of the read_mirrored fix above: one corrupt/partial manifest anywhere in the
+    mirror must not take down the whole listing — it should be skipped, with the rest of the
+    jobs still returned (2026-09-06 review: list_mirrored had the same unguarded
+    model_validate_json call read_mirrored was fixed for, but in a loop, so it was worse — one
+    bad file failed every caller's listing, not just that one job's lookup)."""
+    q, fake = make_q()
+    q.mirror_manifest(make_manifest("good", "python x.py"))
+    fake.blobs["queue/jobs/partial.json"] = b'{"job_id": "partial", "mirrored": true}'
+    got = q.list_mirrored()
+    assert [m.job_id for m in got] == ["good"]
