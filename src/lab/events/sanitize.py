@@ -25,23 +25,38 @@ _SECRET_VALUE = (
 _HEXISH = re.compile(r"^[0-9a-f-]+$", re.IGNORECASE)  # commits, cell ids, job ids — not secrets
 # A `--flag=value` or `--flag value` pair anywhere inside a larger string. Matched directly
 # against the raw text (see `_mask_command_line`) rather than by tokenizing it — free text is not
-# shell-quoted, and treating it as if it were is its own bug (below). Two things a naive
-# `(--?[A-Za-z][\w-]*)(=|\s+)(\S+)` gets wrong, both fixed here:
+# shell-quoted, and treating it as if it were is its own bug (below). Naive versions of this get
+# several things wrong; each is fixed here:
 #   - no boundary before the dash, so it fires *inside* an ordinary hyphenated word ("pass-key",
 #     "well-authenticated" — the `-key`/`-auth...` tail reads as a flag). `(?<!\w)` requires the
 #     character right before the dash(es) be a non-word character (or start of string), which an
 #     ordinary compound word never has.
-#   - the value is `\S+`, so a quoted multi-word value (`--api-key "abc def ghi"`) only captures
-#     up to the first internal space, leaking the rest. The value alternation tries a balanced
-#     quoted span first (double or single — matched by a plain paired-quote regex, never a
-#     quote-interpreting tokenizer like `shlex`, which is what corrupted prose apostrophes
-#     before) and only falls back to a bare `\S+` token when the value isn't quoted.
+#   - a bare `\S+` value alternative with no restriction on its own shape will happily match a
+#     *following* `--flag` token as if it were the current flag's value (`--dry-run --api-key ...`
+#     matches flag=`--dry-run`, value=`--api-key`, consuming both in one span). That leaves the
+#     real flag+secret pair never independently tried — the secret sails through unmasked. Fixed
+#     by `(?!-)\S+`: a bare value may not itself start with `-`, so a boolean flag immediately
+#     followed by another flag (nothing real between them) simply fails to match here at all —
+#     correctly, since it isn't a `flag=value` pair — and the scan resumes at the next flag,
+#     giving it its own independent match.
+#   - an *unbounded* quoted-value alternative (`'[^']*'`) has no cap on distance: if the opening
+#     quote has no genuine closing partner nearby, backtracking happily extends the match to the
+#     next literal quote character anywhere later in the string — including an ordinary
+#     apostrophe inside an unrelated contraction many words away, silently deleting real prose in
+#     between. Double quotes carry far less of this risk in ordinary English prose (contractions
+#     never use `"`), so only `"..."` is treated as a genuine quoted value; a `'`-containing value
+#     (an unterminated quote, a contraction) falls through to the bare-token alternative above,
+#     which is bounded by the next whitespace/flag — at worst one word gets swept up, never an
+#     unbounded span. The double-quoted alternative is itself still explicitly bounded in length
+#     (`{0,200}`, no newline) so even a genuinely unterminated `"` can't reach an unrelated `"`
+#     much later in a long note.
 _INLINE_FLAG = re.compile(
     r"""
     (?<!\w)                     # boundary: not glued onto a preceding word character
     (--?[A-Za-z][\w-]*)         # the flag itself, e.g. --api-key, -k
     (=|\s+)                     # separator: inline '=' or one-or-more whitespace
-    ("[^"]*"|'[^']*'|\S+)       # value: a quoted span as one unit, else a bare token
+    ("[^"\n]{0,200}"|(?!-)\S+)  # value: a bounded double-quoted span as one unit, else a bare
+                                 # token that doesn't itself look like a flag
     """,
     re.VERBOSE,
 )
@@ -135,14 +150,17 @@ def _mask_command_line(text: str) -> str:
     def _mask_flag(m: re.Match[str]) -> str:
         flag, sep, value = m.group(1), m.group(2), m.group(3)
         # Strip a value's surrounding quotes before judging its shape — `_looks_secret` should
-        # see "abc def ghi", not '"abc def ghi"'. Only mask when there's actual reason to
-        # believe a secret is here: either the value itself is secret-shaped (catches a real
-        # secret behind an unremarkable flag name, e.g. `--seed <token>`), or the flag name is
-        # one of the established sensitive names (catches a short, low-entropy secret —
-        # `--password hunter2` — that `_looks_secret`'s length/entropy bar alone would miss).
-        # Masking on flag name alone unconditionally (the prior behavior) is what over-masked
-        # ordinary prose that merely *mentions* a flag (`--basic-auth flag`, `--keyword search`).
-        quoted = len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]
+        # see "abc def ghi", not '"abc def ghi"'. Only double quotes are ever treated as a
+        # genuine delimiter here (see `_INLINE_FLAG` above) — a single quote in `value` is just
+        # part of a bare token (an unterminated quote, a contraction), never something to strip.
+        # Only mask when there's actual reason to believe a secret is here: either the value
+        # itself is secret-shaped (catches a real secret behind an unremarkable flag name, e.g.
+        # `--seed <token>`), or the flag name is one of the established sensitive names (catches
+        # a short, low-entropy secret — `--password hunter2` — that `_looks_secret`'s
+        # length/entropy bar alone would miss). Masking on flag name alone unconditionally (the
+        # prior behavior) is what over-masked ordinary prose that merely *mentions* a flag
+        # (`--basic-auth flag`, `--keyword search`).
+        quoted = len(value) >= 2 and value[0] == '"' and value[-1] == '"'
         stripped = value[1:-1] if quoted else value
         if _looks_secret(stripped) or _SENSITIVE_FLAG_NAME.search(flag):
             return f"{flag}{sep}{MASK}"
