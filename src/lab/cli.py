@@ -1592,6 +1592,7 @@ _COMMAND_SYNONYMS = {
     "stop": "cancel",
     "abort": "cancel",
     "terminate": "cancel",
+    "kill": "cancel",
     "rm": "cancel",
     "delete": "cancel",
     "ps": "list",
