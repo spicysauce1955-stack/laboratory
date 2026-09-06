@@ -690,7 +690,20 @@ def note(
         # informative than the plain `"agent"` this used to record, and it is what every one of
         # those calls actually meant.
         if agent and len(extra_args) == 1:
-            author = extra_args[0]
+            if (
+                job_id is not None
+                and not _JOB_ID_SHAPE.match(job_id)
+                and _JOB_ID_SHAPE.match(extra_args[0])
+            ):
+                # The name-before-job-id ordering: `--agent <name> <job_id>`. `job_id` (the
+                # first declared positional) absorbed the stray agent-name token, and the real
+                # job id — which came second on the command line — landed in `extra_args`
+                # instead. A real job id always matches `_JOB_ID_SHAPE`; the mis-bound token in
+                # `job_id` here does not. Swap them back.
+                author = job_id
+                job_id = extra_args[0]
+            else:
+                author = extra_args[0]
         else:
             joined = " ".join(repr(a) for a in extra_args)
             msg = (
@@ -915,7 +928,10 @@ def _cancel_redirect_message(job_id: str) -> str:
     separate, in-flight fix elsewhere) must not crash `cancel`'s own error path, so it degrades
     to a plain "could not check" message instead of asserting the job is unknown outright
     (`_read_mirrored` is where that degradation actually happens — shared with
-    `_read_mirrored_manifest_or_fail`, not reimplemented here).
+    `_read_mirrored_manifest_or_fail`, not reimplemented here). The later `list_entries()` call
+    (finding the matching registration, for a friendlier redirect) gets the same treatment: a
+    transient queue-store error there degrades to the generic "scheduler-launched, reg_id not
+    found" message rather than propagating a raw exception out of `cancel`.
     """
     from lab.scheduler.queue import default_queue
 
@@ -933,9 +949,12 @@ def _cancel_redirect_message(job_id: str) -> str:
         )
     if mirrored is None:
         return generic
-    reg_id = next(
-        (r.reg_id for r in default_queue().list_entries() if r.job_id == job_id), None
-    )
+    try:
+        reg_id = next(
+            (r.reg_id for r in default_queue().list_entries() if r.job_id == job_id), None
+        )
+    except Exception:  # noqa: BLE001 — a transient queue-store error must not crash `cancel`
+        reg_id = None
     if reg_id is not None:
         return (
             f"job {job_id!r} is scheduler-launched (registration {reg_id!r}) — cancel it with "

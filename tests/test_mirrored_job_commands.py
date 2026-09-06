@@ -77,6 +77,24 @@ class _RaisingQueue:
         raise ValueError("stub manifest, missing required field 'run'")
 
 
+class _RaisingListEntriesQueue:
+    """A QueueStore whose `read_mirrored` works fine (delegates to a real `LocalQueueStore`)
+    but whose `list_entries` blows up -- the second, previously-unguarded call inside
+    `_cancel_redirect_message` (finding the registration that maps to a mirror-only job, for a
+    friendlier redirect message). A transient queue-store error here (network timeout, corrupt
+    registration entry) must not crash `cancel`'s own error path, exactly like a `read_mirrored`
+    crash already doesn't."""
+
+    def __init__(self, root: Path) -> None:
+        self._inner = LocalQueueStore(root)
+
+    def read_mirrored(self, job_id: str):  # noqa: ANN001, ANN201 - test double
+        return self._inner.read_mirrored(job_id)
+
+    def list_entries(self):  # noqa: ANN201 - test double
+        raise ValueError("queue store timeout")
+
+
 # ---------------------------------------------------------------------------
 # logs / metrics / fetch: fall back to the mirror
 # ---------------------------------------------------------------------------
@@ -226,6 +244,24 @@ class TestCancelRedirectsInsteadOfActing:
 
         assert result.exit_code == 2
         assert "could not be read" in result.output
+
+    def test_a_crashing_list_entries_does_not_crash_cancel(self, tmp_path, monkeypatch):
+        """`read_mirrored` succeeds (the job really is mirror-only), but the later
+        `list_entries()` call -- made to find the matching registration for a friendlier
+        message -- raises. That must still degrade to the generic "scheduler-launched, no
+        matching registration" redirect, not an unhandled exception out of `cancel`."""
+        _isolate(tmp_path, monkeypatch)
+        _mirror_only(tmp_path, "jmir-list-entries-crash")
+        monkeypatch.setattr(
+            "lab.scheduler.queue.default_queue",
+            lambda: _RaisingListEntriesQueue(tmp_path / "queue"),
+        )
+
+        result = runner.invoke(app, ["cancel", "jmir-list-entries-crash"])
+
+        assert result.exit_code == 2
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "lab queue cancel" in result.output
 
 
 # ---------------------------------------------------------------------------
