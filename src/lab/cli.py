@@ -295,6 +295,14 @@ def _lab_for_wait(job_id: str) -> Lab:
     terminal. Nothing is written anywhere here; the mirrored manifest is read only to learn which
     backend to build, and `runs/<job_id>/` stays absent, which is what keeps `cancel` and
     reconcile's `unsupervised` pass correctly treating the job as not locally supervised.
+
+    This builds the Lab from `ids[0]` only, so for a mixed `lab wait <deferred_job> <local_job>`
+    it is merely a *default*: `Lab._resolve_manifest` refreshes each job through
+    `Lab._backend_for(<that job's own manifest>.backend.provisioner)`. Before a mirror-only id was
+    accepted here, `ids[0]` was always locally supervised and the two could not disagree; now they
+    can, and routing off `ids[0]` would refresh a local job through SkyPilot — whose
+    dead-supervisor branch tears down a cluster that never existed and raises a false exit-3
+    "a paid machine may still be billing". See `Lab._backend_for`.
     """
     try:
         return _lab_for(job_id)

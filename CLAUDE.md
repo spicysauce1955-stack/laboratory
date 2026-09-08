@@ -153,8 +153,18 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   summary's `mirrored`, and an all-mirrored wait floors its poll interval at 30s because the mirror
   is only as fresh as the 60s tick. The local read stays **first** on purpose (never ask a live
   backend about a job this machine didn't supervise) and `backend.status` stays inside the resolve
-  (it's what finalizes a job whose supervisor died silently). `lab cancel` still refuses a
-  mirror-only job by design — `lab queue cancel` is the path. Until this landed, watching a
+  — it's what finalizes a job whose supervisor died silently, and it is dispatched per job through
+  `Lab._backend_for(<that manifest>.backend.provisioner)`, never through `ids[0]`'s backend (a
+  mixed `wait <deferred_skypilot> <local>` would otherwise tear down a cluster that never existed
+  and raise a false exit 3). Three cost-of-being-wrong rules follow from the mirror being a
+  network read on a 60s tick: a mirror read that **fails mid-poll is "no news yet"**, never an
+  exception (the caller's `--timeout` is the only bound — an exception here surfaces as exit 1,
+  i.e. indistinguishable from a real timeout, after hours of waiting); the teardown settle spans
+  **`_MIRROR_SETTLE_S` = 75s** for a mirrored job, because `tick.py` mirrors terminal status one
+  tick before `teardown_status` and the local 15s window would have fired "teardown not confirmed"
+  on *every* clean deferred run (R10); and the queue store is built **once per `Lab`**
+  (`Lab._queue`), not once per poll — `default_queue()` builds a fresh boto3 client each call.
+  `lab cancel` still refuses a mirror-only job by design — `lab queue cancel` is the path. Until this landed, watching a
   deferred job meant a hand-rolled `lab status` loop, which is exactly how the 98,654-poll storm
   happened. `--sweep` over deferred jobs is still a gap (`jobs_in_sweep` walks local `runs/`). Transient local-API launch errors retry with backoff
   (`LAB_LAUNCH_RETRIES`, `end_reason` prefix `transient:`); remote sweep submits stagger

@@ -89,6 +89,30 @@ class _ScriptedQueue:
         return seq.pop(0) if len(seq) > 1 else seq[0]
 
 
+class _FlakyQueue:
+    """A mirror that raises on the reads named in ``raise_on`` (0-based) and otherwise walks
+    ``_ScriptedQueue``'s script. Models a transient object-store failure — `R2Store.get_text`
+    re-raises every non-NoSuchKey boto error, so a single 5xx or reset lands here as an
+    exception mid-wait."""
+
+    def __init__(self, script: dict[str, list[JobManifest]], raise_on: set[int]) -> None:
+        self.inner = _ScriptedQueue(script)
+        self.raise_on = set(raise_on)
+        self.n = 0
+        self.raised: list[int] = []
+
+    def read_mirrored(self, job_id: str) -> JobManifest | None:
+        i, self.n = self.n, self.n + 1
+        if i in self.raise_on:
+            self.raised.append(i)
+            raise OSError("connection reset by peer (simulated R2 5xx)")
+        return self.inner.read_mirrored(job_id)
+
+    @property
+    def reads(self) -> list[str]:
+        return self.inner.reads
+
+
 def _use_queue(monkeypatch: pytest.MonkeyPatch, queue: Any) -> None:
     monkeypatch.setattr("lab.scheduler.queue.default_queue", lambda: queue)
 
@@ -487,3 +511,334 @@ class TestCliWaitGate:
 
         assert result.exit_code == 0, result.output
         assert json.loads(done.read_text())["mirrored"] == ["jmir"]
+
+
+# ---------------------------------------------------------------------------
+# a transient mirror read must not kill a long wait (review finding 1)
+# ---------------------------------------------------------------------------
+
+
+class TestATransientMirrorFailureIsNotTheEndOfTheWait:
+    """`R2Store.get_text` re-raises every non-NoSuchKey boto error and `default_queue()` can fail
+    on its own, so one 5xx / connection reset on one poll used to unwind `wait_summary`. The CLI's
+    generic handler turns that into **exit 1** — the documented code for "gave up on --timeout" —
+    so a six-hour wait ended indistinguishable from a real timeout because of a network hiccup.
+    A poll that cannot read the mirror means "no news yet"; the caller's own --timeout is the
+    bound, and no retry budget is invented."""
+
+    def test_a_mirror_error_mid_wait_is_survived_and_the_verdict_is_still_right(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        lab = _lab(tmp_path)
+        queue = _FlakyQueue(
+            {
+                "jmir": [
+                    _manifest("jmir", JobState.running),
+                    _manifest("jmir", JobState.succeeded),
+                ]
+            },
+            raise_on={1},  # not the first read: the wait is already six hours old
+        )
+        _use_queue(monkeypatch, queue)
+        _record_sleeps(monkeypatch)
+
+        (m,) = lab.wait(["jmir"], interval=0.01, timeout=600)
+
+        assert queue.raised == [1]  # the failure really happened mid-poll
+        assert m.status is JobState.succeeded  # the real verdict, not a crash
+        assert "mirror could not be read" in capsys.readouterr().err  # said so, on stderr
+
+    def test_a_mirror_that_briefly_reads_as_absent_keeps_waiting(self, tmp_path, monkeypatch):
+        """A version-skewed manifest written by a mid-wait scheduler redeploy makes
+        `read_mirrored` answer `None`, which the resolver turns into a bare FileNotFoundError.
+        Mid-wait that is still just "not yet available"."""
+
+        class _BlinkingQueue:
+            def __init__(self) -> None:
+                self.n = 0
+
+            def read_mirrored(self, job_id: str) -> JobManifest | None:
+                self.n += 1
+                if self.n == 2:
+                    return None  # partial/stub manifest, e.g. a redeployed scheduler host
+                if self.n < 4:
+                    return _manifest("jmir", JobState.running)
+                return _manifest("jmir", JobState.succeeded)
+
+        _use_queue(monkeypatch, _BlinkingQueue())
+        _record_sleeps(monkeypatch)
+
+        (m,) = _lab(tmp_path).wait(["jmir"], interval=0.01, timeout=600)
+
+        assert m.status is JobState.succeeded
+
+    def test_an_unknown_id_still_fails_on_the_first_poll(self, tmp_path, monkeypatch):
+        """The degradation must not swallow the "this id exists nowhere" signal: it has to fail
+        immediately (never sleep its way to the deadline), which is what keeps the CLI gate's
+        exit 2 honest."""
+        lab = _lab(tmp_path)
+        _mirror(tmp_path, monkeypatch)  # empty mirror
+        sleeps = _record_sleeps(monkeypatch)
+
+        with pytest.raises(FileNotFoundError):
+            lab.wait(["nope"], interval=0.01, timeout=600)
+
+        assert sleeps == []
+
+    def test_the_cli_does_not_report_a_mirror_blip_as_a_timeout(self, tmp_path, monkeypatch):
+        """The end-to-end shape of the bug: exit 1 with no way to tell a network hiccup from a
+        real `--timeout`."""
+        _isolate_cli(tmp_path, monkeypatch)
+        running = _manifest("jmir", JobState.running)
+        # Reads 0 and 1 are the CLI's own pre-wait pair (`_mirror_knows`, then `_lab_for_wait`
+        # learning which backend to build); read 2 is the wait's first poll. So read 3 is the
+        # first one that lands *inside* the poll loop, hours in.
+        queue = _FlakyQueue(
+            {"jmir": [running, running, running, _manifest("jmir", JobState.succeeded)]},
+            raise_on={3},
+        )
+        _use_queue(monkeypatch, queue)
+        _record_sleeps(monkeypatch)
+
+        result = runner.invoke(app, ["wait", "jmir", "--interval", "1", "--timeout", "8h"])
+
+        assert queue.raised == [3]
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["all_terminal"] is True
+
+
+# ---------------------------------------------------------------------------
+# the teardown settle has to outlast a scheduler tick for mirrored jobs (finding 5)
+# ---------------------------------------------------------------------------
+
+
+class _TickingMirror:
+    """A mirror that publishes `teardown_status` only once a scheduler tick has passed — what the
+    real one does. `tick.py::_sync` mirrors the terminal manifest, and the supervisor's later
+    `teardown_status` only reaches the mirror on a *following* tick (its `RE_MIRROR_TERMINAL_S`
+    grace window)."""
+
+    def __init__(self, lagging: JobManifest, settled: JobManifest, *, clock, tick_s=60.0) -> None:
+        self.lagging, self.settled, self.clock, self.tick_s = lagging, settled, clock, tick_s
+
+    def read_mirrored(self, job_id: str) -> JobManifest | None:
+        return self.settled if self.clock() >= self.tick_s else self.lagging
+
+
+def _ticking(monkeypatch: pytest.MonkeyPatch, sleeps: list[float]) -> None:
+    _use_queue(
+        monkeypatch,
+        _TickingMirror(
+            _manifest("jmir", JobState.succeeded, provisioner="skypilot"),
+            _manifest("jmir", JobState.succeeded, provisioner="skypilot", teardown="succeeded"),
+            clock=lambda: sum(sleeps),
+        ),
+    )
+
+
+class TestTheSettleSpansASchedulerTickForMirroredJobs:
+    """The settle window was 3 x min(interval, 5) = 15s and explicitly exempt from the mirrored
+    poll floor. A mirrored manifest cannot refresh faster than the scheduler's 60s tick, so every
+    clean deferred wait ended with `teardown_status: None` -> `teardown_unconfirmed` -> the "run
+    `lab reconcile` to be sure no machine is still billing" warning. That is the money alarm
+    firing on every clean run: the R10 failure mode that gets an alarm ignored."""
+
+    def test_a_mirrored_teardown_settles_instead_of_reading_unconfirmed(
+        self, tmp_path, monkeypatch
+    ):
+        lab = _lab(tmp_path)
+        sleeps = _record_sleeps(monkeypatch)
+        _ticking(monkeypatch, sleeps)
+
+        summary = lab.wait_summary(["jmir"], interval=10.0, timeout=600)
+
+        assert summary["teardown_unconfirmed"] == []
+        assert summary["jobs"][0]["teardown_status"] == "succeeded"
+        assert sum(sleeps) >= 60.0  # the old 15s window could not have spanned the tick
+
+    def test_a_clean_deferred_wait_prints_no_teardown_warning(self, tmp_path, monkeypatch):
+        """The user-visible half: exit 0 *and* silence. A warning here is the one nobody would
+        ever act on again."""
+        _isolate_cli(tmp_path, monkeypatch)
+        sleeps = _record_sleeps(monkeypatch)
+        _ticking(monkeypatch, sleeps)
+
+        result = runner.invoke(app, ["wait", "jmir", "--timeout", "600"])
+
+        assert result.exit_code == 0, result.output
+        assert "teardown not confirmed" not in result.stderr
+
+    def test_a_mirrored_teardown_that_never_lands_is_still_unconfirmed(self, tmp_path, monkeypatch):
+        """Do not suppress the alarm — a real leak still has to surface, just after a window long
+        enough to make it mean something."""
+        lab = _lab(tmp_path)
+        sleeps = _record_sleeps(monkeypatch)
+        _use_queue(
+            monkeypatch,
+            _ScriptedQueue({"jmir": [_manifest("jmir", JobState.succeeded, provisioner="skypilot")]}),
+        )
+
+        summary = lab.wait_summary(["jmir"], interval=10.0, timeout=600)
+
+        assert summary["teardown_unconfirmed"] == ["jmir"]
+        assert sum(sleeps) == core_mod._MIRROR_SETTLE_S  # bounded, not a second poll loop
+
+    def test_a_purely_local_wait_keeps_the_fast_settle(self, tmp_path, monkeypatch):
+        """A local job's teardown_status is written to the very file being re-read, seconds after
+        terminal — flooring that at a scheduler tick would add 75s to every ordinary remote
+        wait's exit."""
+        lab = _lab(tmp_path)
+        lab.store.create(_manifest("jloc", JobState.succeeded, provisioner="skypilot"))
+        sleeps = _record_sleeps(monkeypatch)
+        _mirror(tmp_path, monkeypatch)  # empty: nothing here resolves from the mirror
+
+        summary = lab.wait_summary(["jloc"], interval=10.0, timeout=600)
+
+        assert summary["teardown_unconfirmed"] == ["jloc"]
+        assert sleeps == [5.0, 5.0, 5.0]
+
+
+# ---------------------------------------------------------------------------
+# one queue store per Lab, not one per poll (finding 4)
+# ---------------------------------------------------------------------------
+
+
+class TestTheQueueStoreIsBuiltOnce:
+    def test_a_polling_wait_builds_the_queue_store_once(self, tmp_path, monkeypatch):
+        """`default_queue()` -> `R2QueueStore.from_env()` -> `boto3.client("s3", ...)`: botocore
+        service models re-loaded and a fresh TLS connection, per mirrored job per poll. An 8h wait
+        at the 30s floor built ~960 of them — in the change whose point is cutting queue read
+        cost."""
+        lab = _lab(tmp_path)
+        running = _manifest("jmir", JobState.running)
+        queue = _ScriptedQueue(
+            {"jmir": [running, running, running, _manifest("jmir", JobState.succeeded)]}
+        )
+        builds: list[int] = []
+        monkeypatch.setattr(
+            "lab.scheduler.queue.default_queue", lambda: (builds.append(1), queue)[1]
+        )
+        _record_sleeps(monkeypatch)
+
+        lab.wait_summary(["jmir"], interval=0.01, timeout=600)
+
+        assert len(queue.reads) >= 4  # it really did poll several times
+        assert builds == [1]  # ... through one client
+
+    def test_a_second_lab_does_not_inherit_the_first_labs_queue(self, tmp_path, monkeypatch):
+        """The cache is per-Lab, never process-global: tests swap `LAB_QUEUE_DIR` between cases
+        and a leaked store would make one case answer for the next."""
+        _mirror(tmp_path / "a", monkeypatch, _manifest("ja", JobState.succeeded))
+        lab_a = _lab(tmp_path / "a")
+        assert lab_a.wait(["ja"], interval=0.01, timeout=5)[0].job_id == "ja"
+
+        _mirror(tmp_path / "b", monkeypatch, _manifest("jb", JobState.succeeded))
+        lab_b = _lab(tmp_path / "b")
+
+        assert lab_b.wait(["jb"], interval=0.01, timeout=5)[0].job_id == "jb"
+        with pytest.raises(FileNotFoundError):  # `ja` lives only in the *first* queue
+            lab_b.wait(["ja"], interval=0.01, timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# per-job backend routing in a mixed wait (finding 6)
+# ---------------------------------------------------------------------------
+
+
+def test_a_mixed_wait_refreshes_each_job_through_its_own_backend(tmp_path, monkeypatch):
+    """`cli._lab_for_wait(ids[0])` builds one Lab for the whole id list. Now that a mirror-only
+    id is accepted, `lab wait <deferred_skypilot_job> <local_job>` builds a SkyPilot-backed Lab —
+    and refreshing the *local* job through it hits `SkyPilotBackend.status`'s dead-supervisor
+    branch, which tears down `cluster_name_for(<local job id>)`, a cluster that never existed,
+    records `teardown_status="failed"` and exits 3. A "a paid machine may still be billing" alarm
+    for a job that has no machine at all."""
+
+    class _SkyLikeBackend:
+        """Stands in for `SkyPilotBackend`: asked about a non-terminal job whose runner is gone,
+        it attempts a teardown of a cluster named after the job and records the failure."""
+
+        name = "skypilot"
+
+        def __init__(self, home: Path) -> None:
+            self.store = JobStore(home)
+            self.asked: list[str] = []
+
+        def status(self, job_id: str) -> JobState:
+            self.asked.append(job_id)
+            m = self.store.read_manifest(job_id)
+            if m.status is JobState.running:
+                return self.store.update_manifest(
+                    job_id, status=JobState.failed, teardown_status="failed"
+                ).status
+            return m.status
+
+    home = tmp_path / "runs"
+    backend = _SkyLikeBackend(home)
+    lab = Lab(backend=backend, repo=repo_root(Path.cwd()), home=home)
+    lab.store.create(_manifest("jloc", JobState.running, provisioner="local"))
+    lab.store.write_runtime("jloc", runner_pid=999999999)  # a pid that cannot exist
+    _mirror(
+        tmp_path,
+        monkeypatch,
+        _manifest("jmir", JobState.succeeded, provisioner="skypilot", teardown="succeeded"),
+    )
+    _record_sleeps(monkeypatch)
+
+    summary = lab.wait_summary(["jmir", "jloc"], interval=0.01, timeout=600)
+
+    assert backend.asked == []  # never asked about a job it did not run
+    assert summary["teardown_leaks"] == []  # no phantom cluster, no money alarm
+    # ...and the local job still got finalized, by the backend that actually ran it.
+    assert summary["jobs"][1] == {
+        "job_id": "jloc", "state": "failed", "exit_code": None, "teardown_status": None
+    }
+    assert lab.manifest("jloc").end_reason == "runner exited without recording status"
+
+
+# ---------------------------------------------------------------------------
+# callback failures never touch stdout (finding 7)
+# ---------------------------------------------------------------------------
+
+
+def _boom(_arg: Any) -> None:
+    raise RuntimeError("watcher exploded")
+
+
+class TestCallbackFailuresStayOffStdout:
+    def test_a_failing_on_terminal_callback_prints_to_stderr(self, tmp_path, monkeypatch, capsys):
+        lab = _lab(tmp_path)
+        _mirror(tmp_path, monkeypatch, _manifest("jmir", JobState.succeeded))
+        _record_sleeps(monkeypatch)
+
+        lab.wait(["jmir"], interval=0.01, timeout=5, on_terminal=_boom)
+
+        cap = capsys.readouterr()
+        assert cap.out == ""  # stdout carries only the summary JSON, which callers pipe to jq
+        assert "on_terminal callback failed" in cap.err
+
+    def test_a_failing_on_update_callback_prints_to_stderr(self, tmp_path, monkeypatch, capsys):
+        lab = _lab(tmp_path)
+        _mirror(tmp_path, monkeypatch, _manifest("jmir", JobState.succeeded))
+        _record_sleeps(monkeypatch)
+
+        lab.wait_summary(["jmir"], interval=0.01, timeout=5, on_update=_boom)
+
+        cap = capsys.readouterr()
+        assert cap.out == ""
+        assert "on_update callback failed" in cap.err
+
+    def test_an_unwritable_done_file_leaves_the_summary_json_parseable(self, tmp_path, monkeypatch):
+        """`lab wait <job> --done-file /nope/done.json | jq` — the message must not land ahead of
+        the summary on stdout."""
+        _isolate_cli(tmp_path, monkeypatch)
+        _mirror(tmp_path, monkeypatch, _manifest("jmir", JobState.succeeded))
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("")  # mkdir(parents=True) over a regular file fails
+
+        result = runner.invoke(
+            app, ["wait", "jmir", "--timeout", "10", "--done-file", str(blocker / "done.json")]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["all_terminal"] is True
+        assert "callback failed" in result.stderr

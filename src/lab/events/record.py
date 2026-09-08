@@ -25,19 +25,47 @@ from lab.events.sanitize import mask_text, sanitize_params
 RING = 200
 
 #: Cheap, read-only commands whose *successes* are rate-limited on the write path (see
-#: ``store.claim_read_slot``). Nothing here provisions, destroys or spends: a poll that says the
-#: same thing the last poll said one second ago is not a record worth keeping, and 98,654 of them
-#: in five days is how the 2026-09 campaign filled the byte cap and cost itself a day of
-#: forensics. Failures are never limited, whatever the action.
+#: ``store.claim_read_slot``). Nothing here provisions, destroys or spends, and 98,654 successful
+#: ``lab status`` calls in five days is how the 2026-09 campaign filled the byte cap and cost
+#: itself a day of forensics. Failures are never limited, whatever the action.
+#:
+#: **What the rule actually is, and what it costs.** The window is keyed on ``(action, project)``
+#: — the *target* is deliberately not in it. So within the window a successful read is dropped
+#: whatever job or sweep it names: ``lab status jobA`` at t=0 is recorded and a successful
+#: ``lab status jobB`` at t=1 leaves no ledger trace at all, and ``lab history --job jobB`` will
+#: show nothing for that look. This is not "a poll that repeats the previous poll" — it is "at
+#: most one successful read of this action per project per minute", and it is a deliberate trade,
+#: measured before it was taken. Adding the target to the key was proposed and rejected on the
+#: real ledger: over the campaign the *same* job id was re-polled at a median gap of **145.2 s**,
+#: and only **0.3%** of same-job intervals were under 60 s (344 job ids, 100,147 intervals), so a
+#: target-keyed window would have suppressed 0.3% of a 98,654-record storm — it defeats the fix
+#: outright. Do not re-litigate it without new numbers.
+#:
+#: **What it costs, also measured, because the number above is only the benefit side.** Replaying
+#: the same ledger through this window: of 355 distinct job ids polled, **239 (67.3%) would keep no
+#: successful read at all** — cross-job interleaving, not same-job repetition, is what spends the
+#: window (32 shards polled round-robin inside a minute leave one survivor). That is the real price
+#: and it is still the right trade, because the alternative is not "keep them": it is a ledger that
+#: crosses its byte cap and drops whole days, *including every failure record in them*, which is
+#: what actually happened on 2026-09-03.
+#:
+#: The trade is affordable because the ledger is not the record of a job: the job's own manifest
+#: is. Every *mutating* call (``submit``, ``register``, ``fetch``, ``cancel``, ``reconcile``) is
+#: never rate-limited, and neither is any failure of any action — so ``lab history --job X`` still
+#: shows everything that was *done* to X and everything that went wrong with it. Only "somebody
+#: looked at X while it was fine" can go missing. If that ever needs recovering, the cheap way is a
+#: suppression counter folded into the stamp file (already open and locked) and emitted on the next
+#: recorded pair — no extra records, no extra I/O. Deliberately not built: unmeasured need.
 #:
 #: Two spellings of the same read are both real and both handled: the CLI records a group leaf as
 #: ``"queue list"`` (``cli._group_action``) and the MCP tool of the same name as ``"queue_list"``.
 #: ``read_only_key`` normalises them onto the one entry here, so the window is shared across
 #: surfaces rather than each surface getting its own.
-# The reads that get polled in loops. `history`/`report` are deliberately absent: they are the
-# ledger's own forensic surface, and over the 5 days that motivated this limiter they were 33 and
-# 5 calls against 98,654 `status` — no volume to win, and a burst of investigative reads should
-# leave its own trail rather than silently record nothing.
+#:
+#: ``history``/``report`` are deliberately absent: they are the ledger's own forensic surface, and
+#: over those same five days they were 33 and 5 calls against 98,654 ``status`` — no volume to win,
+#: and a burst of investigative reads should leave its own trail rather than silently record
+#: nothing.
 _READ_ONLY_ACTIONS = frozenset({"status", "list", "logs", "metrics", "queue list", "queue show"})
 _current: ContextVar["Call | None"] = ContextVar("lab_events_current", default=None)
 _seq = 0

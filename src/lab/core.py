@@ -21,7 +21,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from lab._util import (
     actual_cost,
@@ -65,6 +65,9 @@ from lab.aggregate import merge_seed_rows
 from lab.sharding import parse_seeds, partition_seeds, seeds_to_arg
 from lab.store import JobStore, cell_id_for
 
+if TYPE_CHECKING:  # import-time only: `lab.scheduler.queue` is reached lazily (module cycle)
+    from lab.scheduler.queue import QueueStore
+
 _TERMINAL_STATES = frozenset(
     {
         JobState.succeeded, JobState.failed, JobState.cancelled,
@@ -79,9 +82,32 @@ _TERMINAL_STATES = frozenset(
 # their poll is also what finalizes a dead supervisor (`backend.status`).
 _MIRROR_MIN_INTERVAL_S = 30.0
 
+# How long :meth:`Lab._settle_teardown` keeps re-reading a *mirrored* job whose teardown_status is
+# still null. The scheduler writes the mirror in two steps: `tick.py::_sync` mirrors the terminal
+# manifest, and the supervisor's later `teardown_status` only reaches the mirror on a following
+# tick (the `RE_MIRROR_TERMINAL_S` grace window). So a laptop that observes terminal at T sees the
+# teardown at the next tick — up to one full tick period later, plus however long that tick itself
+# takes to run. The local settle's 15s cannot span that, which would have made *every* clean
+# deferred wait print the "teardown not confirmed — run `lab reconcile`" warning: the money alarm,
+# wrong almost every time, i.e. the R10 failure mode that gets an alarm ignored. 75s is one full
+# 60s tick plus 25% for the tick's own runtime and clock skew — the smallest window that can
+# contain a whole tick, and deliberately under two ticks so a clean deferred wait does not pay two
+# minutes on the way out. Still null after that is a verdict, not lag: the warning is then earned.
+_MIRROR_SETTLE_S = 75.0
+
 
 class LabError(RuntimeError):
     """Fail-loud lab error (FR-F3)."""
+
+
+class MirrorReadError(LabError):
+    """The scheduler queue's mirror could not be read for a job.
+
+    Distinct from :class:`FileNotFoundError`, which means "this job exists nowhere": this means
+    "the mirror could not answer *this time*" — a transient object-store 5xx/reset, or a queue
+    store that could not even be built. The distinction is load-bearing in :meth:`Lab.wait`, where
+    the first is a caller error and the second is just no news yet.
+    """
 
 
 def _new_job_id() -> str:
@@ -460,6 +486,9 @@ class Lab:
         self.repo = Path(repo)
         self.home = Path(home)
         self.store = JobStore(self.home)
+        # Lazily built, then reused for this Lab's lifetime — see `_queue` / `_backend_for`.
+        self._queue_store: QueueStore | None = None
+        self._backends: dict[str, Backend] = {}
 
     def preflight(self, spec: JobSpec) -> None:
         """Refuse a remote launch that a cheap local check proves cannot work (FR-F3).
@@ -1038,6 +1067,52 @@ class Lab:
     def manifest(self, job_id: str) -> JobManifest:
         return self.store.read_manifest(job_id)
 
+    def _queue(self) -> QueueStore:
+        """The scheduler's queue store, built once per :class:`Lab` and then reused.
+
+        Calling ``default_queue()`` per lookup rebuilds an :class:`~lab.storage.R2Store`, and with
+        it a fresh ``boto3.client("s3", ...)``: botocore's service models are re-loaded and a new
+        TLS connection is opened with nothing to keep alive. A poll loop pays that per mirrored
+        job per poll — an 8h wait at the 30s mirror floor is ~960 clients for one job — in the
+        very code path whose point is cutting the queue's read cost.
+
+        Cached on the instance, never process-globally: ``default_queue()`` reads
+        ``LAB_QUEUE_DIR``/R2 env at call time, and a global cache would leak one test's queue into
+        the next. Every surface builds its Lab per invocation (the CLI is one-shot; the MCP server
+        holds one for the process, which is exactly the lifetime this cache wants).
+        """
+        q = self._queue_store
+        if q is None:
+            from lab.scheduler.queue import default_queue  # local import: avoids a module cycle
+
+            q = self._queue_store = default_queue()
+        return q
+
+    def _backend_for(self, provisioner: str) -> Backend:
+        """The backend that actually ran a job — which is not necessarily this Lab's own.
+
+        ``lab wait`` builds one Lab for a whole id list, from the *first* id's manifest. Now that
+        a mirror-only id is accepted, ``lab wait <deferred_skypilot_job> <local_job>`` builds a
+        SkyPilot-backed Lab and would refresh the *local* job through it: if that job is
+        ``running`` with a dead runner, ``SkyPilotBackend.status``'s dead-supervisor branch tears
+        down ``cluster_name_for(<local job id>)`` — a cluster that never existed — records
+        ``teardown_status="failed"`` and makes the wait exit 3. That is the FR-C2 money alarm
+        firing for a job that has no machine at all.
+
+        So a refresh is routed off each manifest's own ``backend.provisioner``. (:meth:`
+        _sibling_lab` is the per-*repo* version of this dispatch and does not fit: it keeps
+        ``self.backend.name`` and varies the repo, which is the opposite axis.) Backends are cheap
+        handles over the store, and are cached per provisioner for the poll loop.
+        """
+        if provisioner == self.backend.name:
+            return self.backend
+        cached = self._backends.get(provisioner)
+        if cached is None:
+            cached = self._backends[provisioner] = build_backend(
+                provisioner, home=self.home, repo=self.repo
+            )
+        return cached
+
     def _resolve_manifest(self, job_id: str, *, refresh: bool = False) -> tuple[JobManifest, bool]:
         """A job's manifest from the local store, or failing that from the scheduler queue's
         mirror. Returns ``(manifest, mirrored)``.
@@ -1064,21 +1139,33 @@ class Lab:
         Ordering it the other way happens to work today only because both backends' ``status``
         reads the manifest on their first line; that is not something ``Backend`` promises.
 
+        The refresh goes through :meth:`_backend_for`, i.e. the provisioner named by the manifest
+        that was just read — never blindly ``self.backend``, which for a multi-id wait is whatever
+        the *first* id happened to use.
+
         Raises :class:`FileNotFoundError` — the store's own, unchanged — when neither place has
         the job. ``read_mirrored`` answering ``None`` (a partial/version-skewed mirrored manifest,
-        or a read racing an in-progress write) is "not found" too, never a crash.
+        or a read racing an in-progress write) is "not found" too, never a crash. A mirror that
+        *raises* is neither: it is :class:`MirrorReadError`, so a caller can tell "this job does
+        not exist" from "the mirror could not answer this time" (see :meth:`wait`).
         """
         try:
             m = self.manifest(job_id)
         except FileNotFoundError:
-            from lab.scheduler.queue import default_queue  # local import: avoids a module cycle
-
-            mirrored = default_queue().read_mirrored(job_id)
+            try:
+                mirrored = self._queue().read_mirrored(job_id)
+            except Exception as e:  # noqa: BLE001 — every failure mode is "the mirror is down"
+                # `R2Store.get_text` re-raises every non-NoSuchKey boto error, and building the
+                # queue store can fail on its own. Tagged rather than propagated raw so the poll
+                # loop can treat it as "no news yet" instead of dying six hours into a wait.
+                raise MirrorReadError(
+                    f"could not read job {job_id!r} from the scheduler's queue mirror: {e}"
+                ) from e
             if mirrored is None:
                 raise
             return mirrored, True
         if refresh:
-            self.status(job_id)
+            self._backend_for(m.backend.provisioner).status(job_id)
             m = self.manifest(job_id)  # re-read: status may have just finalized/torn down the job
         return m, False
 
@@ -1811,7 +1898,12 @@ class Lab:
         }
 
     def _settle_teardown(
-        self, manifests: list[JobManifest], *, interval: float, attempts: int = 3
+        self,
+        manifests: list[JobManifest],
+        *,
+        interval: float,
+        attempts: int = 3,
+        mirrored: Iterable[str] = (),
     ) -> list[JobManifest]:
         """Re-read manifests briefly so a teardown_status that's merely lagging (a job reports
         terminal a tick before its teardown is recorded) settles to its real value before we
@@ -1820,24 +1912,57 @@ class Lab:
 
         Goes through :meth:`_resolve_manifest`, so a mirror-only job settles too — a plain
         ``self.manifest`` read raises for one, which would have made this the second place in the
-        wait path that a deferred job could not get through. The short sleep is deliberately NOT
-        subject to ``_MIRROR_MIN_INTERVAL_S``: this is a bounded 3-attempt settle at the very end
-        of a wait, not a poll loop, and stretching it to 30s a go would add half a minute of
-        latency to every remote wait's exit."""
+        wait path that a deferred job could not get through.
 
-        def _unsettled(ms: list[JobManifest]) -> bool:
-            return any(
-                m.status in _TERMINAL_STATES  # only terminal jobs can settle; pending never will
+        The window depends on where the unsettled job's state comes from, because the two sources
+        lag by wildly different amounts:
+
+        * **local** (``attempts`` × ``min(interval, 5)`` = 15s by default): the supervisor writes
+          teardown_status to the very file being re-read, seconds after terminal. Unchanged, and
+          deliberately not subject to ``_MIRROR_MIN_INTERVAL_S`` — a 30s-a-go settle would add
+          half a minute of latency to the exit of every ordinary remote wait.
+        * **mirrored** (``_MIRROR_SETTLE_S``, sampled at the mirror floor): the value has to cross
+          a scheduler tick first, which 15s cannot span. See ``_MIRROR_SETTLE_S`` for why this is
+          the difference between a warning that means something and one that fires on every clean
+          deferred run.
+
+        ``mirrored`` names the ids known to have been read from the mirror (``wait`` already
+        collected them, so choosing the window costs no extra object-store GET).
+
+        A re-read that cannot resolve keeps the manifest it already has. This runs *after* the
+        verdict is already computable, so a failed re-read can only leave it where it was —
+        ``teardown_status: None`` stays "unconfirmed", which warns and never masquerades as clean.
+        Raising instead would turn an object-store blip into an exit-1 "gave up on --timeout"
+        *after* a completed wait: the same disguise :meth:`wait` refuses, and worse here because
+        the answer is already in hand."""
+        mirrored_ids = set(mirrored)
+
+        def _unsettled(ms: list[JobManifest]) -> list[JobManifest]:
+            return [
+                m
+                for m in ms
+                if m.status in _TERMINAL_STATES  # only terminal jobs can settle; pending never will
                 and m.backend.provisioner != "local"
                 and m.teardown_status is None
-                for m in ms
-            )
+            ]
 
-        for _ in range(attempts):
-            if not _unsettled(manifests):
-                break
-            time.sleep(min(interval, 5.0))
-            manifests = [self._resolve_manifest(m.job_id)[0] for m in manifests]
+        def _reread(m: JobManifest) -> JobManifest:
+            try:
+                return self._resolve_manifest(m.job_id)[0]
+            except (MirrorReadError, FileNotFoundError) as e:
+                events.note("wait.settle_unreadable", job_id=m.job_id, error=str(e))
+                return m
+
+        step, budget = min(interval, 5.0), attempts * min(interval, 5.0)
+        if any(m.job_id in mirrored_ids for m in _unsettled(manifests)):
+            step, budget = min(_MIRROR_MIN_INTERVAL_S, _MIRROR_SETTLE_S), _MIRROR_SETTLE_S
+        spent = 0.0
+        # Budgeted by intended sleep, not wall clock: the settle's cost is the sleeping.
+        while _unsettled(manifests) and spent < budget:
+            nap = min(step, budget - spent)
+            time.sleep(nap)
+            spent += nap
+            manifests = [_reread(m) for m in manifests]
         return manifests
 
     def _wait_summary_dict(
@@ -1936,8 +2061,12 @@ class Lab:
         )
         if all_terminal or failed_fast:
             # Settle on the fail-fast path too: the offender's teardown_status may be merely
-            # lagging, and a null must not hide a real leak verdict behind "unconfirmed".
-            manifests = self._settle_teardown(manifests, interval=interval)
+            # lagging, and a null must not hide a real leak verdict behind "unconfirmed". The
+            # mirrored ids decide how long that lag is worth waiting out (a scheduler tick, not
+            # a filesystem write) — see `_settle_teardown`.
+            manifests = self._settle_teardown(
+                manifests, interval=interval, mirrored=mirrored_seen
+            )
         summary = self._wait_summary_dict(
             manifests,
             failed_fast=failed_fast,
@@ -1947,7 +2076,8 @@ class Lab:
             try:
                 on_update(summary)
             except Exception as e:  # noqa: BLE001 — a watcher crash must not eat the verdict
-                print(f"[lab] wait on_update callback failed: {e}")
+                # stderr: stdout carries only the summary JSON, which callers pipe into `jq`.
+                print(f"[lab] wait on_update callback failed: {e}", file=sys.stderr)
         return summary
 
     def wait(
@@ -1983,11 +2113,24 @@ class Lab:
         (``confirm`` and several callers unpack manifests from it), and because re-deriving the
         answer afterwards would cost one more object-store GET per mirrored job for something
         the polls above already know.
+
+        **A mirror that cannot answer mid-wait means "no news yet", not a failed wait.** The
+        object store re-raises every non-``NoSuchKey`` error, so one 5xx or reset on one poll used
+        to unwind the whole call — and ``lab wait``'s generic handler turns that into exit 1, the
+        *documented code for "gave up on --timeout"*. Six hours of waiting would end
+        indistinguishable from a timeout because of a network hiccup. The only bound such a poll
+        needs is the caller's own ``timeout``, which is already exactly right; there is no retry
+        budget here on purpose. The **first** poll stays strict about a job that resolves nowhere
+        (``FileNotFoundError``), so an id neither the store nor the mirror knows still fails loudly
+        instead of hanging until the deadline.
         """
         deadline = time.monotonic() + timeout if timeout is not None else None
         pending = list(job_ids)
         effective_interval = interval
         cadence_decided = False
+        first_poll = True
+        last_seen: dict[str, JobManifest] = {}  # freshest manifest ever resolved, per job
+        unreadable: set[str] = set()  # jobs currently degraded (warned about once each)
         while pending:
             still_pending: list[str] = []
             tripwire = False
@@ -1996,7 +2139,29 @@ class Lab:
                 # One resolve per job per poll: `.status` off the manifest this returns is the
                 # same state `self.status(j)` reports (it re-reads after the backend's own
                 # finalizing write), so the extra manifest read the callback used to make is gone.
-                m, mirrored = self._resolve_manifest(j, refresh=True)
+                try:
+                    m, mirrored = self._resolve_manifest(j, refresh=True)
+                except (MirrorReadError, FileNotFoundError) as e:
+                    if isinstance(e, FileNotFoundError) and first_poll:
+                        raise  # an id in neither place is a caller error, not a hiccup
+                    # Either way this job is not in local runs/, so it counts as mirrored for the
+                    # cadence decision below (`mirrored_out` is left alone: it names the ids whose
+                    # *reported* data came from the mirror, and this poll reported none).
+                    resolved += 1
+                    from_mirror += 1
+                    events.note("wait.mirror_unreadable", job_id=j, error=str(e))
+                    if j not in unreadable:
+                        unreadable.add(j)
+                        print(
+                            f"[lab] {j}: the scheduler's queue mirror could not be read "
+                            f"({e}) — treating it as 'no news yet' and polling on. This wait's "
+                            "own --timeout is the bound.",
+                            file=sys.stderr,  # stdout carries only JSON, which callers parse
+                        )
+                    still_pending.append(j)
+                    continue
+                unreadable.discard(j)
+                last_seen[j] = m
                 resolved += 1
                 from_mirror += int(mirrored)
                 if mirrored and mirrored_out is not None:
@@ -2008,9 +2173,11 @@ class Lab:
                     try:
                         on_terminal(m)
                     except Exception as e:  # noqa: BLE001 — callback must never abort the wait
-                        print(f"[lab] wait on_terminal callback failed: {e}")
+                        # stderr: stdout carries only JSON, which callers parse.
+                        print(f"[lab] wait on_terminal callback failed: {e}", file=sys.stderr)
                 if fail_fast and m.status in (JobState.failed, JobState.timed_out):
                     tripwire = True
+            first_poll = False
             if not cadence_decided:
                 # Decided on the first poll, which sees every id in the wait (`pending` starts as
                 # all of them) — not re-decided later, when a mixed wait's local jobs finishing
@@ -2037,7 +2204,26 @@ class Lab:
                     break  # timed out before all jobs finished
                 # never overrun the deadline
                 time.sleep(max(0.05, min(effective_interval, remaining)))
-        return [self._resolve_manifest(j)[0] for j in job_ids]
+        out: list[JobManifest] = []
+        for j in job_ids:
+            try:
+                m, mirrored = self._resolve_manifest(j)
+            except (MirrorReadError, FileNotFoundError) as e:
+                # Same rule as the loop: a blip on the closing read must not discard a completed
+                # wait. Fall back to the freshest state this wait ever saw. Only a mirror that was
+                # unreadable for the *entire* wait leaves nothing to fall back on — and the CLI
+                # gate (`_mirror_knows`) already read it successfully moments earlier, so that is
+                # a genuinely broken mirror and belongs loud.
+                cached = last_seen.get(j)
+                if cached is None:
+                    raise
+                events.note("wait.final_read_unreadable", job_id=j, error=str(e))
+                out.append(cached)
+                continue
+            if mirrored and mirrored_out is not None:
+                mirrored_out.add(j)
+            out.append(m)
+        return out
 
 
 def build_backend(name: str, *, home: Path, repo: Path) -> Backend:

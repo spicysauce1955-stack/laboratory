@@ -241,14 +241,42 @@ def test_lock_files_excluded_from_byte_budget(_events_dir: Path) -> None:
 PAD = "p" * 2000
 
 
-def _successes(day_tag: str, count: int) -> list[dict]:
+def _successes(
+    day_tag: str, count: int, action: str = "status", prefix: str = "poll"
+) -> list[dict]:
     """`count` complete successful calls, padded so a day of them is worth real bytes."""
     out: list[dict] = []
     for i in range(count):
-        id_ = f"poll-{day_tag}-{i}"
-        out.append({"id": id_, "phase": "open", "action": "status", "pad": PAD})
+        id_ = f"{prefix}-{day_tag}-{i}"
+        out.append({"id": id_, "phase": "open", "action": action, "pad": PAD})
         out.append({"id": id_, "phase": "close", "outcome": "ok"})
     return out
+
+
+def _failures(day_tag: str, count: int) -> list[dict]:
+    """`count` complete *failed* calls, padded to the same weight as a success."""
+    out: list[dict] = []
+    for i in range(count):
+        id_ = f"bad-{day_tag}-{i}"
+        out.append({"id": id_, "phase": "open", "action": "submit", "pad": PAD})
+        out.append({"id": id_, "phase": "close", "outcome": "error"})
+    return out
+
+
+def _submit_success(day_tag: str) -> list[dict]:
+    """One successful `submit` — the expensive record, carrying the refs and result payload that
+    `lab history --job <id>` and `lab report`'s cost rows are read from."""
+    id_ = f"submit-{day_tag}"
+    return [
+        {"id": id_, "phase": "open", "action": "submit", "params": {"argv": ["submit"]}},
+        {
+            "id": id_,
+            "phase": "close",
+            "outcome": "ok",
+            "refs": {"job_id": f"job-{day_tag}", "cluster": f"lab-proj-job-{day_tag}"},
+            "result": {"hourly_usd": 0.42},
+        },
+    ]
 
 
 def _ids() -> set[str]:
@@ -257,6 +285,32 @@ def _ids() -> set[str]:
 
 def _stems() -> set[str]:
     return {p.stem for p in store.day_files()}
+
+
+def _record(id_: str) -> dict | None:
+    for r in store.iter_records(store.day_files()):
+        if r.get("id") == id_ and r.get("phase") == "close":
+            return r
+    return None
+
+
+@pytest.fixture
+def compact_stages(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Records which over-cap compaction stages `enforce_caps` actually ran, in order.
+
+    The real `compact` still does the work — this only names the stage, so a test cannot pass
+    because an earlier lever happened to be enough when it was meant to escalate (or because a
+    later one ran when it was meant to stop).
+    """
+    stages: list[str] = []
+    real = store.compact
+
+    def spy(**kwargs: Any) -> None:
+        stages.append("read-only" if kwargs.get("action_filter") is not None else "all-successes")
+        real(**kwargs)
+
+    monkeypatch.setattr(store, "compact", spy)
+    return stages
 
 
 def test_over_cap_compacts_non_today_successes_instead_of_deleting_day_one(
@@ -369,6 +423,194 @@ def test_ttl_ignoring_compaction_leaves_todays_file_alone(_events_dir: Path) -> 
     _write(NOW - timedelta(days=1), *_pair("yesterday_ok", "ok"))
     store.compact(now=NOW, success_ttl_days=14, ignore_ttl=True, exclude_today=True)
     assert _ids() == {"today_ok"}
+
+
+# --- the over-cap escalation: cheapest loss first -----------------------------------------------
+#
+# Dropping *every* success everywhere-but-today was one lever with one price, and the price was
+# far above what the overage costs: the first `lab` call after 50 MB erased every prior day's
+# successful `submit`/`sweep`/`register`/`reconcile` record — refs, result payloads and all —
+# for records well inside the 14-day success TTL. The overage is essentially all poll noise
+# (98,654 successful `lab status` calls in five days), so relief now escalates: read-only
+# successes, then all successes, then whole day files, rechecking the total between stages.
+
+
+def test_over_cap_drops_poll_noise_first_and_keeps_a_prior_days_submit(
+    _events_dir: Path, compact_stages: list[str]
+) -> None:
+    """Stage 1 alone, which is the case that actually happens: the polls are the overage.
+
+    A prior day's successful `submit` must survive *with its refs* — that record is what
+    `lab history --job <yesterday's job>` and `lab report`'s cost rows read, and it is well
+    inside the 14-day success TTL. Before the escalation the byte cap took it on the first
+    `lab` invocation after the ledger crossed 50 MB.
+    """
+    for age in (5, 4, 3, 2, 1, 0):
+        _write(NOW - timedelta(days=age), *_successes(f"d{age}", 100))
+        _write(NOW - timedelta(days=age), *_submit_success(f"d{age}"))
+
+    store.enforce_caps(now=NOW, max_age_days=90, max_mb=0.5)
+
+    assert compact_stages == ["read-only"], "stage 1 was enough; nothing else may have run"
+    ids = _ids()
+    assert not any(i.startswith("poll-d5-") for i in ids), "the poll noise was not dropped"
+    assert any(i.startswith("poll-d0-") for i in ids), "today's records must be left alone"
+    for age in (5, 4, 3, 2, 1, 0):
+        assert f"submit-d{age}" in ids, f"a successful submit was dropped for day {age}"
+    survivor = _record("submit-d5")
+    assert survivor is not None
+    assert survivor["refs"] == {"job_id": "job-d5", "cluster": "lab-proj-job-d5"}
+    assert survivor["result"] == {"hourly_usd": 0.42}
+    assert len(_stems()) == 6, "no day file may be deleted while a cheaper lever is left"
+    assert sum(p.stat().st_size for p in store.day_files()) <= 0.5 * 1024 * 1024
+
+
+def test_over_cap_escalates_to_all_successes_when_poll_noise_is_not_enough(
+    _events_dir: Path, compact_stages: list[str]
+) -> None:
+    """Stage 2: the overage is not polls this time, so the cheap lever cannot pay for it and the
+    broad one — every success outside today — has to run after all. It is a fallback, not the
+    default."""
+    for age in (5, 4, 3, 2, 1):
+        _write(NOW - timedelta(days=age), *_successes(f"d{age}", 100, "submit", "submit"))
+        _write(NOW - timedelta(days=age), *_successes(f"d{age}", 5))
+        _write(NOW - timedelta(days=age), *_pair(f"bad-d{age}", "error"))
+
+    store.enforce_caps(now=NOW, max_age_days=90, max_mb=0.5)
+
+    assert compact_stages == ["read-only", "all-successes"]
+    ids = _ids()
+    assert not any(i.startswith("poll-") for i in ids)
+    assert not any(i.startswith("submit-") for i in ids)
+    assert {f"bad-d{age}" for age in (5, 4, 3, 2, 1)} <= ids, "failures survive stage 2"
+    assert len(_stems()) == 5, "stage 3 must not run once stage 2 got under budget"
+    assert sum(p.stat().st_size for p in store.day_files()) <= 0.5 * 1024 * 1024
+
+
+def test_over_cap_escalates_to_deleting_a_day_when_no_compaction_is_enough(
+    _events_dir: Path, compact_stages: list[str]
+) -> None:
+    """Stage 3, unchanged: a ledger still over the cap once every success is gone loses whole day
+    files, oldest first. Failures are findings, but they are not unbounded."""
+    for age in (5, 4, 3):
+        _write(NOW - timedelta(days=age), *_successes(f"d{age}", 100))
+        _write(NOW - timedelta(days=age), *_failures(f"d{age}", 100))
+
+    store.enforce_caps(now=NOW, max_age_days=90, max_mb=0.5)
+
+    assert compact_stages == ["read-only", "all-successes"]
+    assert (NOW - timedelta(days=5)).strftime("%Y-%m-%d") not in _stems(), "stage 3 never ran"
+    for age in (4, 3):
+        day = store.day_file(NOW - timedelta(days=age))
+        kept = {r["id"] for r in store.iter_records([day]) if r.get("phase") == "close"}
+        assert len(kept) == 100, "a surviving day file lost failures it should have kept"
+    assert sum(p.stat().st_size for p in store.day_files()) <= 0.5 * 1024 * 1024
+
+
+def test_failures_survive_every_compaction_stage(
+    _events_dir: Path, compact_stages: list[str]
+) -> None:
+    """Both compaction levers only ever drop *successes*; a failure leaves the ledger by the age
+    cap or by whole-file deletion, never by compaction."""
+    for age in (3, 2, 1):
+        _write(NOW - timedelta(days=age), *_successes(f"d{age}", 100))
+        _write(NOW - timedelta(days=age), *_successes(f"d{age}", 30, "submit", "submit"))
+        _write(NOW - timedelta(days=age), *_failures(f"d{age}", 60))
+
+    store.enforce_caps(now=NOW, max_age_days=90, max_mb=0.5)
+
+    assert compact_stages == ["read-only", "all-successes"]
+    ids = _ids()
+    assert len([i for i in ids if i.startswith("bad-")]) == 180, "a failure was compacted away"
+    assert not any(i.startswith("poll-") or i.startswith("submit-") for i in ids)
+    assert len(_stems()) == 3, "no day file should have been deleted"
+
+
+def test_todays_file_survives_every_stage(_events_dir: Path, compact_stages: list[str]) -> None:
+    """Today's file is what anyone is about to read. It is excluded from both compactions and
+    from the deletion — even when the ledger is still over budget after everything else is gone."""
+    _write(NOW, *_successes("d0", 100))
+    _write(NOW, *_failures("d0", 50))
+    for age in (3, 2, 1):
+        _write(NOW - timedelta(days=age), *_successes(f"d{age}", 100))
+        _write(NOW - timedelta(days=age), *_failures(f"d{age}", 100))
+
+    store.enforce_caps(now=NOW, max_age_days=90, max_mb=0.2)
+
+    assert _stems() == {NOW.strftime("%Y-%m-%d")}, "every other lever must be spent first"
+    ids = _ids()
+    assert len([i for i in ids if i.startswith("poll-d0-")]) == 100, "today's successes were cut"
+    assert len([i for i in ids if i.startswith("bad-d0-")]) == 50
+    assert sum(p.stat().st_size for p in store.day_files()) > 0.2 * 1024 * 1024, (
+        "the fixture must actually leave today's file over budget for this to prove anything"
+    )
+
+
+# --- the read-only-action filter itself ---------------------------------------------------------
+
+
+def test_read_only_compaction_pairs_a_success_across_two_day_files(_events_dir: Path) -> None:
+    """`compact()`'s cross-day pairing property has to hold for the narrowed selection too, and
+    it is doubly load-bearing here: the `close` carries the outcome and the `open` carries the
+    action, so an `open` in day N with its `close` in day N+1 needs *both* files read to be
+    recognised as a successful read at all."""
+    day_n = NOW - timedelta(days=2)
+    store.append({"id": "A", "phase": "open", "action": "status"}, when=day_n)
+    store.append({"id": "A", "phase": "close", "outcome": "ok"}, when=day_n + timedelta(days=1))
+
+    store.compact(
+        now=NOW,
+        success_ttl_days=0,
+        ignore_ttl=True,
+        exclude_today=True,
+        action_filter=store.is_read_only_action,
+    )
+
+    assert "A" not in _ids(), "a read-only success straddling midnight became a phantom open"
+
+
+def test_read_only_compaction_recognizes_the_mcp_spelling_of_a_grouped_read(
+    _events_dir: Path,
+) -> None:
+    """Both spellings of the same read are real: `queue list` (CLI leaf) and `queue_list` (MCP
+    tool). The filter goes through `read_only_key`, so neither escapes stage 1."""
+    day = NOW - timedelta(days=1)
+    store.append({"id": "cli", "phase": "open", "action": "queue list"}, when=day)
+    store.append({"id": "cli", "phase": "close", "outcome": "ok"}, when=day)
+    store.append({"id": "mcp", "phase": "open", "action": "queue_list"}, when=day)
+    store.append({"id": "mcp", "phase": "close", "outcome": "ok"}, when=day)
+    store.append({"id": "keep", "phase": "open", "action": "sweep_status"}, when=day)
+    store.append({"id": "keep", "phase": "close", "outcome": "ok"}, when=day)
+
+    store.compact(
+        now=NOW,
+        success_ttl_days=0,
+        ignore_ttl=True,
+        exclude_today=True,
+        action_filter=store.is_read_only_action,
+    )
+
+    assert _ids() == {"keep"}
+
+
+def test_read_only_compaction_keeps_a_success_whose_action_is_unknown(_events_dir: Path) -> None:
+    """A `close` whose `open` is gone (its day file was deleted, or it was never written) has no
+    action to test. Stage 1 keeps it — the narrowed lever only drops what it can positively
+    identify as poll noise — and stage 2 is what eventually takes it."""
+    day = NOW - timedelta(days=1)
+    store.append({"id": "orphan", "phase": "close", "outcome": "ok"}, when=day)
+
+    store.compact(
+        now=NOW,
+        success_ttl_days=0,
+        ignore_ttl=True,
+        exclude_today=True,
+        action_filter=store.is_read_only_action,
+    )
+    assert _ids() == {"orphan"}
+
+    store.compact(now=NOW, success_ttl_days=0, ignore_ttl=True, exclude_today=True)
+    assert _ids() == set()
 
 
 def _orphan_lock(day: datetime, *, age_days: float) -> Path:

@@ -530,8 +530,12 @@ R2-mirrored manifest, incl. cost) → `lab fetch <job_id>` (artifacts come from 
   a tick stale. `lab cancel` deliberately still refuses a mirror-only job outright (see next
   bullet) rather than reaching cross-machine.
 - **Cancel applies on the next tick** (≤60s), including killing an already-launched job.
-- **Mirror lag:** `teardown_status` may read `null` from the laptop for a tick or two after
-  success; the scheduler host's manifest is authoritative, `lab reconcile` is ground truth.
+- **Mirror lag:** `teardown_status` reaches the mirror one tick *after* terminal status, so
+  `lab status` on a deferred job may read `null` for a tick or two after success; the scheduler
+  host's manifest is authoritative, `lab reconcile` is ground truth. `lab wait` waits that lag out
+  for you (75s, one tick plus slack) before it reports `teardown_unconfirmed` — so a
+  "teardown not confirmed" warning from `lab wait` on a deferred job is a real finding to check,
+  not routine mirror lag.
 
 ## 6. Canonical workflows
 

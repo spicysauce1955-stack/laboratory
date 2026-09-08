@@ -13,7 +13,7 @@ import hashlib
 import json
 import os
 import sys
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -151,8 +151,14 @@ def claim_read_slot(action: str, project: str, *, now: datetime, min_interval_s:
 
     The 2026-09 campaign made 98,654 *successful* ``lab status`` calls in five days — a flat
     1,050/hour of runaway shell loops — and every pair was written, filling the byte cap with
-    records too fresh for the age-gated ``compact()`` to touch. The cheapest fix is to not write
-    the ninety-nine polls that say exactly what the first one said.
+    records too fresh for the age-gated ``compact()`` to touch. The fix is to record at most one
+    successful read of an action per project per window and drop the rest.
+
+    Note what that does *not* say. The key is ``(action, project)``, with no target in it, so the
+    dropped reads need not have named the same job as the recorded one: a successful
+    ``lab status jobB`` inside ``lab status jobA``'s window is simply not written. That cost was
+    measured against the real ledger and accepted — ``record._READ_ONLY_ACTIONS`` carries the
+    numbers and the reason a target-keyed window does not work.
 
     Cost matters more than precision here: this runs in ~100k short-lived processes, so the
     last-recorded-success time lives in its own tiny stamp file rather than in the day file,
@@ -213,12 +219,54 @@ def _rewrite(path: Path, records: list[dict[str, Any]]) -> None:
     os.replace(tmp, path)
 
 
+def is_read_only_action(action: str) -> bool:
+    """True for the cheap polling reads — the ``_READ_ONLY_ACTIONS`` allowlist in
+    ``lab.events.record``, which is also what the write-path rate limit keys off.
+
+    Imported lazily because ``record`` imports *this* module; a module-level import would be
+    circular. Going through ``read_only_key`` (rather than testing the raw string) is what folds
+    the two real spellings of a grouped read — the CLI's ``queue list`` and the MCP tool's
+    ``queue_list`` — onto one entry.
+    """
+    from lab.events.record import read_only_key
+
+    return read_only_key(action) is not None
+
+
+def _compactable_ids(paths: list[Path], action_filter: Callable[[str], bool] | None) -> set[str]:
+    """Ids of successfully-closed calls, optionally narrowed to actions ``action_filter`` accepts.
+
+    Both passes read *every* day file — see ``compact``'s docstring for why the succeeded set has
+    to be global. The narrowing needs it twice over: a call's outcome lives on its ``close`` and
+    its action lives on its ``open``, so a call straddling UTC midnight has the two halves of the
+    test in two different files. A success whose ``open`` cannot be found has no action to judge
+    and is therefore *not* selected — the narrow lever only ever drops what it can positively
+    identify, and the broader stage above it is what eventually takes the rest.
+    """
+    succeeded = {
+        r["id"] for r in iter_records(paths)
+        if r.get("phase") == "close" and r.get("outcome") == "ok"
+        and isinstance(r.get("id"), str)
+    }
+    if action_filter is None:
+        return succeeded
+    selected: set[str] = set()
+    for r in iter_records(paths):
+        id_, action = r.get("id"), r.get("action")
+        if r.get("phase") != "open" or not isinstance(id_, str) or not isinstance(action, str):
+            continue
+        if id_ in succeeded and action_filter(action):
+            selected.add(id_)
+    return selected
+
+
 def compact(
     *,
     now: datetime,
     success_ttl_days: int,
     ignore_ttl: bool = False,
     exclude_today: bool = False,
+    action_filter: Callable[[str], bool] | None = None,
 ) -> None:
     """Drop successful calls older than the TTL. Failures — and dangling opens, which are
     themselves a finding — stay until the age cap takes them.
@@ -235,8 +283,11 @@ def compact(
     ids are read from.
 
     ``ignore_ttl`` widens the selection to successes of any age and ``exclude_today`` spares the
-    current day file; together they are what ``enforce_caps`` asks for when the ledger is over
-    the byte cap, where the alternative lever is deleting a whole day of forensics.
+    current day file; ``action_filter`` *narrows* it to successes of the actions it accepts.
+    Together they are what ``enforce_caps`` asks for when the ledger is over the byte cap, where
+    the alternative lever is deleting a whole day of forensics — and the narrowing is what keeps
+    the first, cheapest stage from spending a successful ``submit`` to relieve an overage made
+    entirely of ``lab status`` polls.
     """
     cutoff = now - timedelta(days=success_ttl_days)
     today = day_file(now).name
@@ -255,11 +306,7 @@ def compact(
     if not old_paths:
         return
     try:
-        succeeded = {
-            r["id"] for r in iter_records(paths)
-            if r.get("phase") == "close" and r.get("outcome") == "ok"
-            and isinstance(r.get("id"), str)
-        }
+        droppable = _compactable_ids(paths, action_filter)
     except Exception as e:  # noqa: BLE001
         debug(f"compaction failed building the succeeded set: {e}")
         return
@@ -270,7 +317,7 @@ def compact(
                 fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
                 try:
                     records = list(iter_records([path]))
-                    kept = [r for r in records if r.get("id") not in succeeded]
+                    kept = [r for r in records if r.get("id") not in droppable]
                     if len(kept) != len(records):
                         _rewrite(path, kept)
                 finally:
@@ -290,19 +337,32 @@ def _total_size(paths: Iterable[Path]) -> int:
 
 
 def enforce_caps(*, now: datetime, max_age_days: int, max_mb: float) -> None:
-    """Delete whole day files past the age cap; then, if over the byte cap, compact successes
-    everywhere but today before deleting anything, oldest-first.
+    """Delete whole day files past the age cap; then, if over the byte cap, buy the overage back
+    in escalating stages, cheapest loss first, stopping the moment the total is under budget:
 
-    Compacting first is the lesson of the 2026-09 campaign: 98,654 successful ``lab status``
-    calls filled the cap in days, all of them far too fresh for the TTL-gated ``compact()``, so
-    deleting a whole day file was the only lever left — and it took day one of a live campaign,
-    the day of the incident under investigation, while the investigation was running. Successes
-    are the cheap thing to lose (the next poll says the same); a day of failures is not. Under
-    the cap nothing is compacted early, so a fresh success inside its TTL is still readable.
+    1. drop successful **read-only** calls (``is_read_only_action``: the polls) outside today;
+    2. still over → drop **all** successes outside today;
+    3. still over → delete whole day files, oldest first, today excluded.
 
-    Today's file is never the sacrifice, by either lever: it is excluded from the compaction (its
-    records are what anyone is about to read) and from the deletion (a single day over the cap
-    overshoots by at most that day, and tomorrow it is compactable like any other).
+    Compacting before deleting is the lesson of the 2026-09 campaign: 98,654 successful ``lab
+    status`` calls filled the cap in days, all of them far too fresh for the TTL-gated
+    ``compact()``, so deleting a whole day file was the only lever left — and it took day one of a
+    live campaign, the day of the incident under investigation, while the investigation was
+    running.
+
+    Stage 1 exists because stage 2 is far broader than the problem: those 98,654 polls *were*
+    essentially the whole overage, so relieving it should not also cost every prior day's
+    successful ``submit``/``sweep``/``register``/``reconcile`` record — with its ``refs`` and
+    ``result``, the rows ``lab history --job`` and ``lab report``'s costs are read from — for
+    records still well inside the 14-day success TTL. In practice stage 1 ends it; 2 and 3 are the
+    fallback for an overage the polls cannot explain. Under the cap nothing is compacted early, so
+    a fresh success inside its TTL is still readable.
+
+    Failures (and dangling opens) are never compacted at any stage; only stage 3 can take them,
+    and only by the day file. Today's file is never the sacrifice, by any lever: it is excluded
+    from both compactions (its records are what anyone is about to read) and from the deletion (a
+    single day over the cap overshoots by at most that day, and tomorrow it is compactable like
+    any other).
     """
     cutoff = now - timedelta(days=max_age_days)
     today = day_file(now).name
@@ -318,11 +378,21 @@ def enforce_caps(*, now: datetime, max_age_days: int, max_mb: float) -> None:
             remaining.append(path)
     budget = max_mb * 1024 * 1024
     total = _total_size(remaining)
-    if total > budget:
-        compact(now=now, success_ttl_days=0, ignore_ttl=True, exclude_today=True)
+    # Stage 1 (polls only) then stage 2 (every success), with the total rechecked in between:
+    # whichever stage gets the ledger under budget is the last one that runs.
+    for stage_filter in (is_read_only_action, None):
+        if total <= budget:
+            break
+        compact(
+            now=now,
+            success_ttl_days=0,
+            ignore_ttl=True,
+            exclude_today=True,
+            action_filter=stage_filter,
+        )
         remaining = [p for p in remaining if p.exists()]
         total = _total_size(remaining)
-    for path in remaining:  # oldest first
+    for path in remaining:  # stage 3: oldest first
         if total <= budget:
             break
         if path.name == today:

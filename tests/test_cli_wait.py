@@ -17,9 +17,12 @@ class _SummaryMixin:
 
     `_resolve_manifest`/`_resolve_manifests` are borrowed too: the whole wait path reads
     manifests through them (local store first, scheduler mirror second — see
-    tests/test_wait_mirrored_jobs.py). The real ones are defined in terms of `self.status` /
-    `self.manifest`, which every fake below already provides, and the mirror branch only runs on
-    a FileNotFoundError these fakes never raise.
+    tests/test_wait_mirrored_jobs.py). The real ones are defined in terms of `self.manifest` and
+    `self._backend_for(...).status`, both of which every fake below provides — the fakes play both
+    Lab and backend, so `_backend_for` answers `self` (a real Lab routes each job to the backend
+    its own manifest names, so that a mixed local+mirrored wait cannot refresh one job through
+    another's provisioner). The mirror branch only runs on a FileNotFoundError these fakes never
+    raise.
     """
 
     wait_summary = Lab.wait_summary
@@ -27,6 +30,9 @@ class _SummaryMixin:
     _settle_teardown = Lab._settle_teardown
     _resolve_manifest = Lab._resolve_manifest
     _resolve_manifests = Lab._resolve_manifests
+
+    def _backend_for(self, _provisioner):
+        return self
 
 
 def _patch_store(monkeypatch, tmp_path, fake_lab):

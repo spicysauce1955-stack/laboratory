@@ -155,6 +155,59 @@ def test_both_queue_list_spellings_are_rate_limited(clock: Clock) -> None:
     assert [r["action"] for r in _records() if r["phase"] == "open"] == ["queue list", "queue show"]
 
 
+def test_two_reads_naming_different_jobs_inside_one_window_write_one_pair(clock: Clock) -> None:
+    """Intended, not an oversight: the window key is `(action, project)` and the **target is
+    deliberately not in it**, so a successful read is dropped inside the window whatever job it
+    names. `lab status jobA` is recorded; a successful `lab status jobB` a second later leaves no
+    trace, and `lab history --job jobB` shows nothing for that look.
+
+    Putting the primary ref in the key was proposed and measured against the real ledger: over the
+    2026-09 campaign the *same* job id was re-polled at a median gap of 145.2s, and only 0.3% of
+    same-job intervals were under 60s (344 job ids, 100,147 intervals). A target-keyed window would
+    have suppressed 0.3% of a 98,654-record storm — it defeats the fix outright. If you are here to
+    add the target to the key, bring new numbers.
+
+    The cost is affordable because the ledger is not the record of a job (its manifest is) and
+    because of what is never limited — see the companion test below.
+    """
+    with events.record("cli", "status", {"job_id": "jobA"}) as call:
+        call.ref(job_id="jobA")
+    clock.advance(1)
+    with events.record("cli", "status", {"job_id": "jobB"}) as call:
+        call.ref(job_id="jobB")
+
+    records = _records()
+    assert [r["phase"] for r in records] == ["open", "close"], "a second target reopened the window"
+    assert records[0]["params"]["job_id"] == "jobA"
+    assert records[1]["refs"] == {"job_id": "jobA"}
+    assert not any("jobB" in str(r) for r in records)
+
+
+def test_what_still_reaches_the_ledger_for_a_job_whose_poll_was_suppressed(clock: Clock) -> None:
+    """The other half of that trade, and the reason it is affordable: within the same window as a
+    suppressed `status jobB`, every *mutating* call against jobB and every *failing* read of it is
+    still recorded in full. `lab history --job jobB` keeps showing what was **done** to jobB and
+    everything that went wrong with it — only "somebody looked at it and it was fine" is lost."""
+    _poll()  # takes the window with some other job
+    clock.advance(1)
+    with events.record("cli", "status", {"job_id": "jobB"}):  # suppressed
+        pass
+    clock.advance(1)
+    with events.record("cli", "cancel", {"job_id": "jobB"}) as call:
+        call.ref(job_id="jobB")
+    clock.advance(1)
+    with pytest.raises(RuntimeError):
+        with events.record("cli", "status", {"job_id": "jobB"}):
+            raise RuntimeError("job store unreadable")
+
+    opens = [r for r in _records() if r["phase"] == "open"]
+    assert [r["action"] for r in opens] == ["status", "cancel", "status"]
+    assert [r["params"]["job_id"] for r in opens] == ["j-1", "jobB", "jobB"]
+    closes = [r for r in _records() if r["phase"] == "close"]
+    assert [c["outcome"] for c in closes] == ["ok", "ok", "crash"]
+    assert closes[1]["refs"] == {"job_id": "jobB"}
+
+
 def test_a_mutating_action_is_never_rate_limited(clock: Clock) -> None:
     for _ in range(3):
         with events.record("cli", "submit", {}):

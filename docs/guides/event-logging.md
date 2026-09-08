@@ -17,13 +17,32 @@ finding: `lab history` surfaces it as `running-or-died`.
 `list`, `logs`, `metrics`, `queue list`, `queue show` (and their MCP spellings,
 `queue_list`/`queue_show`) — a *successful* call is recorded only if the last recorded
 success of that same action in that same project is more than **60 seconds** old
-(`LAB_EVENTS_READ_MIN_INTERVAL_S`; `0` disables the limit). A poll that says exactly what the poll
-one second ago said is not a finding, and 98,654 successful `lab status` calls over five days is
-how a runaway shell loop once filled the byte cap and cost the ledger a day of real forensics
-(§5). **Failures are never rate-limited** — an `error`, `usage_error`, `crash` or `interrupted`
-read always writes its full pair, with its `trace`. `history` and `report` are deliberately *not*
-on the list: they are the ledger's own forensic surface, and over those same five days they were
-33 and 5 calls, so there is no volume to win by making an investigation leave no trace of itself.
+(`LAB_EVENTS_READ_MIN_INTERVAL_S`; `0` disables the limit). 98,654 successful `lab status` calls
+over five days is how a runaway shell loop once filled the byte cap and cost the ledger a day of
+real forensics (§5). **Failures are never rate-limited** — an `error`, `usage_error`, `crash` or
+`interrupted` read always writes its full pair, with its `trace`. `history` and `report` are
+deliberately *not* on the list: they are the ledger's own forensic surface, and over those same
+five days they were 33 and 5 calls, so there is no volume to win by making an investigation leave
+no trace of itself.
+
+**Read that rule literally: the window is per `(action, project)`, and the job or sweep being
+looked at is not part of it.** `lab status jobA` at t=0 is recorded; a *successful* `lab status
+jobB` one second later is not recorded at all, so `lab history --job jobB` will show nothing for
+that look. That is a deliberate trade and it was measured before it was taken: over the campaign
+above, the *same* job id was re-polled at a median gap of **145.2 s**, and only **0.3%** of
+same-job intervals were under 60 s (344 job ids, 100,147 intervals) — putting the target in the
+key would have suppressed 0.3% of a 98,654-record storm, i.e. defeated the fix. The cost side was
+measured too, and it is not small: replaying that ledger through this window, **239 of 355 polled
+job ids (67.3%) keep no successful read at all**, because what spends the window is cross-job
+interleaving rather than same-job repetition. It is still the right trade, because the alternative
+is not "keep those looks" — it is a ledger that crosses its byte cap and drops whole days,
+*including every failure record in them*, which is exactly what happened on 2026-09-03. The trade is
+affordable because the ledger is not the record of a job — the job's own manifest is — and because
+of what is *never* limited: every **mutating** call (`submit`, `register`, `fetch`, `cancel`,
+`reconcile`) and every **failure** of any action. `lab history --job X` therefore still shows
+everything that was *done* to X and everything that went wrong with it; only "somebody looked at X
+while it was fine" can go missing. Set `LAB_EVENTS_READ_MIN_INTERVAL_S=0` for a session where you
+want every look recorded.
 
 The cost is paid where you can see it: a rate-limited action's `open` line is buffered in memory
 and written at close time (the decision needs the outcome), so a `lab status` killed with SIGKILL
@@ -217,10 +236,16 @@ runs:
   findings, not clutter — so they age out only by the next rule.
 - **Whole day files** are deleted once older than **90 days** (`LAB_EVENTS_MAX_AGE_DAYS`),
   regardless of outcome.
-- **Total size** is capped at **50 MB** (`LAB_EVENTS_MAX_MB`). Over the cap, successes are
-  compacted out of **every day file except today's** first — TTL ignored, because over the cap the
-  alternative is worse — and only if that is still not enough are whole day files deleted,
-  oldest first. **Today's file is never deleted for the byte cap**, by either lever.
+- **Total size** is capped at **50 MB** (`LAB_EVENTS_MAX_MB`). Over the cap, relief **escalates**,
+  cheapest loss first, with the total rechecked between stages and the whole thing stopping as
+  soon as it is under budget:
+  1. successful **read-only** calls (the polls of §1) are compacted out of every day file except
+     today's — TTL ignored, because over the cap the alternative is worse;
+  2. still over → **all** successes are compacted out of every day file except today's;
+  3. still over → whole day files are deleted, oldest first.
+
+  **Failures and dangling opens are never compacted** at stage 1 or 2 — only the age cap or a
+  stage-3 deletion takes them. **Today's file is never the sacrifice**, at any stage.
 - **Stale `.jsonl.lock` files** — a lock whose day file no longer exists, itself more than a day
   old and held by nobody — are deleted in the same pass.
 
@@ -230,6 +255,14 @@ for the 14-day success TTL to touch, so deleting a whole day file was the only l
 had — and it deleted day one of a live campaign, the day of the incident under investigation,
 while the investigation was running. Successes are the cheap thing to lose; a day of failures is
 not. (The write-path half of that fix is the read-poll rate limit in §1.)
+
+Neither is the *order within* the compaction. Those polls were essentially the entire overage, so
+stage 1 alone will almost always be enough — and it has to come first, because stage 2 is far
+broader than the problem: it drops every prior day's successful `submit`, `sweep`, `register` and
+`reconcile` record too, with the `refs` and `result` payloads that `lab history --job <id>` and
+`lab report`'s cost rows are read from, for records still well inside the 14-day success TTL. One
+`lab` invocation after crossing 50 MB should not cost a week of provenance to relieve an overage
+made of `lab status`.
 
 All of it is best-effort: a pruning failure is logged under `LAB_EVENTS_DEBUG=1` (§7) and never
 fails the command that triggered it.
