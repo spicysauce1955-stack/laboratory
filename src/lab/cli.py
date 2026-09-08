@@ -15,7 +15,7 @@ import tempfile
 import traceback
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -44,6 +44,7 @@ from lab.scheduler.models import Guardrails, RegState, Triggers
 from lab.scheduler.price import PriceFeed
 from lab.scheduler.queue import QueueStore, default_queue, wait_for_queue_drain
 from lab.scheduler.register import parse_expires, parse_window
+from lab.scheduler.skew import skew_from_heartbeat
 from lab.scheduler.register import register as sched_register
 from lab.scheduler.register import register_sweep as sched_register_sweep
 from lab.scheduler.register import worst_case_cost
@@ -392,6 +393,8 @@ def submit(
     gpus: int | None = typer.Option(None),
     disk_size: int | None = typer.Option(None, "--disk-size", help="boot/attached volume size in GB (skypilot; DO volume size). cpu backend defaults to 50"),
     accelerators: str | None = typer.Option(None, "--accelerators", help="sky-catalog name, e.g. RTX4090:1 — no underscore (required for Vast)"),
+    accelerator_pool: str | None = typer.Option(None, "--accelerator-pool", help="comma-separated accelerators to fall through when a launch dies in provisioning, e.g. 'RTX4090:1,RTX3090:1'. --accelerators is attempt 1. Off by default; never raises --price-cap"),
+    max_launch_attempts: int | None = typer.Option(None, "--max-launch-attempts", help="bound on launch attempts (default: pool size, else 1; max 6). Each extra attempt can cost a full provisioning timeout"),
     timeout: str | None = typer.Option(
         None, help="hard wall-clock cap, e.g. 2h / 30m / 45s — on overrun the job is killed, the "
         "machine torn down, and the run marked timed_out (FR-I1)"
@@ -431,6 +434,7 @@ def submit(
         cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
         cloud=cloud, region=region, zone=zone, max_hourly_usd=price_cap,
         price_cap_strict=price_cap_strict,
+        accelerator_pool=accelerator_pool, max_launch_attempts=max_launch_attempts,
         timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
         spot_fallback=not no_fallback,
     )
@@ -505,6 +509,8 @@ def sweep(
     gpus: int | None = typer.Option(None),
     disk_size: int | None = typer.Option(None, "--disk-size", help="boot/attached volume size in GB per job (skypilot; DO volume size). cpu backend defaults to 50"),
     accelerators: str | None = typer.Option(None, "--accelerators"),
+    accelerator_pool: str | None = typer.Option(None, "--accelerator-pool", help="comma-separated accelerators to fall through when a launch dies in provisioning, e.g. 'RTX4090:1,RTX3090:1'. --accelerators is attempt 1. Off by default; never raises --price-cap"),
+    max_launch_attempts: int | None = typer.Option(None, "--max-launch-attempts", help="bound on launch attempts (default: pool size, else 1; max 6). Each extra attempt can cost a full provisioning timeout"),
     timeout: str | None = typer.Option(None, help="wall-clock per job, e.g. 2h"),
     provision_timeout: str | None = typer.Option(None, "--provision-timeout", help="abort a host that doesn't reach UP in time, e.g. 10m (skypilot; default per-cloud: vast 8m, do 12m, gcp 20m; 15m when --region/--zone is pinned)"),
     region: str | None = typer.Option(None, "--region", help="pin the cloud region for every job, e.g. europe-west1 (skypilot)"),
@@ -538,6 +544,7 @@ def sweep(
         cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
         cloud=cloud, region=region, zone=zone, max_hourly_usd=price_cap,
         price_cap_strict=price_cap_strict,
+        accelerator_pool=accelerator_pool, max_launch_attempts=max_launch_attempts,
         timeout=timeout, provision_timeout=provision_timeout, use_spot=spot,
         spot_fallback=not no_fallback,
     )
@@ -667,7 +674,14 @@ def init(
 @app.command()
 def status(job_id: str) -> None:
     """Show a job's state + cost + teardown_status (FR-A2, FR-I2, FR-C2); scheduler-launched
-    jobs fall back to the mirrored manifest (spec §4.3). Same shape as the MCP status tool."""
+    jobs fall back to the mirrored manifest (spec §4.3). Same shape as the MCP status tool.
+
+    Two derived fields save you the arithmetic: `is_failed_launch` (terminal but never really
+    ran — never priced, a transient launch error, or destroyed over its price cap; it cost a slot
+    and no money, so don't count it as an experiment failure) and `age_s` (seconds alive, frozen
+    at the final lifetime once terminal). Never subtract `started_at` from a date yourself, and
+    never read `cost: null` as $0 — it means "not known".
+    """
     try:
         _emit(job_status_view(repo_root() / "runs", repo_root(), job_id))
     except FileNotFoundError:
@@ -817,7 +831,7 @@ def notes(
 @app.command()
 def history(
     limit: int = typer.Option(50, "--limit", "-n", help="most recent N calls"),
-    since: str | None = typer.Option(None, "--since", help="window, e.g. 2d / 30m"),
+    since: str | None = typer.Option(None, "--since", help="window: a duration back from now (2d / 30m / 3h30m) or an absolute UTC date (2026-09-06)"),
     action: str | None = typer.Option(None, "--action", help="filter to one command/tool"),
     job: str | None = typer.Option(None, "--job", help="calls that touched this job id"),
     session: str | None = typer.Option(None, "--session", help="filter to one session id"),
@@ -872,19 +886,23 @@ def _since_cutoff(since: str | None) -> datetime | None:
     instead. The returned cutoff is reused by both commands so what they display as the window
     (``report``'s markdown header, ``history --stats``'s ``since`` field) reflects what was
     actually applied rather than always reading as unfiltered.
+
+    ``events.since_cutoff`` accepts an absolute UTC date/time as well as a duration back from
+    now: three ledger records show someone investigating an incident reaching for ``--since
+    2026-09-06`` and getting ``could not convert string to float``, which is the wrong answer to
+    the most natural thing to type while reading a ledger by date.
     """
     if since is None:
         return None
     try:
-        seconds = parse_duration(since)
+        return events.since_cutoff(since)
     except ValueError as e:
         raise typer.BadParameter(f"bad --since {since!r}: {e}") from e
-    return now() - timedelta(seconds=seconds) if seconds is not None else None
 
 
 @app.command()
 def report(
-    since: str = typer.Option("7d", "--since", help="window, e.g. 7d"),
+    since: str = typer.Option("7d", "--since", help="window: a duration back from now (7d / 3h30m) or an absolute UTC date (2026-09-06)"),
     all_projects: bool = typer.Option(False, "--all-projects", help="across every project"),
     out: str | None = typer.Option(None, "--out", help="write to this file instead of stdout"),
 ) -> None:
@@ -1061,9 +1079,25 @@ def sweep_retry(sweep_id: str) -> None:
 
 
 @app.command(name="list")
-def list_jobs() -> None:
-    """List jobs (FR-H1)."""
-    jobs = _lab().list_jobs()
+def list_jobs(
+    spend_alert: float | None = typer.Option(
+        None, "--spend-alert", metavar="USD",
+        help="warn on stderr when this project's realized spend has reached USD. Derived from "
+        "the job manifests on every read (no meter): landed jobs at their actual cost, running "
+        "jobs at rate x elapsed-so-far bounded by their own --timeout (24h if unset), so a "
+        "manifest abandoned at running by a dead supervisor cannot inflate the total — those are "
+        "named in spend.unsupervised_suspect_jobs. Jobs whose rate was never readable are named "
+        "in spend.unknown_cost_jobs, never counted as $0.",
+    ),
+) -> None:
+    """List jobs, with this project's realized spend so far (FR-H1, FR-I2)."""
+    the_lab = _lab()
+    jobs = the_lab.list_jobs()
+    spend = the_lab.spend(jobs, alert_usd=spend_alert)
+    if spend["alert"] is not None:
+        # A $45 crossing was found ~2 landings late in a retrospective audit. Say it the moment
+        # it is read — on stderr, so stdout stays the JSON a caller parses.
+        print(spend["alert"]["message"], file=sys.stderr)
     _emit(
         {
             "jobs": [
@@ -1074,7 +1108,8 @@ def list_jobs() -> None:
                     "created_at": j.created_at,
                 }
                 for j in jobs
-            ]
+            ],
+            "spend": spend,
         }
     )
 
@@ -1442,6 +1477,8 @@ def register(
     accelerators: str | None = typer.Option(
         None, "--gpu", "--accelerators", help="sky-catalog name, e.g. RTX4090:1 — no underscore"
     ),
+    accelerator_pool: str | None = typer.Option(None, "--accelerator-pool", help="comma-separated accelerators to fall through when a launch dies in provisioning, e.g. 'RTX4090:1,RTX3090:1'. --accelerators is attempt 1. Off by default; never raises --price-cap"),
+    max_launch_attempts: int | None = typer.Option(None, "--max-launch-attempts", help="bound on launch attempts (default: pool size, else 1; max 6). Each extra attempt can cost a full provisioning timeout"),
     cloud: str | None = typer.Option(
         None, "--cloud", help="vast | do | gcp (default vast; price/offer triggers are Vast-only)"
     ),
@@ -1515,6 +1552,7 @@ def register(
             cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, cloud=cloud,
             region=region, zone=zone, max_hourly_usd=price_cap,
             price_cap_strict=price_cap_strict,
+            accelerator_pool=accelerator_pool, max_launch_attempts=max_launch_attempts,
             timeout=timeout, use_spot=spot, spot_fallback=not no_fallback,
         ),
         submitted_by="human",
@@ -1553,6 +1591,8 @@ def register_sweep(
     accelerators: str | None = typer.Option(
         None, "--gpu", "--accelerators", help="sky-catalog name, e.g. RTX4090:1 — no underscore"
     ),
+    accelerator_pool: str | None = typer.Option(None, "--accelerator-pool", help="comma-separated accelerators to fall through when a launch dies in provisioning, e.g. 'RTX4090:1,RTX3090:1'. --accelerators is attempt 1. Off by default; never raises --price-cap"),
+    max_launch_attempts: int | None = typer.Option(None, "--max-launch-attempts", help="bound on launch attempts (default: pool size, else 1; max 6). Each extra attempt can cost a full provisioning timeout"),
     cloud: str | None = typer.Option(
         None, "--cloud", help="vast | do | gcp (default vast; price/offer triggers are Vast-only)"
     ),
@@ -1625,6 +1665,7 @@ def register_sweep(
         cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, cloud=cloud,
             region=region, zone=zone, max_hourly_usd=price_cap,
             price_cap_strict=price_cap_strict,
+            accelerator_pool=accelerator_pool, max_launch_attempts=max_launch_attempts,
         timeout=timeout, use_spot=spot, spot_fallback=not no_fallback,
     )
     try:
@@ -1676,8 +1717,26 @@ def queue_list() -> None:
     # per-entry reads taken 30s apart could.
     held_ids = queue.held_ids()
     cancelled_ids = queue.cancel_requested_ids()
+    # Version skew is silent and expensive: the always-on host deserialises registrations with
+    # ITS pydantic models, so an older host drops fields it doesn't know — that is how
+    # `--price-cap` was quietly lost on the deferred path, and it was then misdiagnosed as
+    # `lab register` not having the flag. Diagnostic only: never a gate, never a refusal.
+    #
+    # `may_drop_fields` is False when there is no heartbeat at all: warning about an old host on a
+    # queue no scheduler has ever ticked against asserts a fact nobody has evidence for, and a
+    # diagnostic that is usually wrong is ignored when it is finally right (R10). The verdict and
+    # its `detail` still ride in the payload, next to `heartbeat_age_s: null`.
+    skew = skew_from_heartbeat(hb)
+    if skew.may_drop_fields:
+        typer.echo(f"[lab] warning: {skew.detail}", err=True)
     _emit(
         {
+            "scheduler_skew": {
+                "verdict": skew.verdict,
+                "host_version": skew.host_version,
+                "client_version": skew.client_version,
+                "detail": skew.detail,
+            },
             "heartbeat_age_s": _heartbeat_age_s(hb),
             "host": (hb or {}).get("host"),
             "heartbeat_paused": (hb or {}).get("paused"),

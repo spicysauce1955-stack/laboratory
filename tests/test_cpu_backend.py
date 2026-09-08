@@ -51,6 +51,13 @@ def test_profile_cpu_rejects_accelerators():
         resolve_backend_profile("cpu", ResourceRequest(accelerators="RTX4090:1"))
 
 
+def test_profile_cpu_rejects_an_accelerator_pool():
+    """A rotation pool is a list of GPUs to fall through; on a CPU-only box it can never apply,
+    and silently ignoring it would let a caller believe a launch had fallbacks that it hasn't."""
+    with pytest.raises(LabError, match="CPU-only"):
+        resolve_backend_profile("cpu", ResourceRequest(accelerator_pool="RTX4090:1,RTX3090:1"))
+
+
 def test_profile_passthrough_for_other_backends():
     res = ResourceRequest(cpus=4)
     provisioner, out = resolve_backend_profile("skypilot", res)
@@ -284,6 +291,23 @@ def test_cli_submit_cpu_rejects_accelerators():
     assert result.exit_code == 1
     assert "CPU-only" in result.output
     assert captured == []  # never submitted
+
+
+def test_cli_submit_carries_the_accelerator_pool_into_the_spec():
+    """The pool and its attempt bound must reach `ResourceRequest`, not stop at the parser."""
+    captured: list[JobSpec] = []
+    fake_lab = _make_fake_lab(captured)
+
+    with patch.object(cli_mod, "_lab", return_value=fake_lab):
+        result = CliRunner().invoke(
+            app,
+            ["submit", "-c", "python x.py", "--accelerators", "RTX4090:1",
+             "--accelerator-pool", "RTX4090:1,RTX3090:1", "--max-launch-attempts", "3"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert captured[0].resources.accelerator_pool == "RTX4090:1,RTX3090:1"
+    assert captured[0].resources.max_launch_attempts == 3
 
 
 def test_cli_sweep_cpu_stamps_do_profile():

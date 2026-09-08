@@ -1,6 +1,11 @@
 """`lab queue list` must surface which host wrote the heartbeat — needed to tell two droplets
 ticking against the same queue apart during a scheduler cutover (see
-docs/superpowers/specs/2026-08-27-scheduler-deploy-cutover-design.md)."""
+docs/superpowers/specs/2026-08-27-scheduler-deploy-cutover-design.md).
+
+Parsed from ``result.stdout``, not ``result.output``: this runner mixes stderr into
+``output``, and ``queue list`` legitimately writes warnings there (scheduler version skew).
+stdout carries only JSON — that is the convention these assertions are about.
+"""
 
 import json
 from pathlib import Path
@@ -23,7 +28,7 @@ def test_queue_list_reports_which_host_wrote_the_heartbeat(
     result = runner.invoke(app, ["queue", "list"])
 
     assert result.exit_code == 0, result.output
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     assert data["host"] == "lab-scheduler-old"
 
 
@@ -34,7 +39,7 @@ def test_queue_list_host_is_none_with_no_heartbeat_yet(tmp_path: Path, monkeypat
     result = runner.invoke(app, ["queue", "list"])
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output)["host"] is None
+    assert json.loads(result.stdout)["host"] is None
 
 
 def test_queue_list_reports_the_paused_state_a_completed_tick_observed(
@@ -52,7 +57,7 @@ def test_queue_list_reports_the_paused_state_a_completed_tick_observed(
     result = runner.invoke(app, ["queue", "list"])
 
     assert result.exit_code == 0, result.output
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     assert data["heartbeat_paused"] is True
     assert data["tick_count"] == 3
 
@@ -66,7 +71,7 @@ def test_queue_list_heartbeat_paused_is_none_with_no_heartbeat_yet(
     result = runner.invoke(app, ["queue", "list"])
 
     assert result.exit_code == 0, result.output
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     assert data["heartbeat_paused"] is None
     assert data["tick_count"] is None
 

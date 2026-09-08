@@ -44,6 +44,46 @@ upgrade note.
   additive field here, a caller that ignores it is unaffected. `lab queue list` gained `host`,
   `heartbeat_paused` and `tick_count`, all additive.
 
+  `lab status` / `mcp__lab__status` (v0.12.0) gained three additive derived fields, all computed
+  from data the manifest already carried — nothing existing changed meaning:
+
+  | Field | Meaning |
+  |---|---|
+  | `is_failed_launch` | the job reached a terminal state without ever really running |
+  | `failed_launch_reason` | `null`, or one of `never_reached_up` / `transient_launch_error` / `price_cap_destroyed` — the value set may grow, so treat an unrecognised one as "some failed launch", never as `null` |
+  | `age_s` | seconds alive: counting up while running, **frozen at the final lifetime** once terminal, and `null` before the job starts or when no `ended_at` was ever recorded |
+
+  A failed launch cost a slot and no money; it is deliberately *not* the same question as
+  `cost` being `null`, which means "not known" and never `$0` (the local backend's `hourly_usd:
+  0.0` is a real zero, and a job that ran at a price we could not read is a real failure).
+
+  The pre-existing `estimated_running_usd` **changed meaning** in v0.12.0: it is now bounded by the
+  same ceiling as `lab list`'s spend block (the job's own `--timeout` plus slack, or a 24 h horizon
+  when it declares none) instead of growing without limit. A manifest a dead supervisor left at
+  `running` no longer reports a number that climbs on every read. For a healthy job inside its cap
+  the value is unchanged; for a stale one it stops rising, and is a **lower** bound.
+
+  `lab list` / `mcp__lab__list` (v0.12.0) gained a `spend` block beside the existing `jobs` list
+  (`realized_usd`, `jobs_counted`, `running_usd`, `running_jobs`, `unknown_cost_jobs`,
+  `unsupervised_suspect_jobs`, `scope`, `alert`), and a `--spend-alert <usd>` flag / `spend_alert`
+  argument. It is **derived** from the
+  job manifests on every read — there is no meter and no new state on disk — and it covers this
+  project's own `runs/` only; `scope` states that in the payload, and jobs whose rate was never
+  readable are named in `unknown_cost_jobs` rather than counted as free. Below the threshold (or
+  with none set) `alert` is `null`; on a crossing the CLI additionally warns on **stderr**, so
+  stdout stays the JSON a caller parses. The `jobs` rows are unchanged.
+
+  A still-`running` job's contribution is **bounded** by its own `--timeout` (plus 30 minutes of
+  provisioning/teardown slack, which `started_at` also charges), or by a **24 h** horizon when the
+  job declares no timeout. `realized_usd` therefore never grows on a manifest a dead supervisor
+  left at `running` — the shape ~40% of the 2026-08 DigitalOcean supervisors produced, and which
+  unbounded added ~$67 of money nobody spent to a $0.40/hr job abandoned for a week, climbing on
+  every read. Jobs that hit the bound are named in the additive `unsupervised_suspect_jobs`, the
+  total is a **lower** bound for those, and `alert.message` says so and points at `lab reconcile`
+  (whose `unsupervised` list is the authority on a dead supervisor). Terminal jobs are unaffected:
+  their recorded elapsed time is a fact and is never capped. `scope` carries this wording in every
+  payload; if you quote `realized_usd`, quote `scope` with it.
+
   `lab wait` / `mcp__lab__wait` (v0.12.0) accept a **scheduler-launched (deferred)** job id,
   which they used to reject with exit 2 — a loosening, not a change: every id that worked before
   still works, with the same exit codes. The summary (and each `--done-file` snapshot) gained an
@@ -51,6 +91,36 @@ upgrade note.
   than local `runs/`, whose state can be one scheduler tick stale; a caller that ignores it is
   unaffected. A wait whose *every* job is mirrored polls no faster than every 30s regardless of
   `--interval`, since the mirror cannot refresh faster than the scheduler's tick.
+
+  `lab queue list` (v0.12.0) gained an additive `scheduler_skew` block (`verdict`, `host_version`,
+  `client_version`, `detail`), and the scheduler's heartbeat now carries its own `lab_version`. The
+  verdict is one of `same` / `host_older` / `host_newer` / `unknown` / `no_heartbeat`, and the set
+  may grow — treat an unrecognised value as `unknown`. `host_older` and `unknown` also warn on
+  **stderr**: an older
+  host deserialises registrations with *its* models and silently drops fields it does not know,
+  which is how `--price-cap` was once lost on the deferred path. It is a diagnostic, never a gate;
+  nothing refuses to register because of it.
+
+  `no_heartbeat` means the queue holds **no heartbeat object at all** — no tick has ever completed
+  against it — and is deliberately **silent**: with nothing published there is no host to call
+  old, and the absence is already reported as `heartbeat_age_s: null`. It replaces the `unknown` a
+  heartbeat-less queue used to report *together with* a stderr warning claiming the host predated
+  the `lab_version` field; a queue whose heartbeat exists but carries no version still reports
+  `unknown` and still warns, which is the case that is genuinely evidence of an old host.
+
+  **Durations are a loosening, not a change** (v0.12.0): everywhere `--timeout`-style durations are
+  accepted, a compound form (`3h30m`, `1d2h`) now parses alongside the existing `2h` / `30m` /
+  plain-seconds forms. Units must be largest-first and appear at most once; `3h30` is still
+  rejected, deliberately, because "3h30m" and "3h and 30s" are both plausible readings and this
+  value caps billing on a rented machine. `--since` on `lab history` / `lab report` additionally
+  accepts an absolute **UTC** date or ISO-8601 datetime (`2026-09-06`, `2026-09-06T14:30`); a bare
+  date means the start of that day in UTC, never local time. Durations are still tried first, so
+  `--since 20260906` keeps its old meaning of 20,260,906 seconds.
+
+  `lab submit` / `lab sweep` / `lab register` / `lab register-sweep` and the `submit`/`sweep` MCP
+  tools (v0.12.0) gained additive `--accelerator-pool` / `--max-launch-attempts`. Both default to
+  off, so launch behaviour is unchanged unless you pass them, and rotation never raises
+  `--price-cap`. `--backend cpu` refuses a pool the same way it already refuses `--accelerators`.
 - **MCP** — tool names, argument names, and the shape of returned JSON.
 - **Notes** — `lab note` / `lab notes`, their flags, and the record shape in
   `runs/<job_id>/notes.jsonl` and `~/.lab/notes/index.jsonl` (every line carries `v`, currently

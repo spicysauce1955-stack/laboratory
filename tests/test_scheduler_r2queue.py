@@ -171,6 +171,29 @@ def test_list_mirrored_skips_partial_manifest_instead_of_crashing():
     assert [m.job_id for m in got] == ["good"]
 
 
+def test_list_mirrored_corruption_note_names_the_blob_in_the_ledger(capsys):
+    """The note exists to say *which* object could not be read, and until `sanitize.ObjectKey` it
+    never did: `key` matches the sanitizer's secret-field-name pattern, and a real R2 key is long
+    and high-entropy enough to be masked on value alone even under a different name. So the only
+    place the object was ever named was the stderr line — gone with the terminal scrollback,
+    while the durable record said "a manifest was corrupt". A shard-shaped key is used here
+    because that is the real shape (and the one that trips the entropy rule)."""
+    q, fake = make_q()
+    q.mirror_manifest(make_manifest("good", "python x.py"))
+    key = "queue/jobs/j-20260908-1a2b3c4d-shard-07-of-32.json"
+    fake.blobs[key] = b'{"job_id": "partial", "mirrored": true}'
+
+    with events.record("cli", "queue.list", {}):
+        got = q.list_mirrored()
+        notes = list(events.current().notes)  # type: ignore[union-attr]
+
+    assert [m.job_id for m in got] == ["good"]
+    assert key in capsys.readouterr().err
+    assert [n["k"] for n in notes] == ["queue.manifest_corrupt"]
+    assert notes[0]["d"]["key"] == key  # the whole point: not "…REDACTED…"
+    assert notes[0]["d"]["error"]
+
+
 def test_read_mirrored_permission_error_propagates():
     """A real, persistent I/O failure from the backing store (bad permissions, a broken
     connection) is not corruption and must surface, not degrade to "not yet available" —
@@ -371,11 +394,13 @@ def test_list_entries_skips_partial_entry_instead_of_crashing(capsys):
     assert "queue/entries/reg-partial.json" in err
     assert [n["k"] for n in notes] == ["queue.entry_corrupt"]
     # The key travels in the note's `key` field, exactly as list_mirrored's
-    # `queue.manifest_corrupt` note does. `lab.events.sanitize`'s deny-list masks any field *named*
-    # "key" (and entropy-masks a long path under any other name), so what the ledger stores today
-    # is the mask — a pre-existing sanitizer collision that hits the existing manifest note
-    # identically, and the reason the stderr line above is the surface that names the blob.
+    # `queue.manifest_corrupt` note does. It used to arrive masked — `lab.events.sanitize`'s
+    # deny-list masks any field *named* "key", and entropy-masks a long path under any other
+    # name — so the durable record said only that *something* was corrupt and the stderr line
+    # above was the only surface that ever named the blob. `sanitize.ObjectKey` is the vetting
+    # that lets this one value through (and only this shape of value).
     assert "key" in notes[0]["d"]
+    assert notes[0]["d"]["key"] == "queue/entries/reg-partial.json"
     assert notes[0]["d"]["error"]
 
 

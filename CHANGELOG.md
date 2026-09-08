@@ -4,6 +4,100 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning is 
 breaks the surface in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md); MINOR may, and says so
 with a **BREAKING** entry and an upgrade note.
 
+## v0.12.0 — 2026-09-08
+
+A campaign retrospective (`2026-09-planted-teacher`: $136.70, five days) was checked against the
+lab's own event ledger rather than taken at its word. The ledger disagreed with it in several
+places, and most of this release comes from what the measurements actually said.
+
+### Fixed
+
+- **`lab wait` could not watch a scheduler-launched job**, so the only way to follow a deferred
+  run was a hand-rolled `lab status` loop. The campaign ran **98,654 such calls in five days** — a
+  flat 1,050/hour from ~40 loops that never exited when their jobs went terminal, still polling
+  four days later. `wait` now resolves each id local-`runs/`-first then the queue mirror, so
+  `--done-file` finally covers deferred jobs. Local stays first (never ask a live backend about a
+  job this machine didn't supervise) and `backend.status` stays inside the resolve, because it is
+  what finalizes a job whose supervisor died silently. An all-mirrored wait floors its poll at 30s
+  (the mirror cannot be fresher than the 60s tick) and names those ids in `mirrored`.
+- **A transient mirror read killed a long wait as exit 1** — the documented code for "gave up on
+  `--timeout`" — so a boto 5xx six hours in was indistinguishable from a real timeout. A failed
+  mirror read is now "still pending, retry"; the caller's `--timeout` remains the only bound.
+- **A mirrored teardown could not settle**, so every clean deferred wait would have printed the
+  "teardown not confirmed — run `lab reconcile`" money alarm. Mirrored settles now span one whole
+  scheduler tick. An alarm that is usually wrong gets ignored (R10), and this is the alarm.
+- **`lab queue list` cost 23.3 hours of wall-clock** over the campaign (2,419 calls, 33.6s median).
+  `list_entries` was a serial N+1 and the CLI then did up to 2N more sequential `exists()` calls
+  for hold/cancel markers. Listings now fetch concurrently and markers come from
+  `held_ids()`/`cancel_requested_ids()` — **327-490 sequential round trips become 3**. The
+  scheduler tick reads the same two sets once instead of 2N. Its pre-submit `cancel_requested`
+  re-check stays a fresh read (spec §5 cancel race).
+- **The event ledger deleted the evidence.** Those 98,654 successes pushed it past its 50 MB cap;
+  `compact()` was age-gated at 14 days so it could not touch a fresh burst, and the only lever left
+  was deleting a whole day. It deleted **day one of the campaign under investigation**. Successful
+  reads of cheap commands are now rate-limited to one per 60s per (action, project); failures are
+  never limited; over-cap relief escalates (poll noise, then all successes, then whole days) and
+  today's file is never deleted. Stale `.jsonl.lock` files are reaped.
+
+### Added
+
+- **`lab status` carries `age_s`, `is_failed_launch` and `failed_launch_reason`; `lab list` carries
+  a derived `spend` block and `--spend-alert`.** All were found hand-rolled inside a live shell
+  watcher. `age_s` freezes at the final lifetime once terminal, so a job that *ended* 25 hours ago
+  never reads as a runaway — that subtraction, done by hand against a wrong date belief, got two
+  healthy jobs cancelled. `is_failed_launch` keys on the absence of the whole `CostInfo`, never on
+  a null price: `cost: null` means *not known*, and a job that ran at an unreadable price is a real
+  failure with a real bill. Spend is summed from manifests with no new meter, counts live jobs at
+  rate x elapsed so it moves before a landing, and names `unknown_cost_jobs` instead of counting
+  them as free.
+- **Scheduler version skew is detectable** (`lab.scheduler.skew`). The always-on host outlives any
+  project's venv and deserialises registrations with *its* models, silently dropping fields it does
+  not know — which is how `--price-cap` was once lost on the deferred path, and then misdiagnosed
+  as `lab register` lacking the flag. The heartbeat carries `lab_version` and `lab queue list`
+  reports `scheduler_skew`, warning on stderr. Diagnostic only, never a gate.
+- **A dead-host memo for Vast** (`DeadHostMemo`), keyed on the physical `machine_id` read live at
+  the failure, so a re-draw of a box that just failed to boot costs one attempt instead of a whole
+  provisioning budget. Advisory like `CapacityMemo`: it may spend an attempt, it may never refuse a
+  launch. `--accelerator-pool` / `--max-launch-attempts` promote the campaign's hand-rotation to a
+  flag, **off by default**, and never raise a price cap.
+- **The box bounds its own lifetime from boot**, not from entrypoint start. The wall-clock cap was
+  armed by GNU `timeout` *around the entrypoint*, so provisioning, workdir sync and `uv sync` were
+  uncapped — one job billed 3h49m against a 3h cap and returned zero artifacts. A detached
+  watchdog now arms in the setup script (the earliest thing on the instance that is ours), before
+  `set -e` so a host without `setsid` loses the backstop rather than the job. It carries two
+  deadlines: a boot allowance of `max(45min, 2x the supervisor's own provision budget)`, cleared
+  when the entrypoint phase begins, and a total of `wall + margin + boot`. A healthy job cannot hit
+  it by construction — the run phase can only begin inside the boot allowance, so `timeout` ends
+  the entrypoint a full margin inside the total. **Caveat:** `poweroff` ends the rental on Vast,
+  converts a compute leak into a disk leak on GCP, and stops nothing at all on DigitalOcean, so
+  `--backend cpu --cloud do` gains nothing here; teardown and `lab reconcile` remain its only
+  mechanisms.
+- **A job that dies mid-run salvages its completed rows.** Artifacts synced to the object store only
+  at teardown, so every zero-row timeout returned an empty folder despite hours of billed compute
+  ($10.4 across three of them). The supervisor already rsyncs the remote run dir down every 60s, so
+  the rows are on local disk already — they are now mirrored to `<job_id>/_partial/` at most every
+  300s, adding zero traffic and zero CPU on the rented box. Only whole lines are mirrored, so a
+  torn row is impossible; the copy is marked with the producing job's own `_shard_status`, reusing
+  `sweep-aggregate`'s existing partiality convention rather than inventing a second one; sentinel
+  files are never eligible, so a dead job can never be salvaged back into looking green. A failed
+  mirror is recorded, never raised.
+- **Compound durations** (`3h30m`, `1d2h`) anywhere durations are accepted, and `--since` on
+  `lab history`/`lab report` now takes an absolute **UTC** date or ISO datetime. Both are
+  transcribed from real `outcome != "ok"` ledger records. Bare `3h30` is still refused: it reads as
+  either "3h30m" or "3h and 30s", and this value caps billing on a rented machine.
+
+### Corrected in the record
+
+The retrospective tagged several lab defects that do not exist. `--price-cap-strict` **is** on
+`lab register` (it rides in `JobSpec`); `Registration.code` **does** pin the commit at
+registration; the 2-3% over-cap cases were inside `pricing.OVER_CAP_TOLERANCE = 0.05`, which is
+deliberate. Most consequentially: **SkyPilot does not pick the Vast host from a stale catalog** —
+`sky/provision/vast/utils.py` runs a live `search_offers` at launch. Measured over the campaign
+(571 Vast launches, 240 dead), region-level blacklisting is nearly signal-free (48% vs a 42% base)
+and the placement with the *most* failures was the *healthiest* supply, so the folklore fix would
+have steered a campaign into its worst pool. The scaffolded skill's Corrections table retires all
+of these.
+
 ## v0.11.0 — 2026-09-06
 
 A systematic audit of this machine's event ledger and notes store (60 days of `lab history`,

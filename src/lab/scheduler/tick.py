@@ -10,9 +10,11 @@ import os
 import platform
 import signal
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from lab import __version__
 from lab._util import now, parse_duration, pid_alive, process_start_time
 from lab.core import Lab, build_backend
 from lab.models import JobManifest, JobState, ResourceRequest
@@ -20,9 +22,36 @@ from lab.scheduler.bundle import extract_bundle
 from lab.scheduler.models import ControlConfig, Registration, RegState, TickReport
 from lab.scheduler.price import PriceFeed
 from lab.scheduler.queue import QueueStore
+from lab.scheduler.skew import HEARTBEAT_VERSION_KEY
 from lab.store import JobStore
 
 
+@dataclass(frozen=True)
+class MarkerSnapshot:
+    """The laptop-owned hold/cancel markers as of one point in the tick — two reads, not 2N.
+
+    ``cancel_requested(reg_id)``/``held(reg_id)`` are one round trip each against R2, and the tick
+    asked both **per registration**: at the 2026-09 campaign's 163 registrations that is up to 326
+    sequential HEADs, on an always-on host, every 60 seconds. ``cancel_requested_ids()``/
+    ``held_ids()`` answer the same questions in one listing each (see their docstrings in
+    :mod:`lab.scheduler.queue`), so the tick reads them once and tests membership in memory.
+
+    It is a **snapshot**, and that is the whole reason ``_launch`` keeps its own fresh
+    ``cancel_requested`` **and** ``held`` calls immediately before submitting (spec §5 cancel
+    race): those pre-submit re-checks exist precisely to see a marker that landed *after* the loop
+    began — and after ``_sync``, which does per-registration R2 work between this read and the
+    launch — and serving them from this set would reintroduce the race they were written to close.
+    Money can be spent between those two points; nothing else in a tick can. Both re-reads are
+    bounded by *launches per tick*, not by queue size, which is the cost this snapshot exists to
+    avoid.
+    """
+
+    cancelled: frozenset[str]
+    held: frozenset[str]
+
+    @classmethod
+    def read(cls, queue: QueueStore) -> MarkerSnapshot:
+        return cls(frozenset(queue.cancel_requested_ids()), frozenset(queue.held_ids()))
 
 
 class Scheduler:
@@ -127,9 +156,12 @@ class Scheduler:
         control = self.queue.read_control()
         if not control.paused:
             entries = self.queue.list_entries()
-            self._sync(entries, rep)            # Task 7
+            # Read once, use for the whole tick (see MarkerSnapshot). Paused ticks skip it: they
+            # launch and sync nothing, so there is no question to answer and no reason to pay.
+            markers = MarkerSnapshot.read(self.queue)
+            self._sync(entries, rep, markers)            # Task 7
             self._expire(entries, rep)
-            self._evaluate_and_launch(entries, control, rep)  # Task 6 (+8, 9)
+            self._evaluate_and_launch(entries, control, rep, markers)  # Task 6 (+8, 9)
             if tick_count % self.reconcile_every == 0:
                 try:
                     rep.reconcile = self._reconcile(control.auto_reconcile)
@@ -139,6 +171,12 @@ class Scheduler:
             {
                 "at": rep.at.isoformat(),
                 "host": self.host,
+                # The host is deployed independently of every client's venv, so it drifts -- one
+                # ran a pre-v0.5.0 lab against v0.11.0 clients, silently dropping registration
+                # fields it did not know (`--price-cap`), and the heartbeat published no version
+                # with which to notice. Additive: a reader that doesn't know the field is
+                # unaffected. Classified by `lab.scheduler.skew`.
+                HEARTBEAT_VERSION_KEY: __version__,
                 "tick_count": tick_count,
                 "launched": rep.launched,
                 "errors": rep.errors,
@@ -224,7 +262,7 @@ class Scheduler:
     # ------------------------------------------------------------------ phases
     RE_MIRROR_TERMINAL_S = 900.0  # late manifest fields (teardown_status) land post-terminal
 
-    def _sync(self, entries: list[Registration], rep: TickReport) -> None:
+    def _sync(self, entries: list[Registration], rep: TickReport, markers: MarkerSnapshot) -> None:
         """Mirror launched jobs' state back onto registrations (Task 7)."""
         for reg in entries:
             if reg.job_id is None:
@@ -325,9 +363,13 @@ class Scheduler:
                 except Exception as e:  # noqa: BLE001 — a bad entry must not kill the tick (§5)
                     rep.errors.append(f"{reg.reg_id}: price-verify cancel error: {e}"[:300])
                 continue
-            if manifest.status not in self._TERMINAL_MAP and self.queue.cancel_requested(
-                reg.reg_id
-            ):
+            # Loop-invariant, not race-critical: this cancels an ALREADY-RUNNING job, and the
+            # marker is only ever consulted once per 60s tick anyway, so serving it from the
+            # tick's snapshot costs at most the tick's own duration of extra latency -- less than
+            # the per-entry reads it replaces were themselves adding to that duration. The one
+            # read that must stay fresh is `_launch`'s pre-submit re-check, where the next thing
+            # to happen is renting a machine.
+            if manifest.status not in self._TERMINAL_MAP and reg.reg_id in markers.cancelled:
                 try:
                     lab = self.make_lab(self.home / "_bundles" / reg.reg_id)
                     lab.cancel(reg.job_id)
@@ -431,7 +473,11 @@ class Scheduler:
                 rep.expired.append(reg.reg_id)
 
     def _evaluate_and_launch(
-        self, entries: list[Registration], control: ControlConfig, rep: TickReport
+        self,
+        entries: list[Registration],
+        control: ControlConfig,
+        rep: TickReport,
+        markers: MarkerSnapshot,
     ) -> None:
         from lab import events
 
@@ -452,11 +498,11 @@ class Scheduler:
             reg = self.queue.get_entry(reg.reg_id)  # fresh copy (expiry may have written)
             if reg.state is not RegState.pending:
                 continue
-            if self.queue.cancel_requested(reg.reg_id):
+            if reg.reg_id in markers.cancelled:
                 self._transition(reg, RegState.cancelled, reason="cancelled by user")
                 rep.cancelled.append(reg.reg_id)
                 continue
-            if self.queue.held(reg.reg_id):
+            if reg.reg_id in markers.held:
                 rep.skipped[reg.reg_id] = "held"
                 continue
             blocked = self._trigger_block(reg, by_id, rep)
@@ -538,9 +584,22 @@ class Scheduler:
 
     def _launch(self, reg: Registration, rep: TickReport) -> None:
         reg = self._transition(reg, RegState.launching, reason=None)
+        # Deliberately a FRESH single read, never the tick's MarkerSnapshot: its entire purpose is
+        # to observe a cancel that landed after the evaluation loop began, and the next statement
+        # after it rents a machine. Bounded by launches per tick, not by queue size.
         if self.queue.cancel_requested(reg.reg_id):  # spec §5 cancel race: re-check pre-submit
             self._transition(reg, RegState.cancelled, reason="cancelled by user")
             rep.cancelled.append(reg.reg_id)
+            return
+        # Same race, same discipline, same reason a hold exists at all: `MarkerSnapshot` is read
+        # at the top of the tick, *before* `_sync`'s per-registration R2 work, so a hold placed
+        # during that window is invisible to the bulk pass and the machine would be rented anyway.
+        # A hold that does not hold spends money the operator just said not to spend. Back to
+        # `pending`, never `cancelled` — a hold is reversible, and `lab queue release` must be able
+        # to launch this entry later.
+        if self.queue.held(reg.reg_id):
+            self._transition(reg, RegState.pending, reason="held")
+            rep.skipped[reg.reg_id] = "held"
             return
         try:
             bundle_dir = self.home / "_bundles" / reg.reg_id

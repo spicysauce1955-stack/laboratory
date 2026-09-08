@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from lab.events.sanitize import MASK, mask_text, sanitize_argv, sanitize_params
+from lab.events.sanitize import MASK, ObjectKey, mask_text, sanitize_argv, sanitize_params
 
 SECRET = "abcd1234efgh5678ijkl9012mnop3456qrst"
+
+#: A real R2 queue key, of the shape `queue.manifest_corrupt` exists to name.
+REAL_KEY = "queue/jobs/j-20260908-1a2b3c4d-shard-07-of-32.json"
 
 
 @pytest.mark.parametrize(
@@ -278,3 +281,111 @@ def test_mask_text_catches_a_real_secret_bare_and_inside_a_flag() -> None:
     flagged = mask_text(f"ran with --api-key={SECRET} set")
     assert SECRET not in flagged
     assert "--api-key=" in flagged
+
+
+# --- ObjectKey: a pre-vetted object-store path an internal diagnostic may carry ----------------
+#
+# The bug: `r2queue.list_mirrored`/`list_entries` skip an unparseable blob and record
+# `events.note("queue.manifest_corrupt", key=..., ...)`, and that note has never once named the
+# object it is about — `key` matches `_SECRET_KEY`, and a real key is long and high-entropy
+# enough that renaming the field doesn't rescue it either. The one identifier the diagnostic
+# exists to carry was the one thing destroyed.
+
+
+def test_a_plain_object_key_string_is_still_masked_both_ways() -> None:
+    """The collision this fixes is real and stays real for unwrapped strings: nothing about the
+    deny-list's default behaviour is relaxed. Under the field name `key` it is masked by name;
+    under an innocent name it is masked by entropy."""
+    assert sanitize_params({"key": REAL_KEY}) == {"key": MASK}
+    assert sanitize_params({"blob": REAL_KEY}) == {"blob": MASK}
+
+
+def test_a_vetted_object_key_survives_verbatim_under_a_secret_shaped_field_name() -> None:
+    """`ObjectKey` is a statement about the *value*, made in lab's own source, so it also
+    overrides the field-name rule — `key=` is the natural name for an object key and the whole
+    point is that the diagnostic names its subject."""
+    assert sanitize_params({"key": ObjectKey(REAL_KEY)}) == {"key": REAL_KEY}
+    assert sanitize_params({"object_key": ObjectKey("queue/entries/reg-partial.json")}) == {
+        "object_key": "queue/entries/reg-partial.json"
+    }
+    # nested, and inside a list, since notes are arbitrary mappings
+    assert sanitize_params({"d": {"key": ObjectKey(REAL_KEY)}}) == {"d": {"key": REAL_KEY}}
+    assert sanitize_params({"skipped": [ObjectKey(REAL_KEY)]}) == {"skipped": [REAL_KEY]}
+    # ...but a *container* under a secret-shaped field name is still masked whole, unchanged:
+    # the name rule short-circuits before recursing, and widening that would be a real
+    # weakening (`{"api_keys": [<short secret>, ...]}` relies on it).
+    assert sanitize_params({"keys": [ObjectKey(REAL_KEY)]}) == {"keys": MASK}
+
+
+def test_a_vetted_key_is_a_plain_str_in_the_output() -> None:
+    """The ledger is JSON: the record must not carry a str *subclass* out of the sanitizer."""
+    out = sanitize_params({"key": ObjectKey(REAL_KEY)})["key"]
+    assert type(out) is str
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        # An AWS-style secret access key is 40 base64 chars and genuinely contains `/`, so it is
+        # *path-shaped*. It must not survive the wrapper.
+        ("aws_secret_shaped", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+        # ...nor when it is hiding as one segment of an otherwise plausible path.
+        ("blob_segment", "queue/wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY/manifest.json"),
+        ("hex_token_segment", "queue/" + "a1b2c3d4" * 8 + "/manifest.json"),
+        ("oauth_token", "ya29.a0AfH6SMBx/rest"),
+        ("pem", "-----BEGIN RSA PRIVATE KEY-----/x"),
+        ("high_entropy_no_slash", SECRET),  # a bare token is not a path at all
+        ("base64_padded", "cXVldWUvam9icy9hYmNkZWZnaGlqa2xtbm9w=="),  # `=` isn't in a key
+        ("query_string", "queue/jobs/x.json?api_key=abcdef0123456789abcdef0123456789"),
+        ("url_with_userinfo", "https://user:hunter2@example.com/queue/x.json"),
+        ("whitespace", "queue/jobs/x.json --api-key sk-live-abcdef1234567890"),
+    ],
+)
+def test_wrapping_a_credential_shape_does_not_exempt_it(name: str, value: str) -> None:
+    """Defence in depth behind the type: even at a call site that (wrongly) wraps it, a value
+    that isn't unambiguously an object key falls back to the ordinary deny-list — byte for byte
+    what the same plain string gets today. A mistaken wrap degrades to the status quo; it can
+    never *unmask* something."""
+    assert sanitize_params({"x": ObjectKey(value)}) == sanitize_params({"x": value})
+
+
+def test_wrapping_a_credential_shape_still_masks_the_credential() -> None:
+    """The half of the case above that matters most, asserted directly rather than by equality:
+    these are masked, not merely 'treated the same'."""
+    for value in [
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "queue/wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY/manifest.json",
+        "ya29.a0AfH6SMBx/rest",
+        SECRET,
+    ]:
+        assert sanitize_params({"x": ObjectKey(value)}) == {"x": MASK}
+
+
+def test_an_over_long_vetted_key_is_not_exempt() -> None:
+    """A bounded exemption: an object key is a short identifier, and an unbounded pass-through
+    would be a channel for pasting anything at all into the ledger. Over the bound the value
+    falls back to the deny-list, which masks this one on entropy."""
+    parts = [f"j-2026090{i}-1a2b3c4d-shard-0{i}-of-32.json" for i in range(9)]
+    long_key = "/".join(["queue", *parts])
+    assert len(long_key) > 256
+    assert sanitize_params({"blob": ObjectKey(long_key)}) == {"blob": MASK}
+
+
+def test_the_wrapper_cannot_be_produced_by_deserialization() -> None:
+    """The load-bearing property of the mechanism: `ObjectKey` is a Python type, so no value
+    crossing a trust boundary (argv, an MCP tool argument, a JSON record, a note body) can ever
+    arrive as one. `json.loads` produces `str`, and a `str` takes the ordinary path."""
+    import json
+
+    decoded = json.loads(json.dumps({"key": REAL_KEY}))
+    assert type(decoded["key"]) is str
+    assert sanitize_params(decoded) == {"key": MASK}
+
+
+def test_argv_and_note_text_are_untouched_by_the_wrapper() -> None:
+    """The exemption lives only in the params walk. The argv and free-text paths — the two that
+    handle user input — are not given a bypass at all."""
+    assert sanitize_argv(["lab", "queue", "list", REAL_KEY]) == [
+        "lab", "queue", "list", MASK,
+    ]
+    assert mask_text(f"failed on {REAL_KEY}") == f"failed on {MASK}"

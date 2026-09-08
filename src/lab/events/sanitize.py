@@ -17,10 +17,11 @@ MAX_STR = 512
 MAX_ITEMS = 32
 
 _SECRET_KEY = re.compile(r"key|token|secret|password|credential|auth", re.IGNORECASE)
+_BASE64_BLOB = re.compile(r"^[A-Za-z0-9+/]{40,}={0,2}$")  # bare base64 blobs
 _SECRET_VALUE = (
     re.compile(r"^ya29\."),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    re.compile(r"^[A-Za-z0-9+/]{40,}={0,2}$"),  # bare base64 blobs
+    _BASE64_BLOB,
 )
 _HEXISH = re.compile(r"^[0-9a-f-]+$", re.IGNORECASE)  # commits, cell ids, job ids — not secrets
 # A `--flag=value` or `--flag value` pair anywhere inside a larger string. Matched directly
@@ -75,6 +76,72 @@ _SENSITIVE_FLAG_NAME = re.compile(r"\b(?:key|token|secret|password|credential)\b
 _WORD = re.compile(r"\S+")
 
 
+#: An object-store key, and nothing else: ``[A-Za-z0-9._-]`` segments joined by ``/``, at least
+#: two of them, first character alphanumeric. Note what the character class leaves *out* — every
+#: delimiter a credential travels with (``=`` base64 padding, ``+``, ``?``/``&`` query strings,
+#: ``:``/``@`` URL userinfo, whitespace) — so a secret in its usual company cannot even reach the
+#: rest of the test. Matched with ``fullmatch``.
+_OBJECT_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9._-]+)+")
+#: An unbroken alphanumeric run long enough to *be* a credential, anywhere inside a key. 32 is the
+#: same bar :func:`_looks_secret` uses ("< 32 chars is not a secret"), applied here to runs rather
+#: than to the whole string, because a path's structure is exactly what a pasted blob lacks: real
+#: keys are punctuated (``j-20260908-1a2b3c4d-shard-07-of-32.json`` — longest run 8), while an API
+#: key hiding as a path segment is one long run.
+_LONG_ALNUM_RUN = re.compile(r"[A-Za-z0-9]{32,}")
+#: The exemption is bounded. R2 allows a 1024-byte key; nothing lab writes comes near this, and an
+#: unbounded pass-through would be a channel for putting arbitrary text into the ledger.
+MAX_OBJECT_KEY = 256
+
+
+class ObjectKey(str):
+    """An object-store key an internal call site has vetted as non-secret, so that a diagnostic
+    can name the object it is about. ``str`` subclass: it serialises, formats and compares
+    exactly like the key it wraps.
+
+    **Why it exists.** ``r2queue.list_mirrored``/``list_entries`` skip an unparseable blob and
+    record ``events.note("queue.manifest_corrupt", key=..., ...)``. That note has never once
+    named the offending object: ``key`` matches ``_SECRET_KEY``, and renaming the field doesn't
+    rescue it either, because a real key is long and high-entropy enough that ``_looks_secret``
+    masks it on sight (``queue/jobs/j-20260908-1a2b3c4d-shard-07-of-32.json`` measures 4.45
+    bits). The single identifier the diagnostic exists to carry was the one thing destroyed, and
+    only the stderr line — gone the moment the terminal scrolls — ever named it.
+
+    **Why it cannot pass a credential.** Three independent reasons, in order of strength:
+
+    1. *Provenance.* This is a Python type, and nothing crossing a trust boundary can ever be
+       one. argv arrives as ``str`` from the shell; MCP tool arguments, ledger records and
+       queue blobs arrive as ``str`` from ``json.loads``; config values arrive as ``str`` from
+       YAML/pydantic; a note body arrives as ``str`` from ``-m``. Deserialisation cannot
+       construct a subclass it has never heard of. A value therefore becomes an ``ObjectKey``
+       only where lab's own source says so — an enumerable, reviewable set of call sites (grep
+       the constructor), never as a consequence of anything a user typed.
+       Note the limit of this argument, which is why it is not the only one: the first call
+       sites (``r2queue``'s corruption notes) wrap a key that came back from an R2 *listing*,
+       i.e. whatever object names exist in the bucket — lab chose the field, not the bytes. For
+       anything remote-influenced it is (2), not (1), that carries the weight.
+    2. *Shape.* Even at those call sites the exemption is conditional, so it survives an author
+       wrapping the wrong thing: the value must fullmatch :data:`_OBJECT_KEY`, stay within
+       :data:`MAX_OBJECT_KEY`, contain no :data:`_LONG_ALNUM_RUN`, and match none of the
+       credential patterns ``_SECRET_VALUE`` already knows (``ya29.`` OAuth tokens, PEM blocks,
+       bare base64 blobs — which is where an AWS-style secret access key lands, 40 base64 chars
+       that genuinely do contain ``/`` and would otherwise look path-shaped). Anything failing
+       any of those falls back to :func:`_scalar`, i.e. the unmodified deny-list. A mistaken
+       wrap therefore degrades to today's behaviour; it can never *unmask* something.
+    3. *Blast radius.* Nothing outside this one branch of :func:`_walk` changes. ``_looks_secret``,
+       ``_SECRET_KEY``, ``_INLINE_FLAG`` and every default-pass path behave exactly as before for
+       every plain ``str``, and the two paths that handle user input — :func:`sanitize_argv` and
+       :func:`mask_text` — are given no bypass at all: they take ``str``, and a ``str`` is
+       masked. ``redact()`` still runs on what is let through.
+
+    The residual risk is "a lab author wraps a secret in source", which is a code-review-visible
+    act that (2) then has to be talked past as well. That is a much smaller hole than the
+    alternative on offer — recognising object-key *shape* for every value, which would exempt
+    any credential that happens to look like a path, from anyone, with no author in the loop.
+    """
+
+    __slots__ = ()
+
+
 def _entropy(s: str) -> float:
     counts = {c: s.count(c) for c in set(s)}
     return -sum((n / len(s)) * math.log2(n / len(s)) for n in counts.values())
@@ -91,6 +158,25 @@ def _looks_secret(value: str) -> bool:
     if " " in value or len(value) < 32:
         return False
     return _entropy(value) > 3.5
+
+
+def _is_object_key(text: str) -> bool:
+    """Is ``text`` unambiguously an object-store key? See :class:`ObjectKey` for the argument."""
+    if not text or len(text) > MAX_OBJECT_KEY:
+        return False
+    if not _OBJECT_KEY.fullmatch(text):
+        return False
+    if _LONG_ALNUM_RUN.search(text):
+        return False
+    return not any(p.search(text) for p in _SECRET_VALUE)
+
+
+def _vetted_object_key(value: ObjectKey) -> Any:
+    """Let a vetted key through verbatim, or fall back to the ordinary deny-list if it does not
+    look like one. ``str(value)`` first, so what lands in the record is a plain ``str`` and not a
+    subclass smuggling the exemption onwards."""
+    text = str(value)
+    return redact(text) if _is_object_key(text) else _scalar(text)
 
 
 def _mask_tokens(tokens: Sequence[str]) -> list[str]:
@@ -212,6 +298,11 @@ def mask_text(value: str) -> str:
 
 
 def _walk(value: Any, *, key: str | None = None) -> Any:
+    # Before the field-name rule, deliberately: `ObjectKey` is a statement about the *value*,
+    # made in lab's own source, and `key=` is the natural (and pre-existing) field name for an
+    # object key — a diagnostic that has to misname its subject to keep it is no better off.
+    if isinstance(value, ObjectKey):
+        return _vetted_object_key(value)
     if key is not None and _SECRET_KEY.search(key):
         return MASK
     if isinstance(value, Mapping):

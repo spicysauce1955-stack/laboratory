@@ -1,4 +1,11 @@
-"""What a price cap means once the machine is real (pure; no cloud, no sky, no vastai).
+"""What a job's money record *means* (pure; no cloud, no sky, no vastai).
+
+Three decisions live here — whether a rental exceeded its cap, whether a terminal job ever ran at
+all, and what this project has actually spent so far. All three are arithmetic over records that
+already exist, so they are dependency-free and importable without ``sky`` installed. Talking to
+Vast, tearing machines down and writing manifests all stay with their existing owners.
+
+## The price cap
 
 ``--price-cap`` maps to ``sky.Resources(max_hourly_cost=)``, which SkyPilot's optimizer honours
 against **its own catalog**. On Vast that catalog under-reports ~4x — a fact this codebase already
@@ -12,12 +19,30 @@ exactly what it promised, against a number roughly four times too low.
 
 The lab already *knew*: ``resolve_cost`` reads the rental's real ``dph_total`` seconds after the
 host is UP, which is the only reason those overruns are visible in the manifests at all. What was
-missing is the comparison itself — the one thing that needs no cloud to decide. It lives here,
-dependency-free, so it is trivially testable and importable without ``sky`` installed. Talking to
-Vast, tearing machines down and writing manifests all stay with their existing owners.
+missing is the comparison itself — the one thing that needs no cloud to decide.
+
+## Failed launches and running spend
+
+Both were found hand-rolled inside a live shell watcher during the 2026-09 campaign post-mortem,
+which is the evidence they belong in the tool. See :func:`failed_launch_reason` and
+:func:`realized_spend` for the incidents each one carries.
 """
 
 from __future__ import annotations
+
+from collections.abc import Iterable
+from datetime import datetime
+from typing import Any
+
+from lab._util import actual_cost, duration_seconds, parse_duration
+from lab.models import JobManifest, JobState
+
+_TERMINAL_STATES = frozenset(
+    {
+        JobState.succeeded, JobState.failed, JobState.cancelled,
+        JobState.timed_out, JobState.preempted,
+    }
+)
 
 # `CostInfo.hourly_usd` folds storage in and catalogue prices round, so a cap is not a knife edge.
 # 5% is wide enough that arithmetic never raises a money alarm and far below the 2.6x that actually
@@ -71,3 +96,294 @@ def cap_admission_error(best_offer: float, cap: float, accelerators: str | None)
         f"above --price-cap ${cap:.2f}/hr. Nothing was rented. Raise --price-cap above "
         f"${best_offer:.3f}, or use `lab register --max-hourly` to queue until prices drop."
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# Failed launches
+# ---------------------------------------------------------------------------------------------
+
+
+def failed_launch_reason(m: JobManifest) -> str | None:
+    """Why this job reached a terminal state without its workload ever running — or ``None``.
+
+    A **failed launch** costs a slot and (near enough) no money. Counting one as an ordinary
+    failure corrupts every success rate a campaign computes, and counting its ``null`` cost as
+    ``$0`` corrupts every spend number. During the 2026-09 post-mortem this was found re-derived
+    by hand inside a live shell watcher::
+
+        term and st != 'succeeded' and (hr in (None, 0) or 'provisioning' in end_reason)
+
+    Two of those three disjuncts are wrong here, and the errors point in opposite directions:
+
+    * ``hr is None`` is **not** "free". ``cost: null`` means *not known* — a rule this codebase
+      states explicitly, and one a monitor already broke the other way by reading ``terminal +
+      cost:null`` as still-live. The honest structural signal is that there is no ``CostInfo`` at
+      **all**: :func:`lab.sky_runner.resolve_cost` writes one the instant the host reaches UP, so
+      its absence on a terminal remote job means the host never came up. A ``CostInfo`` that
+      exists with ``hourly_usd=None`` is the opposite case — the machine ran and the *price
+      lookup* failed — and returns ``None`` here, deliberately.
+    * ``hr == 0`` is the **local** backend's genuine zero (own machine, really free), so that
+      clause flagged every local failure as a launch that never happened.
+    * substring-matching ``end_reason`` fires on a workload whose own traceback happens to say
+      "provisioning", deleting a real failure from the record. Every provisioning death already
+      satisfies the structural test above, so no string matching is needed for it.
+
+    The reasons, all machine-readable and stable:
+
+    ``"never_reached_up"``
+        No ``CostInfo`` was ever written: provisioning timed out, the launch errored, or the job
+        was cancelled/preempted before the host was UP. Terminal, not succeeded, never priced.
+    ``"transient_launch_error"``
+        ``end_reason`` carries the documented ``transient:`` prefix — the launch never reached a
+        provider at all. Structurally a subset of the above; named separately because it is the
+        one that is worth retrying verbatim.
+    ``"price_cap_destroyed"``
+        The rental billed over ``--price-cap`` with ``--price-cap-strict`` set, so
+        :func:`lab.sky_runner.enforce_price_cap` destroyed it seconds after boot. It billed a few
+        minutes and the workload never ran; charging that to the failure column hides a *pricing*
+        problem behind a *code* one.
+
+    Deliberately ``None`` for the **local** backend whatever the state: nothing is provisioned,
+    nothing is billed, and there is no launch phase to fail — so a crashed local job is a real
+    failure, not a job that never ran. Also ``None`` for any non-terminal job: a skypilot job is
+    ``running`` with ``cost: null`` for its whole provisioning window, and calling that stillborn
+    is how a monitor cancels a job that was about to start.
+    """
+    if m.status not in _TERMINAL_STATES or m.status is JobState.succeeded:
+        return None
+    if m.backend.provisioner == "local":
+        return None
+    cost = m.cost
+    # `enforce_price_cap` fires exactly on this pair (strict + a definitive over-cap verdict) and
+    # returns straight to teardown, so the pair on a terminal non-succeeded job *is* the destroy.
+    if cost is not None and cost.over_cap is True and m.resources.price_cap_strict:
+        return "price_cap_destroyed"
+    if (m.end_reason or "").startswith("transient:"):
+        return "transient_launch_error"
+    if cost is None:
+        return "never_reached_up"
+    return None
+
+
+def is_failed_launch(m: JobManifest) -> bool:
+    """Did this job reach a terminal state without ever really running? See
+    :func:`failed_launch_reason`, which also says *why*."""
+    return failed_launch_reason(m) is not None
+
+
+# ---------------------------------------------------------------------------------------------
+# Running realized spend
+# ---------------------------------------------------------------------------------------------
+
+# Travels *with* the number, in every payload that carries it: an ambiguous money figure is worse
+# than none, and this one is deliberately narrow.
+SPEND_SCOPE = (
+    "realized USD across this project's own runs/ only: finished jobs at their recorded "
+    "actual_usd (or rate x their own elapsed time when no actual was written), still-running "
+    "jobs at rate x elapsed-so-far BOUNDED by their own --timeout (plus 30m of provisioning and "
+    "teardown slack, which started_at also charges) or by a 24h horizon when the job declares no "
+    "timeout, local-backend jobs at zero (own machine). Derived from the job manifests on every "
+    "read — there is no meter. A job that hit that bound is named in unsupervised_suspect_jobs "
+    "and contributes no more, so the total is a LOWER bound for those. EXCLUDES: jobs whose rate "
+    "was never readable (named in unknown_cost_jobs, never counted as zero), other projects' "
+    "jobs, and scheduler-launched jobs with no local run dir. Not a provider bill."
+)
+
+# What a still-`running` manifest is allowed to bill beyond its own declared wall-clock cap.
+# `started_at` is stamped when the supervisor starts, so it charges provisioning and remote setup
+# (per-cloud provision timeouts run to 20m on gcp) while the box-side cap wraps only the
+# entrypoint; teardown then adds a little more. Deliberately generous: a healthy job that trips
+# the "probably orphaned" flag is exactly the wrong-most-of-the-time alarm this codebase keeps
+# having to undo (R10).
+LIVE_CEILING_GRACE_S = 1800.0
+
+# The ceiling for a live job that declares no `--timeout` at all. Nothing on the box stops such a
+# job, so no honest ceiling exists — but "no ceiling" is how a manifest abandoned at `running`
+# adds ~$67 of money nobody spent and climbs on every read. One explicit, documented horizon is
+# the lesser error, and any job that reaches it is named in `unsupervised_suspect_jobs` so the
+# under-report is visible rather than silent.
+UNCAPPED_LIVE_CEILING_S = 24 * 3600.0
+
+
+def live_ceiling_s(m: JobManifest) -> float:
+    """The most wall-clock time a still-`running` manifest may be billed for.
+
+    The job's own ``--timeout`` is the natural ceiling: the instance enforces it on itself (GNU
+    ``timeout`` + a ``poweroff`` backstop, independent of the local supervisor), so a job cannot
+    bill past it and remain honest. Jobs with no timeout fall back to
+    :data:`UNCAPPED_LIVE_CEILING_S`, and so does a timeout string that does not parse — manifests
+    are on-disk history, and a legacy or hand-edited value must degrade, never raise out of a
+    listing.
+    """
+    try:
+        cap = parse_duration(m.resources.timeout)
+    except ValueError:
+        cap = None
+    return UNCAPPED_LIVE_CEILING_S if cap is None else cap + LIVE_CEILING_GRACE_S
+
+
+def realized_spend(manifests: Iterable[JobManifest], *, at: datetime) -> dict[str, Any]:
+    """What this project's jobs have actually burned by ``at`` — derived, never metered.
+
+    On the 2026-09 campaign a $45 threshold crossing surfaced only in a retrospective self-audit
+    about two landings later, and the two most expensive losses were exactly the ones with no live
+    witness. There was no way to watch realized spend accumulate, so nobody did.
+
+    A running job therefore contributes ``hourly_usd x elapsed-so-far``: waiting for the landing
+    is precisely how a crossing goes unnoticed for two more jobs. A landed job contributes its
+    recorded ``actual_usd``, and when that was never written (the ``--price-cap-strict`` destroy
+    path, and any supervisor that died between pricing the box and finalizing it) it contributes
+    ``hourly_usd x its own`` elapsed time, which stops growing at ``ended_at``.
+
+    **The live term is bounded** (:func:`live_ceiling_s`). A ``running`` manifest is not evidence
+    that a machine is running: roughly 40% of the DigitalOcean supervisors in the 2026-08 campaign
+    died silently, leaving the manifest at ``running`` forever — ``reconcile``'s ``unsupervised``
+    category exists for exactly that shape. Unbounded, a $0.40/hr job abandoned a week ago adds
+    ~$67 that nobody spent, and the figure climbs on every ``lab list`` until ``--spend-alert``
+    fires on a phantom; by this codebase's own R10 rule an alarm that is usually wrong gets
+    ignored, which is the outcome this feature exists to prevent. Every job whose live term hit
+    its ceiling is returned in ``unsupervised_suspect_jobs`` — a *suspicion* derived from
+    arithmetic, deliberately borrowing ``reconcile``'s word rather than inventing a competing one,
+    since ``reconcile`` (which checks the supervisor pid) is where it gets confirmed.
+
+    Derived on every read on purpose. This project's cost-safety rule is that a second stateful
+    source of truth for money is a bug generator, so there is no counter file to keep in sync:
+    the manifests already hold every term.
+
+    The three-way split is the point:
+
+    * a job with a readable amount is **counted**;
+    * a job that never started, and any job on the **local** backend, is a **known zero** and is
+      counted (nothing was provisioned, so nothing was burned) — filing queue noise and dev-loop
+      runs under "unknown" would bury the real unknowns;
+    * a job that started and has no readable rate is **unknown**: named in ``unknown_cost_jobs``
+      and left out of the total entirely, never silently added as zero.
+
+    Returns ``{realized_usd, jobs_counted, running_usd, running_jobs, unknown_cost_jobs,
+    unsupervised_suspect_jobs, scope}``. ``running_usd`` is the still-accruing part of
+    ``realized_usd``, not a separate sum.
+    """
+    total = 0.0
+    running = 0.0
+    counted = 0
+    running_jobs: list[str] = []
+    unknown: list[str] = []
+    suspects: list[str] = []
+
+    for m in manifests:
+        cost = m.cost
+        if cost is not None and cost.actual_usd is not None:
+            total += cost.actual_usd
+            counted += 1
+            continue
+        if m.backend.provisioner == "local":
+            # Own machine, nothing rented — a known zero even mid-run, where the local runner has
+            # not written its CostInfo yet. Listing a local job as "cost unknown" would put every
+            # dev-loop run in the alarm list and teach people to ignore it (R10).
+            counted += 1
+            continue
+        if m.started_at is None:
+            counted += 1  # never provisioned: a known zero, not an unknown
+            continue
+        hourly = cost.hourly_usd if cost is not None else None
+        if hourly is None:
+            unknown.append(m.job_id)
+            continue
+        live = m.status not in _TERMINAL_STATES
+        capped = False
+        if live:
+            ceiling = live_ceiling_s(m)
+            elapsed_so_far = duration_seconds(m.started_at, at) or 0.0
+            capped = elapsed_so_far > ceiling
+            # `max(0, ...)`: a manifest written on a box whose clock ran ahead of this reader's
+            # would otherwise subtract money from the total.
+            seconds: float | None = max(0.0, min(elapsed_so_far, ceiling))
+        else:
+            # A terminal job's elapsed time is a recorded fact, and a recorded fact outranks the
+            # cap it was supposed to obey — a mis-anchored wall-clock cap has already let a 7h
+            # job run 703 minutes, and that money was real.
+            seconds = duration_seconds(m.started_at, m.ended_at)
+        burned = actual_cost(hourly, seconds)
+        if burned is None:  # terminal with no ended_at — nothing honest to size it against
+            unknown.append(m.job_id)
+            continue
+        total += burned
+        counted += 1
+        if live:
+            running += burned
+            running_jobs.append(m.job_id)
+            if capped:
+                suspects.append(m.job_id)
+
+    return {
+        "realized_usd": round(total, 6),
+        "jobs_counted": counted,
+        "running_usd": round(running, 6),
+        "running_jobs": running_jobs,
+        "unknown_cost_jobs": unknown,
+        "unsupervised_suspect_jobs": suspects,
+        "scope": SPEND_SCOPE,
+    }
+
+
+def spend_alert(summary: dict[str, Any], *, threshold_usd: float | None) -> dict[str, Any] | None:
+    """The crossing verdict for a :func:`realized_spend` summary, or ``None`` if it has not
+    crossed (or no threshold was asked for). Pure so both shells can render it their own way."""
+    if threshold_usd is None:
+        return None
+    realized = float(summary["realized_usd"])
+    if realized < threshold_usd:
+        return None
+    return {
+        "threshold_usd": threshold_usd,
+        "realized_usd": realized,
+        "over_by_usd": round(realized - threshold_usd, 6),
+        "message": spend_alert_message(
+            realized_usd=realized,
+            threshold_usd=threshold_usd,
+            running_usd=float(summary["running_usd"]),
+            running_jobs=len(summary["running_jobs"]),
+            unknown_jobs=len(summary["unknown_cost_jobs"]),
+            unsupervised_suspects=len(summary.get("unsupervised_suspect_jobs", [])),
+        ),
+    }
+
+
+def spend_alert_message(
+    *,
+    realized_usd: float,
+    threshold_usd: float,
+    running_usd: float,
+    running_jobs: int,
+    unknown_jobs: int,
+    unsupervised_suspects: int = 0,
+) -> str:
+    """The operator-facing line for a crossed spend threshold.
+
+    Leads with the numbers, says how much of the total is *still climbing*, and names what the
+    total does not include — an alarm nobody can act on gets ignored (R10), and one whose scope is
+    unstated is worse than none.
+    """
+    parts = [
+        f"[lab] SPEND ALERT: this project's jobs have realized ${realized_usd:.2f} against "
+        f"--spend-alert ${threshold_usd:.2f} (${realized_usd - threshold_usd:.2f} over)."
+    ]
+    if running_jobs:
+        parts.append(
+            f"${running_usd:.2f} of that is still accruing on {running_jobs} running job(s)."
+        )
+    if unknown_jobs:
+        parts.append(
+            f"{unknown_jobs} job(s) have no readable rate and are NOT in this total "
+            f"(unknown_cost_jobs)."
+        )
+    if unsupervised_suspects:
+        # The cheap hint that a box may still be billing with nobody watching it: a job cannot
+        # outlive its own wall-clock cap and still be `running` unless its supervisor is gone.
+        parts.append(
+            f"{unsupervised_suspects} job(s) are still marked running past their own wall-clock "
+            f"cap and stopped accruing here (unsupervised_suspect_jobs) — that usually means a "
+            f"dead supervisor, so the real total may be higher: `lab reconcile` to confirm."
+        )
+    parts.append("`lab ps` for what is still billing; `lab list` for the breakdown.")
+    return " ".join(parts)

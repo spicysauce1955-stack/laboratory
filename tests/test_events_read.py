@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from lab.events import store
-from lab.events.read import crossref, fold, read, row
+from lab.events.read import crossref, fold, read, row, since_cutoff
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
 
@@ -170,6 +171,74 @@ def test_read_job_filter_matches_job_ids_list_membership(
 def test_read_since_uses_the_duration_parser(_ledger: None) -> None:
     assert [e.id for e in read(since="2d", now_=NOW)] == ["a"]
     assert {e.id for e in read(since="30d", now_=NOW)} == {"a", "b"}
+
+
+def test_since_cutoff_accepts_durations_including_compounds() -> None:
+    assert since_cutoff("2d", now_=NOW) == NOW - timedelta(days=2)
+    assert since_cutoff("30m", now_=NOW) == NOW - timedelta(minutes=30)
+    assert since_cutoff("3h30m", now_=NOW) == NOW - timedelta(hours=3, minutes=30)
+    assert since_cutoff("3600", now_=NOW) == NOW - timedelta(hours=1)  # plain seconds
+    assert since_cutoff(None) is None
+    assert since_cutoff("") is None
+
+
+def test_since_cutoff_accepts_an_absolute_date_as_utc_midnight() -> None:
+    """Ledger, three times during the 2026-09 campaign: `bad since '2026-09-06': could not
+    convert string to float: '2026-09-06'`. Someone investigating an incident reaches for the
+    date, not for a duration.
+
+    A bare date is the **start of that day in UTC**, never local midnight: the whole ledger is
+    stamped UTC (`store.append` / `_util.now`), the incident box runs UTC+3, and a cutoff
+    silently shifted by the reader's zone would drop or resurrect rows either side of a day
+    boundary with nothing on screen to say so.
+    """
+    assert since_cutoff("2026-09-06") == datetime(2026, 9, 6, tzinfo=timezone.utc)
+    assert since_cutoff("2026-09-06").tzinfo is not None  # comparable with an aware event ts
+
+
+def test_since_cutoff_accepts_iso_datetimes_at_every_precision() -> None:
+    assert since_cutoff("2026-09-07T02") == datetime(2026, 9, 7, 2, tzinfo=timezone.utc)  # ledger
+    assert since_cutoff("2026-09-07T02:30") == datetime(2026, 9, 7, 2, 30, tzinfo=timezone.utc)
+    assert since_cutoff("2026-09-07 02:30:15") == datetime(
+        2026, 9, 7, 2, 30, 15, tzinfo=timezone.utc
+    )
+    # An explicit offset is honoured rather than reinterpreted, and normalised to UTC.
+    assert since_cutoff("2026-09-07T05:30+03:00") == datetime(2026, 9, 7, 2, 30, tzinfo=timezone.utc)
+    assert since_cutoff("2026-09-07T02:30:00Z") == datetime(2026, 9, 7, 2, 30, tzinfo=timezone.utc)
+
+
+def test_since_cutoff_is_utc_regardless_of_the_local_zone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The absolute path must not go through any local-time constructor. Pinned by running the
+    same input under a non-UTC `TZ` (the scheduler droplet and the 2026-08 incident box are both
+    UTC+3) — `datetime.fromisoformat` on a naive string is zone-free, and this asserts nobody
+    later "fixes" it with `astimezone()`/`.timestamp()`, which would silently shift the window."""
+    monkeypatch.setenv("TZ", "Asia/Nicosia")
+    time.tzset()
+    try:
+        assert since_cutoff("2026-09-06") == datetime(2026, 9, 6, tzinfo=timezone.utc)
+    finally:
+        monkeypatch.delenv("TZ", raising=False)
+        time.tzset()
+
+
+def test_since_cutoff_rejects_garbage_naming_both_accepted_forms() -> None:
+    with pytest.raises(ValueError) as exc_info:
+        since_cutoff("garbage")
+    message = str(exc_info.value)
+    assert "garbage" in message
+    assert "2026-09-06" in message  # names the absolute form
+    assert "30m" in message  # ...and the relative one
+    assert "could not convert" not in message
+    for bad in ["2026-13-06", "2026-09-32", "2026-09"]:
+        with pytest.raises(ValueError, match=r"invalid since"):
+            since_cutoff(bad)
+
+
+def test_read_since_accepts_an_absolute_date(_ledger: None) -> None:
+    """The fixture's two events are stamped NOW (2026-08-18) and NOW-5d (2026-08-13)."""
+    assert [e.id for e in read(since="2026-08-18")] == ["a"]
+    assert {e.id for e in read(since="2026-08-01")} == {"a", "b"}
+    assert read(since="2026-08-19") == []
 
 
 def test_read_limit_applies_after_filtering(_ledger: None) -> None:

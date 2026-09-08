@@ -143,6 +143,68 @@ def test_queue_list_renders_markers_from_one_listing_each(tmp_path: Path, monkey
     assert rows[held]["cancel_requested"] is False
 
 
+def test_queue_list_warns_when_the_scheduler_host_is_older(tmp_path: Path):
+    """An older host deserialises registrations with ITS models and silently drops fields it does
+    not know — that is how `--price-cap` was lost on the deferred path, and it was then
+    misdiagnosed as `lab register` not having the flag. The warning goes to stderr because stdout
+    carries only JSON; the verdict is also in the payload so a machine caller can see it."""
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, repo)
+    q = LocalQueueStore(tmp_path / "queue")
+    q.write_heartbeat(
+        {"at": "2026-09-08T00:00:00+00:00", "host": "old-droplet", "tick_count": 1,
+         "lab_version": "0.4.0"}
+    )
+    res = runner.invoke(app, ["queue", "list"], env=env)
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout)["scheduler_skew"]["verdict"] == "host_older"
+    assert "0.4.0" in res.stderr
+
+    # A heartbeat predating the field at all is still evidence of an older host, never silence.
+    q.write_heartbeat({"at": "2026-09-08T00:00:00+00:00", "host": "old-droplet", "tick_count": 2})
+    res = runner.invoke(app, ["queue", "list"], env=env)
+    assert json.loads(res.stdout)["scheduler_skew"]["verdict"] == "unknown"
+    assert res.stderr.strip()
+
+
+def test_queue_list_does_not_invent_an_old_host_when_no_scheduler_ever_ticked(tmp_path: Path):
+    """With no heartbeat object at all there is no host to be old — a project that never deployed
+    a scheduler, or a brand-new queue. Warning about "a lab older than this client's" there is a
+    claim with no evidence behind it, and it trains the reader to skip the one diagnostic that is
+    supposed to make a real skew believable (R10). `heartbeat_age_s: null` already says it."""
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, repo)
+    _register(tmp_path, repo)  # a real entry, so the listing is not trivially empty
+
+    res = runner.invoke(app, ["queue", "list"], env=env)
+
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.stdout)
+    assert payload["scheduler_skew"]["verdict"] == "no_heartbeat"
+    assert payload["heartbeat_age_s"] is None
+    # Asserted against the skew warning's own remedy line: this harness always emits an unrelated
+    # LAB_REPO_DIR warning on stderr.
+    assert "deploy/scheduler/deploy.sh" not in res.stderr
+    assert "older" not in res.stderr
+
+
+def test_queue_list_is_quiet_when_the_host_matches(tmp_path: Path):
+    from lab import __version__
+
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, repo)
+    LocalQueueStore(tmp_path / "queue").write_heartbeat(
+        {"at": "2026-09-08T00:00:00+00:00", "host": "h", "tick_count": 1,
+         "lab_version": __version__}
+    )
+    res = runner.invoke(app, ["queue", "list"], env=env)
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout)["scheduler_skew"]["verdict"] == "same"
+    # Asserted against the skew warning's own remedy line, not "warning": this harness always
+    # emits an unrelated LAB_REPO_DIR warning on stderr.
+    assert "deploy/scheduler/deploy.sh" not in res.stderr
+
+
 def test_scheduler_tick_runs_once(tmp_path: Path):
     repo = _make_repo(tmp_path)
     _register(tmp_path, repo)

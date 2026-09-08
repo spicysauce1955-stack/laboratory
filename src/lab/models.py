@@ -42,6 +42,15 @@ class ResourceRequest(BaseModel):
     # because this project's rule is admission-control and stop-launching, never kill — a running
     # job vanishing over price has to be something the user asked for.
     price_cap_strict: bool = False
+    # Accelerators to fall back through when a launch dies in provisioning, e.g.
+    # "RTX4090:1,RTX3090:1,L40S:1". Opt-in and off by default: the campaign data behind it does
+    # not show rotation helping on average (see lab.placement's rotation section), so this is an
+    # operator's lever, not an improvement everyone should silently get. Rotation changes only
+    # *what* is asked for — never `max_hourly_usd`.
+    accelerator_pool: str | None = None
+    # Hard bound on launch attempts for one job. None -> the size of the pool, or 1 with no pool
+    # (today's behaviour, exactly). Every extra attempt can cost a full provisioning timeout.
+    max_launch_attempts: int | None = None
     timeout: str | None = None  # wall-clock limit, e.g. "2h" (FR-I1)
     provision_timeout: str | None = None  # max time to reach UP, e.g. "10m" (per-cloud default)
     use_spot: bool = False  # opt into spot/interruptible instances (skypilot)
