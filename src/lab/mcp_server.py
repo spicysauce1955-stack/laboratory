@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +24,7 @@ from fastmcp.tools import ToolResult
 from mcp.types import CallToolRequestParams
 
 from lab import events
-from lab._util import now, parse_duration, wrap_with_extras
+from lab._util import parse_duration, wrap_with_extras
 from lab.core import Lab, LabError, default_lab, job_status_view, resolve_backend_profile
 from lab.env import load_lab_env
 from lab.events import store as events_store
@@ -52,10 +52,9 @@ def _since_cutoff(since: str | None) -> datetime | None:
     if since is None:
         return None
     try:
-        seconds = parse_duration(since)
+        return events.since_cutoff(since)  # a duration back from now, or an absolute UTC date
     except ValueError as e:
         raise ToolError(f"bad since {since!r}: {e}") from e
-    return now() - timedelta(seconds=seconds) if seconds is not None else None
 
 
 def _exclude_self(found: list[events.Event]) -> list[events.Event]:
@@ -193,6 +192,8 @@ def build_server(lab: Lab) -> FastMCP:
         gpus: int | None = None,
         disk_size: int | None = None,
         accelerators: str | None = None,
+        accelerator_pool: str | None = None,
+        max_launch_attempts: int | None = None,
         cloud: str | None = None,
         region: str | None = None,
         zone: str | None = None,
@@ -207,11 +208,12 @@ def build_server(lab: Lab) -> FastMCP:
         allow_unknown_config: bool = False,
         preflight: bool = True,
     ) -> dict[str, Any]:
-        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m'; per-cloud default: vast 8m, do 12m, gcp 20m; 15m when region/zone is pinned) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. allow_dirty=False refuses a dirty working tree (default snapshots the diff, FR-B1). disk_size sizes the boot/attached volume in GB (skypilot; DO volume size). cloud picks the skypilot cloud: vast (default) | do | gcp — GCP runs both CPU and GPU jobs (accelerators e.g. 'T4:1'/'L4:1', spot allowed). backend="cpu" provisions a cheap CPU box (DigitalOcean by default, cloud="gcp" to override; default 4 vCPU + 50GB volume, up to 48; --accelerators rejected). region/zone pin where it lands (default: SkyPilot's optimizer picks the cheapest available). price_cap caps compute $/hr, but is NOT a hard ceiling on its own: the optimizer applies it to SkyPilot's catalog, which under-reports Vast ~4x, so a rental can bill above it. The cheapest live Vast offer is checked before launching (an impossible cap fails the submit) and the billed rate is checked after boot (recorded as cost.over_cap); pass price_cap_strict=True to destroy a machine that bills above the cap instead of warning. preflight=False skips the pre-launch credential/quota checks (see the doctor tool)."""
+        """Submit a job without blocking (backend local|skypilot); returns {job_id, cached, status} (FR-A1). cache=True reuses a prior identical succeeded job (FR-B5); with_pkg layers extra runtime packages via uv run --with. provision_timeout (skypilot, e.g. '10m'; per-cloud default: vast 8m, do 12m, gcp 20m; 15m when region/zone is pinned) aborts a host that never reaches UP. use_spot uses spot instances (skypilot); spot_fallback=False makes it spot-only. allow_dirty=False refuses a dirty working tree (default snapshots the diff, FR-B1). disk_size sizes the boot/attached volume in GB (skypilot; DO volume size). cloud picks the skypilot cloud: vast (default) | do | gcp — GCP runs both CPU and GPU jobs (accelerators e.g. 'T4:1'/'L4:1', spot allowed). backend="cpu" provisions a cheap CPU box (DigitalOcean by default, cloud="gcp" to override; default 4 vCPU + 50GB volume, up to 48; --accelerators rejected). region/zone pin where it lands (default: SkyPilot's optimizer picks the cheapest available). price_cap caps compute $/hr, but is NOT a hard ceiling on its own: the optimizer applies it to SkyPilot's catalog, which under-reports Vast ~4x, so a rental can bill above it. The cheapest live Vast offer is checked before launching (an impossible cap fails the submit) and the billed rate is checked after boot (recorded as cost.over_cap); pass price_cap_strict=True to destroy a machine that bills above the cap instead of warning. preflight=False skips the pre-launch credential/quota checks (see the doctor tool). accelerator_pool is a comma-separated fallback list of accelerators tried in order when a launch dies in provisioning (accelerators is attempt 1); max_launch_attempts bounds the attempts. Off by default, and it never raises price_cap — campaign data does not show rotation improving the landing rate, so it is an operator lever, not a default."""
         resources = ResourceRequest(
             cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
             cloud=cloud, region=region, zone=zone, max_hourly_usd=price_cap,
             price_cap_strict=price_cap_strict,
+            accelerator_pool=accelerator_pool, max_launch_attempts=max_launch_attempts,
             timeout=timeout, provision_timeout=provision_timeout, use_spot=use_spot,
             spot_fallback=spot_fallback,
         )
@@ -276,6 +278,8 @@ def build_server(lab: Lab) -> FastMCP:
         gpus: int | None = None,
         disk_size: int | None = None,
         accelerators: str | None = None,
+        accelerator_pool: str | None = None,
+        max_launch_attempts: int | None = None,
         cloud: str | None = None,
         region: str | None = None,
         zone: str | None = None,
@@ -301,6 +305,7 @@ def build_server(lab: Lab) -> FastMCP:
             cpus=cpus, memory=memory, gpus=gpus, disk_size=disk_size, accelerators=accelerators,
             cloud=cloud, region=region, zone=zone, max_hourly_usd=price_cap,
             price_cap_strict=price_cap_strict,
+            accelerator_pool=accelerator_pool, max_launch_attempts=max_launch_attempts,
             timeout=timeout, provision_timeout=provision_timeout, use_spot=use_spot,
             spot_fallback=spot_fallback,
         )
@@ -336,7 +341,7 @@ def build_server(lab: Lab) -> FastMCP:
 
     @mcp.tool
     def status(job_id: str) -> dict[str, Any]:
-        """Return a job's state + timing + cost + teardown_status (FR-A2/FR-I2/FR-C2); cheap to poll (FR-G2). teardown_status "failed" is a money alarm: a paid machine may still be running — call reconcile. "unknown" means the destroy's outcome could not be read (verify against the provider itself, then reconcile); treat any unrecognised value as "unknown", never as success. Scheduler-launched (deferred) jobs are read from the mirrored manifest (mirrored=true; may be a tick stale)."""
+        """Return a job's state + timing + cost + teardown_status (FR-A2/FR-I2/FR-C2); cheap to poll (FR-G2). teardown_status "failed" is a money alarm: a paid machine may still be running — call reconcile. "unknown" means the destroy's outcome could not be read (verify against the provider itself, then reconcile); treat any unrecognised value as "unknown", never as success. is_failed_launch=true means the job reached a terminal state without ever really running (failed_launch_reason: never_reached_up / transient_launch_error / price_cap_destroyed) — it cost a slot and no money, so do not count it as an experiment failure; note that cost:null on its own is "not known", never $0, and never the test. age_s is seconds alive, computed for you (never subtract started_at yourself): it counts up while running and freezes at the final lifetime once terminal, and is null before a job starts or when no end time was recorded. Scheduler-launched (deferred) jobs are read from the mirrored manifest (mirrored=true; may be a tick stale)."""
         try:
             view = job_status_view(home, lab.repo, job_id)
         except FileNotFoundError as e:
@@ -515,8 +520,10 @@ def build_server(lab: Lab) -> FastMCP:
             raise ToolError(str(e)) from e
 
     @mcp.tool(name="list")
-    def list_jobs() -> dict[str, Any]:
-        """List jobs; returns {jobs: [...]} (FR-H1)."""
+    def list_jobs(spend_alert: float | None = None) -> dict[str, Any]:
+        """List jobs; returns {jobs: [...], spend: {...}} (FR-H1, FR-I2). `spend` is this project's realized USD so far, derived from the job manifests on every read (there is no meter): landed jobs at their recorded actual cost, still-running jobs at rate x elapsed-so-far (that part is `running_usd`, and it is included in `realized_usd`). Jobs whose rate was never readable are named in `unknown_cost_jobs` and left OUT of the total — never counted as $0. `scope` states exactly what is and is not included; read it before quoting the number. spend_alert=<usd> sets a threshold: `spend.alert` stays null until the total reaches it, then carries {threshold_usd, realized_usd, over_by_usd, message}."""
+        the_lab = _lab()
+        jobs = the_lab.list_jobs()
         return {
             "jobs": [
                 {
@@ -525,8 +532,9 @@ def build_server(lab: Lab) -> FastMCP:
                     "status": j.status.value,
                     "created_at": _iso(j.created_at),
                 }
-                for j in _lab().list_jobs()
-            ]
+                for j in jobs
+            ],
+            "spend": the_lab.spend(jobs, alert_usd=spend_alert),
         }
 
     @mcp.tool(name="ps")

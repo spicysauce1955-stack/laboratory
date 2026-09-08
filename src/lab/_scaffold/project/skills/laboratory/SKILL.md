@@ -192,7 +192,8 @@ updated cell view.
 ### `mcp__lab__status`
 `{job_id}` → `{state, lab_version, started_at, ended_at, exit_code, end_reason,
 cost, estimated_running_usd, last_log_line, teardown_status, sweep_id,
-code: {git_commit, git_dirty, diff_ref}, mirrored}`. A running remote job shows
+code: {git_commit, git_dirty, diff_ref}, mirrored, age_s, is_failed_launch,
+failed_launch_reason}`. A running remote job shows
 its spend-so-far (`estimated_running_usd`) and latest log line — enough to judge
 "is it alive and worth its bill" from one cheap call. `lab_version` is the lab
 release that produced the run (`null` on pre-0.5.0 manifests) — see §8.
@@ -200,6 +201,19 @@ States: `queued`, `running`, `succeeded`, `failed`, `cancelled`, `timed_out`,
 `preempted`. Cheap to poll. **`teardown_status: "failed"` is the FR-C2 money
 alarm** — call `mcp__lab__reconcile` immediately. Scheduler-launched (deferred)
 jobs are read from the mirrored manifest (`mirrored: true`; may be a tick stale).
+
+**Do not re-derive these two by hand — that is what the fields are for.**
+`age_s` counts up while the job runs and then **freezes at its final lifetime**,
+so "is this a runaway?" is `state == "running" and age_s > X`. Never compute a
+job's age from `started_at` and your own idea of the current date: doing exactly
+that, after an outage, once got two healthy jobs cancelled.
+`is_failed_launch` means the job reached a terminal state *without ever really
+running* (`failed_launch_reason`: `never_reached_up` / `transient_launch_error`
+/ `price_cap_destroyed`) — it cost a slot and no money. It is **not** the same
+question as `cost` being null. `cost: null` means *not known*; a job that ran at
+a price we could not read is a real failure with a real bill, and the local
+backend's `hourly_usd: 0.0` is a genuine zero. Treat an unfamiliar
+`failed_launch_reason` as "some failed launch", never as `null`.
 
 ### `mcp__lab__wait`
 `{job_ids?, sweep?, timeout?=600, interval?=10}` → `{all_terminal, teardown_leaks,
@@ -260,6 +274,8 @@ Designed for live polling at ~5–15s cadence (the early-kill loop).
 
 ### `mcp__lab__history`
 `{limit=50, since?, action?, job?, session?, failures?, full?, stats?}` →
+(`since` takes a duration back from now — `2d`, `30m`, `3h30m` — **or** an
+absolute UTC date/time: `2026-09-06`, `2026-09-06T14:30`.)
 `{"events": [{id, ts, action, surface, status, duration_ms, refs, result,
 error}, ...]}`. **The lab's record of its own calls** — every CLI invocation and
 MCP tool call, with `status` one of `ok` / `error` / `usage_error` / `crash` /
@@ -293,8 +309,17 @@ the local output is empty (e.g. after a fresh clone).
 `{job_id}` → `{"state": "cancelled"}`. Stops the job and tears the machine down.
 
 ### `mcp__lab__list`
-`{}` → `{"jobs": [{job_id, sweep_id, status, created_at}, ...]}`. All jobs in
-`runs/`.
+`{spend_alert?}` → `{"jobs": [{job_id, sweep_id, status, created_at}, ...],
+"spend": {realized_usd, jobs_counted, running_usd, running_jobs,
+unknown_cost_jobs, scope, alert}}`. All jobs in `runs/`, plus **realized spend
+so far** — derived from the manifests on every read, so there is no meter to
+drift. `running_usd` counts live jobs at rate x elapsed, so the total moves
+*before* a landing rather than after it. Jobs whose rate was never readable are
+named in `unknown_cost_jobs` and are **not** counted as free; `scope` states
+what the number covers (this project's `runs/` only). Pass `spend_alert` (CLI:
+`uv run lab list --spend-alert 45`) to get a verdict the moment a threshold is
+crossed instead of discovering it in a post-hoc audit — which is how the two
+most expensive losses of the 2026-09 campaign were found.
 
 ## 5. The CLI surface (and the CLI-only commands)
 
@@ -347,7 +372,8 @@ to 600s); it returns the same summary shape as `done.json`.
 
 `--done-file` is atomically rewritten after **each** job reaches a terminal state (with a
 `pending` list), so a watcher can react mid-wait instead of waiting for process exit.
-`--timeout` accepts durations (`"10m"`, `"2h"`) as well as bare seconds.
+`--timeout` accepts durations (`"10m"`, `"2h"`), compounds (`"3h30m"`, `"1d2h"` — largest unit
+first, each unit at most once) as well as bare seconds.
 
 ### `uv run lab reconcile [--apply]` — leak detection & cleanup (FR-C2)
 
@@ -735,6 +761,12 @@ past its cause costs real time. Each row below is a rule that was once right.
 
 | No longer true | What is true now | Since |
 |---|---|---|
+| "Work out whether a job is a runaway by reading `started_at` and subtracting it from today's date." | `lab status` returns **`age_s`**, computed for you — counting up while running, frozen at the final lifetime once terminal. Doing the subtraction by hand, against a date belief that was one day off after an outage, once got two healthy jobs cancelled. A destructive action still needs a second witness (the queue's own launch row, or the provider balance). | v0.12.0 |
+| "A terminal job with `cost: null` never really launched — treat null as $0." | Wrong in both directions, and `lab status` now answers it directly with **`is_failed_launch`** / `failed_launch_reason`. `cost: null` means *not known*: a job that ran at a price we could not read is a real failure with a real bill, and the local backend's `hourly_usd: 0.0` is a genuine zero. | v0.12.0 |
+| "There is no way to see spend accumulating — sum the landings yourself at the end of a shift." | `lab list` carries a derived `spend` block (including live jobs at rate x elapsed, so it moves *before* a landing), and `--spend-alert <usd>` flags a crossing the moment it is read. Jobs with an unreadable rate are named, never counted as free. | v0.12.0 |
+| "`--timeout` only takes one unit, and `--since` only takes a duration — write `210m` and `2d`." | `3h30m` and `1d2h` parse (largest unit first, each at most once; bare `3h30` is still refused as ambiguous), and `--since` also takes an absolute **UTC** date or ISO datetime, e.g. `--since 2026-09-06`. | v0.12.0 |
+| "SkyPilot re-draws dead Vast hosts because it picks from a stale catalog, so rotate accelerator pools by hand during a dead-host storm." | It does **not**: Vast host selection is a *live* `search_offers` at launch, and the catalog only fixes instance type and region. The lab now remembers a Vast `machine_id` that failed to come up and spends one attempt rather than a whole provisioning budget re-drawing it. Measured on the campaign that prompted the folklore: region-level blacklisting is nearly signal-free (48% vs a 42% base) and the placement with the *most* failures was the healthiest supply, so hand-rotation could steer you into a worse pool. `--accelerator-pool` exists as an operator lever, off by default. | v0.12.0 |
+| "If a deferred job misbehaves in a way the flags should have prevented, the flag must not exist on `lab register`." | Check for **version skew first**: `lab queue list` reports `scheduler_skew` and warns when the always-on host runs an older lab, which deserialises registrations with *its* models and silently drops fields it does not know. That — not a missing flag — is what once lost `--price-cap` on the deferred path. | v0.12.0 |
 | "The wall-clock cap is unreliable — wrap the command in your own timer, or run an external instance-killer." | `--timeout` is enforced **on the instance** by GNU `timeout`, plus a `poweroff` backstop at wall+margin. It does **not** depend on the local supervisor surviving, so a dead supervisor or a killed watcher does not extend the cap. | v0.1.0 |
 | "Killing a backgrounded `lab wait` orphans the job and unsets its cap." | `lab wait` is a *poller*; the supervisor is detached (`start_new_session`) and the cap lives on the box. Killing a wait loses your notification, not your cost bound. A stale `running` manifest afterwards is a *reporting* gap — `lab status <job>` re-checks liveness and finalizes. | v0.1.0 |
 | "`sweep-aggregate` cannot handle a grid with more than one row per seed (e.g. per-α rows)." | Declare the row identity: `--row-key seed,alpha`. Composite keys are supported, and `--row-key` also retrofits a plan made before the flag existed. | v0.2.1 |

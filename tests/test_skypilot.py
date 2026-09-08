@@ -51,7 +51,9 @@ def test_cluster_name_for():
 
 
 def test_build_scripts_and_timeout():
-    setup = build_setup_script()
+    # The setup script now also arms the boot-phase watchdog, so it needs the manifest whose
+    # cap it is bounding (tests/test_boot_watchdog.py owns that behaviour).
+    setup = build_setup_script(make_manifest("j0", "python x.py", timeout="30m"))
     assert "uv sync --frozen" in setup and "astral.sh/uv/install" in setup
     assert "--no-default-groups" in setup
 

@@ -57,6 +57,50 @@ def test_parse_duration_malformed_raises_clear_error():
         assert "could not convert" not in str(exc_info.value)
 
 
+def test_parse_duration_compound():
+    """`--timeout 3h30m` is the obvious way to write three and a half hours, and it used to fail
+    with `could not convert string to float: '3h30'` — twice in the ledger, on two jobs, during
+    the 2026-09 campaign. Components sum; every previously-accepted form is unaffected because it
+    never reaches the compound path (the single-unit/plain parse is tried first, unchanged)."""
+    assert parse_duration("3h30m") == 3 * 3600 + 30 * 60  # the exact ledger input
+    assert parse_duration("1d2h") == 86400 + 7200
+    assert parse_duration("1h30m15s") == 3600 + 1800 + 15
+    assert parse_duration("1d2h3m4s") == 86400 + 7200 + 180 + 4
+    assert parse_duration("0h0m") == 0.0
+    assert parse_duration("1h 30m") == 5400  # optional whitespace between components
+    assert parse_duration("3H30M") == 12600  # case-insensitive, like the single-unit form
+    assert parse_duration("1.5h30m") == 5400 + 1800  # decimals, as the single-unit form allows
+
+
+def test_parse_duration_rejects_ambiguous_or_malformed_compounds():
+    """This function gates a wall-clock cap on a paid machine, so anything whose intent is a
+    guess must refuse rather than resolve to a number:
+
+    * ``3h30``  — a unitless trailing component. Clock-style ("3h30m") or "3h and 30s"? Refuse.
+    * ``3h30x`` — ``x`` is not a unit.
+    * ``30m3h`` — units out of descending order; a transposition typo is indistinguishable from
+      an intent to sum, and the writer can always say ``3h30m``.
+    * ``3h3h``  — a repeated unit; summing to 6h would be inventing intent.
+    * ``m``/``3hm`` — an empty number or an empty unit is not a duration.
+    """
+    import pytest
+
+    for bad in ["3h30", "3h30x", "30m3h", "3h3h", "m", "3hm", "h30m", "3h-30m", "--30m"]:
+        with pytest.raises(ValueError, match=r"invalid duration"):
+            parse_duration(bad)
+
+
+def test_parse_duration_error_names_every_accepted_form():
+    import pytest
+
+    with pytest.raises(ValueError) as exc_info:
+        parse_duration("3h30x")
+    message = str(exc_info.value)
+    for expected in ["<n>s", "<n>m", "<n>h", "<n>d", "3h30m", "seconds"]:
+        assert expected in message
+    assert "could not convert" not in message
+
+
 def test_infer_artifact_type():
     assert infer_artifact_type("fig.png") == "figure"
     assert infer_artifact_type("data.csv") == "table"

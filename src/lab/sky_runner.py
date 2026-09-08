@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import FrameType
@@ -45,8 +45,9 @@ from lab.backends.skypilot import (
     vast_balance,
     vast_hourly_for_cluster,
 )
-from lab.models import BackendInfo, CostInfo, JobManifest, JobState
-from lab.placement import CapacityMemo
+from lab.models import BackendInfo, CostInfo, JobManifest, JobState, ResourceRequest
+from lab.partials import PartialMirror
+from lab.placement import CapacityMemo, DeadHostMemo
 from lab.pricing import exceeds_cap, over_cap_warning
 from lab.preemption import classify_terminal
 from lab.redact import install_log_redaction
@@ -363,6 +364,11 @@ class PartialsFetcher:
         self._cluster = cluster
         self._store = store
         self._job_id = job_id
+        # The other half of the same net (§6c salvage). Fetching the rows onto the supervisor's
+        # disk only saves them if the supervisor survives to upload them, and for a
+        # scheduler-launched job that disk belongs to a droplet nobody reads. See
+        # :mod:`lab.partials`.
+        self._mirror = PartialMirror(job_id, store.output_dir(job_id))
         self._lock = threading.Lock()  # one rsync into `output/` at a time
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -466,6 +472,13 @@ class PartialsFetcher:
         st["consecutive_failures"] = 0
         st["last_error"] = None
         st["last_ok_at"] = now()
+        if phase != "final":
+            # Push what just landed on to durable storage while the box is still alive. Only
+            # mid-run: the `final` fetch is followed by the authoritative `upload_dir`, and a
+            # partial copy of a *finished* job would only muddy what `_partial/` means.
+            # Rate-limited and change-gated inside; returns 0 and records the reason on any
+            # trouble, because nothing here may fail a job (FR-C2 alarms stay for real leaks).
+            self._mirror.maybe_mirror(self._job_status())
         # A monkeypatched-away rsync (several supervisor tests) returns None; treat the transfer
         # as unknown rather than crashing the supervisor over its own instrumentation.
         if isinstance(stats, RsyncStats) and stats.files > 0:
@@ -479,6 +492,19 @@ class PartialsFetcher:
         self._publish()
         self._announce("empty", phase)
 
+    def _job_status(self) -> str:
+        """The producing job's status right now, for the partial marker. Never raises.
+
+        Read per mirror rather than assumed to be ``running`` so that a concurrently-cancelled
+        job's salvaged rows carry the state they were really produced under — the marker's whole
+        job is to be the truth about provenance.
+        """
+        try:
+            manifest = self._store.read_manifest(self._job_id)
+        except Exception:  # noqa: BLE001 — a label, never a fault
+            return "running"
+        return str(manifest.status.value) if manifest.status else "running"
+
     # -- reporting ---------------------------------------------------------
 
     def _publish(self) -> None:
@@ -486,6 +512,7 @@ class PartialsFetcher:
             return
         st = self._state
         record = {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in st.items()}
+        record["mirror"] = dict(self._mirror.state)
         try:
             self._store.write_runtime(self._job_id, partials=record)
         except Exception as e:  # noqa: BLE001 — never let bookkeeping kill the supervisor
@@ -694,6 +721,18 @@ def record_capacity_exhaustion(
 _CAPACITY_LOG_TAIL_BYTES = 200_000
 
 
+def _log_tail(store: JobStore, job_id: str) -> str:
+    """The last :data:`_CAPACITY_LOG_TAIL_BYTES` of a job's log, or "" if it cannot be read."""
+    try:
+        path = store.logs_path(job_id)
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            f.seek(max(0, size - _CAPACITY_LOG_TAIL_BYTES))
+            return f.read().decode(errors="replace")
+    except OSError:
+        return ""
+
+
 def _remember_capacity(
     store: JobStore, job_id: str, manifest: JobManifest, cloud: str, *, error_text: str
 ) -> list[str]:
@@ -702,18 +741,246 @@ def _remember_capacity(
     The zones are usually only in the log: SkyPilot logs a per-zone warning during failover and
     then raises a summary error that names none of them.
     """
-    log_text = ""
-    try:
-        path = store.logs_path(job_id)
-        size = path.stat().st_size
-        with path.open("rb") as f:
-            f.seek(max(0, size - _CAPACITY_LOG_TAIL_BYTES))
-            log_text = f.read().decode(errors="replace")
-    except OSError:
-        pass
     return record_capacity_exhaustion(
-        store.home, manifest, cloud, error_text=error_text, log_text=log_text
+        store.home, manifest, cloud, error_text=error_text, log_text=_log_tail(store, job_id)
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# Dead hosts (the offers that never come up)
+# ---------------------------------------------------------------------------------------------
+# A dead offer bills nothing and costs a whole provisioning slot: 240 of 571 Vast launches in the
+# 2026-09 campaign (42%) ended at the watchdog, at 4-8 minutes each. Nothing else in the system
+# notices, because every cost guardrail is watching the bill.
+#
+# What can be keyed on is the constraint. The job log of a real dead provision names a placement
+# and nothing else (see `lab.placement.parse_drawn_placement`), and the campaign data says a
+# placement is far too coarse to exclude on. The one *sharp* identity in reach is the Vast
+# rental's `machine_id` — the physical machine, stable across rentals — and it exists only while
+# the rental does, i.e. between the launch request and teardown. So it is read here, on the
+# failure path, before `tear_down_and_record` destroys the evidence along with the machine.
+
+# How long to wait for a freshly-requested rental to show up before giving up on identifying the
+# host we drew. SkyPilot's Vast adapter creates the instance almost immediately (it is the *boot*
+# that hangs on a dead offer), so this window is generous, not a budget to be spent.
+DEAD_HOST_DRAW_WINDOW_S = 60.0
+DEAD_HOST_DRAW_POLL_S = 5.0
+
+# Observed verbatim in the campaign's job logs: 20 runs exited non-zero on the entrypoint's own
+# no-CUDA guard, and 2 more printed torch's verdict. These are hosts that advertise a GPU and do
+# not provide one — the "$0.3585 Romania 3090 that lists CUDA it doesn't have". Markers are taken
+# from real lines on this machine, never from recollection: an invented marker never matches,
+# which is indistinguishable from having no detector at all.
+_NO_CUDA_MARKERS = (
+    "no cuda device",
+    "torch.cuda.is_available() is false",
+    "no cuda-capable device is detected",
+)
+
+
+def has_no_cuda_marker(text: str) -> bool:
+    """True iff a job log says the box had no usable GPU. Pure.
+
+    Only ever consulted for a job that *failed*: the same guard also warns and continues on a
+    deliberate CPU smoke run, and treating that as a broken host would strike out a machine that
+    did exactly what it was asked to.
+    """
+    low = text.lower()
+    return any(m in low for m in _NO_CUDA_MARKERS)
+
+
+def vast_machine_id(cluster: str, client: Any | None = None) -> str | None:
+    """The Vast ``machine_id`` backing ``cluster``, or None when it cannot be established.
+
+    ``machine_id`` is the *physical* machine (vast's own ``Instance`` schema: ``id`` is the
+    rental/contract, ``machine_id`` the host it runs on, ``host_id`` its operator). The rental id
+    changes every time you rent the same box, so it is the machine id that can recur — and
+    recurring is the whole phenomenon being recorded.
+
+    Best-effort by contract: no vastai SDK, no credentials, no matching rental, or no such field
+    all return None. Never raises; a diagnostic that fails must not become the failure.
+    """
+    try:
+        from lab.backends.skypilot import _instance_label, list_vast_instances
+
+        needle = cluster.lower()
+        for inst in list_vast_instances(client=client):
+            if needle not in _instance_label(inst):
+                continue
+            machine_id = inst.get("machine_id")
+            return None if machine_id in (None, "") else str(machine_id)
+    except Exception as e:  # noqa: BLE001 — identification is a nicety, never a requirement
+        events.note("dead_host.unidentified", error=str(e))
+    return None
+
+
+def record_dead_host(
+    home: Path,
+    manifest: JobManifest,
+    cloud: str,
+    cluster: str,
+    *,
+    why: str,
+    log_text: str = "",
+    client: Any | None = None,
+) -> list[str]:
+    """Remember a host/placement that failed to deliver a usable machine. Returns the keys written.
+
+    Writes up to three keys, in descending order of how much they are trusted:
+
+    * ``machine`` — the Vast ``machine_id``, when the rental is still there to be asked. Sharp
+      enough to act on.
+    * ``accel`` — the accelerator spec that was asked for. What the rotation policy reads.
+    * ``placement`` — instance type + region, parsed from the log. Evidence only; nothing
+      excludes on it (see :mod:`lab.placement` for the measurement that settled that).
+
+    Best-effort and deliberately quiet: this runs on the error path of a job that has already
+    failed, and nothing here may make that worse.
+    """
+    written: list[str] = []
+    try:
+        from lab.placement import (
+            DeadHostMemo,
+            accelerator_key,
+            machine_key,
+            parse_drawn_placement,
+            placement_key,
+        )
+
+        memo = DeadHostMemo.for_home(home)
+        machine_id = vast_machine_id(cluster, client=client) if cloud == "vast" else None
+        if machine_id is not None:
+            written.append(machine_key(cloud, machine_id))
+        if manifest.resources.accelerators:
+            written.append(accelerator_key(cloud, manifest.resources.accelerators))
+        drawn = parse_drawn_placement(log_text)
+        if drawn.instance_type or drawn.region:
+            written.append(placement_key(cloud, drawn.instance_type, drawn.region))
+        for key in written:
+            memo.record(key)
+        if written:
+            print(f"[lab] dead-host memo ({why}): {', '.join(written)}")
+    except Exception as e:  # noqa: BLE001 — never worsen an already-failing job
+        print(f"[lab] dead-host memo not updated: {e}")
+    return written
+
+
+def _remember_dead_host(
+    store: JobStore, job_id: str, manifest: JobManifest, cloud: str, cluster: str, *, why: str
+) -> list[str]:
+    """:func:`record_dead_host` against this job's own log tail."""
+    return record_dead_host(
+        store.home,
+        manifest,
+        cloud,
+        cluster,
+        why=why,
+        log_text=_log_tail(store, job_id),
+    )
+
+
+def drawn_dead_host(
+    memo: Any,
+    cluster: str,
+    cloud: str,
+    *,
+    window_s: float = DEAD_HOST_DRAW_WINDOW_S,
+    poll_s: float = DEAD_HOST_DRAW_POLL_S,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    client: Any | None = None,
+) -> str | None:
+    """The memo key of a **known-dead** machine we have just drawn again, else None.
+
+    Called right after a launch is requested, so that re-drawing a host that already failed twice
+    costs seconds rather than the whole provisioning budget. Three separate ways of answering
+    "no", all of which mean *carry on with the launch*:
+
+    * the memo knows of no dead machine on this cloud — then nothing is asked and no API call is
+      made, so a lab with an empty memo behaves exactly as it did before this existed;
+    * the rental cannot be identified inside the window (no SDK, no credentials, a cloud other
+      than Vast, or simply a rental that has not registered yet);
+    * the machine we drew is not struck out.
+
+    It cannot say "this host is fine", only "this host is one we have watched fail". That
+    asymmetry is deliberate: the memo may spend an attempt, never refuse one.
+    """
+    if cloud != "vast":
+        return None
+    try:
+        if not memo.has_any(cloud, kind="machine"):
+            return None
+        deadline = monotonic() + window_s
+        while True:
+            machine_id = vast_machine_id(cluster, client=client)
+            if machine_id is not None:
+                from lab.placement import machine_key
+
+                key = machine_key(cloud, machine_id)
+                return key if memo.is_dead(key) else None
+            if monotonic() >= deadline:
+                return None
+            sleep(poll_s)
+    except Exception as e:  # noqa: BLE001 — an advisory check may never fail a launch
+        events.note("dead_host.check_failed", error=str(e))
+        return None
+
+
+# Ceiling on rotation, whatever the caller asks for. Every attempt can cost a full provisioning
+# timeout (8 min on Vast, 20 on GCP), so an unbounded pool is an unbounded wait — the exact cost
+# the 2026-08-23 `--provision-timeout 20m` lesson was about, multiplied.
+MAX_LAUNCH_ATTEMPTS = 6
+
+
+@dataclass
+class LaunchRotation:
+    """The bounded walk over an accelerator pool for one job.
+
+    Off unless asked for: with no pool and no explicit bound this is a single attempt, and the
+    launch path is byte-for-byte what it was before. See :mod:`lab.placement` for why the default
+    is off — the campaign's own numbers do not show rotation helping on average.
+    """
+
+    pool: list[str]
+    max_attempts: int
+    tried: list[str] = field(default_factory=list)
+    attempt: int = 1
+
+    @classmethod
+    def for_manifest(cls, manifest: JobManifest) -> LaunchRotation:
+        from lab.placement import parse_pool
+
+        res = manifest.resources
+        pool = parse_pool(res.accelerator_pool)
+        if res.accelerators and res.accelerators not in pool:
+            # The manifest's own accelerator is always attempt 1, whether or not the user
+            # repeated it in the pool: rotation is a fallback, not a re-plan.
+            pool = [res.accelerators, *pool]
+        requested = res.max_launch_attempts
+        default = len(pool) if len(pool) > 1 else 1
+        bound = default if requested is None else requested
+        return cls(
+            pool=pool,
+            max_attempts=max(1, min(MAX_LAUNCH_ATTEMPTS, bound)),
+            tried=[res.accelerators] if res.accelerators else [],
+        )
+
+    @property
+    def can_retry(self) -> bool:
+        return self.attempt < self.max_attempts
+
+    def advance(self, res: ResourceRequest, memo: Any | None = None) -> ResourceRequest | None:
+        """The spec for the next attempt, or None when the pool or the bound is spent."""
+        from lab.placement import next_accelerator, rotated_resources
+
+        if not self.can_retry:
+            return None
+        nxt = next_accelerator(pool=self.pool, tried=self.tried, res=res, memo=memo)
+        if nxt is None:
+            return None
+        self.tried.append(nxt)
+        self.attempt += 1
+        return rotated_resources(res, nxt)
 
 
 class TransientLaunchError(RuntimeError):
@@ -1180,20 +1447,26 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         # it in the `finally` below.
         partials = PartialsFetcher(cluster, store, job_id)
 
+        def _stop_attempt(request_id: Any, *, cancel: bool) -> bool:
+            """End one launch attempt and destroy whatever it created. True iff confirmed gone.
+
+            Rotation may only continue on a True: relaunching under the same cluster name while
+            the previous machine might still be billing would stack a leak on top of a failure,
+            and the cluster name is the only handle `robust_teardown` and `lab reconcile` have.
+            ``cancel`` is for the paths that did not already abandon the request themselves
+            (``provision_with_watchdog`` api_cancels on its way out; the re-draw check does not).
+            """
+            if cancel:
+                try:
+                    sky.api_cancel(request_id)
+                except Exception as e:  # noqa: BLE001 — best-effort; teardown is the real net
+                    print(f"[lab] api_cancel before relaunch failed: {e}")
+            return tear_down_and_record(sky, cluster, store, job_id, cloud)
+
         try:
             if not adopt:
                 memo = CapacityMemo.for_home(store.home)
-                task = build_task(manifest, workdir=Path.cwd(), memo=memo)
-                events.note(
-                    "provision.attempt",
-                    cloud=cloud,
-                    zone=manifest.resources.zone,
-                    region=manifest.resources.region,
-                    instance=manifest.resources.accelerators,
-                )
-                # Retries transient local-API failures (submit stampede) before giving up (fieldrep #4).
-                machine_requested = True  # from here on, an abort must tear down
-                request_id = _launch_with_retry(sky, task, cluster)
+                dead_memo = DeadHostMemo.for_home(store.home)
                 # stream_and_get blocks until the job is submitted (0.12), i.e. until the host is UP.
                 # Bound it so a dead Vast offer stuck in "loading" can't hang the supervisor forever
                 # (FR-I1). The budget is per-cloud: Vast waits on one host, GCP walks a failover path.
@@ -1207,7 +1480,93 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                     explicit_s, cloud, pinned=pinned
                 ):
                     print(warning)
-                sky_job_id, handle = provision_with_watchdog(sky, request_id, timeout_s=provision_s)
+
+                # The bounded launch walk. With no accelerator pool this is one pass and one
+                # `sky.launch`, identical to the path before rotation existed.
+                rotation = LaunchRotation.for_manifest(manifest)
+                attempt_res = manifest.resources
+                while True:
+                    attempt_manifest = manifest.model_copy(update={"resources": attempt_res})
+                    task = build_task(attempt_manifest, workdir=Path.cwd(), memo=memo)
+                    events.note(
+                        "provision.attempt",
+                        cloud=cloud,
+                        zone=attempt_res.zone,
+                        region=attempt_res.region,
+                        instance=attempt_res.accelerators,
+                        attempt=rotation.attempt,
+                    )
+                    # Retries transient local-API failures (submit stampede) before giving up (fieldrep #4).
+                    machine_requested = True  # from here on, an abort must tear down
+                    request_id = _launch_with_retry(sky, task, cluster)
+
+                    # Did we just draw a machine we have already watched fail? Only asked when
+                    # there is an attempt left to spend on the answer, and only when the memo
+                    # holds one — otherwise this costs nothing at all.
+                    check_started = time.monotonic()
+                    redrawn = (
+                        drawn_dead_host(dead_memo, cluster, cloud) if rotation.can_retry else None
+                    )
+                    # Whatever the check spent comes out of the provisioning budget, not on top of
+                    # it: `--provision-timeout` is a promise about how long a host gets to come up,
+                    # and a diagnostic that quietly extended it would be the kind of drift that
+                    # makes a calibrated timeout meaningless. The floor is itself capped by
+                    # `provision_s`, so a *small* configured timeout is never inflated — the first
+                    # cut of this line floored at a flat 60s and turned a 0.05s test timeout into
+                    # a 60s one, which is the same bug pointing the other way.
+                    _spent = time.monotonic() - check_started
+                    attempt_budget = max(min(provision_s, 60.0), provision_s - _spent)
+                    if redrawn is not None:
+                        nxt = rotation.advance(attempt_res, dead_memo)
+                        if nxt is not None and _stop_attempt(request_id, cancel=True):
+                            print(
+                                f"[lab] drew {redrawn} again — a host that has already failed to "
+                                f"come up; relaunching as {nxt.accelerators} rather than waiting "
+                                f"out {provision_s:.0f}s"
+                            )
+                            events.note("provision.redraw", host=redrawn, to=nxt.accelerators)
+                            attempt_res = nxt
+                            store.update_manifest(job_id, resources=attempt_res)
+                            continue
+                        # Nothing better to do (pool spent, or the machine could not be
+                        # destroyed): wait this launch out like any other. Never fail a job
+                        # *because* of the memo.
+                        events.note("provision.redraw_ignored", host=redrawn)
+                    try:
+                        sky_job_id, handle = provision_with_watchdog(
+                            sky, request_id, timeout_s=attempt_budget
+                        )
+                        break
+                    except ProvisionTimeout:
+                        _remember_dead_host(
+                            store,
+                            job_id,
+                            attempt_manifest,
+                            cloud,
+                            cluster,
+                            why="provision_timeout",
+                        )
+                        nxt = rotation.advance(attempt_res, dead_memo)
+                        if nxt is None:
+                            raise
+                        # Refuse to relaunch onto a cluster name whose machine we could not
+                        # confirm destroyed: a second launch on it would stack a leak on top of a
+                        # failure. The alarm `tear_down_and_record` already wrote stands.
+                        if not _stop_attempt(request_id, cancel=False):
+                            raise
+                        print(
+                            f"[lab] provisioning {attempt_res.accelerators} exceeded "
+                            f"{provision_s:.0f}s; rotating to {nxt.accelerators} "
+                            f"(attempt {rotation.attempt}/{rotation.max_attempts})"
+                        )
+                        events.note(
+                            "provision.rotate",
+                            frm=attempt_res.accelerators,
+                            to=nxt.accelerators,
+                            attempt=rotation.attempt,
+                        )
+                        attempt_res = nxt
+                        store.update_manifest(job_id, resources=attempt_res)
                 # Record cost up-front so a running job already shows it (FR-I2). The host is UP now,
                 # so the Vast rental exists — bill at its real dph_total, not SkyPilot's low catalog
                 # estimate.
@@ -1399,6 +1758,13 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             cluster_gone=cluster_gone,
             reached_terminal=reached_terminal,
         )
+
+        # The other kind of dead host: one that boots, advertises a GPU, and has none. It fails
+        # *after* provisioning, so the watchdog never sees it — the evidence is the entrypoint's
+        # own no-CUDA guard in the log. Recorded here, before teardown, because the rental (and
+        # with it the machine id) exists only until the next few lines destroy it.
+        if final is JobState.failed and has_no_cuda_marker(_log_tail(store, job_id)):
+            _remember_dead_host(store, job_id, manifest, cloud, cluster, why="no_cuda")
 
         # Push the fetched outputs to durable storage (survives teardown / other machines).
         artifacts_uri = None

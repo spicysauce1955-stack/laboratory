@@ -92,6 +92,7 @@ class R2QueueStore:
 
     def list_entries(self) -> list[Registration]:
         from lab import events
+        from lab.events.sanitize import ObjectKey
 
         out: list[Registration] = []
         for key, text, error in self._read_prefix(self._k("entries") + "/"):
@@ -112,7 +113,9 @@ class R2QueueStore:
                 # Anything else — a genuine, persistent I/O failure — is re-raised above and
                 # propagates, including from a pool thread.
                 print(f"[lab] skipping unreadable queue entry {key}: {e}", file=sys.stderr)
-                events.note("queue.entry_corrupt", key=key, error=str(e))
+                # `ObjectKey` for the same reason as `list_mirrored`'s note below: without it the
+                # ledger records that *a* queue entry was corrupt but not which one.
+                events.note("queue.entry_corrupt", key=ObjectKey(key), error=str(e))
                 continue
             out.append(reg)
         return out
@@ -214,6 +217,7 @@ class R2QueueStore:
 
     def list_mirrored(self) -> list[JobManifest]:
         from lab import events
+        from lab.events.sanitize import ObjectKey
 
         out: list[JobManifest] = []
         for key, text, error in self._read_prefix(self._k("jobs") + "/"):
@@ -231,7 +235,15 @@ class R2QueueStore:
                 # so the skip is surfaced (stderr + ledger) rather than silent — otherwise a real
                 # corruption could sit invisible behind a listing that just looks one job short.
                 print(f"[lab] skipping unreadable mirrored manifest {key}: {e}", file=sys.stderr)
-                events.note("queue.manifest_corrupt", key=key, error=str(e))
+                # `ObjectKey`: the note's whole job is naming the blob that could not be read, and
+                # `sanitize` masked it twice over (field named `key`, and a real key is long and
+                # high-entropy) — so until this wrapper existed the durable record said only
+                # "something under queue/jobs/ was corrupt", and the stderr line above was the
+                # only place the object was ever named. What is vetted here is that this field
+                # holds an object key under this store's own prefix and nothing else — the bytes
+                # come back from an R2 listing, so it is `ObjectKey`'s shape gate, not this call
+                # site, that decides whether the value is let through.
+                events.note("queue.manifest_corrupt", key=ObjectKey(key), error=str(e))
                 continue
             out.append(manifest)
         return out

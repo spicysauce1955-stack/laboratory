@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
 from lab._util import now as _now
@@ -139,6 +139,61 @@ def fold(records: Iterable[dict[str, Any]]) -> list[Event]:
     return sorted(events.values(), key=lambda e: e.ts, reverse=True)
 
 
+def _absolute(text: str) -> datetime | None:
+    """An ISO-8601 date or datetime as an **aware UTC** instant, or ``None`` if it isn't one.
+
+    A naive value is *stamped* UTC (``replace``), never converted from local time
+    (``astimezone``): every ledger record is written in UTC, so a bare ``2026-09-06`` means the
+    start of that UTC day and nothing else. Doing it the other way would shift the window by the
+    reader's offset — three hours on the scheduler droplet and on the box the 2026-08 supervisor
+    incident was reconstructed from — with nothing on screen to say the window moved.
+    """
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def since_cutoff(since: str | None, *, now_: datetime | None = None) -> datetime | None:
+    """The instant a ``--since`` window starts, from either a **relative duration** (``2d``,
+    ``30m``, ``3h30m``) or an **absolute UTC date/time** (``2026-09-06``, ``2026-09-07T02``,
+    ``2026-09-07T02:30:00Z``, ``2026-09-07T05:30+03:00``). ``None``/empty means no window.
+
+    Absolute values exist because ``--since`` is reached for during an incident, and the thing
+    an investigator has in hand is a date: the ledger recorded ``bad since '2026-09-06'`` and
+    ``bad since '2026-09-07T02'`` three times in one campaign, both crashing inside
+    ``float()`` because a duration parser was the only thing here.
+
+    Durations are tried **first**, so nothing that parsed before changes meaning — notably a bare
+    number stays seconds (``--since 20260906`` is 20,260,906 seconds ago, not a compact ISO date;
+    ambiguity resolved in favour of the older, already-documented reading).
+
+    Raises ``ValueError`` naming both accepted forms — the shells (``lab history``/``lab report``,
+    and the MCP tools of the same names) turn that into their usage error, so the message is what
+    a user sees.
+    """
+    if since is None:
+        return None
+    text = str(since).strip()
+    if not text:
+        return None
+    try:
+        seconds = parse_duration(text)
+    except ValueError:
+        moment = _absolute(text)
+        if moment is None:
+            raise ValueError(
+                f"invalid since {since!r}: expected a duration back from now (30m, 2d, 3h30m, "
+                "or a plain number of seconds) or an absolute UTC date/time "
+                "(2026-09-06, 2026-09-06T14:30, 2026-09-06T14:30:00+00:00)"
+            ) from None
+        return moment
+    if seconds is None:
+        return None
+    return (now_ or _now()) - timedelta(seconds=seconds)
+
+
 def read(
     *,
     since: str | None = None,
@@ -150,12 +205,12 @@ def read(
     limit: int | None = None,
     now_: datetime | None = None,
 ) -> list[Event]:
-    """Folded rows, newest first. ``since`` takes a duration string (``2d``, ``30m``)."""
+    """Folded rows, newest first. ``since`` takes a duration string (``2d``, ``30m``, ``3h30m``)
+    or an absolute UTC date/time (``2026-09-06``) — see :func:`since_cutoff`."""
     events = fold(store.iter_records(store.day_files()))
     if since:
-        seconds = parse_duration(since)
-        if seconds is not None:
-            cutoff = (now_ or _now()) - timedelta(seconds=seconds)
+        cutoff = since_cutoff(since, now_=now_)
+        if cutoff is not None:
             events = [e for e in events if e.ts >= cutoff]
     if project:
         events = [e for e in events if e.project.get("name") == project]

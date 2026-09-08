@@ -86,8 +86,11 @@ class R2Store:
 
     # -- generic single-object ops -----------------------------------------------
 
+    def put_bytes(self, key: str, data: bytes) -> None:
+        self._s3.put_object(Bucket=self.bucket, Key=key, Body=data)
+
     def put_text(self, key: str, text: str) -> None:
-        self._s3.put_object(Bucket=self.bucket, Key=key, Body=text.encode())
+        self.put_bytes(key, text.encode())
 
     def get_text(self, key: str) -> str | None:
         """The object's text, or None if the key doesn't exist."""

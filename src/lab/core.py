@@ -43,7 +43,7 @@ from lab.manifest import (
     repo_root,
     uv_lock_sha256,
 )
-from lab import events, placement
+from lab import events, placement, pricing
 from lab import notes as lab_notes
 from lab.metrics import final_values, group_series
 from lab.storage import R2Store, r2_enabled
@@ -62,6 +62,7 @@ from lab.models import (
     SweepPlan,
 )
 from lab.aggregate import merge_seed_rows
+from lab.partials import PARTIAL_DIR
 from lab.sharding import parse_seeds, partition_seeds, seeds_to_arg
 from lab.store import JobStore, cell_id_for
 
@@ -405,6 +406,8 @@ def resolve_backend_profile(
         return backend, resources
     if resources.accelerators:
         raise LabError("--backend cpu provisions a CPU-only box; drop --accelerators")
+    if resources.accelerator_pool:
+        raise LabError("--backend cpu provisions a CPU-only box; drop --accelerator-pool")
     cloud = resources.cloud or CPU_DEFAULT_CLOUD
     update: dict[str, Any] = {
         "cloud": cloud,
@@ -1058,6 +1061,15 @@ class Lab:
                 r2 = R2Store.from_env()
                 if manifest.artifacts_uri and r2 is not None:
                     r2.download_dir(job_id, out)
+                if r2 is not None and not (out.exists() and any(out.iterdir())):
+                    # Nothing durable from the end-of-run upload — which is the *normal* state of
+                    # a job whose supervisor died, since `artifacts_uri` is written on the same
+                    # line as that upload. The mid-run mirror (`lab.partials`) is then the only
+                    # copy of rows that were paid for, so fall back to it. It lands the
+                    # `_PARTIAL.json` marker alongside the tables, so what arrives is
+                    # self-describing: `sweep-aggregate` still stamps these rows from the
+                    # producing job's own (non-succeeded) status, exactly as for a partial shard.
+                    r2.download_dir(f"{job_id}/{PARTIAL_DIR}", out)
             except ImportError as e:
                 # R2 env configured but the `r2` extra isn't installed — the fallback is
                 # best-effort recovery, never a reason to fail a local operation.
@@ -1183,6 +1195,30 @@ class Lab:
 
     def list_jobs(self) -> list[JobManifest]:
         return [self.store.read_manifest(j) for j in self.store.list_job_ids()]
+
+    def spend(
+        self,
+        manifests: list[JobManifest] | None = None,
+        *,
+        alert_usd: float | None = None,
+    ) -> dict[str, Any]:
+        """Realized spend across this project's jobs, plus the threshold verdict (FR-I2).
+
+        Thin wrapper over :func:`lab.pricing.realized_spend` so the CLI and MCP shells share one
+        implementation; ``manifests`` lets a caller that has already listed the jobs (both shells
+        do) avoid re-reading every manifest. ``alert_usd`` adds an ``alert`` key: ``None`` until
+        the total crosses it, then the verdict a shell renders — stderr in the CLI, in-payload for
+        MCP, which has no second channel.
+
+        Read :data:`lab.pricing.SPEND_SCOPE` (carried in the return) before quoting the number:
+        it covers this project's ``runs/`` only, and jobs whose rate was never readable are named
+        rather than counted as free.
+        """
+        summary = pricing.realized_spend(
+            self.list_jobs() if manifests is None else manifests, at=now()
+        )
+        summary["alert"] = pricing.spend_alert(summary, threshold_usd=alert_usd)
+        return summary
 
     def ps(self) -> dict[str, Any]:
         """Every non-terminal job this machine knows about, across every project (FR-C2 gap fix).
@@ -2275,6 +2311,41 @@ def job_status_view(home: Path, repo: Path, job_id: str) -> dict[str, Any]:
     )
 
 
+_TERMINAL_VALUES = frozenset(s.value for s in _TERMINAL_STATES)
+
+
+def job_age_s(m: JobManifest, state: str) -> float | None:
+    """Seconds this job has been alive — the arithmetic nobody should be doing by hand.
+
+    On 2026-09 an orchestrator compared ``started_at`` against a *wrongly believed* current date,
+    concluded two healthy jobs were 25-hour runaways and cancelled them: $2 and about two hours of
+    good progress thrown away. The recorded lesson was "never do date arithmetic on ``started_at``
+    by hand", so the tool does it: a caller reads a number instead of parsing a timestamp and
+    subtracting it from a date it may believe wrongly.
+
+    For a **terminal** job this is elapsed-to-terminal — its final lifetime, frozen. Not "seconds
+    since it started": a job that *ended* 25 hours ago is not a 25-hour runaway, and a number that
+    kept climbing after the job landed would rebuild the exact illusion this field exists to
+    prevent. "Is this a runaway?" is ``state == "running" and age_s > X``, and ``state`` is right
+    there in the same view.
+
+    ``None`` when there is no honest answer: before the job starts (nothing has begun), and for a
+    terminal job whose ``ended_at`` was never recorded (a supervisor that died before writing one)
+    — the manifest genuinely does not say when it stopped, and measuring that against ``now``
+    would grow forever.
+
+    Needs no marker of its own on a **mirrored** (scheduler-launched) manifest. ``started_at`` is
+    an absolute UTC instant, so a mirrored running job's age is computed against local ``now`` and
+    is not itself a tick stale; what can be stale is whether it is still running, which is what
+    the view's existing ``mirrored`` flag already qualifies.
+    """
+    if m.started_at is None:
+        return None
+    end = m.ended_at if state in _TERMINAL_VALUES else now()
+    seconds = duration_seconds(m.started_at, end)
+    return None if seconds is None else round(seconds, 3)
+
+
 def _status_fields(
     m: JobManifest,
     *,
@@ -2301,6 +2372,17 @@ def _status_fields(
             if state == "running" and m.cost is not None and m.started_at is not None
             else None
         ),
+        # Terminal without ever really running (never priced / transient launch error / destroyed
+        # over its price cap). A failed launch costs a slot and no money; counting it as an
+        # ordinary failure corrupts every success-rate and cost number a campaign computes, which
+        # is why an operator was re-deriving it by hand inside a shell watcher. `cost: null` alone
+        # is NOT the test — see `pricing.failed_launch_reason` for the cost-unknown boundary.
+        "is_failed_launch": pricing.is_failed_launch(m),
+        "failed_launch_reason": pricing.failed_launch_reason(m),
+        # Seconds alive, computed here so nobody subtracts `started_at` from a date they believe
+        # wrongly (that mistake cancelled two healthy jobs). Frozen at its final lifetime once
+        # terminal; None when there is no honest answer.
+        "age_s": job_age_s(m, state),
         "teardown_status": m.teardown_status,  # FR-C2 — "failed" means a box may still bill
         # How the supervisor actually died, when that could be observed (F5): `{source,
         # returncode, signal, detail}`. `source: "disappeared"` is a real answer — the kernel no

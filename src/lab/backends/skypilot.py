@@ -306,17 +306,182 @@ def _safe_segment(value: str) -> str:
     return re.sub(r"[^a-z0-9-]", "-", value.lower()).strip("-")
 
 
-def build_setup_script() -> str:
-    """Install uv and materialise the locked env on the remote (FR-B2)."""
-    return (
-        "set -e\n"
-        "curl -LsSf https://astral.sh/uv/install.sh | sh\n"
-        'export PATH="$HOME/.local/bin:$PATH"\n'
-        # --no-default-groups: skip dev/test tooling (pytest, ruff, mypy) — a provisioned box
-        # runs the experiment, it does not lint or test the project. Note this no longer keeps
-        # the lab's control plane off the remote: the project depends on `laboratory`, so its
-        # runtime deps install here as a matter of course.
-        "uv sync --frozen --no-default-groups\n"
+# ---------------------------------------------------------------------------
+# The boot-phase watchdog — the box's own bound on its whole lifetime (FR-I1/FR-C2)
+# ---------------------------------------------------------------------------
+#
+# Every wall-clock guarantee the lab makes is anchored to the moment the *entrypoint* starts:
+# GNU `timeout` wraps the entrypoint, and the `poweroff` backstop in `build_run_script` is armed
+# by the run script. Provisioning, workdir sync and `uv sync` all happen in front of that, and a
+# box that hangs there is bounded by nothing that runs on it.
+#
+# Job 20260907-143516-62769a is the bill for that: a 3h (10800s) cap, `end_reason: "failed"`,
+# empty `output/`, empty R2 prefix — and 13755.8s of billing, $2.38. Subtract the run script's
+# own backstop (`wall + SELF_DESTRUCT_MARGIN_S` = 11400s) and 2355.8s of boot phase is left over.
+# The backstop did fire; it fired 49 minutes late because its clock had not started yet.
+#
+# So this arms a second watchdog at the top of the SkyPilot **setup** script. Setup is the
+# earliest thing the provisioner will run for us on the instance: `sky.launch` provisions, rsyncs
+# the workdir, then runs `setup`, then `run`. Nothing before setup is ours to hook (the workdir
+# rsync is SkyPilot's own), so provisioning and sync stay covered by what already covers them —
+# `provision_with_watchdog` locally, `down=True` + `idle_minutes_to_autostop` on the cloud.
+# `setup` is also the right side of the setup/run split for this: a *run* hook would inherit the
+# same "only once the entrypoint starts" blindness that caused the incident, and a setup that
+# fails is FAILED_SETUP (terminal, no retry loop to interact with).
+#
+# The watchdog holds two deadlines, both measured from arming:
+#
+#   boot   cleared by the run script the instant the entrypoint phase begins. This is what
+#          bounds a hang before the entrypoint, and it is short.
+#   total  the whole-rental bound, `wall + SELF_DESTRUCT_MARGIN_S + boot`.
+#
+# It cannot kill a healthy job, and that is an invariant rather than a margin: the run phase only
+# begins if the boot deadline had not fired, i.e. within `boot` of arming, so GNU `timeout` ends
+# the entrypoint within `boot + wall` — SELF_DESTRUCT_MARGIN_S inside `total`, always.
+
+BOOT_WATCHDOG_DIR = "/tmp/lab_watchdog"
+"""Where the watchdog's markers live. Deliberately *not* under ``REMOTE_RUN_DIR``, which is
+rsynced into the job's ``output/`` — control-plane state is not an artifact."""
+
+BOOT_WATCHDOG_POLL_S = 15
+"""How often the detached watchdog re-reads its markers. Small against every deadline it holds,
+and the upper bound on how long a retired watchdog lingers after a relaunch."""
+
+BOOT_ALLOWANCE_FLOOR_S = 2700
+"""Never give the boot phase less than 45 minutes, whatever the cloud's budget says.
+
+Sized against the slowest *legitimate* boot, not against the incident, because the two errors are
+not symmetric: firing late costs one boot phase of rental (~$0.47 at the RTX 4090 prices this was
+found at), firing early destroys a multi-hour run that was working. So this is deliberately the
+loosest of the two bounds.
+
+``uv sync --frozen`` on a cold box materialises the whole locked environment — for a torch/CUDA
+project several GB, over whatever link the host drew. ~5 min was measured on the 2026-08-20 boxes
+(see ``PARTIALS_EMPTY_GRACE_S``); 45 min is 9x that, and covers a 2.5 GB download at 1 MB/s,
+which is about as bad as a Vast host gets before it is simply broken. The largest
+``--provision-timeout`` this box has ever been asked for is 20 min."""
+
+BOOT_ALLOWANCE_PROVISION_MULTIPLE = 2
+"""How much of the supervisor's provisioning budget the box gives the boot phase.
+
+The supervisor's own watchdog (:func:`provision_with_watchdog`, ``provision_timeout_min``) is the
+better-informed one: it can cancel the request, rotate accelerators and record a dead host. The
+box-side backstop must never fire *first* and pre-empt it, so it starts from that number and
+doubles it."""
+
+SELF_DESTRUCT_CMD = "sudo poweroff -f || poweroff -f || sudo shutdown -h now || shutdown -h now"
+"""What "stop billing" means from inside the box. See :func:`build_run_script` for the per-cloud
+table of what this actually releases — it is defence in depth behind teardown, not a substitute
+for it. Named so tests can exercise the watchdog without a privileged call."""
+
+
+def boot_allowance_s(manifest: JobManifest) -> int:
+    """Seconds the boot phase (workdir sync, uv install, ``uv sync``) gets before self-destruct.
+
+    Derived from the calibrated per-cloud provisioning budget rather than invented: see
+    :data:`BOOT_ALLOWANCE_PROVISION_MULTIPLE` and :data:`BOOT_ALLOWANCE_FLOOR_S`. An explicit
+    ``--provision-timeout`` widens it for the same reason — the user said this launch needs that
+    long to come up, and the box must not disagree with the supervisor about it. Pure.
+    """
+    res = manifest.resources
+    pinned = bool(res.region or res.zone)
+    budget = parse_duration(res.provision_timeout) or provision_timeout_min(
+        res.cloud, pinned=pinned
+    ) * 60
+    return int(max(BOOT_ALLOWANCE_FLOOR_S, BOOT_ALLOWANCE_PROVISION_MULTIPLE * budget))
+
+
+def lifetime_bound_s(manifest: JobManifest) -> int | None:
+    """The box's bound on its own whole lifetime, or ``None`` when no cap was requested. Pure.
+
+    ``None`` is deliberate and load-bearing: a job submitted without ``--timeout`` asked for no
+    wall-clock bound, and inventing one here would kill precisely the long healthy runs that this
+    must never touch. Such a job is bounded by the supervisor, autostop and ``lab reconcile``,
+    exactly as it was before.
+    """
+    wall = parse_duration(manifest.resources.timeout)
+    if not wall:
+        return None
+    return int(wall) + SELF_DESTRUCT_MARGIN_S + boot_allowance_s(manifest)
+
+
+def build_boot_watchdog(manifest: JobManifest) -> list[str]:
+    """Shell lines that arm the detached two-deadline watchdog. Empty when there is no cap.
+
+    Survives everything it is meant to survive. ``nohup setsid`` puts it in its own session, so
+    neither the ssh session that ran setup, nor SkyPilot's own process group, nor ``timeout``'s
+    group-kill of the entrypoint tree, nor the death of the local supervisor can take it with
+    them. It needs no network, no credentials and no lab code on the box: it is ``bash``,
+    ``date`` and ``sleep``.
+
+    It also retires itself rather than powering off a machine that is no longer its own. Two
+    markers, both checked before either deadline:
+
+    * ``owner`` holds a token minted at arming. A relaunch onto the same cluster name (the
+      ``_launch_with_retry`` / rotation paths re-run setup) rewrites it, and the older watchdog
+      exits at its next poll instead of leaving a scheduled shutdown behind on a box someone else
+      is now using.
+    * ``disarm`` is the operator's (and an adopting supervisor's) explicit escape hatch.
+
+    It does not fight teardown. The run script's existing ``poweroff`` sits at
+    ``run_start + wall + margin``, which is always at or before the total deadline here — the
+    boot phase is the entire difference — so a clean teardown races nothing that it did not
+    already race before this existed.
+
+    A supervisor restart (``--adopt``) does not re-run setup and so does not re-arm anything: the
+    box keeps the bound it was launched with, which is the right answer. The bound belongs to the
+    *rental*, and restarting the process that watches it does not buy the rental more time.
+    """
+    total = lifetime_bound_s(manifest)
+    if total is None:
+        return []
+    boot = boot_allowance_s(manifest)
+    d = BOOT_WATCHDOG_DIR
+    # One `bash -c '...'` body, single-quoted at the shell level: it must therefore contain no
+    # single quotes. Values reach it through the environment rather than by interpolation.
+    body = (
+        f"d={d}; t0=$(date +%s); "
+        f"while :; do sleep {BOOT_WATCHDOG_POLL_S}; "
+        '[ -f "$d/disarm" ] && exit 0; '
+        '[ "$(cat "$d/owner" 2>/dev/null)" = "$LAB_WD_TOKEN" ] || exit 0; '
+        'e=$(( $(date +%s) - t0 )); '
+        '[ ! -f "$d/started" ] && [ "$e" -ge "$LAB_WD_BOOT" ] && break; '
+        '[ "$e" -ge "$LAB_WD_TOTAL" ] && break; '
+        "done; " + SELF_DESTRUCT_CMD
+    )
+    return [
+        f'mkdir -p "{d}" 2>/dev/null',
+        # A box SkyPilot reuses may carry a previous launch's markers; a stale `started` would
+        # disable the boot deadline for this one.
+        f'rm -f "{d}/started" "{d}/disarm"',
+        'lab_wd_token="$(date +%s)-$$"',
+        f'printf %s "$lab_wd_token" > "{d}/owner"',
+        f'nohup setsid env LAB_WD_TOKEN="$lab_wd_token" LAB_WD_BOOT={boot} '
+        f"LAB_WD_TOTAL={total} bash -c '{body}' >/dev/null 2>&1 </dev/null &",
+    ]
+
+
+def build_setup_script(manifest: JobManifest) -> str:
+    """Arm the boot watchdog, then install uv and materialise the locked env (FR-B2).
+
+    Order matters twice. The watchdog goes first because ``curl … | sh`` and ``uv sync`` are the
+    boot-phase steps that hang, and arming after them would leave exactly the window it exists
+    for uncovered. It also goes *before* ``set -e``, so that a host without ``setsid`` loses the
+    backstop rather than losing the job — best-effort scaffolding must not be able to fail a run.
+    """
+    return "".join(
+        f"{line}\n"
+        for line in [
+            *build_boot_watchdog(manifest),
+            "set -e",
+            "curl -LsSf https://astral.sh/uv/install.sh | sh",
+            'export PATH="$HOME/.local/bin:$PATH"',
+            # --no-default-groups: skip dev/test tooling (pytest, ruff, mypy) — a provisioned box
+            # runs the experiment, it does not lint or test the project. Note this no longer keeps
+            # the lab's control plane off the remote: the project depends on `laboratory`, so its
+            # runtime deps install here as a matter of course.
+            "uv sync --frozen --no-default-groups",
+        ]
     )
 
 
@@ -396,12 +561,17 @@ def build_run_script(manifest: JobManifest) -> str:
 
     wall = int(timeout)
     lines += [
+        # Clear the boot deadline: from here the entrypoint phase owns the box and the outer
+        # watchdog falls back to its total-lifetime bound (see `build_boot_watchdog`). Done
+        # before `timeout` is entered, so a slow first line of the run script is not mistaken for
+        # a boot-phase hang. `mkdir -p` because a job submitted without a cap arms no watchdog
+        # and this must still not be able to fail the run.
+        f'mkdir -p "{BOOT_WATCHDOG_DIR}" 2>/dev/null; touch "{BOOT_WATCHDOG_DIR}/started"',
         # Best-effort backstop (a no-op in unprivileged containers): power the box off at
         # wall+margin so billing can't run far past the cap if teardown is wedged. Detached in its
         # own session so `timeout`'s group-kill above never touches it (§6 cost cap).
         f"nohup setsid bash -c 'sleep {wall + SELF_DESTRUCT_MARGIN_S}; "
-        "sudo poweroff -f || poweroff -f || sudo shutdown -h now || shutdown -h now' "
-        ">/dev/null 2>&1 </dev/null &",
+        f"{SELF_DESTRUCT_CMD}' >/dev/null 2>&1 </dev/null &",
         *_wall_clock_wrap(manifest.run.entrypoint_command, wall),
     ]
     return "\n".join(lines) + "\n"
@@ -1556,7 +1726,7 @@ def build_task(manifest: JobManifest, workdir: Path, *, memo: Any | None = None)
 
     task = sky.Task(
         name=cluster_name_for(manifest.job_id),
-        setup=build_setup_script(),
+        setup=build_setup_script(manifest),
         run=build_run_script(manifest),
         envs={
             "LAB_RUN_ID": manifest.job_id,

@@ -97,7 +97,10 @@ def test_a_broken_refs_from_never_turns_a_successful_tool_call_into_a_crash(
             return result.data
 
     data = asyncio.run(go())
-    assert data == {"jobs": []}  # the tool's real result, not swallowed by the broken annotator
+    # The tool's real result, not swallowed by the broken annotator. Asserted per-key rather than
+    # by whole-payload equality: `list` is free to gain additive fields (it since gained `spend`),
+    # and pinning the exact dict here would make this test fail for a reason it is not about.
+    assert data["jobs"] == []
     _, closed = _records()
     assert closed["outcome"] == "ok"
 

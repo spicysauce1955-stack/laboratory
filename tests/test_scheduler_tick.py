@@ -858,3 +858,158 @@ def test_sweep_ceiling_stops_launching_remaining_points(tmp_path: Path):
     assert rep2.launched == []
     remaining = [r.reg_id for r in regs if r.reg_id != launched_id]
     assert all("sweep budget" in rep2.skipped.get(rid, "") for rid in remaining)
+
+
+# --- the heartbeat names the host's own lab version (version skew was undetectable) -------------
+#
+# The always-on host is deployed independently of every project's venv and has been observed
+# running a pre-v0.5.0 lab against v0.11.0 clients. Registrations cross as pydantic models through
+# R2, so an old host silently drops fields it does not know -- that is how --price-cap died on the
+# deferred path, and a retrospective went on to blame `lab register` for flags it does have. The
+# heartbeat recorded at/host/tick_count/launched/errors/paused and no version at all.
+
+
+def test_heartbeat_carries_the_hosts_own_lab_version(tmp_path: Path):
+    from lab import __version__
+    from lab.scheduler.skew import HEARTBEAT_VERSION_KEY, skew_from_heartbeat
+
+    sched, q = make_sched(tmp_path)
+    sched.tick()
+    hb = q.read_heartbeat()
+    assert hb is not None and hb[HEARTBEAT_VERSION_KEY] == __version__
+    # ... and it is the number the skew predicate reads.
+    assert skew_from_heartbeat(hb, "999.0.0").verdict == "host_older"
+    assert skew_from_heartbeat(hb, __version__).verdict == "same"
+
+
+def test_heartbeat_carries_the_version_even_when_paused(tmp_path: Path):
+    """A paused host is exactly when someone is inspecting it -- e.g. mid-redeploy."""
+    from lab import __version__
+    from lab.scheduler.skew import HEARTBEAT_VERSION_KEY
+
+    sched, q = make_sched(tmp_path)
+    q.write_control(ControlConfig(paused=True))
+    sched.tick()
+    hb = q.read_heartbeat()
+    assert hb is not None and hb[HEARTBEAT_VERSION_KEY] == __version__
+
+
+# --- markers: two reads per tick, not two per registration --------------------------------------
+#
+# `cancel_requested(id)`/`held(id)` are one R2 round trip each and the tick asked both per
+# registration: up to 326 sequential HEADs at the 2026-09 campaign's 163 registrations, every 60s.
+# The per-id predicates are monkeypatched to raise so a regression to per-row reads fails loudly
+# instead of just getting slow again (same pattern as
+# tests/test_scheduler_cli.py::test_queue_list_renders_markers_from_one_listing_each).
+
+
+def _no_per_id_marker_reads(monkeypatch) -> None:
+    def _boom(self: LocalQueueStore, reg_id: str) -> bool:
+        raise AssertionError(f"per-registration marker read for {reg_id}")
+
+    monkeypatch.setattr(LocalQueueStore, "held", _boom)
+    monkeypatch.setattr(LocalQueueStore, "cancel_requested", _boom)
+
+
+def _count_bulk_marker_reads(monkeypatch) -> dict[str, int]:
+    calls = {"cancelled": 0, "held": 0}
+    real_cancelled = LocalQueueStore.cancel_requested_ids
+    real_held = LocalQueueStore.held_ids
+
+    def _cancelled(self: LocalQueueStore) -> set[str]:
+        calls["cancelled"] += 1
+        return real_cancelled(self)
+
+    def _held(self: LocalQueueStore) -> set[str]:
+        calls["held"] += 1
+        return real_held(self)
+
+    monkeypatch.setattr(LocalQueueStore, "cancel_requested_ids", _cancelled)
+    monkeypatch.setattr(LocalQueueStore, "held_ids", _held)
+    return calls
+
+
+def test_tick_reads_markers_once_regardless_of_registration_count(tmp_path: Path, monkeypatch):
+    clock = FakeClock()
+    sched, q = make_sched(tmp_path, clock)
+    later = Triggers(not_before=T0 + timedelta(hours=5))  # nothing launches: no submit path here
+    for i in range(8):
+        put_reg(q, tmp_path, f"reg-{i:02d}", triggers=later)
+    q.hold("reg-03")
+    q.request_cancel("reg-05")
+
+    calls = _count_bulk_marker_reads(monkeypatch)
+    _no_per_id_marker_reads(monkeypatch)
+
+    rep = sched.tick()
+
+    assert calls == {"cancelled": 1, "held": 1}  # two reads for eight registrations
+    # and the snapshot is actually honoured, not merely read
+    assert rep.cancelled == ["reg-05"]
+    assert q.get_entry("reg-05").state is RegState.cancelled
+    assert rep.skipped["reg-03"] == "held"
+    assert "not_before" in rep.skipped["reg-00"]
+    assert rep.launched == []
+
+
+def test_sync_cancels_a_running_job_from_the_same_snapshot(tmp_path: Path, monkeypatch):
+    """`_sync`'s cancel of an already-running job is loop-invariant, not race-critical.
+
+    It is consulted once per 60s tick either way, so serving it from the tick's snapshot costs at
+    most the tick's own duration of extra latency -- less than the per-entry reads it replaces were
+    adding to that duration. Only `_launch`'s pre-submit re-check must stay fresh: there, the next
+    thing that happens is renting a machine.
+    """
+    sched, q = make_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a", command=f"{PYTHON} -c 'import time; time.sleep(60)'")
+    sched.tick()
+    e = q.get_entry("reg-a")
+    assert e.job_id is not None
+    q.request_cancel("reg-a")
+
+    calls = _count_bulk_marker_reads(monkeypatch)
+    _no_per_id_marker_reads(monkeypatch)
+    sched.tick()
+
+    assert calls == {"cancelled": 1, "held": 1}
+    assert q.get_entry("reg-a").state is RegState.cancelled
+    backend = LocalBackend(home=tmp_path / "runs", repo=tmp_path)
+    assert backend.status(e.job_id).value == "cancelled"
+
+
+def test_cancel_landing_after_the_snapshot_is_still_caught_before_submit(
+    tmp_path: Path, monkeypatch
+):
+    """spec §5 cancel race: the pre-submit re-check must be a FRESH read, not the snapshot.
+
+    The marker is written *after* the tick took its snapshot and *after* the evaluation loop began
+    -- by the loop's own per-entry `get_entry` re-read -- so only a fresh read immediately before
+    the submit can see it. Serving that check from the snapshot would rent a machine for a
+    registration the user had already cancelled.
+    """
+    sched, q = make_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a")
+    real_get_entry = LocalQueueStore.get_entry
+    fresh_reads: list[str] = []
+    real_cancel_requested = LocalQueueStore.cancel_requested
+
+    def _cancel_then_read(self: LocalQueueStore, reg_id: str) -> Registration:
+        self.request_cancel(reg_id)  # lands mid-tick, after MarkerSnapshot.read()
+        return real_get_entry(self, reg_id)
+
+    def _counted(self: LocalQueueStore, reg_id: str) -> bool:
+        fresh_reads.append(reg_id)
+        return real_cancel_requested(self, reg_id)
+
+    monkeypatch.setattr(LocalQueueStore, "get_entry", _cancel_then_read)
+    monkeypatch.setattr(LocalQueueStore, "cancel_requested", _counted)
+
+    rep = sched.tick()
+
+    assert rep.launched == []
+    assert rep.cancelled == ["reg-a"]
+    assert real_get_entry(q, "reg-a").state is RegState.cancelled
+    assert sched.store.list_job_ids() == []  # nothing was ever submitted
+    # Exactly one fresh per-id read happened, and it was the pre-submit one: had the loop's
+    # snapshot check caught the cancel, `_launch` would never have run and this would be empty.
+    assert fresh_reads == ["reg-a"]

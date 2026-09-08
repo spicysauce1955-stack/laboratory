@@ -18,6 +18,12 @@ it should refuse. :func:`estimate` therefore reports a *band*, and its consumers
 the search space (a pinned region, a price cap, zones that just ran out of capacity) and prices
 what is left. Ordering, failover, and the actual choice stay SkyPilot's. With no pins, no cap, and
 an empty memo, the search space handed to SkyPilot is exactly what it is today.
+
+Two memos live here, and they are not the same shape. :class:`CapacityMemo` latches a *zone* that
+said "no capacity" for 30 minutes. :class:`DeadHostMemo` counts strikes against a *host* that
+took a whole provisioning slot and never came up — a failure that bills $0, which is precisely
+why nothing else in the system notices it. Both are advisory in the same strict sense: a broken,
+missing or unwritable memo reads as no memory and can never be the reason a launch fails.
 """
 
 from __future__ import annotations
@@ -278,6 +284,369 @@ def parse_exhausted_zones(text: str) -> list[str]:
             if zone not in found:
                 found.append(zone)
     return found
+
+
+# --------------------------------------------------------------------------------------------
+# Dead-host memo
+# --------------------------------------------------------------------------------------------
+# A dead offer bills $0 and so nothing in the cost machinery notices it, but it costs a whole
+# provisioning slot: over five days of the 2026-09 campaign, 240 of 571 Vast launches (42%) died
+# at the provisioning watchdog, ~4-8 minutes each.
+#
+# **What identity is available is the whole design question**, and the honest answer is: very
+# little. Everything the lab saw about the host that took its 240s is in the job log, and a real
+# one (runs/20260903-200140-f01cf6/logs.txt, a "provisioning exceeded 240s" job) reads in full:
+#
+#     Running on cluster: lab-tempotr-5171-20260903-200140-f01cf6
+#     Considered resources (1 node):
+#      INFRA                    INSTANCE               ... GPUS        COST ($)   CHOSEN
+#      Vast (Romania, RO, EU)   1x-RTX_3090-32-65536   ... RTX3090:1   0.25          ✔
+#     ⚙︎ Launching on Vast Romania, RO, EU.
+#     Cancelling 1 request: '9ce01952-…'
+#
+# No instance id, no machine id, no host id — only a *placement*: cloud, instance type, region.
+# The one per-host identity that exists at all is the Vast rental's ``machine_id``, and it can
+# only be had by asking Vast while the rental is still alive (see ``lab.sky_runner``); the
+# catalog, which is all this module may touch, does not know it.
+#
+# So the memo takes three kinds of key and trusts them very differently:
+#
+#   ``machine``    a real physical host (Vast ``machine_id``). Sharp. Decides.
+#   ``accel``      the accelerator spec that was asked for. What rotation reads.
+#   ``placement``  (instance_type, region). Coarse. Recorded as evidence, never used to exclude.
+#
+# The second half of that is a measurement, not a preference. Replaying the campaign's 571 Vast
+# launches: after three failures on one placement key within 30 minutes, the next launch on it
+# died 48% of the time against a 42% base rate — barely a signal. And the placement with by far
+# the most failures (Maryland, US, NA / 1x-RTX_4090, 160 dead) is also the *best* pool anyone had:
+# 37% dead, against Romania's 55% and CA's 75%. A memo that excluded the loudest offender would
+# have steered the campaign out of its healthiest supply and into its worst. Recording a
+# placement is worth doing — it is what ``lab report`` can group on — but excluding on it is not.
+
+# How long a strike is remembered. Longer than :data:`DEFAULT_MEMO_TTL_S` (30 min) on purpose:
+# a zone's capacity comes back on its own, while a host with a bad driver, a wedged disk or a GPU
+# it cannot actually expose is *broken*, and the campaign's two named offenders were re-drawn
+# across days. Six hours keeps it inside one working session, so a machine its owner repairs
+# overnight is not blacklisted forever.
+DEFAULT_DEAD_HOST_TTL_S = 21600.0
+
+# How many strikes inside the TTL make a host dead. Two, because one failure is indistinguishable
+# from bad luck — the same campaign's data has placements failing ~40% of the time and succeeding
+# on the next attempt — and because the cost of being wrong is asymmetric: a wrongly-skipped host
+# costs one extra launch attempt, a wrongly-trusted one costs a whole provisioning slot.
+DEFAULT_DEAD_HOST_STRIKES = 2
+
+# Bounds on the file. Both exist so a runaway sweep cannot turn an advisory cache into a disk
+# problem; both drop the *oldest* evidence first.
+MAX_STRIKES_KEPT = 10
+MAX_MEMO_KEYS = 200
+
+# "⚙︎ Launching on Vast Romania, RO, EU." / "⚙️ Launching on GCP us-central1 (us-central1-a)."
+# Both shapes are real, taken from this machine's logs; the trailing period is SkyPilot's.
+_LAUNCHING_RE = re.compile(r"Launching on\s+(?:Vast|GCP|DO|AWS|Azure|Kubernetes|\w+)\s+(.+?)\.?\s*$")
+# The CHOSEN row of SkyPilot's "Considered resources" table. Vast instance types are
+# ``1x-RTX_3090-32-65536``; GCP's are ``n1-highmem-4`` (sometimes ``…[Spot]``).
+_CONSIDERED_RE = re.compile(
+    r"^\s*(?:Vast|GCP|DO|AWS|Azure)\s*(?:\([^)]*\))?\s+([A-Za-z0-9][\w.\-]*(?:\[Spot\])?)\s+\d"
+)
+
+
+@dataclass(frozen=True)
+class DrawnPlacement:
+    """What a launch log says the optimizer actually drew. Either half may be None."""
+
+    instance_type: str | None
+    region: str | None
+
+
+def parse_drawn_placement(text: str) -> DrawnPlacement:
+    """The instance type and region a launch was waiting on when it died. Pure.
+
+    The **last** ``Launching on`` line wins: SkyPilot prints one per failover hop, so on GCP the
+    first names a zone that already failed while the last names the one we were still waiting for.
+    Returns ``DrawnPlacement(None, None)`` when the log says nothing — a normal outcome (a launch
+    that never got as far as choosing), never an error.
+    """
+    instance_type: str | None = None
+    region: str | None = None
+    for raw in text.splitlines():
+        line = _ANSI_RE.sub("", raw).rstrip()
+        m = _LAUNCHING_RE.search(line)
+        if m:
+            region = m.group(1).strip() or None
+            continue
+        c = _CONSIDERED_RE.search(_strip_log_prefix(line))
+        if c:
+            instance_type = c.group(1)
+    return DrawnPlacement(instance_type=instance_type, region=region)
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# Job logs are timestamped by `install_log_redaction` ("2026-09-03T20:01:42.246Z …"); the
+# "Considered resources" table is column-aligned, so the stamp has to come off before matching.
+_LOG_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s")
+
+
+def _strip_log_prefix(line: str) -> str:
+    return _LOG_PREFIX_RE.sub("", line)
+
+
+def machine_key(cloud: str, machine_id: str | int) -> str:
+    """A key naming one physical host. The only *sharp* identity the lab can obtain."""
+    return f"{cloud}|machine:{machine_id}"
+
+
+def placement_key(cloud: str, instance_type: str | None, region: str | None) -> str:
+    """A key naming a (cloud, instance type, region) — evidence, not a verdict (see above).
+
+    Never a price. The campaign's own workaround keyed on one ("skip the $0.3585 host") and its
+    retrospective flags that as fragile: good hosts recur at the same price as bad ones, and a
+    price is a property of an offer at an instant, not of a machine.
+    """
+    return f"{cloud}|placement:{instance_type or '?'}@{region or '?'}"
+
+
+def accelerator_key(cloud: str, accelerators: str) -> str:
+    """A key naming an accelerator *request* — what the user asked for, not where it landed.
+
+    The rotation policy needs a "how has asking for this been going lately?" question, and at the
+    moment it has to choose there is no placement yet: the region and instance type are the
+    optimizer's answer, not the caller's input. So this keys on the SkyPilot accelerator spec
+    exactly as written on the manifest (``"RTX4090:1"``), which is a real string the lab holds,
+    rather than on a guess at the instance type it will resolve to.
+    """
+    return f"{cloud}|accel:{accelerators}"
+
+
+class DeadHostMemo:
+    """Hosts that failed to come up, remembered with strikes and a TTL. Shared across jobs.
+
+    The same contract as :class:`CapacityMemo`, and for the same reason: **advisory, never
+    authoritative**. A missing, unreadable, corrupt, expired or unwritable memo reads as empty and
+    a failed write is swallowed, so the worst a broken memo can do is let a launch take the path
+    it would have taken anyway. It can never fail one, and it can never be the reason a job does
+    not get a machine.
+
+    Unlike the capacity memo this counts, rather than latches: one failure is bad luck (a
+    placement that just failed still succeeded ~half the time in the campaign data), so a key is
+    "dead" only after :data:`DEFAULT_DEAD_HOST_STRIKES` failures inside the TTL. Strikes expire
+    individually, so a host that failed twelve hours ago and once just now is one strike from
+    dead, not two.
+    """
+
+    FILENAME = "dead_host_memo.json"
+
+    def __init__(self, path: Path, *, ttl_s: float | None = None, strikes: int | None = None):
+        self.path = Path(path)
+        if ttl_s is None:
+            ttl_s = _env_float("LAB_DEAD_HOST_TTL_S", DEFAULT_DEAD_HOST_TTL_S)
+        self.ttl_s = ttl_s
+        if strikes is None:
+            strikes = int(_env_float("LAB_DEAD_HOST_STRIKES", DEFAULT_DEAD_HOST_STRIKES))
+        # A threshold below 1 would make every host dead on sight, including hosts that have
+        # never failed — the one thing this must never do.
+        self.strike_limit = max(1, strikes)
+
+    @classmethod
+    def for_home(
+        cls, home: Path, *, ttl_s: float | None = None, strikes: int | None = None
+    ) -> DeadHostMemo:
+        return cls(Path(home) / cls.FILENAME, ttl_s=ttl_s, strikes=strikes)
+
+    def _load(self) -> dict[str, list[float]]:
+        try:
+            raw = json.loads(self.path.read_text())
+        except Exception:  # noqa: BLE001 — absent/corrupt/unreadable all mean "nothing known"
+            return {}
+        entries = raw.get("entries") if isinstance(raw, dict) else None
+        if not isinstance(entries, dict):
+            return {}
+        out: dict[str, list[float]] = {}
+        for k, v in entries.items():
+            if not isinstance(v, list):
+                continue
+            stamps: list[float] = []
+            for t in v:
+                try:
+                    stamps.append(float(t))
+                except (TypeError, ValueError):
+                    continue  # one bad stamp drops itself, not the entry
+            if stamps:
+                out[str(k)] = stamps
+        return out
+
+    def _live(self, entries: dict[str, list[float]], *, now_s: float) -> dict[str, list[float]]:
+        out: dict[str, list[float]] = {}
+        for k, stamps in entries.items():
+            fresh = [t for t in stamps if now_s - t < self.ttl_s]
+            if fresh:
+                out[k] = fresh[-MAX_STRIKES_KEPT:]
+        return out
+
+    def strikes(self, key: str, *, now_s: float | None = None) -> int:
+        """How many failures this key has collected inside the TTL."""
+        now_s = time.time() if now_s is None else now_s
+        return len(self._live(self._load(), now_s=now_s).get(key, []))
+
+    def is_dead(self, key: str, *, now_s: float | None = None) -> bool:
+        return self.strikes(key, now_s=now_s) >= self.strike_limit
+
+    def dead_keys(
+        self, cloud: str, *, kind: str | None = None, now_s: float | None = None
+    ) -> set[str]:
+        """Every struck-out key for this cloud, optionally narrowed to one kind."""
+        now_s = time.time() if now_s is None else now_s
+        prefix = f"{cloud}|" if kind is None else f"{cloud}|{kind}:"
+        return {
+            k
+            for k, stamps in self._live(self._load(), now_s=now_s).items()
+            if k.startswith(prefix) and len(stamps) >= self.strike_limit
+        }
+
+    def has_any(self, cloud: str, *, kind: str | None = None, now_s: float | None = None) -> bool:
+        """Is there anything to avoid on this cloud at all?
+
+        The cheap gate callers use to keep the no-memory case byte-identical to the behaviour
+        before this existed: a launch with nothing recorded must not pay for a single extra call.
+        """
+        return bool(self.dead_keys(cloud, kind=kind, now_s=now_s))
+
+    def record(self, key: str, *, now_s: float | None = None) -> None:
+        """Add a strike against ``key``. Best-effort; never raises."""
+        from lab import events
+
+        now_s = time.time() if now_s is None else now_s
+        try:
+            entries = self._live(self._load(), now_s=now_s)  # prune expired while we are here
+            entries.setdefault(key, []).append(now_s)
+            entries[key] = entries[key][-MAX_STRIKES_KEPT:]
+            if len(entries) > MAX_MEMO_KEYS:
+                # Evict whole keys oldest-last-strike first: the least recent evidence is the
+                # least useful, and an unbounded cache is a different bug from the one we fix.
+                ordered = sorted(entries.items(), key=lambda kv: max(kv[1]), reverse=True)
+                entries = dict(ordered[:MAX_MEMO_KEYS])
+            # The field is `host`, not `key`: `lab.events.sanitize` is a deny-list and masks a
+            # param literally named "key" as a probable secret — which would have redacted the
+            # one thing this note exists to record.
+            events.note("placement.dead_host", host=key, strikes=len(entries.get(key, [])))
+            atomic_write_text(
+                self.path, json.dumps({"version": 1, "entries": entries}, sort_keys=True)
+            )
+        except Exception as e:  # noqa: BLE001 — a memo write must never fail a job
+            _note(f"[lab] dead-host memo write skipped: {e}")
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+# --------------------------------------------------------------------------------------------
+# Accelerator rotation
+# --------------------------------------------------------------------------------------------
+# The campaign's operating rule was a human: under a dead-host storm, hand-rotate the accelerator
+# (RTX4090 -> 3090 -> 5090 -> L40S) because a different `gpu_name` makes SkyPilot's Vast adapter
+# search a different pool of offers. This promotes that rule to an option — and *only* an option.
+#
+# The campaign's own data does not support making it a default. Replaying those 571 launches:
+# during a storm (3+ dead provisions on one accelerator within 30 min), launches that stayed on
+# the storming accelerator died 51% of the time and launches that rotated away died **69%** of the
+# time (n=16, and confounded — the human rotated precisely when things were worst, and rotated
+# into 3090/5090 pools that are worse in general: 55% and 75% dead against the 4090's 37%). That
+# is far too weak to turn on for everyone, and strong enough to warn about. So: no pool, no
+# rotation, and the default remains exactly one launch attempt.
+
+
+def parse_pool(spec: str | Iterable[str] | None) -> list[str]:
+    """Normalise ``"RTX4090:1,RTX3090:1"`` (or a list) into an ordered, de-duplicated pool. Pure.
+
+    Duplicates collapse because the attempt bound is spent per *entry*: trying the same
+    accelerator twice under the guise of rotation would burn the budget on the thing that just
+    failed.
+    """
+    if spec is None:
+        return []
+    items = spec.split(",") if isinstance(spec, str) else list(spec)
+    out: list[str] = []
+    for item in items:
+        name = str(item).strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def rotated_resources(res: ResourceRequest, accelerators: str) -> ResourceRequest:
+    """``res`` with a different accelerator and **nothing else changed**.
+
+    Specifically not ``max_hourly_usd``: rotating *what* you ask for is the feature; quietly
+    agreeing to pay more is not. Escalating a price cap under a dead-host storm was a deliberate
+    human decision every time in the campaign, and it stays one.
+    """
+    return res.model_copy(update={"accelerators": accelerators})
+
+
+def affordable_under_cap(res: ResourceRequest, accelerators: str) -> bool:
+    """Could ``accelerators`` ever launch under ``res``'s price cap? True when unsure.
+
+    Two deliberate polarities:
+
+    * **Unsure never blocks.** An accelerator this catalog cannot price is offered to SkyPilot
+      anyway, which enforces the cap itself. (The ``lab doctor`` rule: only definitive negatives.)
+    * **The floor, not the ceiling.** Everywhere else in this module a guardrail checks the top of
+      the price band, because an admission check that under-estimates admits jobs it should
+      refuse. Here the question is *feasibility* — "is there any region where this fits?" — and
+      checking the ceiling would refuse a rotation the cap actually permits.
+    """
+    cap = res.max_hourly_usd
+    if cap is None:
+        return True
+    # Priced with the cap *removed*: `estimate` filters candidates by the cap itself, so a capped
+    # estimate answers None both when nothing fits and when the catalog has never heard of the
+    # accelerator — and those two must not be treated alike (one is a definitive no, the other is
+    # "we cannot say", which never blocks).
+    probe = res.model_copy(update={"accelerators": accelerators, "max_hourly_usd": None})
+    est = estimate(probe)
+    if est is None:
+        return True  # the catalog cannot say; SkyPilot will enforce the cap
+    return est.best_hourly_usd <= cap
+
+
+def next_accelerator(
+    *,
+    pool: Iterable[str],
+    tried: Iterable[str],
+    res: ResourceRequest,
+    memo: DeadHostMemo | None = None,
+    now_s: float | None = None,
+) -> str | None:
+    """The next accelerator to try, or None when the pool is spent.
+
+    Order is the user's. Entries already tried on this launch are skipped (the bound must not
+    wrap — a bound that cycles is not a bound), as are entries the catalog says can never fit
+    under the price cap: spending an attempt on those buys a slower failure, not a machine.
+
+    Entries whose placement is currently struck out in ``memo`` are *deferred*, not dropped — if
+    every remaining entry is struck out, the first untried one is returned anyway. A memo that
+    would exclude every candidate must degrade to "no memory", exactly as
+    :func:`lab.backends.skypilot.narrowed_regions` ignores a capacity memo that would exclude
+    every region. Refusing to launch is never the memo's call to make.
+    """
+    already = set(tried)
+    remaining = [
+        a for a in pool if a not in already and affordable_under_cap(res, a)
+    ]
+    if not remaining:
+        return None
+    if memo is not None:
+        cloud = res.cloud or "vast"
+        healthy = [
+            a for a in remaining if not memo.is_dead(accelerator_key(cloud, a), now_s=now_s)
+        ]
+        if healthy:
+            return healthy[0]
+    return remaining[0]
 
 
 # --------------------------------------------------------------------------------------------

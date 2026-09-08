@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 from datetime import datetime, timezone
 from pathlib import Path
 
 _UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
+#: Largest-to-smallest, which is the only order a compound duration may be written in.
+_UNIT_ORDER = ("d", "h", "m", "s")
+#: A whole compound duration: one or more ``<number><unit>`` components, nothing else. Anchored
+#: by ``fullmatch`` at the call site, so a trailing unitless number (``3h30``) or a stray
+#: character (``3h30x``) fails here rather than being silently dropped.
+_COMPOUND = re.compile(r"(?:\d+(?:\.\d+)?[smhd]\s*)+")
+_COMPOUND_PART = re.compile(r"(\d+(?:\.\d+)?)([smhd])")
 
 _ARTIFACT_EXT = {
     "png": "figure", "pdf": "figure", "svg": "figure", "jpg": "figure", "jpeg": "figure",
@@ -51,11 +59,46 @@ def wrap_with_extras(command: str, extras: list[str] | None) -> str:
     return f"uv run {flags} {command}"
 
 
+def _parse_compound(s: str) -> float | None:
+    """Sum a compound duration (``3h30m``, ``1d2h``, ``1h30m15s``), or ``None`` if ``s`` isn't one.
+
+    Deliberately strict, because this gates a wall-clock cap on a machine that bills: a duration
+    that parses to the *wrong* number is far worse than one that refuses to parse, and every
+    rejection below has a one-keystroke unambiguous spelling.
+
+    * Units must run **strictly descending** (``d`` > ``h`` > ``m`` > ``s``), which also forbids
+      repeats. ``30m3h`` is a transposition typo and ``3h3h`` is a duplication typo; both are
+      indistinguishable from an intent to sum, so neither is guessed at — ``3h30m`` and ``6h``
+      say the intended thing exactly.
+    * Every component must carry a number *and* a unit. A trailing unitless component (``3h30``,
+      the literal string the ledger's ``float()`` crash was reported on) is ambiguous between
+      clock notation (``3h30m``) and "3h and 30 seconds", so it is refused rather than resolved.
+    * Nothing outside the components is tolerated (``3h30x``): ``fullmatch``, not ``search``.
+
+    Whitespace between components is allowed (``1h 30m``) — it is a shell-quoting nuisance, not
+    an ambiguity. Decimals are allowed per component because the single-unit form already
+    accepted ``1.5h`` and it would be strange for adding a second component to withdraw that.
+    """
+    if not _COMPOUND.fullmatch(s):
+        return None
+    parts = [(m.group(1), m.group(2)) for m in _COMPOUND_PART.finditer(s)]
+    ranks = [_UNIT_ORDER.index(unit) for _, unit in parts]
+    if any(a >= b for a, b in zip(ranks, ranks[1:])):
+        return None  # out of order or a repeated unit
+    return sum(float(number) * _UNITS[unit] for number, unit in parts)
+
+
 def parse_duration(value: str | float | None) -> float | None:
-    """Parse a wall-clock limit (FR-I1). ``'2h'``/``'30m'``/``'45s'``/``'1d'`` or plain seconds
-    (string or number).
+    """Parse a wall-clock limit (FR-I1). ``'2h'``/``'30m'``/``'45s'``/``'1d'``, a compound
+    (``'3h30m'``, ``'1d2h'``, ``'1h30m15s'``), or plain seconds (string or number).
 
     Returns seconds, or ``None`` for no limit.
+
+    The single-unit/plain parse is tried **first and unchanged**, so every form this accepted
+    before is still parsed by exactly the code that parsed it before — the compound grammar only
+    ever sees input the old parse already rejected, and cannot change an existing answer.
+    ``3h30m`` (twice in the ledger, on two jobs, as ``could not convert string to float: '3h30'``)
+    is what it exists for.
     """
     if value is None:
         return None
@@ -67,10 +110,14 @@ def parse_duration(value: str | float | None) -> float | None:
             return float(s[:-1]) * _UNITS[s[-1]]
         return float(s)
     except ValueError:
-        raise ValueError(
-            f"invalid duration {value!r}: expected <n>s / <n>m / <n>h / <n>d, "
-            "or a plain number of seconds"
-        ) from None
+        pass
+    compound = _parse_compound(s)
+    if compound is not None:
+        return compound
+    raise ValueError(
+        f"invalid duration {value!r}: expected <n>s / <n>m / <n>h / <n>d, a compound like "
+        "3h30m (largest unit first, each unit at most once), or a plain number of seconds"
+    )
 
 
 def atomic_write_text(path: Path, text: str) -> None:

@@ -35,7 +35,22 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   `teardown_status="failed"` and makes `lab wait` exit 3; an **unreadable** outcome flips it to
   `"unknown"` and exits **6** — the machine may be gone or may be billing, so verify against the
   provider itself. `failed` is kept rare on purpose: an alarm that is usually wrong gets ignored
-  (R10). Treat an unrecognised value as `unknown`, never as success. **Recovery: `uv run lab reconcile [--apply]`**
+  (R10). Treat an unrecognised value as `unknown`, never as success.
+  **The box bounds its own lifetime from boot (v0.12.0), not from entrypoint start.** A detached
+  watchdog arms in `build_setup_script` — the earliest thing on the instance that is ours, since
+  the workdir rsync is SkyPilot's own and has no hook — carrying a boot allowance
+  (`max(45min, 2x the supervisor's provision budget)`, cleared when the run phase begins) and a
+  total of `wall + margin + boot`. A healthy job cannot hit it *by construction*: the run phase can
+  only begin inside the boot allowance, so `timeout` ends the entrypoint a full margin inside the
+  total. Sized to the slowest legitimate boot and deliberately **not** fitted to the one incident,
+  whose mechanism is unproven — `actual_usd` is `hourly x supervisor wall`, i.e. the lab's estimate
+  of its own blindness, not a Vast invoice. Remember what `poweroff` is worth per cloud: it ends a
+  Vast rental, turns a GCP compute leak into a disk leak, and **does nothing on DO** — so
+  `--backend cpu --cloud do` gains nothing from any on-box backstop, and teardown + reconcile stay
+  its only mechanisms. Mid-run rows are mirrored to `<job_id>/_partial/` (whole lines only, marked
+  with the producing job's own `_shard_status`, sentinels never eligible so a dead job can't be
+  salvaged back into looking green) so a job that dies at its cap still yields what it computed.
+  **Recovery: `uv run lab reconcile [--apply]`**
   finds orphaned rentals/instances not tied to a running job and destroys them. `--apply` lists
   what it will destroy and **asks**; add `--yes` for unattended use (with no tty it refuses and
   exits 4 rather than prompting). Only the approved set is destroyed.
@@ -74,7 +89,18 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   being 163-326 sequential marker HEADs. Keep the single-id `held()`/`cancel_requested()` for
   single checks, and keep `tick.py`'s pre-submit `cancel_requested` re-check a **fresh** read (spec
   §5 cancel race) — the bulk sets are a snapshot. Tests monkeypatch the per-id predicates to raise
-  so a regression to per-row reads fails loudly instead of just getting slow again.
+  so a regression to per-row reads fails loudly instead of just getting slow again. `tick.py` reads
+  the same two sets once per tick (`MarkerSnapshot`) instead of 2N.
+  **Version skew is the deferred path's silent failure mode (`lab.scheduler.skew`).** The host
+  outlives any project's venv and deserialises registrations with *its* models, so an older host
+  drops fields it doesn't know — that is how `--price-cap` was lost, and it was then misdiagnosed
+  as `lab register` lacking the flag. The heartbeat now carries `lab_version`; `skew_from_heartbeat`
+  classifies `same`/`host_older`/`host_newer`/`unknown` (a heartbeat with no version *is* evidence
+  of an old host; `0.0.0+unknown` is read as unparseable, never as 0.0.0, or every source-tree
+  client would report "host newer"). `lab queue list` emits `scheduler_skew` and warns on stderr.
+  **Diagnostic only — never a gate**, because a false block on the deferred path is worse than the
+  skew. Parsing goes to *patch* granularity: this project ships field-bearing changes in patch
+  releases (v0.7.1), so major.minor would miss the exact class that bit us.
 - **Scheduler redeploy:** `deploy/scheduler/deploy.sh vX.Y.Z` — an immutable blue-green droplet
   swap (build new, verify with a real smoke job, retire old), replacing playground's Ansible role
   (which drifted for 2.5 months undetected — see `docs/superpowers/specs/
@@ -106,6 +132,20 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   CSV; no credentials, no cloud calls). It resolves the instance type a spec lands on, prices every
   region, and remembers zones that just returned `ZONE_RESOURCE_POOL_EXHAUSTED` (30 min TTL,
   advisory — a broken memo is ignored, never fatal) so a sweep's later shards skip them.
+  **SkyPilot does NOT pick the Vast host from the stale catalog** — `sky/provision/vast/utils.py`
+  runs a live `search_offers` at launch and takes `instance_list[0]`; the catalog only fixes
+  instance type and region. The widely-repeated "it re-draws the same dead catalog row" story is
+  false, and a region-level denylist built on it would hurt: measured over the 2026-09 campaign
+  (571 Vast launches, 240 dead = 42%), region+type blacklisting after 3 strikes/30min gives 48% vs
+  the 42% base, and the placement with the *most* failures (Maryland/RTX_4090, 160) is the
+  *healthiest* supply at 37% vs Romania 55% and CA/5090 75% — excluding the loudest offender steers
+  you into the worst pool. So `DeadHostMemo` keys on the Vast **`machine_id`** (the physical box;
+  the rental id changes on every re-rent, so only `machine_id` can recur), read live at the failure
+  *before* teardown because it stops existing after. Coarse region/accelerator keys are recorded as
+  **evidence only and never exclude**. Like `CapacityMemo` it is advisory: it may spend an attempt,
+  it may never refuse a launch. `--accelerator-pool`/`--max-launch-attempts` promote the campaign's
+  hand-rotation to a flag, **off by default** — rotating away measured *worse* than staying (69% vs
+  51%, n=16, confounded), so it is an operator lever, not a default, and it never raises a price cap.
   `--region`/`--zone` pin; `--price-cap` maps to `sky.Resources(max_hourly_cost=)`, a ceiling the
   optimizer enforces. **Estimates are bands and guardrails check the top** — `get_cost()` on an
   unpinned `Resources` returns the cheapest region's price, which made admission control
@@ -171,6 +211,21 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   (`LAB_SUBMIT_STAGGER_S`, default 1.5s). `lab export <job|sweep> --to DIR` writes the
   committable provenance bundle (manifests + tables + diffs + index.json). `lab status` shows
   `estimated_running_usd` + `last_log_line`. Grid is optional when `--seeds` is given.
+  **Derived fields exist so nobody re-derives them (all three were found hand-rolled inside a live
+  watcher).** `lab status` carries `age_s` — counting up while running, **frozen at the final
+  lifetime** once terminal, so a job that *ended* 25h ago never reads as a 25h runaway (that
+  subtraction, done by hand against a wrong date belief, got two healthy jobs cancelled) — plus
+  `is_failed_launch`/`failed_launch_reason`. A failed launch keys on the **absence of the whole
+  `CostInfo`**, never on a null price: `cost: null` = not known, `cost.hourly_usd: null` = it ran
+  and the price was unreadable (a real failure with a real bill), `0.0` = the local backend's true
+  zero; local jobs are excluded entirely. `lab list` carries a derived `spend` block (+
+  `--spend-alert`), summed from manifests with **no new meter** (a second source of truth for money
+  is a bug generator), counting live jobs at rate x elapsed so it moves *before* a landing, and
+  naming `unknown_cost_jobs` rather than counting them as free. Durations accept compounds
+  (`3h30m`; `3h30` still refused as ambiguous — this caps billing) and `--since` accepts an
+  absolute **UTC** date. `sanitize.ObjectKey` lets an internal note carry a vetted object key
+  without opening the deny-list: it is a Python type, so nothing crossing a trust boundary
+  (argv, JSON, YAML) can *be* one, and the value must still pass path-shape + secret checks.
 - **User notes (`lab.notes`):** the channel back from whoever ran the job. `lab note [<job>]
   -m "..."` writes to `runs/<job_id>/notes.jsonl` (beside `logs.txt`, copied into `lab export`
   bundles) **and** a user-global `~/.lab/notes/index.jsonl` (`LAB_NOTES_DIR`, `LAB_NOTES=0`);
