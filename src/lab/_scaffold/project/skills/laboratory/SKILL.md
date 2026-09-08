@@ -323,6 +323,8 @@ uv run lab wait --sweep <sweep_id> --done-file done.json
 uv run lab wait <job_id> --timeout 30m --done-file done.json
 # stop waiting the moment any job fails (exit 4; survivors keep running/billing):
 uv run lab wait --sweep <sweep_id> --fail-fast --done-file done.json
+# a scheduler-launched (deferred) job id works too, from the laptop (v0.12.0):
+uv run lab wait <deferred_job_id> --timeout 8h --done-file done.json
 ```
 
 For long runs the right pattern is still to run `lab wait` as a **Claude Code
@@ -518,15 +520,22 @@ R2-mirrored manifest, incl. cost) → `lab fetch <job_id>` (artifacts come from 
   had been passed by hand; a healthy unpinned host reaches UP in 66–209s. Leave it unset unless
   you pin a region (`--region` narrows the pool: the one pinned launch took 526s, and pinned
   jobs get a 15m default for that reason).
-- **`lab fetch` / `lab metrics` / `lab logs` work from the laptop for scheduler-launched jobs**
-  (v0.11.0 — see Corrections below): they fall back to the mirrored manifest the same way
-  `lab status` already did. `lab wait` does **not** get this treatment yet — it still only
-  checks the local job store, so `lab wait <scheduler-launched-job-id>` fails immediately even
-  though `lab status` on the same id succeeds. `lab cancel` deliberately still refuses a
-  mirror-only job outright (see next bullet) rather than reaching cross-machine.
+- **`lab wait` / `lab fetch` / `lab metrics` / `lab logs` work from the laptop for
+  scheduler-launched jobs** (`lab wait` since v0.12.0, the other three since v0.11.0 — see
+  Corrections below): they fall back to the mirrored manifest the same way `lab status` always
+  did. So **never** hand-roll a `while ... lab status ... sleep` loop to watch a deferred job —
+  background one `lab wait <job_id> --done-file done.json` instead. A wait whose every job is
+  mirrored polls no faster than every 30s (the mirror cannot be fresher than the scheduler's
+  tick) and names those ids in the summary's `mirrored` list, so you can tell which rows may be
+  a tick stale. `lab cancel` deliberately still refuses a mirror-only job outright (see next
+  bullet) rather than reaching cross-machine.
 - **Cancel applies on the next tick** (≤60s), including killing an already-launched job.
-- **Mirror lag:** `teardown_status` may read `null` from the laptop for a tick or two after
-  success; the scheduler host's manifest is authoritative, `lab reconcile` is ground truth.
+- **Mirror lag:** `teardown_status` reaches the mirror one tick *after* terminal status, so
+  `lab status` on a deferred job may read `null` for a tick or two after success; the scheduler
+  host's manifest is authoritative, `lab reconcile` is ground truth. `lab wait` waits that lag out
+  for you (75s, one tick plus slack) before it reports `teardown_unconfirmed` — so a
+  "teardown not confirmed" warning from `lab wait` on a deferred job is a real finding to check,
+  not routine mirror lag.
 
 ## 6. Canonical workflows
 
@@ -735,7 +744,8 @@ past its cause costs real time. Each row below is a rule that was once right.
 | "`--price-cap` is a hard ceiling." | **Still not true, and worth knowing exactly how.** SkyPilot applies it to its own catalog, which under-reports Vast ~4x. Since v0.8.0 the cheapest *live* Vast offer is checked before renting (an impossible cap fails the submit for free) and the *billed* rate is compared after boot and recorded as `cost.over_cap`. The optimizer can still land above the cheapest offer, so pass `--price-cap-strict` if the ceiling must hold, and bound real exposure with `--timeout`. | v0.8.0 |
 | "`reconcile`'s `ghosts` list is Vast-only — a healthy DO/GCP job may show up there as a false positive, so don't trust it for those backends." | Ghost detection now cross-checks every cloud's own SkyPilot-tracked state, not just Vast rental labels; a healthy DO/GCP job is no longer misreported. Each entry's cause is named in the additive `ghost_reasons`. | v0.10.0 |
 | "There's no way to see what's actually running right now except `lab list` (this project only) or eyeballing `reconcile`'s rental counts." | `lab ps` / `mcp__lab__ps` gives a project-agnostic, machine-wide "what's running" view — closes a real gap found live, when both of the above were checked during an incident and neither surfaced jobs running in a *different* project. | v0.10.0 |
-| "`lab fetch`/`lab metrics`/`lab logs` don't work from the laptop for scheduler-launched jobs — only `lab status` reads the mirror." | The three now fall back to the mirrored manifest too (built over an ephemeral job store, never the real local one, so `cancel`/`reconcile` still correctly treat the job as not locally supervised). `lab wait` is the one command still local-only — that's a real, undocumented-until-now gap, not a design choice. | v0.11.0 |
+| "`lab fetch`/`lab metrics`/`lab logs` don't work from the laptop for scheduler-launched jobs — only `lab status` reads the mirror." | The three now fall back to the mirrored manifest too (built over an ephemeral job store, never the real local one, so `cancel`/`reconcile` still correctly treat the job as not locally supervised). | v0.11.0 |
+| "`lab wait` can't watch a scheduler-launched job, so polling `lab status` in a shell loop is the only way to know when a deferred job finishes." | `lab wait <deferred_job_id>` (and `mcp__lab__wait`) now resolve the mirrored manifest, exactly like `lab status`. Hand-rolled poll loops were costing ~1,050 `lab status` calls/hour — 98,654 in one five-day campaign, which also blew the event ledger past its size cap and destroyed a day of forensic records. An all-mirrored wait polls at most every 30s and lists those ids under `mirrored` in the summary/`--done-file`. `lab cancel` is still deliberately local-only (`lab queue cancel <reg_id>` is the way). | v0.12.0 |
 | "Keep `lab note` messages short — long or punctuation-heavy text fails or gets mangled." | Two real bugs, now fixed: the note sanitizer was silently truncating anything over 512 characters (an argv-length cap that should never have applied to note bodies), and a `shlex`-based masking pass was corrupting ordinary apostrophes/quotes in prose. A long, punctuation-rich note now round-trips exactly as written. | v0.11.0 |
 | "`--agent` marks a note as agent-written; it takes no value." | `--agent` is now a real value-bearing option: `--agent=` for the old bare behavior, `--agent=NAME`/`--agent NAME` to name the author. A bare, value-less `--agent` (no `=`) is now a usage error — this is the one **breaking** change in v0.11.0. | v0.11.0 |
 

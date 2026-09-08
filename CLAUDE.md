@@ -66,6 +66,15 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
 - **Deferred scheduling:** `lab register` + `lab queue …` queue jobs (night window / price /
   dependency triggers); an always-on host runs `lab scheduler tick` every 60s (systemd timer,
   `deploy/scheduler/`). Spec: `docs/superpowers/specs/2026-06-10-deferred-scheduling-design.md`.
+  **The queue is R2, so every read is a network round trip and listing it is where the cost hides:**
+  `list_entries`/`list_mirrored` fetch concurrently (8, `LAB_R2_LIST_CONCURRENCY`) in sorted-key
+  order, and `queue list` reads the hold/cancel markers via `held_ids()`/`cancel_requested_ids()` —
+  one listing each, never a round trip per row. Measured on the 2026-09 campaign before this:
+  2,419 `queue list` calls at a **33.6s median = 23.3 hours** of wall-clock, ~65s of a ~70s call
+  being 163-326 sequential marker HEADs. Keep the single-id `held()`/`cancel_requested()` for
+  single checks, and keep `tick.py`'s pre-submit `cancel_requested` re-check a **fresh** read (spec
+  §5 cancel race) — the bulk sets are a snapshot. Tests monkeypatch the per-id predicates to raise
+  so a regression to per-row reads fails loudly instead of just getting slow again.
 - **Scheduler redeploy:** `deploy/scheduler/deploy.sh vX.Y.Z` — an immutable blue-green droplet
   swap (build new, verify with a real smoke job, retire old), replacing playground's Ansible role
   (which drifted for 2.5 months undetected — see `docs/superpowers/specs/
@@ -138,7 +147,26 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   non-succeeded shards by default (`_shard_status` column, `seeds_partial` in the view,
   `--strict` opts out) and `sweep-retry` resubmits only missing seeds. `lab wait` gains
   `--fail-fast` (exit 4), an incrementally-rewritten `--done-file` (with `pending`), and
-  duration-string `--timeout`. Transient local-API launch errors retry with backoff
+  duration-string `--timeout`. **`lab wait` also watches scheduler-launched jobs** — it resolves
+  each id local-`runs/`-first, then the queue mirror (`Lab._resolve_manifest`), so the event-driven
+  `--done-file` watch finally covers deferred jobs; the ids read from the mirror are named in the
+  summary's `mirrored`, and an all-mirrored wait floors its poll interval at 30s because the mirror
+  is only as fresh as the 60s tick. The local read stays **first** on purpose (never ask a live
+  backend about a job this machine didn't supervise) and `backend.status` stays inside the resolve
+  — it's what finalizes a job whose supervisor died silently, and it is dispatched per job through
+  `Lab._backend_for(<that manifest>.backend.provisioner)`, never through `ids[0]`'s backend (a
+  mixed `wait <deferred_skypilot> <local>` would otherwise tear down a cluster that never existed
+  and raise a false exit 3). Three cost-of-being-wrong rules follow from the mirror being a
+  network read on a 60s tick: a mirror read that **fails mid-poll is "no news yet"**, never an
+  exception (the caller's `--timeout` is the only bound — an exception here surfaces as exit 1,
+  i.e. indistinguishable from a real timeout, after hours of waiting); the teardown settle spans
+  **`_MIRROR_SETTLE_S` = 75s** for a mirrored job, because `tick.py` mirrors terminal status one
+  tick before `teardown_status` and the local 15s window would have fired "teardown not confirmed"
+  on *every* clean deferred run (R10); and the queue store is built **once per `Lab`**
+  (`Lab._queue`), not once per poll — `default_queue()` builds a fresh boto3 client each call.
+  `lab cancel` still refuses a mirror-only job by design — `lab queue cancel` is the path. Until this landed, watching a
+  deferred job meant a hand-rolled `lab status` loop, which is exactly how the 98,654-poll storm
+  happened. `--sweep` over deferred jobs is still a gap (`jobs_in_sweep` walks local `runs/`). Transient local-API launch errors retry with backoff
   (`LAB_LAUNCH_RETRIES`, `end_reason` prefix `transient:`); remote sweep submits stagger
   (`LAB_SUBMIT_STAGGER_S`, default 1.5s). `lab export <job|sweep> --to DIR` writes the
   committable provenance bundle (manifests + tables + diffs + index.json). `lab status` shows
@@ -170,6 +198,16 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   `~/.lab/events/YYYY-MM-DD.jsonl` (user-global, project-tagged; `LAB_EVENTS_DIR` overrides,
   `LAB_EVENTS=0` disables). Internals call `events.note(...)`, buffered in memory and flushed
   into the record **only when the call fails** — successes stay tiny, failures carry the trace.
+  **The one exception to "every call" is a repeated successful poll**: for the read-only actions
+  (`status`/`list`/`logs`/`metrics`/`queue list`/`queue show` — *not* `history`/`report`, which are
+  the ledger's own forensic surface) a success is recorded only if the last one for that
+  (action, project) is more than `LAB_EVENTS_READ_MIN_INTERVAL_S` (60s) old, claimed through an
+  `flock`ed stamp under `.reads/` so a poll costs nothing. Failures are never rate-limited. The
+  trade: a read-only action's `open` is buffered and written at close (the decision needs the
+  outcome), so a SIGKILLed `lab status` leaves no trace, while every action that *does* something
+  still writes its `open` immediately and a dangling open stays a finding. This exists because
+  98,654 successful `lab status` calls in five days (a runaway watch loop, 1,050/h) filled the byte
+  cap and cost the ledger a real forensic day — see the retention note below.
   The SkyPilot supervisor gets its own `surface: "supervisor"` record (it's a detached process,
   so notes there would otherwise be dead), joined to its submitter's session via
   `LAB_SESSION_ID` passthrough. Read it with **`lab history`**
@@ -178,7 +216,13 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   unrelated — that tails one job's stdout. Retention: successes compacted after 14d, files
   deleted past 90d or 50 MB (`LAB_EVENTS_SUCCESS_TTL_DAYS`/`LAB_EVENTS_MAX_AGE_DAYS`/
   `LAB_EVENTS_MAX_MB`), guarded by a per-day lock file (`<day>.jsonl.lock`) shared with
-  `append()`. `params` passes through `lab.events.sanitize` first — a **deny-list**, not an
+  `append()`. **Over the byte cap, compaction runs before any deletion** (TTL ignored, today
+  excluded) and **today's file is never deleted** — the byte cap's only lever used to be dropping a
+  whole day oldest-first, and since `compact()` was age-gated at 14d it could not touch a *fresh*
+  burst, so on 2026-09-08 it deleted day one of the live campaign being investigated. Stale
+  `.jsonl.lock` files (no day file, >1d old, and we can take the flock) are reaped by the same
+  once-per-day `maybe_prune`; unlink removes the name and not the inode, so that race is narrowed,
+  not closed — the docstring says so. `params` passes through `lab.events.sanitize` first — a **deny-list**, not an
   allow-list: mask by key name/value shape/entropy, default pass — never raw (FR-J1). The
   console entry point moved to `lab.cli:main`, which runs typer in standalone mode and records
   usage errors/crashes via a `_fail()` helper — `standalone_mode=False` was tried and abandoned

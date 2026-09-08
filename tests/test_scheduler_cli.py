@@ -111,6 +111,38 @@ def test_queue_cancel_hold_pause(tmp_path: Path):
     assert q.read_control().budget_usd_per_day == 5.0
 
 
+def test_queue_list_renders_markers_from_one_listing_each(tmp_path: Path, monkeypatch):
+    """`queue list` must read the hold/cancel markers in bulk, never once per row.
+
+    Per-entry `held()`/`cancel_requested()` cost 163-326 sequential HEADs on the 2026-09 campaign
+    (~65s of a ~70s `queue list`), so the per-id predicates are monkeypatched to raise: any
+    regression to a per-row read fails loudly instead of just getting slow again.
+    """
+    repo = _make_repo(tmp_path)
+    held = _register(tmp_path, repo)["reg_id"]
+    cancelled = _register(tmp_path, repo)["reg_id"]
+    plain = _register(tmp_path, repo)["reg_id"]
+    env = _env(tmp_path, repo)
+    assert runner.invoke(app, ["queue", "hold", held], env=env).exit_code == 0
+    assert runner.invoke(app, ["queue", "cancel", cancelled], env=env).exit_code == 0
+
+    def _boom(self, reg_id: str) -> bool:
+        raise AssertionError(f"per-entry marker read for {reg_id}")
+
+    monkeypatch.setattr(LocalQueueStore, "held", _boom)
+    monkeypatch.setattr(LocalQueueStore, "cancel_requested", _boom)
+
+    res = runner.invoke(app, ["queue", "list"], env=env)
+    assert res.exit_code == 0, res.output
+    rows = {r["reg_id"]: r for r in json.loads(res.stdout)["entries"]}
+    assert rows[held]["state"] == "held"
+    assert rows[cancelled]["cancel_requested"] is True
+    assert rows[cancelled]["state"] == RegState.pending.value  # cancel pending != held
+    assert rows[plain]["state"] == RegState.pending.value
+    assert rows[plain]["cancel_requested"] is False
+    assert rows[held]["cancel_requested"] is False
+
+
 def test_scheduler_tick_runs_once(tmp_path: Path):
     repo = _make_repo(tmp_path)
     _register(tmp_path, repo)

@@ -43,6 +43,14 @@ upgrade note.
   sibling field, `ghost_reasons: dict[str, str]`, naming why each entry was flagged; like every
   additive field here, a caller that ignores it is unaffected. `lab queue list` gained `host`,
   `heartbeat_paused` and `tick_count`, all additive.
+
+  `lab wait` / `mcp__lab__wait` (v0.12.0) accept a **scheduler-launched (deferred)** job id,
+  which they used to reject with exit 2 — a loosening, not a change: every id that worked before
+  still works, with the same exit codes. The summary (and each `--done-file` snapshot) gained an
+  additive `mirrored: list[str]` naming the ids read from the scheduler's queue mirror rather
+  than local `runs/`, whose state can be one scheduler tick stale; a caller that ignores it is
+  unaffected. A wait whose *every* job is mirrored polls no faster than every 30s regardless of
+  `--interval`, since the mirror cannot refresh faster than the scheduler's tick.
 - **MCP** — tool names, argument names, and the shape of returned JSON.
 - **Notes** — `lab note` / `lab notes`, their flags, and the record shape in
   `runs/<job_id>/notes.jsonl` and `~/.lab/notes/index.jsonl` (every line carries `v`, currently
