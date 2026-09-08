@@ -1013,3 +1013,71 @@ def test_cancel_landing_after_the_snapshot_is_still_caught_before_submit(
     # Exactly one fresh per-id read happened, and it was the pre-submit one: had the loop's
     # snapshot check caught the cancel, `_launch` would never have run and this would be empty.
     assert fresh_reads == ["reg-a"]
+
+
+def test_a_hold_landing_after_the_snapshot_still_stops_the_launch(tmp_path: Path, monkeypatch):
+    """A hold that does not hold spends money the operator just said not to spend.
+
+    `MarkerSnapshot` is read at the top of the tick, before `_sync`'s per-registration R2 work, so
+    `lab queue hold <reg>` issued during that window is invisible to the bulk pass -- exactly as a
+    cancel is. The per-entry `held()` the snapshot replaced would have caught it, so the final gate
+    before renting a machine reads fresh, for the same reason the cancel re-check does.
+    """
+    sched, q = make_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a")
+    real_get_entry = LocalQueueStore.get_entry
+
+    def _hold_then_read(self: LocalQueueStore, reg_id: str) -> Registration:
+        self.hold(reg_id)  # lands mid-tick, after MarkerSnapshot.read()
+        return real_get_entry(self, reg_id)
+
+    monkeypatch.setattr(LocalQueueStore, "get_entry", _hold_then_read)
+
+    rep = sched.tick()
+
+    assert rep.launched == []
+    assert rep.skipped["reg-a"] == "held"
+    assert sched.store.list_job_ids() == []  # nothing was ever submitted
+    # A hold is not a cancel: the entry stays launchable for whenever it is released.
+    assert real_get_entry(q, "reg-a").state is RegState.pending
+
+
+def test_a_held_entry_launches_normally_once_released(tmp_path: Path):
+    """The other half: the fresh check must not strand an entry in `launching`."""
+    sched, q = make_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a")
+    q.hold("reg-a")
+    assert sched.tick().launched == []
+
+    q.release("reg-a")
+    rep = sched.tick()
+
+    assert rep.launched == ["reg-a"]
+    assert q.get_entry("reg-a").state is RegState.launched
+
+
+def test_the_pre_submit_gates_cost_one_read_each_per_launch(tmp_path: Path, monkeypatch):
+    """Fresh reads are bounded by launches per tick, never by queue size -- the whole point of
+    `MarkerSnapshot` (163 registrations x 2 markers = up to 326 sequential HEADs every 60s)."""
+    sched, q = make_sched(tmp_path)
+    for i in range(4):
+        put_reg(q, tmp_path, f"reg-{i}", triggers=Triggers(not_before=T0 + timedelta(hours=5)))
+    put_reg(q, tmp_path, "reg-go")  # the only launchable one
+    reads = {"held": 0, "cancelled": 0}
+    real_held, real_cancel = LocalQueueStore.held, LocalQueueStore.cancel_requested
+
+    def _held(self: LocalQueueStore, reg_id: str) -> bool:
+        reads["held"] += 1
+        return real_held(self, reg_id)
+
+    def _cancel(self: LocalQueueStore, reg_id: str) -> bool:
+        reads["cancelled"] += 1
+        return real_cancel(self, reg_id)
+
+    monkeypatch.setattr(LocalQueueStore, "held", _held)
+    monkeypatch.setattr(LocalQueueStore, "cancel_requested", _cancel)
+
+    rep = sched.tick()
+
+    assert rep.launched == ["reg-go"]
+    assert reads == {"held": 1, "cancelled": 1}  # one launch, one read each -- not five

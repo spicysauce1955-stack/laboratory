@@ -311,10 +311,16 @@ the local output is empty (e.g. after a fresh clone).
 ### `mcp__lab__list`
 `{spend_alert?}` → `{"jobs": [{job_id, sweep_id, status, created_at}, ...],
 "spend": {realized_usd, jobs_counted, running_usd, running_jobs,
-unknown_cost_jobs, scope, alert}}`. All jobs in `runs/`, plus **realized spend
+unknown_cost_jobs, unsupervised_suspect_jobs, scope, alert}}`. All jobs in
+`runs/`, plus **realized spend
 so far** — derived from the manifests on every read, so there is no meter to
 drift. `running_usd` counts live jobs at rate x elapsed, so the total moves
-*before* a landing rather than after it. Jobs whose rate was never readable are
+*before* a landing rather than after it — **bounded by each job's own
+`--timeout`** (24h if it declares none), so a manifest a dead supervisor left at
+`running` cannot keep adding money nobody spent. Jobs that hit that bound are
+named in `unsupervised_suspect_jobs`: the total is a *lower* bound for them, and
+`lab reconcile` is what confirms the supervisor is really gone. Jobs whose rate
+was never readable are
 named in `unknown_cost_jobs` and are **not** counted as free; `scope` states
 what the number covers (this project's `runs/` only). Pass `spend_alert` (CLI:
 `uv run lab list --spend-alert 45`) to get a verdict the moment a threshold is

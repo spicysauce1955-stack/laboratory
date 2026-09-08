@@ -20,6 +20,7 @@ for. That is the whole reason ``vast_machine_id`` has to go and ask Vast.
 
 from __future__ import annotations
 
+import signal
 import sys
 import types
 from pathlib import Path
@@ -305,6 +306,23 @@ class TestLaunchRotationBound:
         res = _res(max_launch_attempts=0)
         assert runner_mod.LaunchRotation.for_manifest(_manifest(res)).max_attempts == 1
 
+    def test_peeking_costs_nothing(self, monkeypatch):
+        """The re-draw check has to know *whether* it could rotate before it knows whether it
+        will. Asking may not spend the attempt (see the run_job test below)."""
+        monkeypatch.setattr(P, "affordable_under_cap", lambda res, a: True)
+        res = _res(accelerator_pool="RTX3090:1,L40S:1")
+        rot = runner_mod.LaunchRotation.for_manifest(_manifest(res))
+
+        first = rot.peek(res)
+        assert first is not None and first.accelerators == "RTX3090:1"
+        assert rot.attempt == 1 and rot.tried == ["RTX4090:1"]
+        # Asked twice without committing, it answers the same thing twice.
+        again = rot.peek(res)
+        assert again is not None and again.accelerators == "RTX3090:1"
+
+        rot.commit(first)
+        assert rot.attempt == 2 and rot.tried == ["RTX4090:1", "RTX3090:1"]
+
     def test_advance_stops_at_the_bound_not_at_the_pool_end(self, monkeypatch):
         monkeypatch.setattr(P, "affordable_under_cap", lambda res, a: True)
         res = _res(accelerator_pool="RTX3090:1,L40S:1", max_launch_attempts=2)
@@ -410,6 +428,19 @@ def _install(monkeypatch, sky: _FakeSky, *, timeouts: int) -> dict[str, int]:
     monkeypatch.setattr(runner_mod, "vast_machine_id", lambda cluster, client=None: "41234")
     monkeypatch.setattr(P, "affordable_under_cap", lambda res, a: True)
     return counters
+
+
+def _abort_note() -> dict[str, Any]:
+    """The supervisor's last ``abort`` note. Buffered notes are flushed on a failed call, and an
+    abort is one by construction, so this is the ledger an operator actually gets."""
+    from lab.events import store as events_store
+
+    closes = [
+        r for r in events_store.iter_records(events_store.day_files()) if r["phase"] == "close"
+    ]
+    notes = [n["d"] for r in closes for n in r.get("trace", []) if n["k"] == "abort"]
+    assert notes, "the supervisor recorded no abort note at all"
+    return notes[-1]
 
 
 def _store(tmp_path: Path, job_id: str, res: ResourceRequest) -> JobStore:
@@ -592,6 +623,187 @@ class TestRunJobRotation:
         memo = P.DeadHostMemo.for_home(store.home)
         assert memo.strikes(P.machine_key("vast", "41234")) == 0
 
+    def test_a_signal_after_a_rotation_destroys_the_machine_that_is_running(
+        self, tmp_path, monkeypatch
+    ):
+        """The rotation's own teardown must not disarm the abort path's (FR-C2).
+
+        Attempt 1 dies and is torn down cleanly, which writes ``teardown_status="succeeded"``.
+        Attempt 2 comes up and runs. A SIGTERM then arrives — laptop suspend, scheduler restart,
+        box shutdown — and the abort path used to read that stale ``succeeded`` as "already
+        handled", leave the *second* machine running, and flip the job to ``failed`` while the
+        manifest still asserted the machine was gone. ``lab wait`` exits 0: a billing rental with
+        every alarm answered.
+        """
+        sky = _FakeSky()
+        _install(monkeypatch, sky, timeouts=1)  # attempt 1 times out, attempt 2 lands
+        teardowns: list[str] = []
+
+        def _teardown(sky_mod: Any, cluster: str, st: Any, jid: str, cloud: str = "vast", **kw: Any):
+            teardowns.append(cluster)
+            st.update_manifest(jid, teardown_status="succeeded")
+            return True
+
+        def _sigtermed(*a: Any, **k: Any):
+            raise runner_mod.SupervisorTerminated(signal.SIGTERM)
+
+        monkeypatch.setattr(runner_mod, "tear_down_and_record", _teardown)
+        monkeypatch.setattr(runner_mod, "_wait_terminal", _sigtermed)
+        store = _store(tmp_path, "dk", _res(accelerator_pool="RTX3090:1"))
+
+        with pytest.raises(SystemExit) as exc:
+            runner_mod.run_job(store.job_dir("dk"))
+
+        assert exc.value.code == 128 + signal.SIGTERM
+        assert len(sky.launches) == 2, "the job did not rotate; the test proves nothing"
+        assert len(teardowns) == 2, (
+            "the machine attempt 2 was running on was never destroyed — the abort path took the "
+            "abandoned attempt's teardown as an answer for it"
+        )
+        m = store.read_manifest("dk")
+        assert m.status is JobState.failed and "SIGTERM" in (m.end_reason or "")
+        # And the ledger says a teardown happened here, so this path can be audited months later
+        # (`lab history --full`) rather than re-derived from a manifest field that gets rewritten.
+        assert _abort_note()["teardown"] is True
+
+    def test_the_manifest_never_claims_a_teardown_that_did_not_happen(self, tmp_path, monkeypatch):
+        """Worse than a plain leak: the abandoned attempt's ``succeeded`` was left standing for a
+        machine nothing had touched. Whatever the abort-time teardown really returns is what the
+        manifest must say — that is the field `lab wait` turns into exit 3/6."""
+        sky = _FakeSky()
+        _install(monkeypatch, sky, timeouts=1)
+        outcomes = iter(["succeeded", "unknown"])
+
+        def _teardown(sky_mod: Any, cluster: str, st: Any, jid: str, cloud: str = "vast", **kw: Any):
+            status = next(outcomes, "unknown")
+            st.update_manifest(jid, teardown_status=status)
+            return status == "succeeded"
+
+        def _sigtermed(*a: Any, **k: Any):
+            raise runner_mod.SupervisorTerminated(signal.SIGTERM)
+
+        monkeypatch.setattr(runner_mod, "tear_down_and_record", _teardown)
+        monkeypatch.setattr(runner_mod, "_wait_terminal", _sigtermed)
+        store = _store(tmp_path, "dl", _res(accelerator_pool="RTX3090:1"))
+
+        with pytest.raises(SystemExit):
+            runner_mod.run_job(store.job_dir("dl"))
+
+        assert store.read_manifest("dl").teardown_status == "unknown"
+
+    def test_an_unconfirmed_teardown_leaves_the_machine_ours_to_destroy(
+        self, tmp_path, monkeypatch
+    ):
+        """The re-draw check tears down, is told "unconfirmed", and then deliberately goes on
+        supervising that same machine (never fail a job because of the memo). Recording that as
+        "this attempt has been torn down" would make the abort path skip the one box we know we
+        could not confirm dead — the same leak as finding 1, entered the other way."""
+        sky = _FakeSky()
+        _install(monkeypatch, sky, timeouts=0)  # the launch it declines to abandon comes up
+        teardowns: list[bool] = []
+
+        def _teardown(sky_mod: Any, cluster: str, st: Any, jid: str, cloud: str = "vast", **kw: Any):
+            ok = len(teardowns) > 0  # only the first (the re-draw's) is unconfirmed
+            teardowns.append(ok)
+            st.update_manifest(jid, teardown_status="succeeded" if ok else "failed")
+            return ok
+
+        def _sigtermed(*a: Any, **k: Any):
+            raise runner_mod.SupervisorTerminated(signal.SIGTERM)
+
+        monkeypatch.setattr(runner_mod, "tear_down_and_record", _teardown)
+        monkeypatch.setattr(runner_mod, "_wait_terminal", _sigtermed)
+        store = _store(tmp_path, "dq", _res(accelerator_pool="RTX3090:1"))
+        memo = P.DeadHostMemo.for_home(store.home, strikes=2)
+        memo.record(P.machine_key("vast", "41234"))
+        memo.record(P.machine_key("vast", "41234"))
+
+        with pytest.raises(SystemExit):
+            runner_mod.run_job(store.job_dir("dq"))
+
+        assert len(sky.launches) == 1, "the unconfirmed teardown must not have been relaunched over"
+        assert teardowns == [False, True], "the abort path skipped a machine still under this job"
+
+    def test_a_rotated_job_strikes_the_accelerator_that_actually_booted(self, tmp_path, monkeypatch):
+        """Finding 4: the memo has to name the accelerator the dead box came up as.
+
+        Attempt 1 (RTX4090) times out — one strike, fairly. Attempt 2 rotates to RTX3090, boots,
+        and reports no CUDA. Striking RTX4090 for that would retire a pool entry that has failed
+        once, on evidence from a machine it never ran on, and leave the accelerator that really
+        misbehaved unmarked — a memo that steers the next job the wrong way is worse than none.
+        """
+        sky = _FakeSky(status_name="FAILED")
+        _install(monkeypatch, sky, timeouts=1)
+        store = _store(tmp_path, "dm", _res(accelerator_pool="RTX3090:1"))
+        store.logs_path("dm").write_text(
+            "(lab-dm, pid=2044) no CUDA device. Exiting non-zero (no CPU-smoke at GPU price).\n"
+        )
+
+        runner_mod.run_job(store.job_dir("dm"))
+
+        m = store.read_manifest("dm")
+        assert m.status is JobState.failed and m.resources.accelerators == "RTX3090:1"
+        memo = P.DeadHostMemo.for_home(store.home)
+        assert memo.strikes(P.accelerator_key("vast", "RTX3090:1")) == 1  # the box that booted
+        assert memo.strikes(P.accelerator_key("vast", "RTX4090:1")) == 1  # its own timeout, only
+        assert memo.is_dead(P.accelerator_key("vast", "RTX4090:1")) is False
+
+    def test_the_failure_names_the_budget_the_host_was_actually_given(self, tmp_path, monkeypatch):
+        """The dead-host check is paid for out of the provisioning budget, so the host can get
+        less than ``--provision-timeout`` says. Quoting the nominal number makes the one message
+        an operator calibrates timeouts from unreproducible."""
+        sky = _FakeSky()
+        counters = _install(monkeypatch, sky, timeouts=99)
+        ticks = [0.0]
+
+        def _clock() -> float:  # every monotonic() reading is 90s after the last
+            ticks[0] += 90.0
+            return ticks[0]
+
+        monkeypatch.setattr(runner_mod.time, "monotonic", _clock)
+        store = _store(tmp_path, "dn", _res(provision_timeout="100s"))
+
+        rc = runner_mod.run_job(store.job_dir("dn"))
+
+        assert rc == 1
+        assert counters["budget"] == 60, "100s minus the 90s spent, floored at 60"
+        assert "exceeded 60s" in (store.read_manifest("dn").end_reason or "")
+
+    def test_a_redraw_that_does_not_rotate_keeps_its_attempt(self, tmp_path, monkeypatch):
+        """Finding 5: the re-draw check may only spend an attempt on a rotation that happens.
+
+        The drawn machine is known-dead, so rotation is considered — but its teardown cannot be
+        confirmed, so the code correctly declines to relaunch and waits the launch out instead.
+        With the candidate already marked tried and the attempt already counted, the genuine
+        ProvisionTimeout that follows had nothing left to rotate with (``max_launch_attempts=2``)
+        and the job died on a host we already knew was dead.
+        """
+        sky = _FakeSky()
+        _install(monkeypatch, sky, timeouts=1)
+        confirms = iter([False])  # only the first teardown is unconfirmed
+
+        def _teardown(sky_mod: Any, cluster: str, st: Any, jid: str, cloud: str = "vast", **kw: Any):
+            ok = next(confirms, True)
+            st.update_manifest(jid, teardown_status="succeeded" if ok else "failed")
+            return ok
+
+        monkeypatch.setattr(runner_mod, "tear_down_and_record", _teardown)
+        store = _store(
+            tmp_path,
+            "dp",
+            _res(accelerator_pool="RTX3090:1,L40S:1", max_launch_attempts=2),
+        )
+        memo = P.DeadHostMemo.for_home(store.home, strikes=2)
+        memo.record(P.machine_key("vast", "41234"))
+        memo.record(P.machine_key("vast", "41234"))
+
+        rc = runner_mod.run_job(store.job_dir("dp"))
+
+        assert rc == 0
+        assert len(sky.launches) == 2, "the rotation the timeout was owed never happened"
+        # And onto the candidate the re-draw check had picked, not the one after it.
+        assert store.read_manifest("dp").resources.accelerators == "RTX3090:1"
+
     def test_an_unwritable_memo_does_not_stop_a_job_from_running(self, tmp_path, monkeypatch):
         sky = _FakeSky()
         _install(monkeypatch, sky, timeouts=0)
@@ -602,3 +814,68 @@ class TestRunJobRotation:
 
         assert runner_mod.run_job(store.job_dir("d9")) == 0
         assert store.read_manifest("d9").status is JobState.succeeded
+
+
+# --------------------------------------------------------------------------------------------
+# _teardown_on_abort — what the guard is allowed to mean
+# --------------------------------------------------------------------------------------------
+
+
+class TestTeardownOnAbort:
+    """The abort path asks one question: does the machine that exists *right now* still need
+    destroying? ``teardown_status`` on the manifest cannot answer it — there is one such field
+    per job and a rotation writes it once per abandoned attempt."""
+
+    def _running_job(self, tmp_path: Path, monkeypatch, **fields: Any) -> JobStore:
+        monkeypatch.setitem(sys.modules, "sky", _FakeSky())
+        store = JobStore(tmp_path / "runs")
+        store.create(_manifest(_res(), "ab"))
+        store.update_manifest("ab", status=JobState.running, **fields)
+        return store
+
+    def _record_calls(self, monkeypatch) -> list[str]:
+        calls: list[str] = []
+
+        def _teardown(sky_mod: Any, cluster: str, st: Any, jid: str, cloud: str = "vast", **kw: Any):
+            calls.append(cluster)
+            st.update_manifest(jid, teardown_status="succeeded")
+            return True
+
+        monkeypatch.setattr(runner_mod, "tear_down_and_record", _teardown)
+        return calls
+
+    def test_an_earlier_attempts_teardown_does_not_answer_for_this_one(self, tmp_path, monkeypatch):
+        store = self._running_job(tmp_path, monkeypatch, teardown_status="succeeded")
+        calls = self._record_calls(monkeypatch)
+
+        runner_mod._teardown_on_abort(
+            store, "ab", "lab-ab", "vast", why="SIGTERM", launched=True, torn_down=False
+        )
+
+        assert calls == ["lab-ab"]
+        assert store.read_manifest("ab").status is JobState.failed
+
+    def test_the_current_machine_is_not_destroyed_twice(self, tmp_path, monkeypatch):
+        """The guard stays for a reason: a second destroy of a cluster that is already gone has
+        nothing left for the provider-direct fallback to confirm against and can come back
+        ``failed`` — an alarm that is usually wrong is the one nobody acts on (R10)."""
+        store = self._running_job(tmp_path, monkeypatch)
+        calls = self._record_calls(monkeypatch)
+
+        runner_mod._teardown_on_abort(
+            store, "ab", "lab-ab", "vast", why="SIGTERM", launched=True, torn_down=True
+        )
+
+        assert calls == []
+        assert store.read_manifest("ab").status is JobState.failed  # still made terminal
+
+    def test_a_supervisor_that_never_launched_raises_no_alarm(self, tmp_path, monkeypatch):
+        store = self._running_job(tmp_path, monkeypatch)
+        calls = self._record_calls(monkeypatch)
+
+        runner_mod._teardown_on_abort(
+            store, "ab", "lab-ab", "vast", why="SIGTERM", launched=False, torn_down=False
+        )
+
+        assert calls == []
+        assert store.read_manifest("ab").status is JobState.running

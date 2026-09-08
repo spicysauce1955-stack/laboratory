@@ -37,10 +37,13 @@ class MarkerSnapshot:
     :mod:`lab.scheduler.queue`), so the tick reads them once and tests membership in memory.
 
     It is a **snapshot**, and that is the whole reason ``_launch`` keeps its own fresh
-    ``cancel_requested`` call immediately before submitting (spec §5 cancel race): the pre-submit
-    re-check exists precisely to see a cancel that landed *after* the loop began, and serving it
-    from this set would reintroduce the race it was written to close. Money can be spent between
-    those two points; nothing else in a tick can.
+    ``cancel_requested`` **and** ``held`` calls immediately before submitting (spec §5 cancel
+    race): those pre-submit re-checks exist precisely to see a marker that landed *after* the loop
+    began — and after ``_sync``, which does per-registration R2 work between this read and the
+    launch — and serving them from this set would reintroduce the race they were written to close.
+    Money can be spent between those two points; nothing else in a tick can. Both re-reads are
+    bounded by *launches per tick*, not by queue size, which is the cost this snapshot exists to
+    avoid.
     """
 
     cancelled: frozenset[str]
@@ -587,6 +590,16 @@ class Scheduler:
         if self.queue.cancel_requested(reg.reg_id):  # spec §5 cancel race: re-check pre-submit
             self._transition(reg, RegState.cancelled, reason="cancelled by user")
             rep.cancelled.append(reg.reg_id)
+            return
+        # Same race, same discipline, same reason a hold exists at all: `MarkerSnapshot` is read
+        # at the top of the tick, *before* `_sync`'s per-registration R2 work, so a hold placed
+        # during that window is invisible to the bulk pass and the machine would be rented anyway.
+        # A hold that does not hold spends money the operator just said not to spend. Back to
+        # `pending`, never `cancelled` — a hold is reversible, and `lab queue release` must be able
+        # to launch this entry later.
+        if self.queue.held(reg.reg_id):
+            self._transition(reg, RegState.pending, reason="held")
+            rep.skipped[reg.reg_id] = "held"
             return
         try:
             bundle_dir = self.home / "_bundles" / reg.reg_id

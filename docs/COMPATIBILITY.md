@@ -57,14 +57,32 @@ upgrade note.
   `cost` being `null`, which means "not known" and never `$0` (the local backend's `hourly_usd:
   0.0` is a real zero, and a job that ran at a price we could not read is a real failure).
 
+  The pre-existing `estimated_running_usd` **changed meaning** in v0.12.0: it is now bounded by the
+  same ceiling as `lab list`'s spend block (the job's own `--timeout` plus slack, or a 24 h horizon
+  when it declares none) instead of growing without limit. A manifest a dead supervisor left at
+  `running` no longer reports a number that climbs on every read. For a healthy job inside its cap
+  the value is unchanged; for a stale one it stops rising, and is a **lower** bound.
+
   `lab list` / `mcp__lab__list` (v0.12.0) gained a `spend` block beside the existing `jobs` list
-  (`realized_usd`, `jobs_counted`, `running_usd`, `running_jobs`, `unknown_cost_jobs`, `scope`,
-  `alert`), and a `--spend-alert <usd>` flag / `spend_alert` argument. It is **derived** from the
+  (`realized_usd`, `jobs_counted`, `running_usd`, `running_jobs`, `unknown_cost_jobs`,
+  `unsupervised_suspect_jobs`, `scope`, `alert`), and a `--spend-alert <usd>` flag / `spend_alert`
+  argument. It is **derived** from the
   job manifests on every read — there is no meter and no new state on disk — and it covers this
   project's own `runs/` only; `scope` states that in the payload, and jobs whose rate was never
   readable are named in `unknown_cost_jobs` rather than counted as free. Below the threshold (or
   with none set) `alert` is `null`; on a crossing the CLI additionally warns on **stderr**, so
   stdout stays the JSON a caller parses. The `jobs` rows are unchanged.
+
+  A still-`running` job's contribution is **bounded** by its own `--timeout` (plus 30 minutes of
+  provisioning/teardown slack, which `started_at` also charges), or by a **24 h** horizon when the
+  job declares no timeout. `realized_usd` therefore never grows on a manifest a dead supervisor
+  left at `running` — the shape ~40% of the 2026-08 DigitalOcean supervisors produced, and which
+  unbounded added ~$67 of money nobody spent to a $0.40/hr job abandoned for a week, climbing on
+  every read. Jobs that hit the bound are named in the additive `unsupervised_suspect_jobs`, the
+  total is a **lower** bound for those, and `alert.message` says so and points at `lab reconcile`
+  (whose `unsupervised` list is the authority on a dead supervisor). Terminal jobs are unaffected:
+  their recorded elapsed time is a fact and is never capped. `scope` carries this wording in every
+  payload; if you quote `realized_usd`, quote `scope` with it.
 
   `lab wait` / `mcp__lab__wait` (v0.12.0) accept a **scheduler-launched (deferred)** job id,
   which they used to reject with exit 2 — a loosening, not a change: every id that worked before
@@ -75,12 +93,20 @@ upgrade note.
   `--interval`, since the mirror cannot refresh faster than the scheduler's tick.
 
   `lab queue list` (v0.12.0) gained an additive `scheduler_skew` block (`verdict`, `host_version`,
-  `client_version`), and the scheduler's heartbeat now carries its own `lab_version`. The verdict
-  is one of `same` / `host_older` / `host_newer` / `unknown`, and the set may grow — treat an
-  unrecognised value as `unknown`. `host_older` and `unknown` also warn on **stderr**: an older
+  `client_version`, `detail`), and the scheduler's heartbeat now carries its own `lab_version`. The
+  verdict is one of `same` / `host_older` / `host_newer` / `unknown` / `no_heartbeat`, and the set
+  may grow — treat an unrecognised value as `unknown`. `host_older` and `unknown` also warn on
+  **stderr**: an older
   host deserialises registrations with *its* models and silently drops fields it does not know,
   which is how `--price-cap` was once lost on the deferred path. It is a diagnostic, never a gate;
   nothing refuses to register because of it.
+
+  `no_heartbeat` means the queue holds **no heartbeat object at all** — no tick has ever completed
+  against it — and is deliberately **silent**: with nothing published there is no host to call
+  old, and the absence is already reported as `heartbeat_age_s: null`. It replaces the `unknown` a
+  heartbeat-less queue used to report *together with* a stderr warning claiming the host predated
+  the `lab_version` field; a queue whose heartbeat exists but carries no version still reports
+  `unknown` and still warns, which is the case that is genuinely evidence of an old host.
 
   **Durations are a loosening, not a change** (v0.12.0): everywhere `--timeout`-style durations are
   accepted, a compound form (`3h30m`, `1d2h`) now parses alongside the existing `2h` / `30m` /

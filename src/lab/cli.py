@@ -1084,8 +1084,10 @@ def list_jobs(
         None, "--spend-alert", metavar="USD",
         help="warn on stderr when this project's realized spend has reached USD. Derived from "
         "the job manifests on every read (no meter): landed jobs at their actual cost, running "
-        "jobs at rate x elapsed-so-far. Jobs whose rate was never readable are named in "
-        "spend.unknown_cost_jobs, never counted as $0.",
+        "jobs at rate x elapsed-so-far bounded by their own --timeout (24h if unset), so a "
+        "manifest abandoned at running by a dead supervisor cannot inflate the total — those are "
+        "named in spend.unsupervised_suspect_jobs. Jobs whose rate was never readable are named "
+        "in spend.unknown_cost_jobs, never counted as $0.",
     ),
 ) -> None:
     """List jobs, with this project's realized spend so far (FR-H1, FR-I2)."""
@@ -1719,6 +1721,11 @@ def queue_list() -> None:
     # ITS pydantic models, so an older host drops fields it doesn't know — that is how
     # `--price-cap` was quietly lost on the deferred path, and it was then misdiagnosed as
     # `lab register` not having the flag. Diagnostic only: never a gate, never a refusal.
+    #
+    # `may_drop_fields` is False when there is no heartbeat at all: warning about an old host on a
+    # queue no scheduler has ever ticked against asserts a fact nobody has evidence for, and a
+    # diagnostic that is usually wrong is ignored when it is finally right (R10). The verdict and
+    # its `detail` still ride in the payload, next to `heartbeat_age_s: null`.
     skew = skew_from_heartbeat(hb)
     if skew.may_drop_fields:
         typer.echo(f"[lab] warning: {skew.detail}", err=True)
@@ -1728,6 +1735,7 @@ def queue_list() -> None:
                 "verdict": skew.verdict,
                 "host_version": skew.host_version,
                 "client_version": skew.client_version,
+                "detail": skew.detail,
             },
             "heartbeat_age_s": _heartbeat_age_s(hb),
             "host": (hb or {}).get("host"),

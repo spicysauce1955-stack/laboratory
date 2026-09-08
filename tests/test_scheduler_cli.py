@@ -167,6 +167,27 @@ def test_queue_list_warns_when_the_scheduler_host_is_older(tmp_path: Path):
     assert res.stderr.strip()
 
 
+def test_queue_list_does_not_invent_an_old_host_when_no_scheduler_ever_ticked(tmp_path: Path):
+    """With no heartbeat object at all there is no host to be old — a project that never deployed
+    a scheduler, or a brand-new queue. Warning about "a lab older than this client's" there is a
+    claim with no evidence behind it, and it trains the reader to skip the one diagnostic that is
+    supposed to make a real skew believable (R10). `heartbeat_age_s: null` already says it."""
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, repo)
+    _register(tmp_path, repo)  # a real entry, so the listing is not trivially empty
+
+    res = runner.invoke(app, ["queue", "list"], env=env)
+
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.stdout)
+    assert payload["scheduler_skew"]["verdict"] == "no_heartbeat"
+    assert payload["heartbeat_age_s"] is None
+    # Asserted against the skew warning's own remedy line: this harness always emits an unrelated
+    # LAB_REPO_DIR warning on stderr.
+    assert "deploy/scheduler/deploy.sh" not in res.stderr
+    assert "older" not in res.stderr
+
+
 def test_queue_list_is_quiet_when_the_host_matches(tmp_path: Path):
     from lab import __version__
 

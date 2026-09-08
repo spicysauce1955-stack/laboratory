@@ -56,6 +56,7 @@ def _remote(
     ended_at: datetime | None = None,
     price_cap_strict: bool = False,
     max_hourly_usd: float | None = None,
+    timeout: str | None = None,
 ) -> JobManifest:
     """A skypilot job manifest, in whatever lifecycle shape the test needs."""
     m = make_manifest(job_id, "python x.py")
@@ -67,6 +68,7 @@ def _remote(
                     "cloud": "vast",
                     "price_cap_strict": price_cap_strict,
                     "max_hourly_usd": max_hourly_usd,
+                    "timeout": timeout,
                 }
             ),
             "status": status,
@@ -505,6 +507,196 @@ class TestRealizedSpend:
         assert "runs/" in low and "unknown_cost_jobs" in low and "still-running" in low
 
 
+def test_estimated_running_usd_is_bounded_the_same_way_realized_spend_is() -> None:
+    """`lab status`'s own live estimate had the same unbounded shape `realized_spend` just fixed.
+
+    A dead supervisor leaves a manifest at `running` forever, so an unbounded estimate keeps
+    climbing over money nobody spent — on the single-job surface an operator reads most often.
+    """
+    from lab.core import _estimated_running_usd
+    from lab.pricing import live_ceiling_s
+
+    m = _remote(
+        "stale",
+        status=JobState.running,
+        timeout="2h",
+        cost=CostInfo(hourly_usd=0.40),
+        started_at=now() - timedelta(days=7),
+    )
+
+    est = _estimated_running_usd(m, "running")
+
+    assert est is not None
+    assert est == pytest.approx(0.40 * live_ceiling_s(m) / 3600.0, rel=1e-3)
+    assert est < 1.5  # unbounded, a week at $0.40/hr reads ~$67
+
+
+class TestALiveJobsContributionIsBounded:
+    """A `running` manifest is not evidence that a machine is running.
+
+    ~40% of the DigitalOcean supervisors in the 2026-08 campaign died silently, leaving the
+    manifest at `running` forever — `reconcile`'s `unsupervised` category exists for exactly that
+    shape. Charging such a job `rate x (now - started_at)` with no ceiling adds money nobody spent,
+    grows on every read, and fires `--spend-alert` on a phantom; by this project's own R10 rule an
+    alarm that is usually wrong gets ignored, which is the outcome the feature exists to prevent.
+    """
+
+    def test_a_week_old_stale_running_job_does_not_inflate_the_total(self) -> None:
+        at = now()
+        m = _remote(
+            "stale",
+            status=JobState.running,
+            timeout="2h",
+            cost=CostInfo(hourly_usd=0.40),
+            started_at=at - timedelta(days=7),
+        )
+
+        summary = realized_spend([m], at=at)
+
+        # Unbounded, this reads ~$67. The box kills itself at its own 2h cap (GNU timeout +
+        # poweroff), so no honest reading of this manifest bills more than that cap plus the
+        # provisioning/teardown slack `started_at` also charges.
+        assert summary["realized_usd"] < 1.5, summary
+        assert summary["realized_usd"] >= 0.40 * 2  # the cap itself is still counted
+
+    def test_the_phantom_stops_growing_on_every_read(self) -> None:
+        at = now()
+        m = _remote(
+            "stale",
+            status=JobState.running,
+            timeout="2h",
+            cost=CostInfo(hourly_usd=0.40),
+            started_at=at - timedelta(days=7),
+        )
+
+        first = realized_spend([m], at=at)["realized_usd"]
+        later = realized_spend([m], at=at + timedelta(days=1))["realized_usd"]
+
+        assert later == first
+
+    def test_the_alert_does_not_fire_on_a_phantom(self) -> None:
+        """The whole point: $45 must mean $45 of real money."""
+        at = now()
+        m = _remote(
+            "stale",
+            status=JobState.running,
+            timeout="2h",
+            cost=CostInfo(hourly_usd=0.40),
+            started_at=at - timedelta(days=7),
+        )
+
+        summary = realized_spend([m], at=at)
+
+        assert spend_alert(summary, threshold_usd=45.0) is None
+
+    def test_a_genuinely_running_job_inside_its_cap_still_counts_and_still_moves(self) -> None:
+        at = now()
+        m = _remote(
+            "live",
+            status=JobState.running,
+            timeout="4h",
+            cost=CostInfo(hourly_usd=2.0),
+            started_at=at - timedelta(minutes=30),
+        )
+
+        summary = realized_spend([m], at=at)
+
+        assert summary["realized_usd"] == pytest.approx(1.0, abs=1e-3)
+        assert summary["running_jobs"] == ["live"]
+        assert summary["unsupervised_suspect_jobs"] == []  # nothing suspicious about it yet
+        # and it is still a *live* witness: the number moves between reads.
+        later = realized_spend([m], at=at + timedelta(minutes=30))
+        assert later["realized_usd"] == pytest.approx(2.0, abs=1e-3)
+
+    def test_a_job_past_its_own_cap_is_surfaced_as_a_probable_dead_supervisor(self) -> None:
+        """Capping quietly would hide the far more interesting fact: a job that outlived its own
+        wall-clock cap and is still `running` almost certainly has no supervisor left."""
+        at = now()
+        m = _remote(
+            "orphan",
+            status=JobState.running,
+            timeout="2h",
+            cost=CostInfo(hourly_usd=0.40),
+            started_at=at - timedelta(days=7),
+        )
+
+        summary = realized_spend([m], at=at)
+
+        assert summary["unsupervised_suspect_jobs"] == ["orphan"]
+        assert summary["running_jobs"] == ["orphan"]  # still counted, just no longer growing
+
+    def test_a_job_with_no_timeout_is_bounded_by_the_documented_horizon(self) -> None:
+        """"No timeout" is not "bill forever": there is no self-enforced ceiling, so the module
+        applies its own explicit one and says so, rather than being silently unbounded."""
+        at = now()
+        m = _remote(
+            "uncapped",
+            status=JobState.running,
+            timeout=None,
+            cost=CostInfo(hourly_usd=1.0),
+            started_at=at - timedelta(days=30),
+        )
+
+        summary = realized_spend([m], at=at)
+
+        assert summary["realized_usd"] == pytest.approx(24.0, abs=1e-3)  # 24 h x $1.00
+        assert summary["unsupervised_suspect_jobs"] == ["uncapped"]
+
+    def test_an_unparseable_timeout_never_raises_out_of_a_listing(self) -> None:
+        """Manifests are on-disk history: a legacy or hand-edited `timeout` must degrade to the
+        horizon, not blow up `lab list`."""
+        at = now()
+        m = _remote(
+            "junk",
+            status=JobState.running,
+            timeout="banana",
+            cost=CostInfo(hourly_usd=1.0),
+            started_at=at - timedelta(days=30),
+        )
+
+        summary = realized_spend([m], at=at)
+
+        assert summary["realized_usd"] == pytest.approx(24.0, abs=1e-3)
+
+    def test_a_clock_that_runs_backwards_never_bills_negative(self) -> None:
+        at = now()
+        m = _remote(
+            "skewed",
+            status=JobState.running,
+            timeout="2h",
+            cost=CostInfo(hourly_usd=1.0),
+            started_at=at + timedelta(hours=1),
+        )
+
+        assert realized_spend([m], at=at)["realized_usd"] == 0.0
+
+    def test_a_landed_job_is_never_capped(self) -> None:
+        """The bound is about *live* arithmetic. A terminal job's elapsed time is a recorded fact,
+        even when it overran (a wall-clock cap has been mis-anchored before: a 7h cap allowed
+        703min), and the recorded fact wins."""
+        at = now()
+        m = _remote(
+            "over",
+            status=JobState.succeeded,
+            timeout="2h",
+            cost=CostInfo(hourly_usd=1.0),
+            started_at=at - timedelta(hours=11, minutes=43),
+            ended_at=at,
+        )
+
+        summary = realized_spend([m], at=at)
+
+        assert summary["realized_usd"] == pytest.approx(11.72, abs=1e-2)
+        assert summary["unsupervised_suspect_jobs"] == []
+
+    def test_the_scope_states_the_bound_and_its_direction(self) -> None:
+        summary = realized_spend([], at=now())
+
+        low = summary["scope"].lower()
+        assert "unsupervised_suspect_jobs" in low
+        assert "timeout" in low or "cap" in low
+
+
 class TestTheSpendAlert:
     def test_it_fires_the_moment_the_threshold_is_crossed(self) -> None:
         summary = realized_spend(
@@ -545,6 +737,41 @@ class TestTheSpendAlert:
         assert "2" in msg and "not" in msg.lower()  # the unknowns are outside the total
         assert "lab ps" in msg or "lab list" in msg  # an alarm with no action is noise
 
+    def test_the_message_points_a_capped_out_job_at_reconcile(self) -> None:
+        """A job that stopped accruing because it passed its own cap is the tool's strongest
+        cheap hint of a dead supervisor, and `reconcile` is where that gets confirmed."""
+        msg = spend_alert_message(
+            realized_usd=47.30,
+            threshold_usd=45.0,
+            running_usd=1.20,
+            running_jobs=1,
+            unknown_jobs=0,
+            unsupervised_suspects=1,
+        )
+
+        assert "reconcile" in msg
+        assert "unknown_cost_jobs" not in msg  # there were none; don't invent an unknowns clause
+
+    def test_the_alert_carries_the_suspects_from_the_summary(self) -> None:
+        at = now()
+        summary = realized_spend(
+            [
+                _remote("a", status=JobState.succeeded, cost=CostInfo(actual_usd=47.30)),
+                _remote(
+                    "orphan",
+                    status=JobState.running,
+                    timeout="2h",
+                    cost=CostInfo(hourly_usd=0.40),
+                    started_at=at - timedelta(days=7),
+                ),
+            ],
+            at=at,
+        )
+
+        alert = spend_alert(summary, threshold_usd=45.0)
+
+        assert alert is not None and "reconcile" in alert["message"]
+
 
 # ---------------------------------------------------------------------------------------------
 # The shells
@@ -572,6 +799,32 @@ class TestLabListShowsRunningSpend:
         payload = json.loads(result.stdout)
         assert payload["spend"]["realized_usd"] == 12.5
         assert payload["jobs"][0]["job_id"] == "a"  # the existing shape is untouched
+
+    def test_a_stale_running_job_neither_inflates_the_listing_nor_raises_the_alarm(
+        self, tmp_path
+    ) -> None:
+        """End to end on the surface an operator actually reads: the abandoned-manifest shape
+        (~40% of the 2026-08 DO supervisors) must not manufacture a $45 crossing."""
+        lab = _seed_project(
+            tmp_path,
+            _remote(
+                "stale",
+                status=JobState.running,
+                timeout="2h",
+                cost=CostInfo(hourly_usd=0.40),
+                started_at=now() - timedelta(days=7),
+            ),
+        )
+
+        with patch.object(cli_mod, "_lab", return_value=lab):
+            result = runner.invoke(app, ["list", "--spend-alert", "45"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["spend"]["realized_usd"] < 1.5
+        assert payload["spend"]["unsupervised_suspect_jobs"] == ["stale"]
+        assert payload["spend"]["alert"] is None
+        assert "SPEND ALERT" not in result.stderr
 
     def test_crossing_the_threshold_warns_on_stderr(self, tmp_path) -> None:
         lab = _seed_project(

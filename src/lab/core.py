@@ -2346,6 +2346,23 @@ def job_age_s(m: JobManifest, state: str) -> float | None:
     return None if seconds is None else round(seconds, 3)
 
 
+def _estimated_running_usd(m: JobManifest, state: str) -> float | None:
+    """Burn-so-far for a live job (field-report #7): a derived estimate, never a meter.
+
+    Bounded by the same ceiling :func:`pricing.realized_spend` uses, for the same reason. Roughly
+    40% of DigitalOcean supervisors die silently, leaving a manifest at ``running`` forever; an
+    unbounded estimate then climbs on every read over money nobody spent, which is precisely the
+    wrong-most-of-the-time alarm this codebase keeps having to undo (R10). The box enforces its own
+    ``--timeout``, so a job cannot bill past it and stay honest.
+    """
+    if state != "running" or m.cost is None or m.started_at is None:
+        return None
+    elapsed = duration_seconds(m.started_at, now())
+    if elapsed is None:
+        return None
+    return actual_cost(m.cost.hourly_usd, min(elapsed, pricing.live_ceiling_s(m)))
+
+
 def _status_fields(
     m: JobManifest,
     *,
@@ -2366,12 +2383,12 @@ def _status_fields(
         "exit_code": m.exit_code,
         "end_reason": m.end_reason,
         "cost": m.cost.model_dump() if m.cost else None,
-        # Burn-rate visibility mid-run (field-report #7): a derived estimate, not a meter.
-        "estimated_running_usd": (
-            actual_cost(m.cost.hourly_usd, duration_seconds(m.started_at, now()))
-            if state == "running" and m.cost is not None and m.started_at is not None
-            else None
-        ),
+        # Burn-rate visibility mid-run (field-report #7): a derived estimate, not a meter. Bounded
+        # by the same ceiling `pricing.realized_spend` uses, and for the same reason: ~40% of DO
+        # supervisors die silently, leaving a manifest at `running` forever, and an unbounded
+        # estimate then climbs on every read over money nobody spent. The box enforces its own
+        # `--timeout`, so a job cannot bill past it and stay honest.
+        "estimated_running_usd": _estimated_running_usd(m, state),
         # Terminal without ever really running (never priced / transient launch error / destroyed
         # over its price cap). A failed launch costs a slot and no money; counting it as an
         # ordinary failure corrupts every success-rate and cost number a campaign computes, which

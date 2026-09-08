@@ -34,7 +34,7 @@ from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
-from lab._util import actual_cost, duration_seconds
+from lab._util import actual_cost, duration_seconds, parse_duration
 from lab.models import JobManifest, JobState
 
 _TERMINAL_STATES = frozenset(
@@ -180,11 +180,46 @@ def is_failed_launch(m: JobManifest) -> bool:
 SPEND_SCOPE = (
     "realized USD across this project's own runs/ only: finished jobs at their recorded "
     "actual_usd (or rate x their own elapsed time when no actual was written), still-running "
-    "jobs at rate x elapsed-so-far, local-backend jobs at zero (own machine). Derived from the "
-    "job manifests on every read — there is no meter. EXCLUDES: jobs whose rate was never "
-    "readable (named in unknown_cost_jobs, never counted as zero), other projects' jobs, and "
-    "scheduler-launched jobs with no local run dir. Not a provider bill."
+    "jobs at rate x elapsed-so-far BOUNDED by their own --timeout (plus 30m of provisioning and "
+    "teardown slack, which started_at also charges) or by a 24h horizon when the job declares no "
+    "timeout, local-backend jobs at zero (own machine). Derived from the job manifests on every "
+    "read — there is no meter. A job that hit that bound is named in unsupervised_suspect_jobs "
+    "and contributes no more, so the total is a LOWER bound for those. EXCLUDES: jobs whose rate "
+    "was never readable (named in unknown_cost_jobs, never counted as zero), other projects' "
+    "jobs, and scheduler-launched jobs with no local run dir. Not a provider bill."
 )
+
+# What a still-`running` manifest is allowed to bill beyond its own declared wall-clock cap.
+# `started_at` is stamped when the supervisor starts, so it charges provisioning and remote setup
+# (per-cloud provision timeouts run to 20m on gcp) while the box-side cap wraps only the
+# entrypoint; teardown then adds a little more. Deliberately generous: a healthy job that trips
+# the "probably orphaned" flag is exactly the wrong-most-of-the-time alarm this codebase keeps
+# having to undo (R10).
+LIVE_CEILING_GRACE_S = 1800.0
+
+# The ceiling for a live job that declares no `--timeout` at all. Nothing on the box stops such a
+# job, so no honest ceiling exists — but "no ceiling" is how a manifest abandoned at `running`
+# adds ~$67 of money nobody spent and climbs on every read. One explicit, documented horizon is
+# the lesser error, and any job that reaches it is named in `unsupervised_suspect_jobs` so the
+# under-report is visible rather than silent.
+UNCAPPED_LIVE_CEILING_S = 24 * 3600.0
+
+
+def live_ceiling_s(m: JobManifest) -> float:
+    """The most wall-clock time a still-`running` manifest may be billed for.
+
+    The job's own ``--timeout`` is the natural ceiling: the instance enforces it on itself (GNU
+    ``timeout`` + a ``poweroff`` backstop, independent of the local supervisor), so a job cannot
+    bill past it and remain honest. Jobs with no timeout fall back to
+    :data:`UNCAPPED_LIVE_CEILING_S`, and so does a timeout string that does not parse — manifests
+    are on-disk history, and a legacy or hand-edited value must degrade, never raise out of a
+    listing.
+    """
+    try:
+        cap = parse_duration(m.resources.timeout)
+    except ValueError:
+        cap = None
+    return UNCAPPED_LIVE_CEILING_S if cap is None else cap + LIVE_CEILING_GRACE_S
 
 
 def realized_spend(manifests: Iterable[JobManifest], *, at: datetime) -> dict[str, Any]:
@@ -200,6 +235,17 @@ def realized_spend(manifests: Iterable[JobManifest], *, at: datetime) -> dict[st
     path, and any supervisor that died between pricing the box and finalizing it) it contributes
     ``hourly_usd x its own`` elapsed time, which stops growing at ``ended_at``.
 
+    **The live term is bounded** (:func:`live_ceiling_s`). A ``running`` manifest is not evidence
+    that a machine is running: roughly 40% of the DigitalOcean supervisors in the 2026-08 campaign
+    died silently, leaving the manifest at ``running`` forever — ``reconcile``'s ``unsupervised``
+    category exists for exactly that shape. Unbounded, a $0.40/hr job abandoned a week ago adds
+    ~$67 that nobody spent, and the figure climbs on every ``lab list`` until ``--spend-alert``
+    fires on a phantom; by this codebase's own R10 rule an alarm that is usually wrong gets
+    ignored, which is the outcome this feature exists to prevent. Every job whose live term hit
+    its ceiling is returned in ``unsupervised_suspect_jobs`` — a *suspicion* derived from
+    arithmetic, deliberately borrowing ``reconcile``'s word rather than inventing a competing one,
+    since ``reconcile`` (which checks the supervisor pid) is where it gets confirmed.
+
     Derived on every read on purpose. This project's cost-safety rule is that a second stateful
     source of truth for money is a bug generator, so there is no counter file to keep in sync:
     the manifests already hold every term.
@@ -213,14 +259,16 @@ def realized_spend(manifests: Iterable[JobManifest], *, at: datetime) -> dict[st
     * a job that started and has no readable rate is **unknown**: named in ``unknown_cost_jobs``
       and left out of the total entirely, never silently added as zero.
 
-    Returns ``{realized_usd, jobs_counted, running_usd, running_jobs, unknown_cost_jobs, scope}``.
-    ``running_usd`` is the still-accruing part of ``realized_usd``, not a separate sum.
+    Returns ``{realized_usd, jobs_counted, running_usd, running_jobs, unknown_cost_jobs,
+    unsupervised_suspect_jobs, scope}``. ``running_usd`` is the still-accruing part of
+    ``realized_usd``, not a separate sum.
     """
     total = 0.0
     running = 0.0
     counted = 0
     running_jobs: list[str] = []
     unknown: list[str] = []
+    suspects: list[str] = []
 
     for m in manifests:
         cost = m.cost
@@ -242,7 +290,20 @@ def realized_spend(manifests: Iterable[JobManifest], *, at: datetime) -> dict[st
             unknown.append(m.job_id)
             continue
         live = m.status not in _TERMINAL_STATES
-        burned = actual_cost(hourly, duration_seconds(m.started_at, at if live else m.ended_at))
+        capped = False
+        if live:
+            ceiling = live_ceiling_s(m)
+            elapsed_so_far = duration_seconds(m.started_at, at) or 0.0
+            capped = elapsed_so_far > ceiling
+            # `max(0, ...)`: a manifest written on a box whose clock ran ahead of this reader's
+            # would otherwise subtract money from the total.
+            seconds: float | None = max(0.0, min(elapsed_so_far, ceiling))
+        else:
+            # A terminal job's elapsed time is a recorded fact, and a recorded fact outranks the
+            # cap it was supposed to obey — a mis-anchored wall-clock cap has already let a 7h
+            # job run 703 minutes, and that money was real.
+            seconds = duration_seconds(m.started_at, m.ended_at)
+        burned = actual_cost(hourly, seconds)
         if burned is None:  # terminal with no ended_at — nothing honest to size it against
             unknown.append(m.job_id)
             continue
@@ -251,6 +312,8 @@ def realized_spend(manifests: Iterable[JobManifest], *, at: datetime) -> dict[st
         if live:
             running += burned
             running_jobs.append(m.job_id)
+            if capped:
+                suspects.append(m.job_id)
 
     return {
         "realized_usd": round(total, 6),
@@ -258,6 +321,7 @@ def realized_spend(manifests: Iterable[JobManifest], *, at: datetime) -> dict[st
         "running_usd": round(running, 6),
         "running_jobs": running_jobs,
         "unknown_cost_jobs": unknown,
+        "unsupervised_suspect_jobs": suspects,
         "scope": SPEND_SCOPE,
     }
 
@@ -280,6 +344,7 @@ def spend_alert(summary: dict[str, Any], *, threshold_usd: float | None) -> dict
             running_usd=float(summary["running_usd"]),
             running_jobs=len(summary["running_jobs"]),
             unknown_jobs=len(summary["unknown_cost_jobs"]),
+            unsupervised_suspects=len(summary.get("unsupervised_suspect_jobs", [])),
         ),
     }
 
@@ -291,6 +356,7 @@ def spend_alert_message(
     running_usd: float,
     running_jobs: int,
     unknown_jobs: int,
+    unsupervised_suspects: int = 0,
 ) -> str:
     """The operator-facing line for a crossed spend threshold.
 
@@ -310,6 +376,14 @@ def spend_alert_message(
         parts.append(
             f"{unknown_jobs} job(s) have no readable rate and are NOT in this total "
             f"(unknown_cost_jobs)."
+        )
+    if unsupervised_suspects:
+        # The cheap hint that a box may still be billing with nobody watching it: a job cannot
+        # outlive its own wall-clock cap and still be `running` unless its supervisor is gone.
+        parts.append(
+            f"{unsupervised_suspects} job(s) are still marked running past their own wall-clock "
+            f"cap and stopped accruing here (unsupervised_suspect_jobs) — that usually means a "
+            f"dead supervisor, so the real total may be higher: `lab reconcile` to confirm."
         )
     parts.append("`lab ps` for what is still billing; `lab list` for the breakdown.")
     return " ".join(parts)

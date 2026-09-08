@@ -102,9 +102,26 @@ class TestFromHeartbeat:
         assert s.host_version == "unknown"
         assert "could not compare" in s.detail
 
-    def test_no_heartbeat_at_all(self):
+    def test_no_heartbeat_at_all_claims_nothing_about_a_host(self):
+        """No heartbeat is not a heartbeat that predates the version field.
+
+        A project that never deployed a scheduler, or a queue no tick has ever completed against,
+        has no host to be old — asserting "it is running a lab older than yours, redeploy it" there
+        is simply false, and a diagnostic that is usually wrong is the one nobody believes when it
+        is finally right (R10).
+        """
         s = skew_from_heartbeat(None, "0.11.0")
-        assert s.verdict == "unknown" and s.host_version is None
+
+        assert s.verdict == "no_heartbeat"
+        assert s.host_version is None
+        assert s.may_drop_fields is False  # nothing has deserialised anything: nothing was dropped
+        assert "older" not in s.detail and "deploy/scheduler/deploy.sh" not in s.detail
+        assert "heartbeat" in s.detail
+
+    def test_an_empty_heartbeat_object_is_still_a_host_that_wrote_one(self):
+        # Something ticked and published no version -- that IS the old-host evidence.
+        s = skew_from_heartbeat({}, "0.11.0")
+        assert s.verdict == "unknown" and s.may_drop_fields is True
 
     def test_a_heartbeat_that_is_not_a_mapping_never_raises(self):
         # heartbeat.json is external JSON; a truncated or hand-edited one can be anything.

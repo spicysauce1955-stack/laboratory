@@ -24,6 +24,13 @@ problem, and **"cannot tell" is its own answer** — a heartbeat with no version
 mystery, it is a host that predates the field, which is itself evidence of "older". Collapsing
 that into "fine" is the exact silence this module exists to end.
 
+A fourth answer is **"there is no heartbeat"**, and it is not the same as any of them. A queue no
+tick has ever completed against — a project that never deployed a scheduler, a queue whose
+heartbeat object does not exist yet — has no host to be old, and telling its owner that "this host
+predates the release that added lab_version, redeploy it" is a fact nobody has evidence for. This
+is the diagnostic that has to be believable when a real skew shows up, so it says only what it
+knows: the absence itself, which ``lab queue list`` already reports as ``heartbeat_age_s: null``.
+
 Pure and dependency-free (the model here is :mod:`lab.pricing`): no cloud, no ``sky``, no I/O.
 Reading the heartbeat and printing the warning stay with their existing owners.
 """
@@ -56,7 +63,15 @@ which is a fabricated verdict from a version string that means "I don't know min
 unparseable instead.
 """
 
-Verdict = Literal["same", "host_older", "host_newer", "unknown"]
+Verdict = Literal["same", "host_older", "host_newer", "unknown", "no_heartbeat"]
+
+NO_HEARTBEAT_DETAIL = (
+    "no scheduler heartbeat in this queue, so there is no host version to compare — no tick has "
+    "ever completed against it (a queue that predates its scheduler, or a project that never "
+    "deployed one). This says nothing about any host's lab version. If a scheduler is supposed to "
+    "be running here, the missing heartbeat is itself the problem: check the systemd timer on the "
+    "always-on host."
+)
 
 
 @dataclass(frozen=True)
@@ -66,7 +81,8 @@ class SchedulerSkew:
     ``host_version``/``client_version`` are echoed back verbatim (``None`` when absent) so a caller
     can print what it actually compared rather than a re-derived guess; on an ``unknown`` verdict
     they are how you tell the two causes apart — a **missing** field leaves ``host_version`` at
-    ``None``, an **unparseable** one carries the offending string.
+    ``None``, an **unparseable** one carries the offending string. ``no_heartbeat`` is the third,
+    separate case: no host published anything at all, so there is nothing to tell apart.
     """
 
     verdict: Verdict
@@ -78,11 +94,16 @@ class SchedulerSkew:
     def may_drop_fields(self) -> bool:
         """Could this host be silently truncating what this client writes?
 
-        True for ``host_older`` *and* ``unknown`` — i.e. everything that is not provably safe. A
-        heartbeat with no version comes from a host older than the release that added the field, so
-        the absence of evidence is here a weak form of the evidence itself; and an unparseable pair
+        True for ``host_older`` *and* ``unknown`` — i.e. every case where a host really did write a
+        heartbeat and its version could not be excluded from the dangerous direction. A heartbeat
+        with no version comes from a host older than the release that added the field, so the
+        absence of evidence is there a weak form of the evidence itself; and an unparseable pair
         leaves the dangerous direction un-excluded. The cost of being wrong is asymmetric: a
         needless line on stderr against a silently dropped ``--price-cap`` that nobody can see.
+
+        False for ``no_heartbeat``: with no heartbeat at all, no host has deserialised anything, so
+        nothing can have been dropped. That asymmetry is the point — the warning is only worth
+        printing while it is about something real (R10).
         """
         return self.verdict in ("host_older", "unknown")
 
@@ -136,14 +157,18 @@ def skew_from_heartbeat(
 ) -> SchedulerSkew:
     """:func:`classify_skew` against a heartbeat dict, defaulting the client to this process's lab.
 
-    A missing heartbeat, a heartbeat that is not a mapping (the file is external JSON and a
-    truncated or hand-edited one can be anything), a missing field or a null field all mean the
-    same thing to a caller: the host's version could not be read.
+    Two outcomes, not one. **No heartbeat** (``None``) is ``no_heartbeat``: nothing was published,
+    so nothing is known about any host and nothing is claimed about one. A heartbeat that *exists*
+    but cannot be read for a version — not a mapping (the file is external JSON and a truncated or
+    hand-edited one can be anything), missing the field, or carrying null — is ``unknown``: a host
+    did write it, and the version it did not publish is evidence in the dangerous direction.
     """
     if client_version is None:
         from lab import __version__
 
         client_version = __version__
+    if heartbeat is None:
+        return SchedulerSkew("no_heartbeat", None, client_version, NO_HEARTBEAT_DETAIL)
     raw = heartbeat.get(HEARTBEAT_VERSION_KEY) if isinstance(heartbeat, Mapping) else None
     return classify_skew(None if raw is None else str(raw), client_version)
 
