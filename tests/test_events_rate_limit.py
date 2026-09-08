@@ -303,7 +303,17 @@ def test_concurrent_pollers_write_exactly_one_pair(tmp_path: Path) -> None:
     import sys
 
     events_dir = tmp_path / "concurrent-events"
-    env = {**os.environ, "LAB_EVENTS_DIR": str(events_dir)}
+    # The window is pinned long instead of left at its 60s default. What this test is about is
+    # that the check-and-stamp is atomic *across processes*; at the default it also silently
+    # depended on 16 Python interpreter startups all landing inside 60s of wall clock, so on a
+    # loaded machine the late ones claimed a fresh window and legitimately wrote a second pair —
+    # a red suite reporting a race that had not happened. Real-clock coupling has bitten this
+    # repo's tests before; the assertion below is only meaningful while the window cannot expire.
+    env = {
+        **os.environ,
+        "LAB_EVENTS_DIR": str(events_dir),
+        "LAB_EVENTS_READ_MIN_INTERVAL_S": "3600",
+    }
     procs = [subprocess.Popen([sys.executable, "-c", POLLER], env=env) for _ in range(16)]
     for p in procs:
         assert p.wait() == 0
