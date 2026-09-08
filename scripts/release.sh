@@ -40,6 +40,10 @@ uv run pytest -m packaging -q
 
 say "version bump"
 run uv version "$BARE"
+# The scaffolded skill declares its own version in frontmatter, and it is what a consumer
+# project reads. It drifted two minor versions once (written at v0.9.0, still saying so at
+# v0.12.0) because nothing kept it honest; test_scaffold_skill_version pins the invariant.
+run sed -i -E "s/^(  version: )\"[0-9]+\.[0-9]+\.[0-9]+\"/\\1\"$BARE\"/" src/lab/_scaffold/project/skills/laboratory/SKILL.md
 run uv lock
 if [[ "$DRY_RUN" != "--dry-run" ]]; then
   [[ "$(uv version --short)" == "$BARE" ]] || {
