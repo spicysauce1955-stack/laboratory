@@ -268,6 +268,41 @@ def _lab_for_mirrored(job_id: str) -> Lab:
     return default_lab(home=home, backend=provisioner)
 
 
+def _mirror_knows(job_id: str) -> bool:
+    """Does the scheduler's mirrored queue have a usable manifest for ``job_id``?
+
+    The "is this id real?" half of the mirror fallback, for `wait`'s up-front guard over several
+    ids at once (it cannot use `_read_mirrored_manifest_or_fail`, which exits the process). A
+    mirror that cannot answer — the `_read_mirrored` degradation, or a partial manifest reading
+    as `None` — counts as "does not know", so the id falls through to the same `unknown job
+    id(s)` exit 2 it has always produced rather than being silently accepted and then crashing
+    mid-wait.
+    """
+    try:
+        return _read_mirrored(job_id) is not None
+    except _MirrorReadFailed:
+        return False
+
+
+def _lab_for_wait(job_id: str) -> Lab:
+    """The Lab `wait` polls with: the backend that actually ran ``job_id``, over the **real**
+    local ``runs/`` home even when the job is known only via the scheduler's mirror.
+
+    Deliberately NOT `_lab_for_mirrored`: that seeds the mirrored manifest into a throwaway
+    `JobStore`, which for a one-shot read is exactly right but for a *wait* would be fatal —
+    `Lab._resolve_manifest` tries the local store first, so every later poll would re-read that
+    frozen snapshot instead of the mirror and the wait could never observe the job reach
+    terminal. Nothing is written anywhere here; the mirrored manifest is read only to learn which
+    backend to build, and `runs/<job_id>/` stays absent, which is what keeps `cancel` and
+    reconcile's `unsupervised` pass correctly treating the job as not locally supervised.
+    """
+    try:
+        return _lab_for(job_id)
+    except FileNotFoundError:
+        provisioner = _read_mirrored_manifest_or_fail(job_id).backend.provisioner
+        return default_lab(home=repo_root() / "runs", backend=provisioner)
+
+
 def _lab_for_mirrored_or_fail(job_id: str) -> Lab:
     """`_lab_for_mirrored`, but a job missing from both local runs/ and the mirror is a
     structured error (FR-F3)."""
@@ -1071,6 +1106,12 @@ def wait(
     Run as a Claude Code background task — its completion is the push signal the session acts on,
     so the agent need not poll. Exit codes: 0 clean; 1 gave up on --timeout; 2 bad args;
     3 teardown leaked (a paid machine may still bill); 4 --fail-fast tripped.
+
+    Scheduler-launched (deferred) job ids work too: they have no local runs/ record, so they are
+    read from the scheduler queue's mirrored manifest — the same fallback `lab status` uses — and
+    named in the summary's `mirrored` list, since their state can be one scheduler tick stale. A
+    wait whose every job is mirrored polls no faster than every 30s. Never hand-roll a
+    `lab status` poll loop for one of these.
     """
     try:
         timeout_s = parse_duration(timeout)
@@ -1082,12 +1123,15 @@ def wait(
         _emit({"error": msg})
         _fail(2, msg)
     store = JobStore(repo_root() / "runs")
-    missing = [j for j in ids if not store.manifest_path(j).exists()]
+    # Local runs/ OR the scheduler's mirror (spec §4.3): a scheduler-launched job has no local
+    # record at all, and rejecting its id here is what left a `lab status` poll loop as the only
+    # way to watch a deferred job (98,654 such calls in one five-day campaign).
+    missing = [j for j in ids if not store.manifest_path(j).exists() and not _mirror_knows(j)]
     if missing:  # fail-loud (FR-F3), not a raw traceback
         msg = f"unknown job id(s): {missing}"
         _emit({"error": msg})
         _fail(2, msg)
-    the_lab = _lab_for(ids[0])
+    the_lab = _lab_for_wait(ids[0])
     on_update = (
         (lambda s: atomic_write_text(done_file, json.dumps(s, indent=2, default=str)))
         if done_file is not None
@@ -1618,6 +1662,12 @@ def queue_list() -> None:
     queue = default_queue()
     entries = queue.list_entries()
     hb = queue.read_heartbeat()
+    # Two listings, not two round trips per entry: asking `held()`/`cancel_requested()` per row
+    # cost 163-326 sequential HEADs on the campaign that motivated this (2026-09, ~65s of a ~70s
+    # `queue list`). One snapshot each also means the rows can no longer self-contradict, which
+    # per-entry reads taken 30s apart could.
+    held_ids = queue.held_ids()
+    cancelled_ids = queue.cancel_requested_ids()
     _emit(
         {
             "heartbeat_age_s": _heartbeat_age_s(hb),
@@ -1629,9 +1679,9 @@ def queue_list() -> None:
                 {
                     "reg_id": r.reg_id,
                     "state": "held"
-                    if (r.state is RegState.pending and queue.held(r.reg_id))
+                    if (r.state is RegState.pending and r.reg_id in held_ids)
                     else r.state.value,
-                    "cancel_requested": queue.cancel_requested(r.reg_id),
+                    "cancel_requested": r.reg_id in cancelled_ids,
                     "job_id": r.job_id,
                     "last_skip_reason": r.last_skip_reason,
                     "expires_at": r.guardrails.expires_at,

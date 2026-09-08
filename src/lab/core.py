@@ -72,6 +72,13 @@ _TERMINAL_STATES = frozenset(
     }
 )
 
+# Floor on the poll interval of a wait whose every job is read from the scheduler's mirror
+# (:meth:`Lab._resolve_manifest`). The mirror is only as fresh as the scheduler's tick (60s by
+# default), so polling it faster than this spends one object-store GET per job per poll to learn
+# nothing. Local jobs keep the caller's interval: their manifests are a free filesystem read, and
+# their poll is also what finalizes a dead supervisor (`backend.status`).
+_MIRROR_MIN_INTERVAL_S = 30.0
+
 
 class LabError(RuntimeError):
     """Fail-loud lab error (FR-F3)."""
@@ -1031,6 +1038,62 @@ class Lab:
     def manifest(self, job_id: str) -> JobManifest:
         return self.store.read_manifest(job_id)
 
+    def _resolve_manifest(self, job_id: str, *, refresh: bool = False) -> tuple[JobManifest, bool]:
+        """A job's manifest from the local store, or failing that from the scheduler queue's
+        mirror. Returns ``(manifest, mirrored)``.
+
+        The same fallback :func:`job_status_view` has always given ``lab status`` (spec §4.3),
+        extended to the wait path so it can watch a **scheduler-launched (deferred)** job. Those
+        never get a record in this project's ``runs/`` — the scheduler launches them from its own
+        host and only mirrors their manifests — so ``lab wait`` rejected their ids outright while
+        ``lab status`` on the same id answered fine. That gap is what made a loop around
+        ``lab status`` the only way to watch a deferred job: 98,654 ``lab status`` calls over one
+        five-day campaign, which also blew the event ledger past its size cap.
+
+        ``refresh=True`` additionally asks the backend for the job's live state and re-reads the
+        manifest (the read/status/re-read shape :func:`job_status_view` uses). That call is not a
+        cosmetic freshness detail: ``LocalBackend.status`` / ``SkyPilotBackend.status`` are what
+        notice a supervisor that died without recording a terminal state and *write* the terminal
+        manifest (and, on skypilot, attempt the teardown that never ran). A poll loop reduced to a
+        plain manifest read would leave such a job ``running`` forever and burn every wait's full
+        timeout — ~40% of the DO supervisors in the 2026-08 campaign died silently.
+
+        The local read comes first precisely so a mirrored job can never reach a live backend:
+        this machine is not its supervisor, and acting on a job it never supervised is the
+        cross-machine risk ``cancel`` refuses (SkyPilot client/server skew, ``lab._skycompat``).
+        Ordering it the other way happens to work today only because both backends' ``status``
+        reads the manifest on their first line; that is not something ``Backend`` promises.
+
+        Raises :class:`FileNotFoundError` — the store's own, unchanged — when neither place has
+        the job. ``read_mirrored`` answering ``None`` (a partial/version-skewed mirrored manifest,
+        or a read racing an in-progress write) is "not found" too, never a crash.
+        """
+        try:
+            m = self.manifest(job_id)
+        except FileNotFoundError:
+            from lab.scheduler.queue import default_queue  # local import: avoids a module cycle
+
+            mirrored = default_queue().read_mirrored(job_id)
+            if mirrored is None:
+                raise
+            return mirrored, True
+        if refresh:
+            self.status(job_id)
+            m = self.manifest(job_id)  # re-read: status may have just finalized/torn down the job
+        return m, False
+
+    def _resolve_manifests(self, job_ids: Iterable[str]) -> tuple[list[JobManifest], list[str]]:
+        """:meth:`_resolve_manifest` over several jobs, without refreshing: ``(manifests, ids
+        that were read from the mirror)``."""
+        manifests: list[JobManifest] = []
+        mirrored: list[str] = []
+        for job_id in job_ids:
+            m, from_mirror = self._resolve_manifest(job_id)
+            manifests.append(m)
+            if from_mirror:
+                mirrored.append(job_id)
+        return manifests, mirrored
+
     def list_jobs(self) -> list[JobManifest]:
         return [self.store.read_manifest(j) for j in self.store.list_job_ids()]
 
@@ -1753,7 +1816,14 @@ class Lab:
         """Re-read manifests briefly so a teardown_status that's merely lagging (a job reports
         terminal a tick before its teardown is recorded) settles to its real value before we
         classify clean vs. leaked vs. unconfirmed. Only re-reads while some remote job still
-        shows a null teardown."""
+        shows a null teardown.
+
+        Goes through :meth:`_resolve_manifest`, so a mirror-only job settles too — a plain
+        ``self.manifest`` read raises for one, which would have made this the second place in the
+        wait path that a deferred job could not get through. The short sleep is deliberately NOT
+        subject to ``_MIRROR_MIN_INTERVAL_S``: this is a bounded 3-attempt settle at the very end
+        of a wait, not a poll loop, and stretching it to 30s a go would add half a minute of
+        latency to every remote wait's exit."""
 
         def _unsettled(ms: list[JobManifest]) -> bool:
             return any(
@@ -1767,11 +1837,11 @@ class Lab:
             if not _unsettled(manifests):
                 break
             time.sleep(min(interval, 5.0))
-            manifests = [self.manifest(m.job_id) for m in manifests]
+            manifests = [self._resolve_manifest(m.job_id)[0] for m in manifests]
         return manifests
 
     def _wait_summary_dict(
-        self, manifests: list[JobManifest], *, failed_fast: bool
+        self, manifests: list[JobManifest], *, failed_fast: bool, mirrored: Iterable[str] = ()
     ) -> dict[str, Any]:
         """The FR-C2 verdict as data (one shape for CLI + MCP + done-file snapshots)."""
         all_terminal = all(m.status in _TERMINAL_STATES for m in manifests)
@@ -1803,6 +1873,11 @@ class Lab:
             "all_terminal": all_terminal,
             "failed_fast": failed_fast,
             "pending": pending,  # still running — and, for remote jobs, still billing
+            # Which of these jobs was read from the scheduler's queue mirror rather than this
+            # project's own runs/ (a scheduler-launched job has no local record at all). Named
+            # ids, not a bare flag, so a mixed wait says *which* rows can be a scheduler tick
+            # stale — the same caveat `lab status`'s `mirrored` field carries.
+            "mirrored": list(mirrored),
             "teardown_leaks": teardown_leaks,
             "teardown_unknown": teardown_unknown,
             "teardown_unconfirmed": teardown_unconfirmed,
@@ -1834,19 +1909,26 @@ class Lab:
         must not masquerade as clean — run ``lab reconcile`` to be sure). ``on_update`` receives
         a fresh summary snapshot after each job's terminal transition and once more with the
         final summary — the incremental done-file feed (field-report #3). ``fail_fast`` returns
-        as soon as any job is failed/timed_out; no surviving job is ever cancelled."""
+        as soon as any job is failed/timed_out; no surviving job is ever cancelled.
+
+        Scheduler-launched jobs are resolved from the queue mirror (:meth:`_resolve_manifest`)
+        and named in the summary's ``mirrored`` list."""
 
         def _on_terminal(_m: JobManifest) -> None:
             if on_update is not None:
+                ms, snapshot_mirrored = self._resolve_manifests(job_ids)
                 on_update(
-                    self._wait_summary_dict(
-                        [self.manifest(j) for j in job_ids], failed_fast=False
-                    )
+                    self._wait_summary_dict(ms, failed_fast=False, mirrored=snapshot_mirrored)
                 )
 
+        # Filled by `wait` from the polls it already makes, rather than re-resolved here: an
+        # up-front pass of its own would spend an extra object-store GET per mirrored job (and
+        # this method must not be the place that first learns whether an id exists — `wait`
+        # already raises for an id in neither place).
+        mirrored_seen: set[str] = set()
         manifests = self.wait(
             job_ids, interval=interval, timeout=timeout, fail_fast=fail_fast,
-            on_terminal=_on_terminal,
+            on_terminal=_on_terminal, mirrored_out=mirrored_seen,
         )
         all_terminal = all(m.status in _TERMINAL_STATES for m in manifests)
         failed_fast = fail_fast and not all_terminal and any(
@@ -1856,7 +1938,11 @@ class Lab:
             # Settle on the fail-fast path too: the offender's teardown_status may be merely
             # lagging, and a null must not hide a real leak verdict behind "unconfirmed".
             manifests = self._settle_teardown(manifests, interval=interval)
-        summary = self._wait_summary_dict(manifests, failed_fast=failed_fast)
+        summary = self._wait_summary_dict(
+            manifests,
+            failed_fast=failed_fast,
+            mirrored=[j for j in job_ids if j in mirrored_seen],  # in the caller's id order
+        )
         if on_update is not None:
             try:
                 on_update(summary)
@@ -1872,46 +1958,86 @@ class Lab:
         timeout: float | None = None,
         fail_fast: bool = False,
         on_terminal: Callable[[JobManifest], None] | None = None,
+        mirrored_out: set[str] | None = None,
     ) -> list[JobManifest]:
         """Block until every job reaches a terminal state (or ``timeout``), then return manifests.
 
         Meant to run as a Claude Code background task: its completion is the push signal, so the
-        agent need not poll (FR-G1). Uses cheap status reads (FR-G2); status reads the store, so
-        this works for jobs of any backend.
+        agent need not poll (FR-G1). Uses cheap status reads (FR-G2); one
+        :meth:`_resolve_manifest` per job per poll, which reads the local store for a job this
+        machine supervises and the scheduler's queue mirror for a **scheduler-launched
+        (deferred)** one — so this works for jobs of any backend, launched from anywhere.
 
         ``on_terminal`` fires once per job on its first observed terminal transition (errors are
         logged, never fatal). ``fail_fast`` returns immediately when any job reaches
         ``failed``/``timed_out`` — preempted (retryable) and cancelled (operator-initiated) do
         not trigger it. ``wait`` never mutates jobs: nothing is cancelled on the way out.
+
+        When *every* job resolves from the mirror the poll interval is floored at
+        ``_MIRROR_MIN_INTERVAL_S`` — the mirror cannot be fresher than the scheduler's tick, so
+        polling it faster only spends object-store GETs. A mixed local+mirrored wait keeps the
+        caller's interval.
+
+        ``mirrored_out``, when given, collects the ids that resolved from the mirror. It is an
+        out-parameter rather than part of the return value because the return type is contract
+        (``confirm`` and several callers unpack manifests from it), and because re-deriving the
+        answer afterwards would cost one more object-store GET per mirrored job for something
+        the polls above already know.
         """
         deadline = time.monotonic() + timeout if timeout is not None else None
         pending = list(job_ids)
+        effective_interval = interval
+        cadence_decided = False
         while pending:
             still_pending: list[str] = []
             tripwire = False
+            resolved = from_mirror = 0
             for j in pending:
-                state = self.status(j)
-                if state not in _TERMINAL_STATES:
+                # One resolve per job per poll: `.status` off the manifest this returns is the
+                # same state `self.status(j)` reports (it re-reads after the backend's own
+                # finalizing write), so the extra manifest read the callback used to make is gone.
+                m, mirrored = self._resolve_manifest(j, refresh=True)
+                resolved += 1
+                from_mirror += int(mirrored)
+                if mirrored and mirrored_out is not None:
+                    mirrored_out.add(j)
+                if m.status not in _TERMINAL_STATES:
                     still_pending.append(j)
                     continue
                 if on_terminal is not None:
                     try:
-                        on_terminal(self.manifest(j))
+                        on_terminal(m)
                     except Exception as e:  # noqa: BLE001 — callback must never abort the wait
                         print(f"[lab] wait on_terminal callback failed: {e}")
-                if fail_fast and state in (JobState.failed, JobState.timed_out):
+                if fail_fast and m.status in (JobState.failed, JobState.timed_out):
                     tripwire = True
+            if not cadence_decided:
+                # Decided on the first poll, which sees every id in the wait (`pending` starts as
+                # all of them) — not re-decided later, when a mixed wait's local jobs finishing
+                # first would silently slow the survivors down.
+                cadence_decided = True
+                if resolved and from_mirror == resolved and interval < _MIRROR_MIN_INTERVAL_S:
+                    effective_interval = _MIRROR_MIN_INTERVAL_S
+                    print(
+                        f"[lab] every job in this wait is read from the scheduler's mirror, "
+                        f"which refreshes on the scheduler's tick — polling every "
+                        f"{effective_interval:g}s instead of {interval:g}s. State may be a tick "
+                        f"stale (`mirrored` in the summary names these jobs).",
+                        file=sys.stderr,  # stdout carries only JSON, which callers parse
+                    )
             pending = still_pending
             if tripwire or not pending:
                 break
             if deadline is None:
-                time.sleep(max(0.05, interval))  # guard against a busy-loop on interval<=0
+                # guard against a busy-loop on interval<=0
+                time.sleep(max(0.05, effective_interval))
             else:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break  # timed out before all jobs finished
-                time.sleep(max(0.05, min(interval, remaining)))  # never overrun the deadline
-        return [self.manifest(j) for j in job_ids]
+                # never overrun the deadline
+                time.sleep(max(0.05, min(effective_interval, remaining)))
+        return [self._resolve_manifest(j)[0] for j in job_ids]
 
 
 def build_backend(name: str, *, home: Path, repo: Path) -> Backend:

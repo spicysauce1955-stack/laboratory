@@ -9,6 +9,7 @@ per-project filtering is a read-side concern.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import sys
@@ -104,6 +105,8 @@ def iter_records(paths: Iterable[Path]) -> Iterator[dict[str, Any]]:
 
 
 STAMP = ".pruned"
+READ_STAMP_DIR = ".reads"
+READ_MIN_INTERVAL_S = 60.0
 
 
 def _int_env(name: str, default: int) -> int:
@@ -120,6 +123,84 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+def read_min_interval_s() -> float:
+    """Minimum gap between two *recorded* successes of the same read-only action.
+
+    ``LAB_EVENTS_READ_MIN_INTERVAL_S``, default 60s. Garbage falls back to the default (see
+    ``_float_env``); ``0`` or a negative value disables the limit and records every poll.
+    """
+    return _float_env("LAB_EVENTS_READ_MIN_INTERVAL_S", READ_MIN_INTERVAL_S)
+
+
+def read_stamp_path(action: str, project: str) -> Path:
+    """The per-``(action, project)`` last-recorded-success stamp.
+
+    Kept in a subdirectory so it can never be mistaken for a day file: ``day_files()`` globs
+    ``????-??-??.jsonl`` at the top level, so nothing here enters the byte budget, the age cap or
+    any read. The name is slugified and hash-suffixed — a project directory name is arbitrary
+    text, and two different projects must not collide onto one window.
+    """
+    key = f"{action}\x00{project}"
+    slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in f"{action}-{project}")[:48]
+    digest = hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:8]
+    return events_dir() / READ_STAMP_DIR / f"{slug}-{digest}.stamp"
+
+
+def claim_read_slot(action: str, project: str, *, now: datetime, min_interval_s: float) -> bool:
+    """Claim the right to record one success for ``(action, project)``; ``False`` means skip it.
+
+    The 2026-09 campaign made 98,654 *successful* ``lab status`` calls in five days — a flat
+    1,050/hour of runaway shell loops — and every pair was written, filling the byte cap with
+    records too fresh for the age-gated ``compact()`` to touch. The cheapest fix is to not write
+    the ninety-nine polls that say exactly what the first one said.
+
+    Cost matters more than precision here: this runs in ~100k short-lived processes, so the
+    last-recorded-success time lives in its own tiny stamp file rather than in the day file,
+    which would otherwise have to be read (or rewritten) on every poll.
+
+    Concurrency: the check and the stamp update happen under ``flock`` on the stamp itself, so
+    two simultaneous polls cannot both decide they are the first. The lock is taken
+    non-blocking — another process holding it *is* a concurrent poll of this same action, which
+    is exactly the case to skip, and a poll must never wait on the ledger.
+
+    Every failure mode resolves to ``True`` (record it): a missing, corrupt, or unreadable stamp
+    means "no recent success", and a clock that moved backwards records rather than suppresses.
+    An unrecorded call is invisible forever, so the fallback direction is to keep it.
+    """
+    if not enabled() or min_interval_s <= 0:
+        return True
+    path = read_stamp_path(action, project)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # O_RDWR (not "a+"): O_APPEND would pin every write to end-of-file, and this file is
+        # rewritten in place, not appended to.
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "r+", encoding="utf-8") as f:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return False
+            try:
+                last = None
+                try:
+                    last = float(f.read(64).strip())
+                except (ValueError, OSError) as e:
+                    debug(f"unreadable read-rate stamp {path} (recording): {e}")
+                current = now.timestamp()
+                if last is not None and 0.0 <= current - last < min_interval_s:
+                    return False
+                f.seek(0)
+                f.truncate()
+                f.write(f"{current:.3f}")
+                f.flush()
+                return True
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except OSError as e:
+        debug(f"read-rate stamp failed for {action}: {e}")
+        return True
+
+
 def _rewrite(path: Path, records: list[dict[str, Any]]) -> None:
     """Replace a day file. Caller must hold the lock via lock_path(path).
 
@@ -132,7 +213,13 @@ def _rewrite(path: Path, records: list[dict[str, Any]]) -> None:
     os.replace(tmp, path)
 
 
-def compact(*, now: datetime, success_ttl_days: int) -> None:
+def compact(
+    *,
+    now: datetime,
+    success_ttl_days: int,
+    ignore_ttl: bool = False,
+    exclude_today: bool = False,
+) -> None:
     """Drop successful calls older than the TTL. Failures — and dangling opens, which are
     themselves a finding — stay until the age cap takes them.
 
@@ -143,9 +230,16 @@ def compact(*, now: datetime, success_ttl_days: int) -> None:
     succeeded when day N is compacted on its own — day N has no close to prove it, and day N+1's
     close, read on its own turn, has no matching open in *that* file to pair it with. Read that
     way, a known success becomes a permanent "running-or-died" phantom after the TTL. Computing
-    the set globally first, then filtering each eligible file against it, closes that gap.
+    the set globally first, then filtering each eligible file against it, closes that gap — and
+    it holds for both selections below, since only the *rewritten* set narrows, never the set the
+    ids are read from.
+
+    ``ignore_ttl`` widens the selection to successes of any age and ``exclude_today`` spares the
+    current day file; together they are what ``enforce_caps`` asks for when the ledger is over
+    the byte cap, where the alternative lever is deleting a whole day of forensics.
     """
     cutoff = now - timedelta(days=success_ttl_days)
+    today = day_file(now).name
     paths = day_files()
     old_paths = []
     for path in paths:
@@ -154,7 +248,9 @@ def compact(*, now: datetime, success_ttl_days: int) -> None:
         except ValueError as e:
             debug(f"compaction skipped unparseable day file {path}: {e}")
             continue
-        if stamped < cutoff:
+        if exclude_today and path.name == today:
+            continue
+        if ignore_ttl or stamped < cutoff:
             old_paths.append(path)
     if not old_paths:
         return
@@ -183,9 +279,33 @@ def compact(*, now: datetime, success_ttl_days: int) -> None:
             debug(f"compaction failed for {path}: {e}")
 
 
+def _total_size(paths: Iterable[Path]) -> int:
+    total = 0
+    for p in paths:
+        try:
+            total += p.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
 def enforce_caps(*, now: datetime, max_age_days: int, max_mb: float) -> None:
-    """Delete whole day files past the age cap, then oldest-first until under the byte cap."""
+    """Delete whole day files past the age cap; then, if over the byte cap, compact successes
+    everywhere but today before deleting anything, oldest-first.
+
+    Compacting first is the lesson of the 2026-09 campaign: 98,654 successful ``lab status``
+    calls filled the cap in days, all of them far too fresh for the TTL-gated ``compact()``, so
+    deleting a whole day file was the only lever left — and it took day one of a live campaign,
+    the day of the incident under investigation, while the investigation was running. Successes
+    are the cheap thing to lose (the next poll says the same); a day of failures is not. Under
+    the cap nothing is compacted early, so a fresh success inside its TTL is still readable.
+
+    Today's file is never the sacrifice, by either lever: it is excluded from the compaction (its
+    records are what anyone is about to read) and from the deletion (a single day over the cap
+    overshoots by at most that day, and tomorrow it is compactable like any other).
+    """
     cutoff = now - timedelta(days=max_age_days)
+    today = day_file(now).name
     remaining: list[Path] = []
     for path in day_files():
         try:
@@ -197,21 +317,73 @@ def enforce_caps(*, now: datetime, max_age_days: int, max_mb: float) -> None:
         else:
             remaining.append(path)
     budget = max_mb * 1024 * 1024
-    total = 0
-    for p in remaining:
-        try:
-            total += p.stat().st_size
-        except OSError:
-            continue
+    total = _total_size(remaining)
+    if total > budget:
+        compact(now=now, success_ttl_days=0, ignore_ttl=True, exclude_today=True)
+        remaining = [p for p in remaining if p.exists()]
+        total = _total_size(remaining)
     for path in remaining:  # oldest first
         if total <= budget:
             break
+        if path.name == today:
+            continue
         try:
             size = path.stat().st_size
         except OSError:
             continue
         total -= size
         path.unlink(missing_ok=True)
+
+
+def reap_stale_locks(*, now: datetime, min_age_days: float = 1.0) -> None:
+    """Delete ``.jsonl.lock`` files whose day file is gone and which are themselves a day stale.
+
+    Ten of these were sitting in the real ledger directory, one for the day the byte cap had
+    already deleted: litter that outlives the file it guarded, and a misleading one at that.
+
+    Three conditions make this safe against a process that might be holding a lock right now,
+    and all three are needed:
+
+    * **The day file must be absent.** A lock whose day file exists is live infrastructure — it
+      is the mutual exclusion between ``append()`` and the rewrite in ``compact()``.
+    * **The lock must be older than a day.** ``append()`` creates the lock before the day file,
+      so a brand-new lock with no day file is a writer mid-flight, not litter.
+    * **We must be able to take the lock ourselves**, non-blocking. Anything holding it makes us
+      leave it alone.
+
+    Even so, unlinking a lock is not free of theory: a holder keeps its ``flock`` on the now
+    unnamed inode, while a later process creating the same name gets a *different* inode and a
+    lock that excludes nobody. That is why the flock probe is taken before the unlink — it closes
+    the window down to a writer that has opened the name but not yet flocked it, for a day whose
+    file has been absent for over 24h, and whose worst case is one interleaved line rather than
+    lost data. Deleting nothing at all is the other option, and it is what left the litter.
+    """
+    try:
+        locks = sorted(events_dir().glob("????-??-??.jsonl.lock"))
+    except OSError as e:
+        debug(f"lock listing failed: {e}")
+        return
+    for lock in locks:
+        day = Path(str(lock)[: -len(".lock")])
+        if day.exists():
+            continue
+        try:
+            mtime = datetime.fromtimestamp(lock.stat().st_mtime, tz=timezone.utc)
+            if now - mtime < timedelta(days=min_age_days):
+                continue
+            with lock.open("a", encoding="utf-8") as f:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as e:
+                    debug(f"lock {lock} is held, leaving it: {e}")
+                    continue
+                try:
+                    if not day.exists():  # re-checked under the lock
+                        lock.unlink(missing_ok=True)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception as e:  # noqa: BLE001 — retention is best-effort, always
+            debug(f"reaping {lock} failed: {e}")
 
 
 def maybe_prune(*, now: datetime) -> None:
@@ -231,5 +403,6 @@ def maybe_prune(*, now: datetime) -> None:
             max_age_days=_int_env("LAB_EVENTS_MAX_AGE_DAYS", 90),
             max_mb=_float_env("LAB_EVENTS_MAX_MB", 50),
         )
+        reap_stale_locks(now=now)
     except Exception as e:  # noqa: BLE001
         debug(f"pruning failed: {e}")

@@ -354,7 +354,7 @@ def build_server(lab: Lab) -> FastMCP:
         interval: float = 10,
         fail_fast: bool = False,
     ) -> dict[str, Any]:
-        """Block until the job(s) (or every job in a sweep) reach a terminal state, up to timeout (seconds or '10m'/'2h'), then return the FR-C2 verdict: {all_terminal, failed_fast, pending, teardown_leaks, teardown_unconfirmed, jobs}. fail_fast=True returns as soon as any job is failed/timed_out (failed_fast=true, offender listed first; pending names still-running — and still-billing — jobs; nothing is cancelled). Non-empty teardown_leaks = a paid machine may still be billing — call reconcile. teardown_unconfirmed = teardown never recorded either way; treat as suspect, not clean."""
+        """Block until the job(s) (or every job in a sweep) reach a terminal state, up to timeout (seconds or '10m'/'2h'), then return the FR-C2 verdict: {all_terminal, failed_fast, pending, mirrored, teardown_leaks, teardown_unconfirmed, jobs}. fail_fast=True returns as soon as any job is failed/timed_out (failed_fast=true, offender listed first; pending names still-running — and still-billing — jobs; nothing is cancelled). Non-empty teardown_leaks = a paid machine may still be billing — call reconcile. teardown_unconfirmed = teardown never recorded either way; treat as suspect, not clean. Scheduler-launched (deferred) job ids work here: they are read from the mirrored manifest and listed in `mirrored` (state may be a scheduler tick stale, and such a wait polls no faster than every 30s)."""
         try:
             timeout_s = parse_duration(timeout)
         except ValueError as e:
@@ -362,9 +362,14 @@ def build_server(lab: Lab) -> FastMCP:
         ids = _lab().jobs_in_sweep(sweep) if sweep else list(job_ids or [])
         if not ids:
             raise ToolError("pass job id(s) or sweep=<sweep_id>")
-        for j in ids:
-            _require(j)
-        return _lab_for(ids[0]).wait_summary(
+        # Local runs/ OR the scheduler's mirror: a scheduler-launched (deferred) job has no local
+        # record, and `_require` alone rejected its id outright. Unlike the read-only tools this
+        # deliberately does NOT go through `_lab_for_any`/`_lab_for_mirrored`: their throwaway
+        # JobStore holds a frozen snapshot of the mirrored manifest, which `Lab._resolve_manifest`
+        # (local store first) would then re-read on every poll — a wait that could never see the
+        # job finish. Reading straight from `home` keeps each poll going back to the mirror.
+        manifests = [_manifest_or_mirror(j)[0] for j in ids]  # raises ToolError on an unknown id
+        return default_lab(home=home, backend=manifests[0].backend.provisioner).wait_summary(
             ids, interval=interval, timeout=timeout_s, fail_fast=fail_fast
         )
 
@@ -674,6 +679,8 @@ def build_server(lab: Lab) -> FastMCP:
             from lab._util import now
 
             age = max(0.0, (now() - datetime.fromisoformat(str(hb["at"]))).total_seconds())
+        entries = queue.list_entries()
+        held_ids = queue.held_ids()  # one listing, not a round trip per row (see cli.queue_list)
         return {
             "heartbeat_age_s": age,
             "host": (hb or {}).get("host"),
@@ -683,13 +690,13 @@ def build_server(lab: Lab) -> FastMCP:
             "entries": [
                 {
                     "reg_id": r.reg_id,
-                    "state": "held" if (r.state is RegState.pending and queue.held(r.reg_id))
+                    "state": "held" if (r.state is RegState.pending and r.reg_id in held_ids)
                     else r.state.value,
                     "job_id": r.job_id,
                     "last_skip_reason": r.last_skip_reason,
                     "expires_at": _iso(r.guardrails.expires_at),
                 }
-                for r in queue.list_entries()
+                for r in entries
             ],
         }
 

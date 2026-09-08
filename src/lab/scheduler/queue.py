@@ -37,9 +37,23 @@ class QueueStore(Protocol):
     def write_heartbeat(self, data: dict[str, Any]) -> None: ...
     def request_cancel(self, reg_id: str) -> None: ...
     def cancel_requested(self, reg_id: str) -> bool: ...
+    def cancel_requested_ids(self) -> set[str]:
+        """Every reg_id with a cancel marker, in one listing.
+
+        The bulk form of ``cancel_requested`` — a listing that needs the marker state of every
+        entry (``lab queue list``) must not pay one round trip per entry: 163 registrations cost
+        up to ~326 sequential ``exists()`` calls, which dominated a measured 33.6s median. The
+        single-id predicates stay: one check must not pay for a whole listing.
+        """
+        ...
+
     def hold(self, reg_id: str) -> None: ...
     def release(self, reg_id: str) -> None: ...
     def held(self, reg_id: str) -> bool: ...
+    def held_ids(self) -> set[str]:
+        """Every reg_id with a hold marker, in one listing (see ``cancel_requested_ids``)."""
+        ...
+
     def put_bundle(self, reg_id: str, src: Path) -> str:
         """Store a code bundle; return an opaque key. Pass it unchanged to fetch_bundle
         (its structure differs per store and must not be interpreted by callers)."""
@@ -99,11 +113,29 @@ class LocalQueueStore:
     def _marker(self, kind: str, reg_id: str) -> Path:
         return self.root / kind / reg_id
 
+    def _marker_ids(self, kind: str) -> set[str]:
+        """Every marker id under ``<root>/<kind>/`` — the exact inverse of ``_marker``.
+
+        ``_marker`` writes the bare reg_id as the file name (no suffix), so the id is the file
+        name — with two exclusions, both of which would otherwise invent registrations that don't
+        exist: ``_atomic_write`` writes ``<reg_id>.tmp`` beside the marker before renaming it, so
+        a crash mid-``hold`` leaves one behind; and anything that isn't a regular file (a stray
+        subdirectory) is not a marker. A missing directory means "none held/cancelled", not an
+        error.
+        """
+        d = self.root / kind
+        if not d.is_dir():
+            return set()
+        return {p.name for p in d.iterdir() if p.is_file() and not p.name.endswith(".tmp")}
+
     def request_cancel(self, reg_id: str) -> None:
         self._atomic_write(self._marker("cancelled", reg_id), "")
 
     def cancel_requested(self, reg_id: str) -> bool:
         return self._marker("cancelled", reg_id).exists()
+
+    def cancel_requested_ids(self) -> set[str]:
+        return self._marker_ids("cancelled")
 
     def hold(self, reg_id: str) -> None:
         self._atomic_write(self._marker("held", reg_id), "")
@@ -113,6 +145,9 @@ class LocalQueueStore:
 
     def held(self, reg_id: str) -> bool:
         return self._marker("held", reg_id).exists()
+
+    def held_ids(self) -> set[str]:
+        return self._marker_ids("held")
 
     # -- bundles ----------------------------------------------------------------
     def put_bundle(self, reg_id: str, src: Path) -> str:

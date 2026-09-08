@@ -13,6 +13,24 @@ the call starts, and a `close` line when it ends. A `close` that never arrives �
 killed, the laptop slept mid-`submit`, a provision hung forever — is not lost data, it's the
 finding: `lab history` surfaces it as `running-or-died`.
 
+**Successful polls of a cheap read are rate-limited.** For the read-only actions — `status`,
+`list`, `logs`, `metrics`, `queue list`, `queue show` (and their MCP spellings,
+`queue_list`/`queue_show`) — a *successful* call is recorded only if the last recorded
+success of that same action in that same project is more than **60 seconds** old
+(`LAB_EVENTS_READ_MIN_INTERVAL_S`; `0` disables the limit). A poll that says exactly what the poll
+one second ago said is not a finding, and 98,654 successful `lab status` calls over five days is
+how a runaway shell loop once filled the byte cap and cost the ledger a day of real forensics
+(§5). **Failures are never rate-limited** — an `error`, `usage_error`, `crash` or `interrupted`
+read always writes its full pair, with its `trace`. `history` and `report` are deliberately *not*
+on the list: they are the ledger's own forensic surface, and over those same five days they were
+33 and 5 calls, so there is no volume to win by making an investigation leave no trace of itself.
+
+The cost is paid where you can see it: a rate-limited action's `open` line is buffered in memory
+and written at close time (the decision needs the outcome), so a `lab status` killed with SIGKILL
+leaves no trace at all rather than a `running-or-died` row. Every action that *does* something —
+`submit`, `sweep`, `cancel`, `reconcile`, `scheduler tick` — still writes its `open` the instant
+it starts, so a killed mutating call is still visible as the finding it is.
+
 One exception: `lab mcp` itself is never opened as a call. It's a long-lived server, not a
 one-shot invocation — a client tears it down with SIGTERM or SIGKILL, neither of which the
 process gets a chance to react to, so every session would otherwise leave a permanent dangling
@@ -84,6 +102,11 @@ of `lab` processes at once can't produce a torn or interleaved line. The lock li
 file rather than on the day file itself because `compact()` rewrites that file by replacing it
 (`os.replace`, for an atomic swap) — a lock held on the old inode wouldn't block a writer that
 opens the file fresh afterward, so the lock has to be somewhere whose identity never changes.
+
+Two other things live in the directory, neither of them a ledger file: `.pruned` (the once-per-day
+retention stamp) and `.reads/` (one tiny per-`(action, project)` stamp holding the last recorded
+success of a rate-limited read, §1). Only `YYYY-MM-DD.jsonl` files are ever read, counted against
+the byte cap, or deleted by retention.
 
 ## 3. Reading it
 
@@ -194,12 +217,21 @@ runs:
   findings, not clutter — so they age out only by the next rule.
 - **Whole day files** are deleted once older than **90 days** (`LAB_EVENTS_MAX_AGE_DAYS`),
   regardless of outcome.
-- **Total size** is capped at **50 MB** (`LAB_EVENTS_MAX_MB`), oldest files deleted first once
-  over. In practice the age and success-TTL caps keep the store well under this on any normal
-  workload — the byte cap exists as a runaway alarm (something looping and writing far more than
-  usual), not something you should expect to hit routinely.
+- **Total size** is capped at **50 MB** (`LAB_EVENTS_MAX_MB`). Over the cap, successes are
+  compacted out of **every day file except today's** first — TTL ignored, because over the cap the
+  alternative is worse — and only if that is still not enough are whole day files deleted,
+  oldest first. **Today's file is never deleted for the byte cap**, by either lever.
+- **Stale `.jsonl.lock` files** — a lock whose day file no longer exists, itself more than a day
+  old and held by nobody — are deleted in the same pass.
 
-All three are best-effort: a pruning failure is logged under `LAB_EVENTS_DEBUG=1` (§7) and never
+The compact-before-delete order is not a detail: it is the 2026-09 incident. 98,654 successful
+`lab status` calls at a flat 1,050/hour filled the cap in days, every one of them far too *fresh*
+for the 14-day success TTL to touch, so deleting a whole day file was the only lever the byte cap
+had — and it deleted day one of a live campaign, the day of the incident under investigation,
+while the investigation was running. Successes are the cheap thing to lose; a day of failures is
+not. (The write-path half of that fix is the read-poll rate limit in §1.)
+
+All of it is best-effort: a pruning failure is logged under `LAB_EVENTS_DEBUG=1` (§7) and never
 fails the command that triggered it.
 
 ## 6. Secrets

@@ -138,6 +138,30 @@ def test_mcp_status_reads_mirrored_manifest(tmp_path, monkeypatch):
     assert out["state"] == "running" and out["mirrored"] is True
 
 
+def test_mcp_wait_reads_a_mirrored_manifest(tmp_path: Path, monkeypatch):
+    """`wait` was the last read surface that rejected a scheduler-launched job id outright, which
+    left a `status` poll loop as the only way to watch a deferred job (98,654 such CLI calls in
+    one five-day campaign). It resolves the mirror now — and, unlike metrics/logs/fetch, without
+    an ephemeral JobStore: a frozen snapshot of the mirrored manifest in a local store would make
+    every later poll re-read the snapshot instead of the mirror. See tests/
+    test_wait_mirrored_jobs.py for the core-level cases."""
+    lab, server = _make(tmp_path)
+    m = make_manifest("jmir-wait", "python x.py").model_copy(
+        update={"status": JobState.succeeded, "teardown_status": "succeeded"}
+    )
+    _mirrored_queue(tmp_path, monkeypatch, m)
+
+    async def go():
+        async with Client(server) as c:
+            return (await c.call_tool("wait", {"job_ids": ["jmir-wait"], "timeout": 5})).data
+
+    out = asyncio.run(go())
+    assert out["all_terminal"] is True
+    assert out["mirrored"] == ["jmir-wait"]  # says the state may be a scheduler tick stale
+    assert out["jobs"][0]["state"] == "succeeded"
+    assert not lab.store.manifest_path("jmir-wait").exists()  # never seeded locally
+
+
 def test_mcp_metrics_logs_fetch_read_mirrored_manifest(tmp_path: Path, monkeypatch):
     """A scheduler-launched job (mirrored only, never in this project's local runs/) must be
     observable via metrics/logs/fetch_artifacts too, not just `status` -- the code-review gap

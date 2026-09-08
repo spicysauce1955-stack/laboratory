@@ -58,6 +58,60 @@ def test_markers(tmp_path: Path):
     assert not q.held("reg-a")
 
 
+def test_marker_id_sets_are_the_exact_inverse_of_hold_and_request_cancel(tmp_path: Path):
+    """`lab queue list` asked each entry's marker state one round trip at a time — 163
+    registrations cost up to ~326 sequential `exists()` calls after the listing itself. These
+    return the whole marker set in one directory/prefix listing, so the parse has to be the exact
+    inverse of what `hold`/`request_cancel` write (no suffix, one path segment)."""
+    q = LocalQueueStore(tmp_path)
+    assert q.held_ids() == set()  # no directory yet
+    assert q.cancel_requested_ids() == set()
+
+    q.hold("reg-a")
+    q.hold("reg-b")
+    q.request_cancel("reg-b")
+    q.request_cancel("reg-c")
+
+    assert q.held_ids() == {"reg-a", "reg-b"}
+    assert q.cancel_requested_ids() == {"reg-b", "reg-c"}
+    # agrees with the single-id predicates it replaces, in both directions
+    for reg_id in ("reg-a", "reg-b", "reg-c", "reg-missing"):
+        assert q.held(reg_id) == (reg_id in q.held_ids())
+        assert q.cancel_requested(reg_id) == (reg_id in q.cancel_requested_ids())
+
+    q.release("reg-a")
+    assert q.held_ids() == {"reg-b"}
+
+
+def test_held_ids_ignores_a_write_temporary_and_stray_paths(tmp_path: Path):
+    """`_atomic_write` writes `<reg_id>.tmp` next to the marker before renaming it, so a crash
+    mid-hold leaves one behind; read literally it would invent a held registration called
+    "reg-x.tmp". A stray subdirectory under the marker dir must not crash or count either."""
+    q = LocalQueueStore(tmp_path)
+    q.hold("reg-real")
+    (tmp_path / "held" / "reg-x.tmp").write_text("")
+    (tmp_path / "held" / "stray-dir").mkdir()
+    (tmp_path / "cancelled").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "cancelled" / "reg-y.tmp").write_text("")
+
+    assert q.held_ids() == {"reg-real"}
+    assert q.cancel_requested_ids() == set()
+
+
+def test_marker_id_sets_do_one_directory_listing_not_one_stat_per_id(tmp_path: Path, monkeypatch):
+    """The whole point is the round-trip count: these must never fall back to per-id `held()`
+    checks (which on the R2 store is a HEAD each)."""
+    q = LocalQueueStore(tmp_path)
+    for i in range(20):
+        q.hold(f"reg-{i:02d}")
+
+    def _refuse(self: LocalQueueStore, reg_id: str) -> bool:
+        raise AssertionError("held_ids() must not check ids one at a time")
+
+    monkeypatch.setattr(LocalQueueStore, "held", _refuse)
+    assert len(q.held_ids()) == 20
+
+
 def test_bundle_roundtrip(tmp_path: Path):
     q = LocalQueueStore(tmp_path / "q")
     src = tmp_path / "code.tar.gz"

@@ -357,6 +357,36 @@ def test_queue_list_tool_reports_host(tmp_path: Path, monkeypatch: pytest.Monkey
     assert data["host"] == "lab-scheduler-new"
 
 
+def test_queue_list_tool_reads_holds_in_bulk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The MCP surface must not regress to a marker read per row either (see the CLI twin)."""
+    from lab.scheduler.queue import LocalQueueStore
+
+    monkeypatch.setenv("LAB_QUEUE_DIR", str(tmp_path / "queue"))
+    _, server = _make_with_repo(tmp_path)
+
+    async def register():
+        async with Client(server) as c:
+            return (await c.call_tool(
+                "register",
+                {"command": "python exp.py", "expires": "+1d", "timeout": "1h"},
+            )).data
+
+    reg_id = asyncio.run(register())["reg_id"]
+    LocalQueueStore(tmp_path / "queue").hold(reg_id)
+
+    def _boom(self, reg_id: str) -> bool:
+        raise AssertionError(f"per-entry marker read for {reg_id}")
+
+    monkeypatch.setattr(LocalQueueStore, "held", _boom)
+
+    async def go():
+        async with Client(server) as c:
+            return (await c.call_tool("queue_list", {})).data
+
+    data = asyncio.run(go())
+    assert [r["state"] for r in data["entries"]] == ["held"]
+
+
 def test_queue_list_tool_reports_heartbeat_paused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from lab.scheduler.queue import LocalQueueStore
 

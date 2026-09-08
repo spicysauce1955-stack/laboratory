@@ -23,6 +23,22 @@ from lab.events import store
 from lab.events.sanitize import mask_text, sanitize_params
 
 RING = 200
+
+#: Cheap, read-only commands whose *successes* are rate-limited on the write path (see
+#: ``store.claim_read_slot``). Nothing here provisions, destroys or spends: a poll that says the
+#: same thing the last poll said one second ago is not a record worth keeping, and 98,654 of them
+#: in five days is how the 2026-09 campaign filled the byte cap and cost itself a day of
+#: forensics. Failures are never limited, whatever the action.
+#:
+#: Two spellings of the same read are both real and both handled: the CLI records a group leaf as
+#: ``"queue list"`` (``cli._group_action``) and the MCP tool of the same name as ``"queue_list"``.
+#: ``read_only_key`` normalises them onto the one entry here, so the window is shared across
+#: surfaces rather than each surface getting its own.
+# The reads that get polled in loops. `history`/`report` are deliberately absent: they are the
+# ledger's own forensic surface, and over the 5 days that motivated this limiter they were 33 and
+# 5 calls against 98,654 `status` — no volume to win, and a burst of investigative reads should
+# leave its own trail rather than silently record nothing.
+_READ_ONLY_ACTIONS = frozenset({"status", "list", "logs", "metrics", "queue list", "queue show"})
 _current: ContextVar["Call | None"] = ContextVar("lab_events_current", default=None)
 _seq = 0
 _session: str | None = None
@@ -117,6 +133,11 @@ class Call:
         # two back-to-back `record()` blocks sharing a context) leaves the outer call current
         # again once the inner one closes, instead of wiping it to `None`.
         self._token: "Token[Call | None] | None" = None
+        # A read-only call's `open` record, held here until `finish()` knows the outcome — the
+        # rate-limit decision depends on it. `None` for every mutating action, whose `open` is
+        # written at call start exactly as before.
+        self._deferred_open: dict[str, Any] | None = None
+        self._read_key: tuple[str, str] | None = None
 
     def ref(self, **ids: Any) -> None:
         self._refs.update({k: v for k, v in ids.items() if v is not None})
@@ -129,8 +150,27 @@ def current() -> Call | None:
     return _current.get()
 
 
+def read_only_key(action: str) -> str | None:
+    """The rate-limit key for a cheap read-only action, or ``None`` if it isn't one.
+
+    ``queue_list`` (MCP) and ``queue list`` (CLI) name the same read, so they normalise onto one
+    key. No non-read-only action collides under that normalisation — the allowlist is a closed
+    set (``sweep_status``, say, normalises to ``"sweep status"``, which is not in it).
+    """
+    normalized = action.replace("_", " ")
+    return normalized if normalized in _READ_ONLY_ACTIONS else None
+
+
 def begin(surface: str, action: str, params: Mapping[str, Any]) -> Call:
-    """Open a call: write the open line immediately, so a call that never closes is visible."""
+    """Open a call: write the open line immediately, so a call that never closes is visible.
+
+    "Immediately" still holds for every action that *does* something. A cheap read-only action
+    (``_READ_ONLY_ACTIONS``) buffers its open line in memory instead and writes it in
+    ``finish()``, because whether it is written at all depends on the outcome, which does not
+    exist yet. The trade is deliberate and one-sided: a SIGKILLed ``lab status`` now leaves no
+    trace, while a SIGKILLed ``lab submit`` still leaves the dangling ``open`` that CLAUDE.md and
+    ``compact()`` both treat as a finding in its own right.
+    """
     global _seq, _pruned
     call = Call(_new_id(), now(), _seq)
     _seq += 1
@@ -138,22 +178,56 @@ def begin(surface: str, action: str, params: Mapping[str, Any]) -> Call:
     if not _pruned:
         _pruned = True
         store.maybe_prune(now=now())
-    store.append(
-        {
-            "id": call.id,
-            "ts": call.started.isoformat(),
-            "phase": "open",
-            "session": _session_id(),
-            "seq": call.seq,
-            "surface": surface,
-            "action": action,
-            "params": sanitize_params(params),
-            "project": _project(),
-            "lab_version": __version__,
-        },
-        when=call.started,
-    )
+    project = _project()
+    opened: dict[str, Any] = {
+        "id": call.id,
+        "ts": call.started.isoformat(),
+        "phase": "open",
+        "session": _session_id(),
+        "seq": call.seq,
+        "surface": surface,
+        "action": action,
+        "params": sanitize_params(params),
+        "project": project,
+        "lab_version": __version__,
+    }
+    key = read_only_key(action)
+    if key is None:
+        store.append(opened, when=call.started)
+    else:
+        call._deferred_open = opened
+        name = project.get("name")
+        call._read_key = (key, name if isinstance(name, str) else "-")
     return call
+
+
+def _restore_context(call: Call) -> None:
+    if call._token is not None:
+        try:
+            _current.reset(call._token)
+        except (RuntimeError, ValueError) as e:  # noqa: BLE001 — never fail a command
+            store.debug(f"context reset failed: {e}")
+            _current.set(None)
+    else:
+        _current.set(None)
+
+
+def _skip_as_a_repeat_poll(call: Call, ended: datetime) -> bool:
+    """True when this successful read-only call is a repeat inside the window, so neither of its
+    records is written. Only ever consulted for ``outcome == "ok"``: a failure is never
+    rate-limited, and never stamps the window either — a failure that consumed the window would
+    hide the very next success behind a window that success never opened."""
+    if call._read_key is None:
+        return False
+    action, project = call._read_key
+    try:
+        claimed = store.claim_read_slot(
+            action, project, now=ended, min_interval_s=store.read_min_interval_s()
+        )
+    except Exception as e:  # noqa: BLE001 — a broken limiter must degrade to recording
+        store.debug(f"read-rate check failed for {action}: {e}")
+        return False
+    return not claimed
 
 
 def finish(
@@ -164,6 +238,11 @@ def finish(
     error: dict[str, Any] | None = None,
 ) -> None:
     ended = now()
+    deferred = call._deferred_open
+    call._deferred_open = None
+    if deferred is not None and outcome == "ok" and _skip_as_a_repeat_poll(call, ended):
+        _restore_context(call)
+        return
     record_: dict[str, Any] = {
         "id": call.id,
         "ts": ended.isoformat(),
@@ -177,15 +256,12 @@ def finish(
     }
     if outcome != "ok" and call.notes:
         record_["trace"] = list(call.notes)
+    if deferred is not None:
+        # Written under the *start* day, so a call straddling UTC midnight still lands its open
+        # in day N and its close in day N+1 — the pairing `compact()` is careful to honour.
+        store.append(deferred, when=call.started)
     store.append(record_, when=ended)
-    if call._token is not None:
-        try:
-            _current.reset(call._token)
-        except (RuntimeError, ValueError) as e:  # noqa: BLE001 — never fail a command
-            store.debug(f"context reset failed: {e}")
-            _current.set(None)
-    else:
-        _current.set(None)
+    _restore_context(call)
 
 
 def finish_current(

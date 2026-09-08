@@ -13,11 +13,20 @@ from lab.models import BackendInfo, JobState
 
 
 class _SummaryMixin:
-    """Borrow the real summary/settle logic so the fakes exercise Lab.wait_summary."""
+    """Borrow the real summary/settle logic so the fakes exercise Lab.wait_summary.
+
+    `_resolve_manifest`/`_resolve_manifests` are borrowed too: the whole wait path reads
+    manifests through them (local store first, scheduler mirror second — see
+    tests/test_wait_mirrored_jobs.py). The real ones are defined in terms of `self.status` /
+    `self.manifest`, which every fake below already provides, and the mirror branch only runs on
+    a FileNotFoundError these fakes never raise.
+    """
 
     wait_summary = Lab.wait_summary
     _wait_summary_dict = Lab._wait_summary_dict
     _settle_teardown = Lab._settle_teardown
+    _resolve_manifest = Lab._resolve_manifest
+    _resolve_manifests = Lab._resolve_manifests
 
 
 def _patch_store(monkeypatch, tmp_path, fake_lab):

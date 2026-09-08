@@ -3,6 +3,8 @@ failures once the anchor ages — the scheduler watchdog already taught us that.
 
 from __future__ import annotations
 
+import fcntl
+import os
 import threading
 from collections.abc import Iterable, Iterator
 from datetime import datetime, timedelta, timezone
@@ -234,6 +236,204 @@ def test_lock_files_excluded_from_byte_budget(_events_dir: Path) -> None:
     # Glob exclusion is proven by prior test; this verifies the pattern holds
     assert all(p.name.endswith(".jsonl") for p in day_files)
     assert not any(p.name.endswith(".lock") for p in day_files)
+
+
+PAD = "p" * 2000
+
+
+def _successes(day_tag: str, count: int) -> list[dict]:
+    """`count` complete successful calls, padded so a day of them is worth real bytes."""
+    out: list[dict] = []
+    for i in range(count):
+        id_ = f"poll-{day_tag}-{i}"
+        out.append({"id": id_, "phase": "open", "action": "status", "pad": PAD})
+        out.append({"id": id_, "phase": "close", "outcome": "ok"})
+    return out
+
+
+def _ids() -> set[str]:
+    return {r["id"] for r in store.iter_records(store.day_files())}
+
+
+def _stems() -> set[str]:
+    return {p.stem for p in store.day_files()}
+
+
+def test_over_cap_compacts_non_today_successes_instead_of_deleting_day_one(
+    _events_dir: Path,
+) -> None:
+    """The 2026-09 incident, reproduced: five campaign days of successful `lab status` polls
+    (98,654 of them in reality, at a flat 1,050/hour) plus today's, over the byte cap. Every
+    success is *fresh*, so the age-gated `compact()` could not touch one of them and the byte
+    cap's only lever was deleting a whole day file — it deleted day one of the campaign, the day
+    of the incident under investigation, mid-investigation.
+
+    Over the cap, successes are droppable regardless of age: compact first, delete only if that
+    was not enough. Day one keeps its failure record, and today's file is never the sacrifice.
+    """
+    for age in (5, 4, 3, 2, 1, 0):
+        _write(NOW - timedelta(days=age), *_successes(f"d{age}", 100))
+    _write(NOW - timedelta(days=5), *_pair("incident", "error"))
+
+    store.enforce_caps(now=NOW, max_age_days=90, max_mb=0.5)
+
+    day_one = (NOW - timedelta(days=5)).strftime("%Y-%m-%d")
+    assert day_one in _stems(), "day one of the campaign was deleted to satisfy the byte cap"
+    assert NOW.strftime("%Y-%m-%d") in _stems(), "today's file was sacrificed to the byte cap"
+    ids = _ids()
+    assert "incident" in ids, "the failure under investigation was dropped"
+    assert not any(i.startswith("poll-d5-") for i in ids), "non-today successes were not compacted"
+    assert any(i.startswith("poll-d0-") for i in ids), "today's records must be left alone"
+    total = sum(p.stat().st_size for p in store.day_files())
+    assert total <= 0.5 * 1024 * 1024
+
+
+def test_over_cap_compaction_never_drops_a_failure(_events_dir: Path) -> None:
+    """Failures survive the over-cap compaction; only the age cap (or, still, whole-file deletion
+    as a last resort) may take them."""
+    for age in (3, 2, 1):
+        _write(
+            NOW - timedelta(days=age),
+            *[
+                {"id": f"bad-d{age}-{i}", "phase": "close", "outcome": "error", "pad": PAD}
+                for i in range(100)
+            ],
+        )
+    store.enforce_caps(now=NOW, max_age_days=90, max_mb=0.5)
+    survivors = _ids()
+    # Whatever files survive, they were not rewritten: every failure in them is still there.
+    for age in (3, 2, 1):
+        day = store.day_file(NOW - timedelta(days=age))
+        if not day.exists():
+            continue
+        assert len({r["id"] for r in store.iter_records([day])}) == 100
+    assert survivors, "every file was deleted — the deletion lever ran unbounded"
+
+
+def test_over_cap_still_deletes_a_day_when_compaction_is_not_enough(_events_dir: Path) -> None:
+    """Compaction is a first lever, not a replacement: a ledger over the cap purely on failure
+    records still loses whole day files, oldest first, exactly as before."""
+    for age in (5, 4, 3):
+        _write(
+            NOW - timedelta(days=age),
+            *[
+                {"id": f"bad-d{age}-{i}", "phase": "close", "outcome": "error", "pad": PAD}
+                for i in range(100)
+            ],
+        )
+    store.enforce_caps(now=NOW, max_age_days=90, max_mb=0.3)
+    assert (NOW - timedelta(days=5)).strftime("%Y-%m-%d") not in _stems()
+    total = sum(p.stat().st_size for p in store.day_files())
+    assert total <= 0.3 * 1024 * 1024
+
+
+def test_todays_file_is_never_deleted_for_the_byte_cap(_events_dir: Path) -> None:
+    """A single day over the cap by itself overshoots by at most that day; deleting the live day
+    would destroy exactly the records anyone is about to read."""
+    _write(
+        NOW,
+        *[
+            {"id": f"bad-today-{i}", "phase": "close", "outcome": "error", "pad": PAD}
+            for i in range(100)
+        ],
+    )
+    store.enforce_caps(now=NOW, max_age_days=90, max_mb=0.05)
+    assert _stems() == {NOW.strftime("%Y-%m-%d")}
+
+
+def test_under_the_cap_nothing_is_compacted(_events_dir: Path) -> None:
+    """The over-cap compaction is a cap lever only: under budget, a fresh success inside the TTL
+    is still there to be read."""
+    _write(NOW - timedelta(days=1), *_pair("fresh_ok", "ok"))
+    store.enforce_caps(now=NOW, max_age_days=90, max_mb=50)
+    assert "fresh_ok" in _ids()
+
+
+def test_ttl_ignoring_compaction_still_pairs_a_success_across_two_day_files(
+    _events_dir: Path,
+) -> None:
+    """The over-cap path's new parameters must not reintroduce the per-file `succeeded` set bug
+    `compact()`'s docstring documents: an `open` in day N with its `close` in day N+1 is a
+    success, and the `open` must go with it rather than becoming a `running-or-died` phantom."""
+    day_n = NOW - timedelta(days=2)
+    store.append({"id": "A", "phase": "open", "action": "status"}, when=day_n)
+    store.append({"id": "A", "phase": "close", "outcome": "ok"}, when=day_n + timedelta(days=1))
+
+    store.compact(now=NOW, success_ttl_days=14, ignore_ttl=True, exclude_today=True)
+
+    assert "A" not in _ids()
+
+
+def test_ttl_ignoring_compaction_leaves_todays_file_alone(_events_dir: Path) -> None:
+    _write(NOW, *_pair("today_ok", "ok"))
+    _write(NOW - timedelta(days=1), *_pair("yesterday_ok", "ok"))
+    store.compact(now=NOW, success_ttl_days=14, ignore_ttl=True, exclude_today=True)
+    assert _ids() == {"today_ok"}
+
+
+def _orphan_lock(day: datetime, *, age_days: float) -> Path:
+    lock = store.lock_path(store.day_file(day))
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("", encoding="utf-8")
+    stamp = (NOW - timedelta(days=age_days)).timestamp()
+    os.utime(lock, (stamp, stamp))
+    return lock
+
+
+def test_a_stale_lock_with_no_day_file_is_reaped(_events_dir: Path) -> None:
+    """Ten of these were sitting in the real ledger directory, one of them for the day whose data
+    the byte cap had already deleted — litter that outlives the file it guarded."""
+    lock = _orphan_lock(NOW - timedelta(days=30), age_days=30)
+    store.reap_stale_locks(now=NOW)
+    assert not lock.exists()
+
+
+def test_a_lock_whose_day_file_still_exists_is_kept(_events_dir: Path) -> None:
+    day = NOW - timedelta(days=30)
+    _write(day, *_pair("old", "error"))
+    lock = store.lock_path(store.day_file(day))
+    stamp = (NOW - timedelta(days=30)).timestamp()
+    os.utime(lock, (stamp, stamp))
+    store.reap_stale_locks(now=NOW)
+    assert lock.exists(), "the lock for a live day file is load-bearing"
+
+
+def test_a_fresh_orphan_lock_is_kept(_events_dir: Path) -> None:
+    """Younger than a day: a process may be between creating the lock and writing its first
+    record, and its day file does not exist yet."""
+    lock = _orphan_lock(NOW, age_days=0)
+    store.reap_stale_locks(now=NOW)
+    assert lock.exists()
+
+
+def test_a_held_lock_is_not_reaped(_events_dir: Path) -> None:
+    """Belt and braces on top of the age and day-file conditions: if anything holds the lock
+    right now, leave it. `flock` is per open-file-description, so a second handle on the same
+    path conflicts even inside one process."""
+    lock = _orphan_lock(NOW - timedelta(days=30), age_days=30)
+    with lock.open("a", encoding="utf-8") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+        try:
+            store.reap_stale_locks(now=NOW)
+        finally:
+            fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+    assert lock.exists()
+
+
+def test_reaping_a_lock_never_raises(_events_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _orphan_lock(NOW - timedelta(days=30), age_days=30)
+
+    def _boom(self: Path, *a: object, **k: object) -> None:
+        raise OSError("nope")
+
+    monkeypatch.setattr(Path, "unlink", _boom)
+    store.reap_stale_locks(now=NOW)  # best-effort like the rest of retention
+
+
+def test_maybe_prune_reaps_stale_locks(_events_dir: Path) -> None:
+    lock = _orphan_lock(NOW - timedelta(days=30), age_days=30)
+    store.maybe_prune(now=NOW)
+    assert not lock.exists()
 
 
 def test_enforce_caps_handles_missing_files(
