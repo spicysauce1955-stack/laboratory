@@ -92,6 +92,12 @@ If asked to *write* a new experiment, the entrypoint MUST:
 | Accept grid overrides as `key=value` argv         | e.g. Hydra picks up `seed=3 K=200` from `sys.argv` |
 | Report the config it actually consumed            | Write `$LAB_RUN_DIR/effective_config.json` (one call: `lab.experiment.get_overrides(known={...})`) |
 
+**Optional: find which parameters pass a test.** `lab.search.grid_search(evaluate, {"name": [values]})`
+runs your `evaluate` on every combination and writes each one that answered True to
+`$LAB_RUN_DIR/hits.jsonl`. All model code stays in `evaluate`, so it works with any simulator.
+`lab.search.find_boundary` narrows one numeric parameter to where the answer flips, and
+`lab.search.crosses_threshold(trace, threshold)` is a ready-made True/False test for a trace.
+
 **The config-consumption handshake (field-report #1).** A *succeeded* job whose argv
 overrides were never consumed (no `effective_config.json`, or the file omits submitted keys)
 is **flipped to `failed`** at the succeeded transition — a typo'd or stale key must not
