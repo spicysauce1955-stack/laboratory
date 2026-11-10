@@ -152,8 +152,8 @@ upgrade note.
 
 Everything under `lab.*` that is not the above — module layout, internal signatures, the
 `lab.core.Lab` Python API — plus the test suite, `research/`, `docs/`, the field reports, and
-this repo's own `.claude/` and `experiments/`. Import from `lab.experiment` and `lab.metrics`
-(the contract helpers) and drive everything else through the CLI or MCP.
+this repo's own `.claude/` and `experiments/`. Import from `lab.experiment`, `lab.metrics` and
+`lab.search` (the experiment-side helpers) and drive everything else through the CLI or MCP.
 
 ## What `lab init` owns
 
