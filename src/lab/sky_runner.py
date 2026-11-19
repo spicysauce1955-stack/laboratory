@@ -774,7 +774,7 @@ def resolve_cost(
     folding the disk in there fixes ``estimated_usd``, the dashboard, and the scheduler's spend
     accounting at once.
     """
-    from lab.placement import storage_hourly_usd
+    from lab.placement import effective_disk_gb, storage_hourly_usd
 
     compute = _resolve_hourly(cluster, handle, cloud)
     # The comparison the launch path never made. SkyPilot applied the cap to its own catalog,
@@ -801,10 +801,15 @@ def resolve_cost(
                 open_call.result(
                     over_cap=True, actual_hourly_usd=compute, cap_hourly_usd=cap
                 )
-    storage = storage_hourly_usd(cloud, manifest.resources.disk_size, instance_type)
+    # The disk the job actually launched with, not the raw request: `build_task` applies the same
+    # `effective_disk_gb` default, and a scheduler-registered GCP/DO job (which never passes
+    # through `resolve_backend_profile`) arrives here with `disk_size=None` while billing for
+    # 50/100 GB — left out, its hourly_usd/actual_usd/spend under-reported (~16% on a GCP n4).
+    disk_gb = effective_disk_gb(manifest.resources)
+    storage = storage_hourly_usd(cloud, disk_gb, instance_type)
     total = None if compute is None else compute + storage
     estimated = actual_cost(total, parse_duration(manifest.resources.timeout))
-    disk = manifest.resources.disk_size or 0
+    disk = disk_gb or 0
     shape = f"{cloud} {instance_type or 'unknown instance type'}"
     priced = "compute unknown" if compute is None else f"compute ${compute:.4f}/hr"
     return CostInfo(
