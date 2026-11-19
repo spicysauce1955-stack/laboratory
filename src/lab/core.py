@@ -393,7 +393,7 @@ def _mirror_sweep_aggregate(path: Path, key: str) -> None:
 
 # Bump when a cell's aggregate outputs would change for the same inputs (a merge or format
 # change), so fingerprints recorded by an older lab stop matching and the cell is re-merged.
-_AGGREGATE_FORMAT = 1
+_AGGREGATE_FORMAT = 2  # 2: hits for seeds missing from results.csv are dropped
 
 
 # (job_id, terminal state, results file, hits file) of one shard an aggregate includes.
@@ -1164,7 +1164,8 @@ class Lab:
         gets one concatenated ``hits.jsonl`` beside the result aggregate (:func:`merge_hits`;
         same inclusion rules, every hit stamped ``_shard_status``), recorded as ``hits_ref`` /
         ``hits`` on the cell. Seed presence is judged by the result table alone — a hit never
-        makes a seed present. When no included shard has one, a cell hits file left by an earlier
+        makes a seed present — and a hit naming a seed the table lists as missing is left out,
+        so the two cell files agree on which seeds the cell covers. When no included shard has one, a cell hits file left by an earlier
         aggregate is removed, so the plan, the file and an export bundle cannot disagree.
 
         Runs under the sweep's plan lock (:meth:`JobStore.sweep_lock`), so it can neither write
@@ -1221,7 +1222,9 @@ class Lab:
             # Both merges run before anything is written: a fatal line in either leaves this
             # cell's files exactly as they were. Hits files are read one at a time, as merged.
             merged_hits, n_hits = merge_hits(
-                ((hf.read_text(), st) for hf, st in hit_files), row_key=cell.row_key
+                ((hf.read_text(), st) for hf, st in hit_files), row_key=cell.row_key,
+                # Hits only for seeds the table lists as present, so the two files agree.
+                seed_column=cell.seed_column, present_seeds=present,
             )
             cell.seeds_present = present
             cell.seeds_partial = partial

@@ -336,7 +336,8 @@ def test_aggregate_empty_hits_file_means_searched_and_nothing_passed(tmp_path: P
 
 def test_aggregate_hits_never_count_a_seed_as_present(tmp_path: Path):
     """Seed presence is judged by results.csv alone: a shard that left hits but no result rows
-    still has its seeds missing, so sweep-retry buys them back."""
+    still has its seeds missing, so sweep-retry buys them back — and the missing seed's hits are
+    left out of the cell file, which only covers the seeds results.csv lists as present."""
     lab = _lab(tmp_path)
     sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0-1", shard_size=1)
     cell = lab.sweep_plan(sweep_id).cells[0]
@@ -346,7 +347,7 @@ def test_aggregate_hits_never_count_a_seed_as_present(tmp_path: Path):
 
     c = lab.aggregate_sweep(sweep_id).cells[0]
     assert c.seeds_present == [0] and c.missing_seeds == [1] and c.status == "incomplete"
-    assert c.hits == 1
+    assert c.hits == 0  # searched (the file exists), but seed 1's search never finished
 
 
 def test_aggregate_succeeded_shard_with_torn_hits_fails_loud(tmp_path: Path):

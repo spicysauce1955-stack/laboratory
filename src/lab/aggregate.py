@@ -22,7 +22,7 @@ from __future__ import annotations
 import csv
 import io
 import json
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from typing import Any
 
 STATUS_COLUMN = "_shard_status"
@@ -153,11 +153,30 @@ def _hit_identity(hit: dict[str, Any], key_cols: list[str] | None) -> str:
     return "h" + _CANONICAL.encode(hit)
 
 
+def _seed_of(value: Any) -> int | None:
+    """The integer seed a hit's seed field names, or ``None`` when it names none we can judge
+    (an int, an integral float, or a string of an int; never a bool, which is JSON true/false)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
 def merge_hits(
     shard_hits: Iterable[tuple[str, str]],
     *,
     row_key: list[str] | None = None,
     status_column: str = STATUS_COLUMN,
+    seed_column: str | None = None,
+    present_seeds: Collection[int] | None = None,
 ) -> tuple[str, int]:
     """Concatenate shard ``hits.jsonl`` texts into one cell-level JSONL, every hit stamped.
 
@@ -186,11 +205,21 @@ def merge_hits(
     file mid-append and tear its tail) and raises ``ValueError`` for a succeeded one, whose file
     should be whole. Output order is deterministic: owning shard's submission order, then line.
 
+    **Seed presence** (``seed_column`` + ``present_seeds``, both or neither): a hit whose
+    ``seed_column`` names a seed not in ``present_seeds`` is dropped — the cell's result table
+    lists that seed as missing, so its hits come from a search that never finished (a partial
+    shard flushed them and died before the seed's row). A hit naming no seed, or one that is not
+    an integer, cannot be judged and is kept. The drop happens before ownership is decided, so a
+    dropped hit can never win a key away from a kept one. Without both, nothing is dropped.
+
     Memory: each hit is serialized (stamped, compact) as soon as it is parsed and only that line
     and its identity are kept — never the parsed object, which for 866k hits was most of a
     1.4 GB peak (stress run 2026-11-19).
     """
     key_cols = list(row_key) if row_key is not None else None
+    present = (
+        set(present_seeds) if seed_column is not None and present_seeds is not None else None
+    )
     # Per shard, in submission order: its rank and two parallel lists, each hit's identity and
     # its output line (parallel lists rather than a tuple per hit: one object fewer per hit).
     shards: list[tuple[tuple[int, int], list[str], list[str]]] = []
@@ -215,6 +244,10 @@ def merge_hits(
                         f"{line[:80]!r}"
                     )
                 continue  # torn/garbled line of a partial shard — skip, keep the rest
+            if present is not None and seed_column in hit:
+                seed = _seed_of(hit[seed_column])
+                if seed is not None and seed not in present:
+                    continue  # its seed is missing from the result table: an unfinished search
             hit.pop(status_column, None)  # never part of a hit's identity, and restamped below
             idents.append(_hit_identity(hit, key_cols))
             hit[status_column] = status

@@ -137,6 +137,16 @@ seed in the hit, one combination passing for two seeds is reported once — put 
 grid or return it as a column if you need per-seed counts. Hits never make a seed present; that
 is `results.csv`'s job.
 
+**The cell's hits cover exactly the seeds its `results.csv` lists as present.** A hit that names
+its seed (in the cell's `--seed-column`, as an integer or a string of one) is left out of the cell
+`hits.jsonl` when that seed is missing from the result table. That happens when a shard flushed
+some of a seed's hits and then died before writing the seed's row: those hits come from a search
+that never finished, and keeping them would make the two cell files disagree about which seeds
+the cell covers. Nothing is lost — the shard's own `hits.jsonl` is untouched (and `lab export`
+still bundles it under that job), and `sweep-retry` re-runs the missing seed, whose hits then land
+together with its row. A hit that names no seed, or names one that is not an integer, cannot be
+judged and is always kept — another reason to put the seed in each hit.
+
 ### Retry missing seeds
 
 If some shards failed or timed out, buy back only what is missing:
