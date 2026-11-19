@@ -124,3 +124,39 @@ def test_redact_keeps_the_signed_url_readable():
 def test_redact_signed_url_patterns_are_idempotent():
     once = redact(SIGNED_URL)
     assert redact(once) == once
+
+
+# --- S3/R2 presigned URLs and token-bearing query params ----------------------------------------
+
+R2_PRESIGNED = (
+    "GET https://acc.r2.cloudflarestorage.com/lab-artifacts/j-1/results.csv"
+    "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+    "&X-Amz-Credential=8c1f3a9e2b7d4c6f0a5e9b3d1c7f2a4e%2F20261119%2Fauto%2Fs3%2Faws4_request"
+    "&X-Amz-Security-Token=FwoGZXIvYXdzEJr"
+    "&X-Amz-Signature=" + "ab" * 32
+)
+
+
+def test_redact_masks_an_s3_presigned_url_but_keeps_it_readable():
+    """The R2 twin of the GCS signed URL above: the signature grants access, the credential names
+    the access key id, and a session token is a credential outright."""
+    out = redact(R2_PRESIGNED)
+    assert "ab" * 32 not in out
+    assert "8c1f3a9e2b7d4c6f0a5e9b3d1c7f2a4e" not in out
+    assert "FwoGZXIvYXdzEJr" not in out
+    assert "lab-artifacts/j-1/results.csv" in out and "X-Amz-Signature=" in out
+    assert redact(out) == out
+
+
+def test_redact_masks_token_and_password_query_params():
+    out = redact("https://api.x.io/v1?token=abc123&access_token=zzz&password=pw&sig=s1&page=2")
+    for secret in ("abc123", "=zzz", "=pw&", "s1"):
+        assert secret not in out, out
+    assert "page=2" in out
+    assert redact(out) == out
+
+
+def test_redact_masks_password_and_secret_json_fields():
+    out = redact('{"user": "x", "password": "hunter2", "secret": "s3", "api_key": "k"}')
+    assert "hunter2" not in out and '"s3"' not in out and '"k"' not in out
+    assert '"user": "x"' in out
