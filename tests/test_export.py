@@ -160,6 +160,35 @@ def test_export_sweep_bundles_plan_and_cell_aggregates(tmp_path):
     cell = lab.sweep_plan(sweep_id).cells[0]
     assert (dest / "cells" / cell.cell_id / "results.csv").exists()
     assert len(index["jobs"]) == 2
+    assert not (dest / "cells" / cell.cell_id / "hits.jsonl").exists()  # no search, no file
+
+
+def test_export_sweep_bundles_the_cell_hits_aggregate(tmp_path):
+    """The cell's concatenated hits.jsonl is the sweep-level answer of a search; it travels with
+    the CSV aggregate, and each shard's own hits.jsonl travels under its job's output/."""
+    from lab.manifest import repo_root
+
+    repo = repo_root(Path.cwd())
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
+    sweep_id, _ = lab.sweep("true", {"N": [1]}, seeds="0-1", shard_size=1)
+    plan = lab.sweep_plan(sweep_id)
+    for jid, seed in zip(plan.cells[0].shard_job_ids, [0, 1]):
+        out = lab.store.output_dir(jid)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "results.csv").write_text(f"seed,acc\n{seed},0.9\n")
+        (out / "hits.jsonl").write_text(f'{{"seed": {seed}, "g": 1}}\n')
+        lab.store.update_manifest(jid, status=JobState.succeeded)
+    cell = lab.aggregate_sweep(sweep_id).cells[0]
+
+    dest = tmp_path / "bundle"
+    index = lab.export(sweep_id, dest)
+
+    exported = dest / "cells" / cell.cell_id / "hits.jsonl"
+    assert exported.read_text() == Path(cell.hits_ref).read_text()
+    assert [json.loads(line)["seed"] for line in exported.read_text().splitlines()] == [0, 1]
+    assert index["sweep"]["cells"][0]["hits"] == 2
+    for jid in cell.shard_job_ids:
+        assert (dest / jid / "output" / "hits.jsonl").exists()
 
 
 def test_export_unknown_id_fails_loud(tmp_path):

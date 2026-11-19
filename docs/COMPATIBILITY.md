@@ -146,7 +146,10 @@ upgrade note.
   `fetch_artifacts` output (an older manifest keeps `"other"` until its artifacts are next
   collected by `lab fetch`, `lab export` or `sweep-aggregate`). A
   `lab export` bundle therefore now carries those files under `output/`, under the same
-  `--max-file-mb` cap as any table. `logs.txt` gained a leading UTC timestamp per line in v0.7.0
+  `--max-file-mb` cap as any table. A sweep plan's cells (and the `sweep-aggregate` /
+  `sweep-retry` cell view) gained `hits_ref` and `hits`, the cell's concatenated `lab.search`
+  `hits.jsonl` and its count; both are `null` on a plan written before them or when no shard
+  searched. `logs.txt` gained a leading UTC timestamp per line in v0.7.0
   (`LAB_LOG_TIMESTAMPS=0` restores the old format); its *content* has never been frozen, but
   anything parsing it should expect the prefix. A newer lab always reads
   manifests written by an older one; new fields are optional. Every manifest records
