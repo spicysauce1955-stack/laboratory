@@ -189,6 +189,47 @@ def test_a_retired_note_is_still_history(tmp_path: Path) -> None:
     assert retired[0].retired["reason"] == "enforced on-box since v0.1.0"
 
 
+def test_a_retired_note_no_longer_counts_on_its_job(tmp_path: Path) -> None:
+    """`lab status` shows `notes: N` from `count_for_job`. The retirement is an append to the
+    *index*; the per-job file still holds the original, so reading that file alone kept counting
+    a retired note as live forever."""
+    runs = tmp_path / "runs"
+    (runs / "j-1").mkdir(parents=True)
+    n = notes.write(text="the cap is not enforced on the box", job_id="j-1", home=runs)
+    assert n is not None and notes.count_for_job("j-1", home=runs) == 1
+
+    notes.retire(n.id, reason="enforced since v0.1.0")
+
+    assert notes.count_for_job("j-1", home=runs) == 0
+    [only] = notes.for_job("j-1", home=runs)  # still history: listed once, marked retired
+    assert only.id == n.id and only.retired is not None
+    assert only.retired["reason"] == "enforced since v0.1.0"
+
+
+def test_a_retired_note_no_longer_counts_on_the_index_fallback_either(tmp_path: Path) -> None:
+    """No per-job file (written with no home): the index holds the original AND its retirement
+    line, which used to be counted as two live notes for the job."""
+    runs = tmp_path / "runs"
+    n = notes.write(text="x", job_id="j-2", home=None)
+    assert n is not None
+    notes.retire(n.id, reason="stale")
+
+    assert notes.count_for_job("j-2", home=runs) == 0
+    assert [x.id for x in notes.for_job("j-2", home=runs)] == [n.id]
+
+
+def test_retiring_one_note_leaves_the_jobs_other_notes_live(tmp_path: Path) -> None:
+    runs = tmp_path / "runs"
+    (runs / "j-3").mkdir(parents=True)
+    a = notes.write(text="a", job_id="j-3", home=runs)
+    notes.write(text="b", job_id="j-3", home=runs)
+    assert a is not None
+    notes.retire(a.id, reason="stale")
+
+    assert notes.count_for_job("j-3", home=runs) == 1
+    assert [x.text for x in notes.for_job("j-3", home=runs) if x.retired is None] == ["b"]
+
+
 def test_retiring_an_unknown_note_is_an_error_the_caller_can_report(tmp_path: Path) -> None:
     with pytest.raises(KeyError):
         notes.retire("nope", reason="whatever")

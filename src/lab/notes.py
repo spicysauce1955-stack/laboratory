@@ -339,11 +339,20 @@ def write(
 
 
 def for_job(job_id: str, *, home: Path | str) -> list[Note]:
-    """This job's own notes, oldest first — the per-job file when it exists, else the index."""
+    """This job's own notes, oldest first — the per-job file when it exists, else the index —
+    with retirements applied.
+
+    A retirement is appended to the *index* only (:func:`retire`), so the per-job file still
+    holds the original line forever; and in the index-only case the retirement line itself
+    carries the job id. Either way, reading without folding the index's retirements over the
+    result counted a retired note as live (``lab status``'s ``notes: N``) indefinitely.
+    """
+    index = _read(index_path())
     local = _read(job_notes_path(job_id, home=home))
-    if local:
-        return local
-    return [n for n in _read(index_path()) if n.job_id == job_id]
+    own = local if local else [n for n in index if n.job_id == job_id and n.retired is None]
+    ids = {n.id for n in own}
+    retirements = [n for n in index if n.retired is not None and n.id in ids]
+    return _resolve_retirements(own + retirements)
 
 
 def search(
