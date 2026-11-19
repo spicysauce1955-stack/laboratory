@@ -278,7 +278,8 @@ def test_aggregate_hits_follow_the_csv_inclusion_rules(tmp_path: Path):
     import json as _json
 
     lab = _lab(tmp_path)
-    sweep_id, _ = lab.sweep("true N=1000", {}, seeds="0-3", shard_size=1)
+    # `N` is a grid key, i.e. an override the lab injects: the only kind the config audit judges.
+    sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0-3", shard_size=1)
     ok, partial, running, wrong_config = lab.sweep_plan(sweep_id).cells[0].shard_job_ids
     for jid, seed in zip((ok, partial, running, wrong_config), range(4)):
         _write_hits(lab, jid, f'{{"seed": {seed}}}\n')
