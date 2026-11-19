@@ -15,6 +15,7 @@ anything wrong with the polluted test itself. Reset it here so every test starts
 from __future__ import annotations
 
 import importlib
+import os
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,45 @@ _CLOUD_ENV = (
     "GOOGLE_APPLICATION_CREDENTIALS",
     "GOOGLE_CLOUD_PROJECT",
 )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Session-wide isolation underneath the per-test fixtures.
+
+    A test that calls `monkeypatch.undo()` reverts every autouse fixture's patches too, and used to
+    fall straight through to the developer's real `~/.lab` — 105 job-index entries and their ledger
+    records on 2026-11-19 — with the cloud-client guards gone as well. These session values are what
+    an undo falls back to, so the worst it can reach is a throwaway directory.
+    """
+    import tempfile
+
+    root = Path(tempfile.mkdtemp(prefix="lab-tests-"))
+    for name, sub in (
+        ("LAB_EVENTS_DIR", "events"),
+        ("LAB_JOBS_INDEX_DIR", "jobs"),
+        ("LAB_NOTES_DIR", "notes"),
+    ):
+        os.environ[name] = str(root / sub)
+    os.environ["LAB_DOTENV"] = "0"
+    for name in _CLOUD_ENV:
+        os.environ.pop(name, None)
+
+    from lab.backends import skypilot as _sp
+    from lab.storage import R2Store as _R2Store
+
+    def _no_real_client(*a: object, **k: object) -> object:
+        raise AssertionError("a test built a real cloud client after its fixtures were undone")
+
+    _sp._get_do_client = _no_real_client  # type: ignore[assignment]
+    _sp._get_vast_client = _no_real_client  # type: ignore[assignment]
+    _real_r2_init = _R2Store.__init__
+
+    def _r2_fakes_only(self, endpoint, bucket="lab-artifacts", client=None):  # type: ignore[no-untyped-def]
+        if client is None:
+            _no_real_client()
+        _real_r2_init(self, endpoint, bucket, client)
+
+    _R2Store.__init__ = _r2_fakes_only  # type: ignore[method-assign]
 
 
 @pytest.fixture(autouse=True)

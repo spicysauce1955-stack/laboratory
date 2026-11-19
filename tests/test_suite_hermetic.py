@@ -34,3 +34,15 @@ def test_a_real_r2_client_cannot_be_built_in_a_test():
 def test_a_fake_client_is_still_allowed():
     fake = object()
     assert R2Store("https://x", "b", client=fake)._s3 is fake
+
+
+def test_an_undone_monkeypatch_still_lands_in_isolated_dirs(monkeypatch):
+    """`monkeypatch.undo()` reverts conftest's per-test isolation; the session layer must hold."""
+    real = Path.home() / ".lab"
+    monkeypatch.undo()
+    for name in ("LAB_EVENTS_DIR", "LAB_JOBS_INDEX_DIR", "LAB_NOTES_DIR"):
+        assert not Path(os.environ[name]).resolve().is_relative_to(real.resolve())
+    assert os.environ["LAB_DOTENV"] == "0"
+    assert "LAB_R2_ENDPOINT" not in os.environ
+    with pytest.raises(AssertionError, match="real"):
+        R2Store("https://real.example", "real")
