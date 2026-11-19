@@ -1568,6 +1568,13 @@ class Lab:
         other_projects: list[dict[str, Any]] = []
         unattributed: list[str] = []
 
+        def _resolved_dir(path: Path) -> Path:
+            """``path`` made comparable with what the registry stores (``record_job`` resolves)."""
+            try:
+                return Path(path).expanduser().resolve()
+            except (OSError, RuntimeError):
+                return Path(path)
+
         def _ours_only(
             pass_name: str, items: list[Any], identify: Callable[[Any], str]
         ) -> list[Any]:
@@ -1588,11 +1595,22 @@ class Lab:
               project, which is the only place that can tell leaked from live)
             * unattributable       -> ``unattributed``, never destroyed. Same treatment
               ``gcp_unmatched`` already had, now applied to every pass.
+
+            "Us" is this **job store** (``self.home``), not this project *name*. Two stores share a
+            name all the time — two clones of one project, or the scheduler host
+            (``LAB_REPO_DIR=/opt/<project>``) beside the laptop checkout on one cloud account — so
+            a stamped slug that matches ours proves only which project, never which store. Such a
+            resource is ours if its job is in this ``runs/``, or if the machine-wide registry
+            names *this* runs_dir as its creator; otherwise it is someone else's (registry names
+            another runs_dir) or unprovable, and never destroyed. The registry is per-machine,
+            so a job the scheduler host launched is unknown here and stays unattributed — which
+            is the point: only the store that launched it can tell leaked from live.
             """
             from lab.backends.skypilot import project_slug
 
             kept: list[Any] = []
             my_slug = project_slug(me) if me else None
+            my_runs = _resolved_dir(self.home)
             # This project's own job store is the most authoritative source there is for its own
             # jobs, and it was not consulted: attribution used only the machine-wide index (written
             # from 2026-08-20 onward) and the event ledger (retention-bounded, and switched off
@@ -1606,12 +1624,40 @@ class Lab:
             for item in items:
                 ident = identify(item)
                 slug, cands = read[id(item)]
-                if slug is not None:
-                    # Stamped on the resource itself: no lookup can contradict it.
-                    owner = me if slug == my_slug else slug
+                # The registry's record of which job store created this job, when it has one.
+                # Only the registry knows a runs_dir; a ledger-only attribution carries None.
+                registered = next(
+                    (
+                        attributions[c]
+                        for c in cands
+                        if c in attributions and attributions[c].runs_dir is not None
+                    ),
+                    None,
+                )
+                owner: str | None
+                owner_runs: str | None = None
+                if slug is not None and slug != my_slug:
+                    # Stamped on the resource itself: no lookup can make it ours.
+                    owner = slug
                 elif any(c in ours_locally for c in cands):
                     owner = me
+                elif registered is not None and registered.runs_dir is not None:
+                    if _resolved_dir(registered.runs_dir) == my_runs:
+                        owner = me  # the registry names *this* store as its creator
+                    else:
+                        # Another job store — possibly of the same project name, in which case
+                        # this is exactly the case a slug comparison used to destroy.
+                        owner = registered.project or slug or "unknown"
+                        owner_runs = str(_resolved_dir(registered.runs_dir))
+                elif slug is not None:
+                    # Our slug, and nothing that says which store: a sibling clone's job, or one
+                    # the scheduler host launched (its registry is on another machine). Unproven.
+                    owner = None
                 else:
+                    # A legacy, unstamped name with no registry record — a job that predates the
+                    # registry. The ledger's project name is the only evidence that exists for
+                    # those (documented fallback); it cannot tell two same-named stores apart,
+                    # and is bounded by the ledger's retention.
                     owner = next(
                         (
                             attributions[c].project
@@ -1623,10 +1669,11 @@ class Lab:
                 if owner is None:
                     unattributed.append(ident)
                     events.note("reconcile.unattributed", pass_=pass_name, resource=ident)
-                elif owner != me:
-                    other_projects.append(
-                        {"pass": pass_name, "resource": ident, "project": owner}
-                    )
+                elif owner_runs is not None or owner != me:
+                    entry: dict[str, Any] = {"pass": pass_name, "resource": ident, "project": owner}
+                    if owner_runs is not None:
+                        entry["runs_dir"] = owner_runs  # additive: which store, not just project
+                    other_projects.append(entry)
                     events.note(
                         "reconcile.other_project", pass_=pass_name, resource=ident, owner=owner
                     )
