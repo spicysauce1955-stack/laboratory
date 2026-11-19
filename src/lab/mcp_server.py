@@ -819,7 +819,8 @@ def build_server(lab: Lab) -> FastMCP:
         found = _exclude_self(
             events.read(
                 since=since, project=project, action=action, job=job, session=session,
-                failures_only=failures, limit=None,
+                # +1 for this call's own open row (`_exclude_self`); a bound lets the reader stop.
+                failures_only=failures, limit=limit + 1 if limit > 0 and not stats else None,
             )
         )
         if stats:
