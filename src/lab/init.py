@@ -134,29 +134,35 @@ def _translate_ignore_line(raw: str) -> str | None:
 
     SkyPilot globs a ``.skyignore`` line as ``**/<line>``, or ``./<line>`` when it starts with
     ``/``. Git anchors a pattern to its directory when it has a slash anywhere but the end, and a
-    leading ``**/`` means "at any depth" — so those are the two cases that need rewriting.
-    Negations and escapes have no ``.skyignore`` spelling; callers filter them out first.
+    leading ``**/`` means "at any depth" — so those are the two cases that need rewriting. A
+    ``\\#``/``\\!`` escape names a literal file; ``.skyignore`` has no escapes, so a leading ``#``
+    is kept from reading as a comment by spelling the any-depth prefix out. A ``!negation`` has no
+    ``.skyignore`` spelling at all; callers filter those out first.
     """
     line = raw.strip()
     if not line or line.startswith("#"):
         return None
+    if line.startswith("\\"):
+        line = line[1:]
     trailing = "/" if line.endswith("/") else ""
     body = line.rstrip("/")
     if not body:
         return None
     if body.startswith("**/"):
-        return body[len("**/") :] + trailing
-    if "/" in body:
+        out = body[len("**/") :] + trailing
+    elif "/" in body:
         return "/" + body.lstrip("/") + trailing
-    return body + trailing
+    else:
+        out = body + trailing
+    return "**/" + out if out.startswith("#") else out
 
 
 def _git_ignore_patterns(root: Path) -> tuple[list[str], list[str]]:
     """``(skyignore_lines, dropped)`` from ``.gitignore`` and ``.git/info/exclude`` at ``root``.
 
-    ``dropped`` are lines with no ``.skyignore`` equivalent (``!negation``, ``\\``-escapes). A
-    dropped negation means the file it re-included is now excluded — safe for secrets, but a job
-    that needed that file will not find it, so the caller names them.
+    ``dropped`` are the ``!negation`` lines, which have no ``.skyignore`` equivalent. A dropped
+    negation means the file it re-included is now excluded — safe for secrets, but a job that
+    needed that file will not find it, so the caller names them.
     """
     lines: list[str] = []
     dropped: list[str] = []
@@ -167,7 +173,7 @@ def _git_ignore_patterns(root: Path) -> tuple[list[str], list[str]]:
             continue
         for raw in text.splitlines():
             stripped = raw.strip()
-            if stripped.startswith(("!", "\\")):
+            if stripped.startswith("!"):
                 dropped.append(stripped)
                 continue
             translated = _translate_ignore_line(raw)

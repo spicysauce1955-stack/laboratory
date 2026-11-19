@@ -105,6 +105,17 @@ def test_an_existing_skyignore_is_never_rewritten(tmp_path: Path) -> None:
     assert "gcp-key.json" in text and "secrets" in text
 
 
+def test_escaped_patterns_are_carried_and_still_exclude(tmp_path: Path) -> None:
+    from sky.data.storage_utils import get_excluded_files
+
+    _git_project(tmp_path, GITIGNORE + "\\#scratch\n")
+    (tmp_path / "sub").mkdir()
+    scaffold(tmp_path)
+    (tmp_path / "sub" / "#scratch").write_text("x")  # created after init: only a pattern covers it
+
+    assert "sub/#scratch" in {e.rstrip("/") for e in get_excluded_files(str(tmp_path))}
+
+
 def test_check_mode_writes_no_skyignore(tmp_path: Path) -> None:
     _git_project(tmp_path, GITIGNORE)
     scaffold(tmp_path, check=True)
@@ -134,6 +145,8 @@ def test_not_a_git_repo_still_seeds_from_the_gitignore(tmp_path: Path) -> None:
         ("*.pem", "*.pem"),
         ("  ", None),
         ("# comment", None),
+        ("\\#notes", "**/#notes"),  # an escaped '#' must not become a .skyignore comment
+        ("\\!bang", "!bang"),  # .skyignore has no negation, so a literal '!' needs no escape
     ],
 )
 def test_gitignore_line_translation(line: str, expected: str | None) -> None:
