@@ -115,6 +115,8 @@ GCP_REQUIRED_APIS = ("compute.googleapis.com", "cloudresourcemanager.googleapis.
 # How many of the cheapest candidate regions to check regional quota in. Quota is per-region and
 # the optimizer may pick any of ~40, so checking one proves little and checking all is far too
 # slow; a handful establishes whether the project has quota *somewhere* it would plausibly land.
+# A handful is evidence, not proof: "none of them has quota" blocks only when they are every
+# candidate (see _quota_regions), and is a warning otherwise.
 _QUOTA_REGIONS_TO_CHECK = 3
 
 
@@ -380,17 +382,52 @@ def check_iam(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
     return _ok("iam", f"all {len(GCP_REQUIRED_PERMISSIONS)} required permissions present")
 
 
-def _quota_regions(res: ResourceRequest, ctx: dict[str, Any]) -> list[str]:
-    """The regions worth checking quota in: the pin, else the cheapest few candidates."""
+def _quota_regions(res: ResourceRequest, ctx: dict[str, Any]) -> tuple[list[str], bool]:
+    """``(regions to check, complete)``: the pin, else the cheapest few candidates.
+
+    ``complete`` says whether those are *every* region the launch could use. Only then is "no
+    checked region has quota" a definitive negative; otherwise SkyPilot can fail over to a region
+    nobody asked about, and blocking on a partial look would refuse a launch that works.
+    """
     if res.region:
-        return [res.region]
+        return [res.region], True
     if res.zone:
-        return [res.zone.rsplit("-", 1)[0]]
-    est = ctx.get("estimate")
-    cands = ctx.get("candidates") or []
-    if not cands and est is None:
-        return ["us-central1"]
-    return [c.region for c in cands[:_QUOTA_REGIONS_TO_CHECK]] or ["us-central1"]
+        return [res.zone.rsplit("-", 1)[0]], True
+    regions = list(dict.fromkeys(c.region for c in ctx.get("candidates") or []))
+    if not regions:
+        return ["us-central1"], False  # one region of ~40 proves nothing about the rest
+    return regions[:_QUOTA_REGIONS_TO_CHECK], len(regions) <= _QUOTA_REGIONS_TO_CHECK
+
+
+def _no_quota_verdict(
+    name: str,
+    found: dict[str, tuple[float, float] | None],
+    want: float,
+    what: str,
+    *,
+    complete: bool,
+    fix: str,
+) -> CheckResult:
+    """The verdict when no checked region has ``want`` free — ``fail`` only if that is definitive.
+
+    A metric a region does not report is "cannot tell" (a family metered under another name, or
+    not at all), never zero, so any such region makes the whole answer a ``skip``. Definite
+    numbers from only *some* of the usable regions are worth saying (``warn``), never blocking.
+    """
+    seen = ", ".join(
+        f"{r}={q[0] - q[1]:.0f} free" if q is not None else f"{r}=not reported"
+        for r, q in found.items()
+    )
+    if any(q is None for q in found.values()):
+        return _skip(name, f"quota not reported for {what}, cannot tell ({seen})")
+    if not complete:
+        return _warn(
+            name,
+            f"none of the {len(found)} cheapest region(s) checked has {want:.0f} {what} free "
+            f"({seen}); the launch may still land in a region not checked",
+            fix,
+        )
+    return _fail(name, f"no region this launch can use has {want:.0f} {what} free ({seen})", fix)
 
 
 def _region_quotas(compute: Any, project: str, region: str) -> dict[str, tuple[float, float]]:
@@ -430,6 +467,10 @@ def check_quota_gpu(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
     family = _gpu_family(res.accelerators)
     if family is None:
         return _skip("quota_gpu", "no accelerators requested")
+    if family.startswith("TPU"):
+        # TPUs are metered as TPU_* quotas and do not draw on GPUS_ALL_REGIONS; judging them by
+        # NVIDIA_*_GPUS failed every TPU request.
+        return _skip("quota_gpu", f"{res.accelerators} is a TPU; GPU quota does not apply")
     creds, project = ctx.get("creds"), ctx.get("project")
     if creds is None or not project:
         return _skip("quota_gpu", "no credentials to check with")
@@ -445,7 +486,7 @@ def check_quota_gpu(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
             ),
             None,
         )
-        regions = _quota_regions(res, ctx)
+        regions, complete = _quota_regions(res, ctx)
         metric = f"NVIDIA_{family}_GPUS"
         regional = {r: _region_quotas(compute, project, r).get(metric) for r in regions}
     except Exception as e:  # noqa: BLE001
@@ -461,13 +502,13 @@ def check_quota_gpu(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
         )
     usable = {r: q for r, q in regional.items() if q is not None and q[0] - q[1] >= want}
     if not usable:
-        seen = ", ".join(
-            f"{r}={q[0]:.0f}" if q else f"{r}=none" for r, q in regional.items()
-        )
-        return _fail(
+        return _no_quota_verdict(
             "quota_gpu",
-            f"no checked region has {want}x {family} free ({seen})",
-            f"request NVIDIA_{family}_GPUS quota in a region you intend to use",
+            regional,
+            want,
+            metric,
+            complete=complete,
+            fix=f"request {metric} quota in a region you intend to use",
         )
     where = ", ".join(f"{r} {q[0] - q[1]:.0f} free" for r, q in usable.items())
     detail = f"{family}x{want}: {where}"
@@ -511,16 +552,19 @@ def check_quota_cpu(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
         return _skip("quota_cpu", "no credentials to check with")
     try:
         compute = _build(creds, "compute", "v1")
-        regions = _quota_regions(res, ctx)
+        regions, complete = _quota_regions(res, ctx)
         quotas = {r: _region_quotas(compute, project, r).get("CPUS") for r in regions}
     except Exception as e:  # noqa: BLE001
         return _skip("quota_cpu", f"could not read CPU quota: {str(e)[:160]}")
     usable = {r: q for r, q in quotas.items() if q is not None and q[0] - q[1] >= want}
     if not usable:
-        return _fail(
+        return _no_quota_verdict(
             "quota_cpu",
-            f"no checked region has {want} vCPUs free ({', '.join(quotas)})",
-            "request a CPUS quota increase for the region you intend to use",
+            quotas,
+            want,
+            "vCPUs (CPUS)",
+            complete=complete,
+            fix="request a CPUS quota increase for the region you intend to use",
         )
     return _ok("quota_cpu", f"{want} vCPU: {', '.join(usable)} ok")
 
@@ -534,16 +578,19 @@ def check_quota_disk(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
         return _skip("quota_disk", "no credentials to check with")
     try:
         compute = _build(creds, "compute", "v1")
-        regions = _quota_regions(res, ctx)
+        regions, complete = _quota_regions(res, ctx)
         quotas = {r: _region_quotas(compute, project, r).get("DISKS_TOTAL_GB") for r in regions}
     except Exception as e:  # noqa: BLE001
         return _skip("quota_disk", f"could not read disk quota: {str(e)[:160]}")
     usable = {r: q for r, q in quotas.items() if q is not None and q[0] - q[1] >= want}
     if not usable:
-        return _fail(
+        return _no_quota_verdict(
             "quota_disk",
-            f"no checked region has {want} GB of disk quota free",
-            "request a DISKS_TOTAL_GB increase for the region you intend to use",
+            quotas,
+            want,
+            "GB of disk (DISKS_TOTAL_GB)",
+            complete=complete,
+            fix="request a DISKS_TOTAL_GB increase for the region you intend to use",
         )
     return _ok("quota_disk", f"{want} GB: {', '.join(usable)} ok")
 

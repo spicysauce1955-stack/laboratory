@@ -94,6 +94,111 @@ def test_zero_preemptible_cpu_quota_is_not_a_failure(monkeypatch, ctx):
 
 
 # --------------------------------------------------------------------------------------------
+# Regional quota: `fail` only when every region the launch could use was checked
+# --------------------------------------------------------------------------------------------
+
+
+def _cands(*regions):
+    from lab.placement import Candidate
+
+    return [Candidate(region=r, zones=(), hourly_usd=0.35) for r in regions]
+
+
+FIVE = ("us-central1", "us-east1", "us-west1", "europe-west4", "asia-east1")
+
+
+def test_gpu_quota_outside_the_checked_regions_does_not_block(monkeypatch, ctx):
+    """Only the 3 cheapest candidates are asked about. A project holding T4 quota only in the 4th
+    is a launch SkyPilot fails over to — refusing it on a partial look is a confident false
+    negative, and only definitive negatives may block."""
+    compute = fake_compute(
+        region_quotas={r: {"NVIDIA_T4_GPUS": (0, 0)} for r in FIVE[:3]}
+        | {"europe-west4": {"NVIDIA_T4_GPUS": (4, 0)}},
+        project_quotas={"GPUS_ALL_REGIONS": 4},
+    )
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    ctx["candidates"] = _cands(*FIVE)
+    result = D.check_quota_gpu(ResourceRequest(cloud="gcp", accelerators="T4:1"), ctx)
+    assert result.status == "warn"
+    assert not result.blocking
+
+
+def test_gpu_quota_fails_when_every_usable_region_was_checked(monkeypatch, ctx):
+    compute = fake_compute(
+        region_quotas={r: {"NVIDIA_T4_GPUS": (0, 0)} for r in FIVE[:2]},
+        project_quotas={"GPUS_ALL_REGIONS": 4},
+    )
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    ctx["candidates"] = _cands(*FIVE[:2])
+    result = D.check_quota_gpu(ResourceRequest(cloud="gcp", accelerators="T4:1"), ctx)
+    assert result.status == "fail"
+
+
+def test_gpu_quota_in_a_pinned_region_is_definitive(monkeypatch, ctx):
+    compute = fake_compute(
+        region_quotas={"us-east1": {"NVIDIA_T4_GPUS": (0, 0)}},
+        project_quotas={"GPUS_ALL_REGIONS": 4},
+    )
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    ctx["candidates"] = _cands(*FIVE)
+    res = ResourceRequest(cloud="gcp", accelerators="T4:1", region="us-east1")
+    assert D.check_quota_gpu(res, ctx).status == "fail"
+
+
+def test_a_quota_metric_that_is_not_reported_is_a_skip(monkeypatch, ctx):
+    """Absent is "cannot tell" (a metric named differently, a family GCP meters elsewhere), never
+    "zero"."""
+    compute = fake_compute(
+        region_quotas={"us-central1": {"CPUS": (24, 0)}},
+        project_quotas={"GPUS_ALL_REGIONS": 4},
+    )
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    res = ResourceRequest(cloud="gcp", accelerators="A100-80GB:1", region="us-central1")
+    result = D.check_quota_gpu(res, ctx)
+    assert result.status == "skip"
+
+
+def test_a_tpu_request_is_not_judged_by_gpu_quota(monkeypatch, ctx):
+    """TPUs are metered as TPU_* quotas, never NVIDIA_*_GPUS, and do not draw on
+    GPUS_ALL_REGIONS — so every TPU request used to fail this check."""
+    compute = fake_compute(
+        region_quotas={"us-central2": {"TPU_V4_PODSLICE": (32, 0)}},
+        project_quotas={"GPUS_ALL_REGIONS": 0},
+    )
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    ctx["candidates"] = _cands("us-central2")
+    result = D.check_quota_gpu(ResourceRequest(cloud="gcp", accelerators="tpu-v4-8"), ctx)
+    assert result.status == "skip"
+
+
+def test_cpu_quota_outside_the_checked_regions_does_not_block(monkeypatch, ctx):
+    compute = fake_compute(
+        region_quotas={r: {"CPUS": (8, 8)} for r in FIVE[:3]}
+        | {"europe-west4": {"CPUS": (24, 0)}}
+    )
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    ctx["candidates"] = _cands(*FIVE)
+    result = D.check_quota_cpu(ResourceRequest(cloud="gcp", cpus=4), ctx)
+    assert result.status == "warn"
+
+
+def test_cpu_quota_fails_when_every_usable_region_was_checked(monkeypatch, ctx):
+    compute = fake_compute(region_quotas={"us-east1": {"CPUS": (8, 8)}})
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    ctx["candidates"] = _cands("us-east1")
+    assert D.check_quota_cpu(ResourceRequest(cloud="gcp", cpus=4), ctx).status == "fail"
+
+
+def test_no_candidates_means_an_unrepresentative_look(monkeypatch, ctx):
+    """With no priced candidates the check falls back to us-central1 — one region of ~40, which
+    proves nothing about the others."""
+    compute = fake_compute(region_quotas={"us-central1": {"CPUS": (0, 0)}})
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    result = D.check_quota_cpu(ResourceRequest(cloud="gcp", cpus=4), ctx)
+    assert result.status != "fail"
+
+
+# --------------------------------------------------------------------------------------------
 # Fail-open on error, fail-closed on a definitive negative
 # --------------------------------------------------------------------------------------------
 
