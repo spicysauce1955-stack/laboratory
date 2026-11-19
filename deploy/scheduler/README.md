@@ -28,6 +28,11 @@ writing nothing in this repo has confirmed it actually carries that tag — the 
 simply refuse until you've checked (`doctl compute droplet list --tag-name lab-scheduler`) and,
 if needed, tagged it (`doctl compute droplet tag <id> --tag-name lab-scheduler`).
 
+**A paused queue is refused, and left paused.** If `control.paused` is already true at preflight
+(or becomes true while step 1 drains), someone paused it on purpose: the script never resumes a
+pause it did not make, and it could not drain or smoke-test a paused queue anyway (a paused
+scheduler syncs nothing). Resume it yourself first if that pause is no longer wanted.
+
 **The smoke test spends real money** — step 7 is a real registration that launches a real cloud
 rental via SkyPilot (`--cloud do` by default), not a simulation. Budget for it like any other
 job. If step 1's drain-wait times out, the message names the blocking `reg_id`s; there is no

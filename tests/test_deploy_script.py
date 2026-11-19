@@ -240,6 +240,28 @@ def test_a_do_token_that_does_not_authenticate_refuses_before_touching_anything(
     _no_secret_leaked(r)
 
 
+# ------------------------------------------------------------------------------ #10 operator's pause
+
+
+def test_a_queue_paused_before_the_deploy_is_refused_and_left_paused(world) -> None:  # type: ignore[no-untyped-def]
+    """An operator paused the queue on purpose. The deploy used to resume it unconditionally (step
+    6, cleanup, rollback). It cannot drain or smoke-test a paused queue either, so it refuses."""
+    r = world(control={"paused": True})
+    assert r.rc != 0
+    assert "paused" in r.err
+    assert r.paused
+    assert not any(c[:2] in (["queue", "pause"], ["queue", "resume"]) for c in r.lab_calls)
+    assert r.droplet("new") is None
+
+
+def test_a_pause_landing_during_the_drain_is_not_undone(world) -> None:  # type: ignore[no-untyped-def]
+    r = world({"pause_during_drain": True})
+    assert r.rc != 0
+    assert r.paused  # still the operator's pause
+    assert not any(c[:2] == ["queue", "resume"] for c in r.lab_calls)
+    assert r.droplet("new") is None
+
+
 # ------------------------------------------------------------------------------ unchanged paths
 
 

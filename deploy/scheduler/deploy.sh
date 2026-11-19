@@ -49,6 +49,8 @@ cd "$REPO_ROOT"
 say() { printf '\n=== %s\n' "$1"; }
 run() { if [[ "$DRY_RUN" == "--dry-run" ]]; then echo "[dry-run] $*"; else "$@"; fi; }
 json_field() { python3 -c "import json,sys; print(json.load(sys.stdin).get(sys.argv[1], ''))" "$1" 2>/dev/null; }
+# `control.paused` from a `lab queue list` payload: True / False, or empty when unreadable.
+control_paused() { python3 -c "import json,sys; print(json.load(sys.stdin)['control']['paused'])" 2>/dev/null; }
 
 DROPLET_NAME="lab-scheduler-$(date -u +%Y%m%dT%H%M%SZ)"
 REGION="nyc3"
@@ -108,6 +110,7 @@ resolve_new_droplet_id() {
 RENDERED=""
 PAUSED=0
 RESUMED=0
+PRE_PAUSED=0            # the queue was paused before this deploy touched it: never resume it
 NEW_DROPLET_CREATED=0
 NEW_DROPLET_VERIFIED=0
 NEW_DROPLET_POWERED_OFF=0
@@ -277,6 +280,21 @@ else
     exit 1
   fi
   echo "preflight: queue is live, last heartbeat from '$preflight_host' ${preflight_age}s ago"
+  # A queue someone else paused is not ours to resume -- and it cannot be deployed through either:
+  # a paused scheduler syncs nothing, so step 1's drain could never observe a job finishing, and
+  # the step-7 smoke job could never launch. Refuse, touching nothing (PAUSED stays 0, so cleanup
+  # has nothing to undo).
+  preflight_paused="$(echo "$preflight_queue_json" | control_paused)" || preflight_paused=""
+  case "$preflight_paused" in
+    False) ;;
+    True)
+      PRE_PAUSED=1
+      echo "preflight: REFUSING -- the queue is already PAUSED (control.paused=true) and this deploy did not pause it. Someone paused it on purpose, and this script never resumes a pause it did not make; it also cannot drain or smoke-test a paused queue. If that pause is no longer wanted, resume it yourself ('uv run lab queue resume') and re-run." >&2
+      exit 1 ;;
+    *)
+      echo "preflight: could not read control.paused from 'lab queue list' -- cannot tell whether an operator paused the queue" >&2
+      exit 1 ;;
+  esac
 fi
 
 if [[ "$DRY_RUN" == "--dry-run" ]]; then
@@ -296,6 +314,18 @@ say "1. wait for drain (unpaused)"
 run uv run lab queue wait-drain --timeout "$DRAIN_TIMEOUT"
 
 say "2. pause"
+if [[ "$DRY_RUN" != "--dry-run" ]]; then
+  # The drain can take up to $DRAIN_TIMEOUT; an operator may have paused the queue meanwhile.
+  # Pausing on top of that and resuming at step 6 would silently undo their pause, so re-read it
+  # first and leave a pause that is not ours strictly alone.
+  prepause_json="$(uv run lab queue list)" || {
+    echo "could not re-read the queue before pausing it -- not touching it" >&2; exit 1; }
+  if [[ "$(echo "$prepause_json" | control_paused)" != "False" ]]; then
+    PRE_PAUSED=1
+    echo "REFUSING: the queue was paused by someone else while this deploy drained it (or its control state is unreadable). Not pausing, not resuming, nothing built -- resume it yourself if that pause is no longer wanted, then re-run." >&2
+    exit 1
+  fi
+fi
 run uv run lab queue pause
 [[ "$DRY_RUN" == "--dry-run" ]] || PAUSED=1
 
