@@ -906,14 +906,29 @@ class VolumeSettlement:
         }
 
 
+# A "gone" read is confirmed by a second read this long after it. DO's read-by-id is eventually
+# consistent too: live on 2026-11-19 a volume the lab had just read as `not_found` read back as
+# present on the next GET, and only stayed gone ~20 s later. One read is not a verdict.
+_GONE_CONFIRM_S = 2.0
+_FLAPPED = "read as gone, then present again (DO read-by-id still settling)"
+
+
+def _confirmed_gone(client: Any, vid: str) -> bool:
+    time.sleep(_GONE_CONFIRM_S)
+    return _read_do_volume(client, vid)[0] == "gone"
+
+
 def _settle_one_do_volume(
     client: Any, vid: str, s: VolumeSettlement
 ) -> tuple[str, str, BaseException | None] | None:
-    """One pass over one volume: ``None`` once DO answers 404 for it, else ``(kind, why, exc)``
-    with ``kind`` in ``detaching`` (retry), ``refused`` (stop) or ``unverified`` (retry)."""
+    """One pass over one volume: ``None`` once DO answers 404 for it twice, ``_GONE_CONFIRM_S``
+    apart; else ``(kind, why, exc)`` with ``kind`` in ``detaching`` (retry), ``refused`` (stop)
+    or ``unverified`` (retry)."""
     state, info = _read_do_volume(client, vid)
     if state == "gone":
-        return None
+        if _confirmed_gone(client, vid):
+            return None
+        return "unverified", _FLAPPED, None
     if state == "present" and info.get("name"):
         s.names.setdefault(vid, str(info["name"]))
     try:
@@ -931,14 +946,18 @@ def _settle_one_do_volume(
             return "refused", text, e
         return "unverified", f"could not be read ({info}) and the delete failed: {text}", e
     if _is_do_not_found(reply):
-        return None
+        if _confirmed_gone(client, vid):
+            return None
+        return "unverified", _FLAPPED, None
     if vid not in s.deleted:
         s.deleted.append(vid)
     # Read it straight back, so an accepted delete settles in this pass rather than costing a
     # sleep — the healthy path stays free of the ladder.
     state, info = _read_do_volume(client, vid)
     if state == "gone":
-        return None
+        if _confirmed_gone(client, vid):
+            return None
+        return "unverified", _FLAPPED, None
     why = "still reads as present" if state == "present" else f"cannot be read back ({info})"
     return "unverified", f"delete accepted, but the volume {why}", None
 

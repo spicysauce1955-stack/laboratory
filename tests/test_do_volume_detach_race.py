@@ -161,7 +161,9 @@ class TestTheDetachRaceIsNotALeak:
 
         assert failures == []
         assert deleted == ["vol-1"]
-        assert no_sleep == [], f"slept {no_sleep} on a volume that deleted first try"
+        # Only the one confirmation re-read (`_GONE_CONFIRM_S`): DO's read-by-id can flap right
+        # after a delete, so "gone" is read twice. Never the detach ladder.
+        assert no_sleep == [m._GONE_CONFIRM_S], f"slept {no_sleep} on a volume that deleted first try"
         assert client.volumes.delete_calls == 1
 
     def test_nothing_matching_is_success_without_waiting(self, monkeypatch, no_sleep):

@@ -163,8 +163,8 @@ class TestTheCostIsBounded:
         out = m.robust_teardown(FakeSky(do), CLUSTER, cloud="do", backoffs=(0,))
 
         assert out["status"] == "succeeded"
-        assert do.slept == []
-        assert len([c for c in do.calls if c.startswith("volumes.")]) <= 6, do.calls
+        assert do.slept == [m._GONE_CONFIRM_S]  # the confirming second read, never the ladder
+        assert len([c for c in do.calls if c.startswith("volumes.")]) <= 7, do.calls
 
     def test_a_stuck_volume_costs_at_most_the_ladder(self, monkeypatch: pytest.MonkeyPatch) -> None:
         do = _install(monkeypatch, _job_e(detach_s=None))
@@ -347,3 +347,32 @@ class TestRememberedWhileRunning:
         assert ok is True
         assert "vol-e" not in do.vols
         assert store.read_manifest("j2").teardown_status == "succeeded"
+
+
+def test_one_not_found_read_is_not_enough_to_call_a_volume_gone(monkeypatch):
+    """Live, 2026-11-19: right after the lab verified a cancelled job's volume gone (a single
+    `not_found` GET), a GET by id returned it present again; ~20 s later it was gone for good.
+    DO's read-by-id is eventually consistent too, so "gone" needs a second, later read."""
+    from lab.backends import skypilot as sp
+
+    replies = iter([
+        {"id": "not_found", "message": "failed to get volume: not found"},   # first read: gone?
+        {"volume": {"id": "v1", "name": "lab-x-head", "droplet_ids": []}},   # ...present again
+        {"volume": {"id": "v1", "name": "lab-x-head", "droplet_ids": []}},   # next pass: still
+    ] + [{"id": "not_found", "message": "failed to get volume: not found"}] * 10)
+
+    class _Volumes:
+        def get(self, volume_id):
+            return next(replies)
+
+        def delete(self, volume_id):
+            return None  # accepted
+
+    class _Client:
+        volumes = _Volumes()
+
+    monkeypatch.setattr(sp.time, "sleep", lambda s: None)
+
+    s = sp.settle_do_volumes(["v1"], client=_Client())
+
+    assert s.gone == ["v1"] and s.passes >= 2  # not declared gone on the flapping first read
