@@ -3,11 +3,12 @@ emit (FR-F1) and the on-disk manifest format (FR-B3)."""
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer, field_validator
 
 ArtifactType = Literal["figure", "table", "checkpoint", "log", "other"]
 Submitter = Literal["human", "agent"]
@@ -184,6 +185,34 @@ class JobManifest(BaseModel):
     # consumed (None = never reported, ≠ {} = reported empty), and the submitted keys it ignored.
     config_effective: dict[str, Any] | None = None
     unconsumed_config: list[str] = Field(default_factory=list)
+
+    @field_validator("final_metrics", mode="before")
+    @classmethod
+    def _drop_non_finite_metrics(cls, value: Any) -> Any:
+        """Keep only finite final metrics, on write *and* on read.
+
+        A NaN/Inf final value used to be stored as-is and serialised by pydantic as JSON
+        ``null``, which ``dict[str, float]`` then refused on the next read — one diverged run
+        made the manifest unreadable and crashed every command that lists the project (``list``,
+        ``status``, ``wait``, reconcile). A non-finite value is not a baseline anything can be
+        confirmed against, so it is dropped here rather than widened into the type; manifests
+        already written with a ``null`` load again with that metric absent.
+        """
+        return _finite_only(value) if isinstance(value, dict) else value
+
+    @field_serializer("final_metrics")
+    def _serialize_finite_metrics(self, value: dict[str, float]) -> dict[str, float]:
+        # `model_copy(update=...)` (every store write) skips validators, so filter on the way out
+        # too: the null must never reach disk in the first place.
+        return _finite_only(value)
+
+
+def _finite_only(metrics: dict[str, Any]) -> dict[str, Any]:
+    return {
+        k: v
+        for k, v in metrics.items()
+        if v is not None and not (isinstance(v, (int, float)) and not math.isfinite(v))
+    }
 
 
 class SweepCell(BaseModel):

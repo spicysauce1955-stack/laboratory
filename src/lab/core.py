@@ -530,6 +530,9 @@ class Lab:
         # Lazily built, then reused for this Lab's lifetime — see `_queue` / `_backend_for`.
         self._queue_store: QueueStore | None = None
         self._backends: dict[str, Backend] = {}
+        # Manifests the most recent `list_jobs` could not read: [{job_id, error}] (see there).
+        self.unreadable_jobs: list[dict[str, str]] = []
+        self._warned_unreadable: set[str] = set()
 
     def preflight(self, spec: JobSpec) -> None:
         """Refuse a remote launch that a cheap local check proves cannot work (FR-F3).
@@ -1368,7 +1371,33 @@ class Lab:
         return manifests, mirrored
 
     def list_jobs(self) -> list[JobManifest]:
-        return [self.store.read_manifest(j) for j in self.store.list_job_ids()]
+        """Every readable manifest in this project's store.
+
+        One unreadable manifest (corrupt JSON, or a schema an older/newer lab wrote) used to
+        raise out of here and take down ``list``, ``status``/``wait`` and reconcile for the whole
+        project. It is now skipped with a stderr warning (once per Lab) and named in
+        :attr:`unreadable_jobs`, which :meth:`spend` and :meth:`reconcile` carry into their
+        output — skipped is never the same as absent: reconcile keeps such a job's machine
+        protected, because for all it knows that job is running.
+        """
+        manifests: list[JobManifest] = []
+        unreadable: list[dict[str, str]] = []
+        for job_id in self.store.list_job_ids():
+            try:
+                manifests.append(self.store.read_manifest(job_id))
+            except (OSError, ValueError) as e:  # ValueError covers pydantic's ValidationError
+                reason = f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"[:300]
+                unreadable.append({"job_id": job_id, "error": reason})
+                if job_id not in self._warned_unreadable:
+                    self._warned_unreadable.add(job_id)
+                    print(
+                        f"[lab] skipping unreadable manifest {job_id} ({reason}); see "
+                        f"{self.store.manifest_path(job_id)}",
+                        file=sys.stderr,
+                    )
+                    events.note("core.manifest_unreadable", job_id=job_id, error=reason)
+        self.unreadable_jobs = unreadable
+        return manifests
 
     def spend(
         self,
@@ -1392,6 +1421,9 @@ class Lab:
             self.list_jobs() if manifests is None else manifests, at=now()
         )
         summary["alert"] = pricing.spend_alert(summary, threshold_usd=alert_usd)
+        # Jobs `list_jobs` had to skip: their spend is unknown, so name them like
+        # `unknown_cost_jobs` rather than let the total silently read as complete.
+        summary["unreadable_jobs"] = [u["job_id"] for u in self.unreadable_jobs]
         return summary
 
     def ps(self) -> dict[str, Any]:
@@ -1744,6 +1776,16 @@ class Lab:
                 aliases.add(str(recorded))
             for alias in aliases:
                 protected[alias] = j.job_id
+        # A manifest `list_jobs` could not read is not evidence its job ended: it may be a running
+        # job whose file another lab version wrote. Skipping it must not unprotect its machine —
+        # that would make it an "orphan" and destroy a live job's box (the 2026-08-20 shape).
+        unreadable_ids = [u["job_id"] for u in self.unreadable_jobs]
+        for job_id in unreadable_ids:
+            aliases = {cluster_name_for(job_id), f"lab-{job_id}"}
+            if recorded := self.store.read_runtime(job_id).get("cluster"):
+                aliases.add(str(recorded))
+            for alias in aliases:
+                protected.setdefault(alias, job_id)
 
         me = local_project()
         other_projects: list[dict[str, Any]] = []
@@ -1781,6 +1823,7 @@ class Lab:
             # was therefore permanently unattributable, and `--apply` silently refused to clean it
             # up. A job in our own runs/ is ours by definition.
             ours_locally = {j.job_id for j in self.list_jobs()}
+            ours_locally |= {u["job_id"] for u in self.unreadable_jobs}  # ours, if unreadable
             read = {id(item): _lab_identity(identify(item)) for item in items}
             candidates = {c for _, cands in read.values() for c in cands}
             attributions = attribute_jobs(candidates) if candidates else {}
@@ -2111,6 +2154,9 @@ class Lab:
             # (nothing was attempted) and on a fully-confirmed cleanup. Non-empty means the cloud
             # is in a state this tool cannot vouch for — the CLI exits 5 and says to verify.
             "destroy_outcomes": destroy_outcomes,
+            # Jobs whose manifest could not be read. Their machines were kept protected (never
+            # orphaned), so a real leak behind one needs a human: fix or remove the manifest.
+            "unreadable_manifests": unreadable_ids,
             "applied": apply,
         }
 
