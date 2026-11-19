@@ -458,12 +458,12 @@ def build_server(lab: Lab) -> FastMCP:
         use_spot: bool = False,
         use_cache: bool = True,
     ) -> dict[str, Any]:
-        """Check whether a launch on this cloud would work, BEFORE it costs a provision — run this when a submit fails to provision, or before the first job on a new cloud/shape. Returns {cloud, ok, checks:[{name,status,detail,fix}], blocking:[...]} where status is ok|warn|fail|skip. Verifies credentials (including SkyPilot's API-server daemon, which does not inherit .env), project, billing, enabled APIs, IAM permissions, and quota for the requested shape, then reports the catalog's instance type and price band. GCP GPU quota is checked at both levels Google enforces: a project can hold regional NVIDIA_*_GPUS quota and still be blocked by a global GPUS_ALL_REGIONS of 0. status="skip" means the check could not answer and is never a blocker; only "fail" is a definitive negative. use_cache=False re-runs every check instead of reusing cached results (e.g. right after fixing credentials or quota)."""
-        from lab.core import default_disk_gb, validate_cloud
-        from lab.doctor import doctor_view, run_checks
+        """Check whether a launch on this cloud would work, BEFORE it costs a provision — run this when a submit fails to provision, or before the first job on a new cloud/shape. Returns {cloud, ok, checks:[{name,status,detail,fix}], blocking:[...]} where status is ok|warn|fail|skip. cloud="local" (the default backend) returns a trivial ok report: nothing there can fail. Verifies credentials (including SkyPilot's API-server daemon, which does not inherit .env), project, billing, enabled APIs, IAM permissions, and quota for the requested shape, then reports the catalog's instance type and price band. GCP GPU quota is checked at both levels Google enforces: a project can hold regional NVIDIA_*_GPUS quota and still be blocked by a global GPUS_ALL_REGIONS of 0. status="skip" means the check could not answer and is never a blocker; only "fail" is a definitive negative. use_cache=False re-runs every check instead of reusing cached results (e.g. right after fixing credentials or quota)."""
+        from lab.core import default_disk_gb
+        from lab.doctor import doctor_view, run_checks, validate_doctor_cloud
 
         try:
-            validate_cloud(cloud)
+            validate_doctor_cloud(cloud)
         except LabError as e:
             raise ToolError(str(e)) from e
         resources = ResourceRequest(

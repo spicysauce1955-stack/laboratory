@@ -33,7 +33,6 @@ from lab.core import (
     job_status_view,
     orphan_key,
     resolve_backend_profile,
-    validate_cloud,
 )
 from lab.env import load_lab_env
 from lab.events import store as events_store
@@ -1490,7 +1489,9 @@ def reconcile(
 
 @app.command()
 def doctor(
-    cloud: str | None = typer.Option(None, "--cloud", help="vast | do | gcp (default vast)"),
+    cloud: str | None = typer.Option(
+        None, "--cloud", help="vast | do | gcp | local (default vast; local has nothing to check)"
+    ),
     accelerators: str | None = typer.Option(
         None, "--gpu", "--accelerators", help="check quota for this accelerator, e.g. T4:1"
     ),
@@ -1511,14 +1512,14 @@ def doctor(
     Quota is checked at both levels GCP enforces: a fresh project can hold regional GPU quota and
     still be blocked by a global ``GPUS_ALL_REGIONS`` of 0.
     """
-    from lab.doctor import doctor_view, format_report, run_checks
+    from lab.doctor import doctor_view, format_report, run_checks, validate_doctor_cloud
 
     resources = ResourceRequest(
         cpus=cpus, disk_size=disk_size, accelerators=accelerators,
         cloud=cloud, region=region, zone=zone, use_spot=spot,
     )
     try:
-        validate_cloud(cloud)
+        validate_doctor_cloud(cloud)
     except LabError as e:
         _emit({"error": str(e)})
         _fail(2, e)
