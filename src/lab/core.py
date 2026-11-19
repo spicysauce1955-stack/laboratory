@@ -2484,7 +2484,10 @@ class Lab:
             on_terminal=_on_terminal, mirrored_out=mirrored_seen,
         )
         all_terminal = all(m.status in _TERMINAL_STATES for m in manifests)
-        failed_fast = fail_fast and not all_terminal and any(
+        # "Tripped" = asked for, and some job failed/timed out — NOT "the wait was cut short".
+        # Requiring a survivor made a lone failing job exit 0, and made a multi-job verdict depend
+        # on whether the failures landed in the same poll. Survivors are still named in `pending`.
+        failed_fast = fail_fast and any(
             m.status in (JobState.failed, JobState.timed_out) for m in manifests
         )
         if all_terminal or failed_fast:

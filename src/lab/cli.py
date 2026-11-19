@@ -23,7 +23,7 @@ import typer
 
 from lab import __version__, events
 from lab import notes as lab_notes
-from lab._util import atomic_write_text, now, parse_duration, wrap_with_extras
+from lab._util import atomic_write_text, parse_duration, wrap_with_extras
 from lab.core import (
     Lab,
     LabError,
@@ -40,11 +40,11 @@ from lab.events.annotate import digest_of, refs_from
 from lab.events.sanitize import sanitize_argv
 from lab.manifest import git_work_tree, repo_root
 from lab.models import JobManifest, JobSpec, ResourceRequest
-from lab.scheduler.models import Guardrails, RegState, Triggers
+from lab.queue_view import queue_list_view
+from lab.scheduler.models import Guardrails, Triggers
 from lab.scheduler.price import PriceFeed
 from lab.scheduler.queue import QueueStore, default_queue, wait_for_queue_drain
 from lab.scheduler.register import parse_expires, parse_window
-from lab.scheduler.skew import skew_from_heartbeat
 from lab.scheduler.register import register as sched_register
 from lab.scheduler.register import register_sweep as sched_register_sweep
 from lab.scheduler.register import worst_case_cost
@@ -633,9 +633,9 @@ def lint(
 @app.command()
 def mcp() -> None:
     """Run the MCP server on stdio (the command scaffolded into ``.mcp.json``)."""
-    from lab.mcp_server import build_server
+    from lab.mcp_server import build_server, run_stdio
 
-    build_server(default_lab()).run()
+    run_stdio(build_server(default_lab()))  # stdout is the JSON-RPC stream; diagnostics -> stderr
 
 
 @app.command()
@@ -692,7 +692,7 @@ def status(job_id: str) -> None:
 
 
 @app.command()
-def logs(job_id: str, tail: int = typer.Option(100)) -> None:
+def logs(job_id: str, tail: int = typer.Option(100, help="last N lines (0 = none)")) -> None:
     """Tail a job's logs (FR-D1); scheduler-launched jobs fall back to the mirrored manifest
     (spec §4.3), same as `lab status`."""
     for line in _lab_for_mirrored_or_fail(job_id).logs(job_id, tail=tail):
@@ -1142,15 +1142,18 @@ def wait(
     ),
     fail_fast: bool = typer.Option(
         False, "--fail-fast",
-        help="exit 4 as soon as any job is failed/timed_out (preempted/cancelled don't trip it); "
-        "surviving jobs are NOT cancelled — `pending` in the summary names them",
+        help="exit 4 as soon as any job is failed/timed_out (preempted/cancelled don't trip it), "
+        "also when every job has already finished; surviving jobs are NOT cancelled — `pending` "
+        "in the summary names them",
     ),
 ) -> None:
     """Block until the job(s) reach a terminal state, then exit (FR-G1).
 
     Run as a Claude Code background task — its completion is the push signal the session acts on,
     so the agent need not poll. Exit codes: 0 clean; 1 gave up on --timeout; 2 bad args;
-    3 teardown leaked (a paid machine may still bill); 4 --fail-fast tripped.
+    3 teardown leaked (a paid machine may still bill); 4 --fail-fast tripped; 6 teardown outcome
+    unknown (verify with the provider). When several apply, 3 > 6 > 4 > 1: a leak on a job that
+    already finished is reported even if another job is still running at --timeout.
 
     Scheduler-launched (deferred) job ids work too: they have no local runs/ record, so they are
     read from the scheduler queue's mirrored manifest — the same fallback `lab status` uses — and
@@ -1206,24 +1209,21 @@ def wait(
             "block volume is still billing.",
             err=True,
         )
+    # Precedence 3 > 6 > 4 > 1 (docs/COMPATIBILITY.md). Money outranks everything: exit 3 is the
+    # documented URGENT "a paid machine may still be billing — run `lab reconcile` now" alarm
+    # (FR-C2), and exit 6 is the same concern without the certainty — an unverified machine costs
+    # the same as a verified one (R10). Both are checked before the fail-fast *and* the timeout
+    # exits: a job that already finished with a leaked teardown is billing now, whether or not
+    # some other job in the same wait is still running. Checking the timeout first used to report
+    # that as exit 1 ("gave up"), while `lab wait <that job>` alone exited 3.
+    if teardown_leaks:
+        _fail(3, "teardown leaked on at least one job")
+    if teardown_unknown:
+        _fail(6, "teardown outcome unknown on at least one job — verify with the provider")
     if summary["failed_fast"]:
-        # Money outranks the fail-fast signal. Exit 3 is the documented URGENT "a paid machine
-        # may still be billing — run `lab reconcile` now" alarm (FR-C2); exit 6 is the same
-        # concern without the certainty, and it still outranks 4 because an unverified machine
-        # costs the same as a verified one (R10).
-        if teardown_leaks:
-            _fail(3, "fail-fast: teardown leaked")
-        if teardown_unknown:
-            _fail(6, "fail-fast: teardown outcome unknown")
         _fail(4, "fail-fast: a job failed/timed out")
     if not all_terminal:
         _fail(1, "gave up: --timeout elapsed before all jobs reached a terminal state")
-    if teardown_leaks:
-        # all terminal but at least one cluster may still be billing
-        _fail(3, "teardown leaked on at least one job")
-    if teardown_unknown:
-        # all terminal, nothing confirmed leaked, but at least one outcome is unreadable
-        _fail(6, "teardown outcome unknown on at least one job — verify with the provider")
 
 
 @app.command()
@@ -1688,13 +1688,6 @@ queue_app = typer.Typer(help="Manage deferred registrations (spec §6).", no_arg
 app.add_typer(queue_app, name="queue")
 
 
-def _heartbeat_age_s(hb: dict[str, Any] | None) -> float | None:
-    if not hb or "at" not in hb:
-        return None
-    at = datetime.fromisoformat(str(hb["at"]))
-    return max(0.0, (now() - at).total_seconds())
-
-
 def _require_entry(queue: QueueStore, reg_id: str) -> None:
     try:
         queue.get_entry(reg_id)
@@ -1710,55 +1703,10 @@ def queue_list() -> None:
     wrote it. `heartbeat_paused` is what the *last completed tick* actually observed and acted
     on -- unlike `control.paused` below (which flips the instant a write lands), it's the signal
     a redeploy cutover needs to confirm the running scheduler has genuinely stopped launching."""
-    queue = default_queue()
-    entries = queue.list_entries()
-    hb = queue.read_heartbeat()
-    # Two listings, not two round trips per entry: asking `held()`/`cancel_requested()` per row
-    # cost 163-326 sequential HEADs on the campaign that motivated this (2026-09, ~65s of a ~70s
-    # `queue list`). One snapshot each also means the rows can no longer self-contradict, which
-    # per-entry reads taken 30s apart could.
-    held_ids = queue.held_ids()
-    cancelled_ids = queue.cancel_requested_ids()
-    # Version skew is silent and expensive: the always-on host deserialises registrations with
-    # ITS pydantic models, so an older host drops fields it doesn't know — that is how
-    # `--price-cap` was quietly lost on the deferred path, and it was then misdiagnosed as
-    # `lab register` not having the flag. Diagnostic only: never a gate, never a refusal.
-    #
-    # `may_drop_fields` is False when there is no heartbeat at all: warning about an old host on a
-    # queue no scheduler has ever ticked against asserts a fact nobody has evidence for, and a
-    # diagnostic that is usually wrong is ignored when it is finally right (R10). The verdict and
-    # its `detail` still ride in the payload, next to `heartbeat_age_s: null`.
-    skew = skew_from_heartbeat(hb)
-    if skew.may_drop_fields:
-        typer.echo(f"[lab] warning: {skew.detail}", err=True)
-    _emit(
-        {
-            "scheduler_skew": {
-                "verdict": skew.verdict,
-                "host_version": skew.host_version,
-                "client_version": skew.client_version,
-                "detail": skew.detail,
-            },
-            "heartbeat_age_s": _heartbeat_age_s(hb),
-            "host": (hb or {}).get("host"),
-            "heartbeat_paused": (hb or {}).get("paused"),
-            "tick_count": (hb or {}).get("tick_count"),
-            "control": queue.read_control().model_dump(),
-            "entries": [
-                {
-                    "reg_id": r.reg_id,
-                    "state": "held"
-                    if (r.state is RegState.pending and r.reg_id in held_ids)
-                    else r.state.value,
-                    "cancel_requested": r.reg_id in cancelled_ids,
-                    "job_id": r.job_id,
-                    "last_skip_reason": r.last_skip_reason,
-                    "expires_at": r.guardrails.expires_at,
-                }
-                for r in entries
-            ],
-        }
-    )
+    view = queue_list_view(default_queue())  # shared with the MCP tool (lab.queue_view)
+    if view.warning is not None:
+        typer.echo(view.warning, err=True)
+    _emit(view.payload)
 
 
 @queue_app.command(name="show")

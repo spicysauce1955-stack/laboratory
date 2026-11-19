@@ -24,8 +24,15 @@ upgrade note.
   would bill over it. A price feed that cannot answer never blocks, so this does not fail
   closed on a Vast API outage.
 
-  On `lab wait`, 3 outranks 6 outranks 4: a *confirmed* leak is the most urgent signal, an
-  unverifiable one is still a money signal, and both outrank the fail-fast notice. Exit 5 and 6
+  On `lab wait`, 3 outranks 6 outranks 4 outranks 1: a *confirmed* leak is the most urgent
+  signal, an unverifiable one is still a money signal, and both outrank the fail-fast notice and
+  the `--timeout` give-up — a job that already finished with a leaked teardown is billing whether
+  or not another job in the same wait is still running (that case used to exit 1). `--fail-fast`
+  trips (exit 4, `failed_fast: true`) whenever any job in the wait failed or timed out, including
+  when every job had already finished by the time it was seen; it used to require a still-running
+  survivor, so a lone failing job exited 0 and a multi-job verdict depended on poll timing.
+  Without `--fail-fast` a failed job is still exit 0: the code describes the wait and the
+  teardown, and the experiment's outcome is `jobs[].state`. Exit 5 and 6
   were added in v0.7.0; a caller that treats "non-zero" as failure is unaffected, one that
   enumerates codes must learn them.
 
@@ -100,6 +107,19 @@ upgrade note.
   host deserialises registrations with *its* models and silently drops fields it does not know,
   which is how `--price-cap` was once lost on the deferred path. It is a diagnostic, never a gate;
   nothing refuses to register because of it.
+
+  The MCP `register` / `register_sweep` tools gained the deferred-path arguments `lab register` /
+  `lab register-sweep` already had — `price_cap`, `price_cap_strict`, `region`, `zone`,
+  `use_spot`, `spot_fallback`, `accelerator_pool`, `max_launch_attempts`, `gpus`, plus `hold`
+  (register) and `with_pkg` (register_sweep) — and the MCP `doctor` tool gained `use_cache`
+  (`lab doctor --no-cache`). All additive with the CLI's defaults; a test now diffs every
+  CLI command against its MCP tool so the two cannot drift silently again.
+
+  `lab queue list` and the MCP `queue_list` tool now return one shared view (`lab.queue_view`):
+  the MCP tool gained the `scheduler_skew` block and each entry's `cancel_requested`, both
+  additive. The CLI's `entries[].expires_at` is now ISO-8601 with a `T` separator, the form the
+  MCP tool always returned, instead of Python's `str()` form with a space; both parse with
+  `datetime.fromisoformat`.
 
   `no_heartbeat` means the queue holds **no heartbeat object at all** — no tick has ever completed
   against it — and is deliberately **silent**: with nothing published there is no host to call

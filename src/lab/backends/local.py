@@ -20,6 +20,7 @@ from lab._util import infer_artifact_type, now, pid_alive, process_start_time
 from lab.manifest import sha256_file
 from lab.metrics import METRICS_FILE, read_points
 from lab.models import ArtifactRecord, JobManifest, JobState
+from lab.runner import stop_group
 from lab.store import JobStore
 
 _TERMINAL = {
@@ -27,6 +28,39 @@ _TERMINAL = {
 }
 
 
+
+
+_TAIL_BLOCK = 64 * 1024
+# A log with almost no '\n' (a progress bar redrawn with '\r') would otherwise be read whole while
+# looking for line breaks; past this, the tail is taken from what was read.
+_TAIL_MAX_BYTES = 16 * 1024 * 1024
+
+
+def tail_lines(path: Path, n: int | None) -> list[str]:
+    """The last ``n`` lines of ``path``: all of them for ``None``, none for ``n <= 0``.
+
+    Reads backwards from the end in blocks, so showing 100 lines of a multi-GB log costs about 100
+    lines of I/O, and decodes with ``errors="replace"``: an experiment's stdout is not promised to
+    be UTF-8, and one stray byte used to crash ``lab logs``. A block boundary can split a
+    multi-byte character, but only inside the first, partial line, which is always dropped.
+    """
+    if n is not None and n <= 0:
+        return []
+    with path.open("rb") as f:
+        if n is None:
+            return f.read().decode("utf-8", errors="replace").splitlines()
+        pos = f.seek(0, os.SEEK_END)
+        buf = b""
+        # n+1 line breaks guarantee n whole lines after the first (possibly partial) one.
+        while pos > 0 and buf.count(b"\n") <= n and len(buf) < _TAIL_MAX_BYTES:
+            step = min(_TAIL_BLOCK, pos)
+            pos -= step
+            f.seek(pos)
+            buf = f.read(step) + buf
+    lines = buf.decode("utf-8", errors="replace").splitlines()
+    if pos > 0:
+        lines = lines[1:]  # began mid-line (or mid-character)
+    return lines[-n:]
 
 
 def _kill(pid: int, *, group: bool) -> None:
@@ -80,8 +114,7 @@ class LocalBackend:
         p = self.store.logs_path(job_id)
         if not p.exists():
             return []
-        lines = p.read_text().splitlines()
-        return lines[-tail:] if tail else lines
+        return tail_lines(p, tail)
 
     def cancel(self, job_id: str) -> JobState:
         m = self.store.read_manifest(job_id)
@@ -93,9 +126,14 @@ class LocalBackend:
         )
         rt = self.store.read_runtime(job_id)
         if rt.get("command_pgid"):
-            _kill(rt["command_pgid"], group=True)
-        if rt.get("runner_pid"):
-            _kill(rt["runner_pid"], group=False)
+            # SIGTERM, a grace, then SIGKILL — an experiment that ignores SIGTERM must not outlive
+            # the `cancelled` just recorded. Skipped if the group id now belongs to someone else.
+            stop_group(rt["command_pgid"], leader_start_time=rt.get("command_start_time"))
+        runner_pid = rt.get("runner_pid")
+        if runner_pid and pid_alive(runner_pid, start_time=rt.get("runner_start_time")):
+            # Only the runner we launched: a bare PID may have been recycled by now, and this
+            # used to SIGTERM whatever held the number.
+            _kill(runner_pid, group=False)
         return JobState.cancelled
 
     def collect_artifacts(self, job_id: str, dest: str) -> list[ArtifactRecord]:

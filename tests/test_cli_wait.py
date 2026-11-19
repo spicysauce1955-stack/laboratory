@@ -192,6 +192,44 @@ def test_wait_fail_fast_returns_on_failed_job(monkeypatch, tmp_path):
     assert summary["jobs"][0]["job_id"] == "j1"  # offender first
 
 
+def test_wait_fail_fast_trips_on_a_single_failed_job(monkeypatch, tmp_path):
+    """`--fail-fast` means "exit 4 if any job failed/timed out" — it must not depend on whether
+    some *other* job was still running when the failure was seen. A lone failing job used to
+    report failed_fast=false (everything was terminal, so nothing was "cut short")."""
+    monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+    lab = _two_job_lab(tmp_path, {"j1": JobState.failed})
+    summary = lab.wait_summary(["j1"], interval=0.01, timeout=5, fail_fast=True)
+    assert summary["failed_fast"] is True
+    assert summary["all_terminal"] is True
+
+
+def test_wait_fail_fast_does_not_depend_on_poll_timing(monkeypatch, tmp_path):
+    """Two jobs that both fail before the first poll are all-terminal on that poll; the verdict
+    must be the same as when the failures are seen one poll apart."""
+    monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+    lab = _two_job_lab(tmp_path, {"j1": JobState.failed, "j2": JobState.timed_out})
+    summary = lab.wait_summary(["j1", "j2"], interval=0.01, timeout=5, fail_fast=True)
+    assert summary["failed_fast"] is True
+    assert summary["pending"] == []
+
+
+def test_wait_without_fail_fast_never_reports_failed_fast(monkeypatch, tmp_path):
+    monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+    lab = _two_job_lab(tmp_path, {"j1": JobState.failed})
+    summary = lab.wait_summary(["j1"], interval=0.01, timeout=5)
+    assert summary["failed_fast"] is False
+
+
+def test_cli_wait_fail_fast_exits_4_for_a_single_failed_job(monkeypatch, tmp_path):
+    monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+    _patch_store(monkeypatch, tmp_path, _two_job_lab(tmp_path, {"j1": JobState.failed}))
+    result = CliRunner().invoke(app, ["wait", "j1", "--fail-fast"])
+    assert result.exit_code == 4, result.output
+    # ...and without the flag a failed job is still a clean wait: exit 0 is about the wait and
+    # the teardown, not the experiment's outcome (that is `jobs[].state`).
+    assert CliRunner().invoke(app, ["wait", "j1"]).exit_code == 0
+
+
 def test_wait_fail_fast_ignores_preempted_and_cancelled(monkeypatch, tmp_path):
     monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
     statuses = {"j1": JobState.preempted, "j2": JobState.cancelled, "j3": JobState.succeeded}
@@ -348,6 +386,36 @@ def test_cli_wait_fail_fast_with_confirmed_leak_exits_3(monkeypatch, tmp_path):
     _patch_store(monkeypatch, tmp_path, _FakeLab())
     result = CliRunner().invoke(app, ["wait", "j1", "j2", "--fail-fast", "--timeout", "5"])
     assert result.exit_code == 3  # leak alarm wins over fail-fast's 4
+
+
+def test_cli_wait_timeout_does_not_mask_a_leak_on_a_finished_job(monkeypatch, tmp_path):
+    """The reviewer's repro: `lab wait A B --timeout 3` with A already terminal and leaked, B still
+    running. `lab wait A` alone exits 3; adding a still-running B used to turn that into exit 1
+    ("gave up on --timeout") — the leak was in the summary but the exit code said nothing was
+    known yet, which is the code a background-task hook acts on."""
+    leaked = make_manifest("A", "python x.py").model_copy(
+        update={"status": JobState.succeeded, "backend": BackendInfo(provisioner="skypilot"),
+                "teardown_status": "failed"}
+    )
+    running = make_manifest("B", "python x.py").model_copy(
+        update={"status": JobState.running, "backend": BackendInfo(provisioner="skypilot")}
+    )
+
+    class _FakeLab(_SummaryMixin):
+        wait = Lab.wait  # the real poll loop: B never finishes, so the deadline ends the wait
+
+        def status(self, job_id):
+            return leaked.status if job_id == "A" else running.status
+
+        def manifest(self, job_id):
+            return leaked if job_id == "A" else running
+
+    _patch_store(monkeypatch, tmp_path, _FakeLab())
+    result = CliRunner().invoke(app, ["wait", "A", "B", "--timeout", "0.2", "--interval", "0.05"])
+    assert result.exit_code == 3, result.output
+    summary = json.loads(result.stdout)
+    assert summary["all_terminal"] is False and summary["pending"] == ["B"]
+    assert summary["teardown_leaks"] == ["A"]
 
 
 def test_wait_summary_settles_offender_teardown_on_fail_fast(monkeypatch, tmp_path):
