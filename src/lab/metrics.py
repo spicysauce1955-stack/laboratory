@@ -11,6 +11,7 @@ coupling-free). MLflow can slot in behind this same read interface later.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from collections.abc import Iterable
@@ -72,6 +73,11 @@ def final_values(points: list[dict[str, Any]]) -> dict[str, float]:
     The durable per-job baseline a reproducibility re-run is judged against (FR-B4): the manifest
     snapshots this at terminal time so an old run stays confirmable even after its run dir / object
     store copy is pruned.
+
+    Non-finite points (NaN, ±Infinity — Python's ``json`` writes and reads them, and ``float()``
+    accepts them) are skipped, so a series' value is its last *finite* one and a series with none
+    is absent. A NaN here used to reach the manifest, where pydantic serialises it as ``null`` and
+    its own ``float`` field then refuses to read it back: one diverged loss made the job unreadable.
     """
     best: dict[str, tuple[int, float]] = {}
     for pt in points:
@@ -82,6 +88,8 @@ def final_values(points: list[dict[str, Any]]) -> dict[str, float]:
             numeric = float(value)
         except (TypeError, ValueError):
             continue  # a non-numeric point can't be a baseline; skip it, never crash finalize
+        if not math.isfinite(numeric):
+            continue
         if name not in best or step >= best[name][0]:
             best[name] = (step, numeric)
     return {name: value for name, (_, value) in best.items()}
