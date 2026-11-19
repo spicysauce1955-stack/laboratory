@@ -717,14 +717,19 @@ class Scheduler:
         changed = reg.state_changed_at or reg.created_at
         if (self.now_fn() - changed).total_seconds() < self.LAUNCHING_ORPHAN_S:
             return
-        job = next(
-            (
-                m
-                for j in self.store.list_job_ids()
-                if (m := self.store.read_manifest(j)).registration_id == reg.reg_id
-            ),
-            None,
-        )
+        # Only a job submitted by THIS launch is evidence: `_launch` writes `launching` (stamping
+        # `state_changed_at`) before it submits, so this attempt's manifest was created at or
+        # after that instant. A reg that was relaunched (price-verify rollback, preemption) also
+        # has earlier attempts on file under the same registration_id -- adopting the oldest
+        # bound it to a stale cancelled/preempted job, and the next sync mirrored that onto a reg
+        # whose real attempt was still running. Newest wins if there are several.
+        candidates = [
+            m
+            for j in self.store.list_job_ids()
+            if (m := self.store.read_manifest(j)).registration_id == reg.reg_id
+            and m.created_at >= changed
+        ]
+        job = max(candidates, key=lambda m: m.created_at) if candidates else None
         if job is not None:  # the submit happened -> repair forward
             self._transition(
                 reg, RegState.launched, reason="repaired: launch had completed",

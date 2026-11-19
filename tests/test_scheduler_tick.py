@@ -260,6 +260,59 @@ def test_orphaned_launching_with_existing_job_repairs_to_launched(tmp_path: Path
     assert repaired.state is RegState.launched and repaired.job_id == job_id
 
 
+def _stuck_launching_with_attempts(
+    tmp_path: Path, attempts: list[tuple[str, JobState, timedelta]]
+) -> tuple[Scheduler, LocalQueueStore]:
+    """reg-a stuck in `launching` since 20 min ago, plus earlier/later job attempts for it."""
+    sched, q = _watchdog_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a", command="python x.py", expires=utc_now() + timedelta(days=1))
+    for job_id, status, created_ago in attempts:
+        sched.store.create(make_manifest(job_id, "python x.py").model_copy(update={
+            "status": status, "registration_id": "reg-a",
+            "created_at": utc_now() - created_ago}))
+    q.put_entry(q.get_entry("reg-a").model_copy(update={
+        "state": RegState.launching, "job_id": None,
+        "state_changed_at": utc_now() - timedelta(minutes=20)}))
+    sched._launch = lambda reg, rep: None  # type: ignore[method-assign]
+    return sched, q
+
+
+def test_repair_adopts_this_attempts_job_not_an_earlier_cancelled_one(tmp_path: Path):
+    """A reg that was relaunched (price-verify rollback, preemption) has an EARLIER attempt in the
+    store carrying the same registration_id. Adopting the oldest bound the reg to that cancelled
+    attempt -- and the next tick mirrored it to `cancelled` while this attempt was still running."""
+    sched, q = _stuck_launching_with_attempts(tmp_path, [
+        ("j-20260101-aaaa", JobState.cancelled, timedelta(hours=2)),  # before this launch began
+        ("j-20260102-bbbb", JobState.running, timedelta(minutes=19)),  # this launch's submit
+    ])
+    sched.tick()
+    e = q.get_entry("reg-a")
+    assert e.state is RegState.launched and e.job_id == "j-20260102-bbbb"
+    sched.tick()
+    assert q.get_entry("reg-a").state is RegState.launched  # never flipped to cancelled
+
+
+def test_repair_never_adopts_only_a_prior_attempt(tmp_path: Path):
+    """The only job on file predates this `launching`: this launch never submitted, so the reg
+    goes back to pending -- it must not inherit the old attempt's terminal state."""
+    sched, q = _stuck_launching_with_attempts(tmp_path, [
+        ("j-20260101-aaaa", JobState.preempted, timedelta(hours=2)),
+    ])
+    rep = sched.tick()
+    e = q.get_entry("reg-a")
+    assert e.state is RegState.pending and e.job_id is None
+    assert any("no job manifest" in err for err in rep.errors)
+
+
+def test_repair_picks_the_newest_attempt_after_the_launch_began(tmp_path: Path):
+    sched, q = _stuck_launching_with_attempts(tmp_path, [
+        ("j-20260102-cccc", JobState.running, timedelta(minutes=10)),
+        ("j-20260102-bbbb", JobState.failed, timedelta(minutes=19)),
+    ])
+    sched.tick()
+    assert q.get_entry("reg-a").job_id == "j-20260102-cccc"
+
+
 def test_sync_mirrors_terminal_state_and_manifest(tmp_path: Path):
     sched, q = make_sched(tmp_path)
     put_reg(q, tmp_path, "reg-a")
