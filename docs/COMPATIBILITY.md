@@ -169,7 +169,11 @@ upgrade note.
   tools (v0.12.0) gained additive `--accelerator-pool` / `--max-launch-attempts`. Both default to
   off, so launch behaviour is unchanged unless you pass them, and rotation never raises
   `--price-cap`. `--backend cpu` refuses a pool the same way it already refuses `--accelerators`.
-- **MCP** — tool names, argument names, and the shape of returned JSON.
+- **MCP** — tool names, argument names, and the shape of returned JSON. After v0.12.0 the
+  server's `serverInfo.version` is the lab's version (it reported FastMCP's), and `lab mcp`
+  starts without FastMCP's banner or its PyPI update check — no network call on start.
+  `doctor(cloud="local")` / `lab doctor --cloud local` now return a one-check ok report instead
+  of refusing `local` as an unknown cloud (a loosening).
 - **Notes** — `lab note` / `lab notes`, their flags, and the record shape in
   `runs/<job_id>/notes.jsonl` and `~/.lab/notes/index.jsonl` (every line carries `v`, currently
   `1`). The per-job file is part of the `runs/<job_id>/` layout below and is copied into

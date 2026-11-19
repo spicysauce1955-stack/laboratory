@@ -20,13 +20,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import IO, Any
 
+import fastmcp
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
 from mcp.types import CallToolRequestParams
 
-from lab import events
+from lab import __version__, events
 from lab._util import parse_duration, unwritable_dest_message, wrap_with_extras
 from lab.core import Lab, LabError, default_lab, job_status_view, resolve_backend_profile
 from lab.env import load_lab_env
@@ -88,7 +89,9 @@ def run_stdio(server: FastMCP) -> None:
     transport = os.fdopen(os.dup(sys.stdout.fileno()), "wb")
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
     sys.stdout = _StdoutForDiagnostics(transport)
-    server.run()
+    # No banner: FastMCP's start-up banner is decoration for a human terminal, and rendering it
+    # is what asks PyPI for a newer FastMCP — a network call on every agent session's start.
+    server.run(show_banner=False)
 
 
 def _since_cutoff(since: str | None) -> datetime | None:
@@ -151,7 +154,12 @@ class EventMiddleware(Middleware):
 
 
 def build_server(lab: Lab) -> FastMCP:
-    mcp: FastMCP = FastMCP("laboratory")
+    # Belt and braces with `run_stdio`'s show_banner=False: the update check is the banner's
+    # only network call, and a stdio server for an agent must make none on start.
+    fastmcp.settings.check_for_updates = "off"
+    # serverInfo.version is how a client tells which lab it is talking to; FastMCP otherwise
+    # reports its own version there.
+    mcp: FastMCP = FastMCP("laboratory", version=__version__)
     mcp.add_middleware(EventMiddleware())
     home = lab.home
     store = JobStore(home)
