@@ -419,6 +419,31 @@ def test_list_entries_skips_corrupt_bytes_instead_of_crashing(capsys):
     assert "queue/entries/reg-corrupt.json" in capsys.readouterr().err
 
 
+def test_list_entries_reports_which_entries_it_skipped():
+    """Skipping an unreadable entry is right for a listing, but a caller that *decides* from the
+    listing -- a dependency check, bundle GC, the deploy drain gate -- must be able to tell
+    "this registration does not exist" from "this registration exists and could not be read"."""
+    from lab.scheduler.queue import unreadable_entry_ids
+
+    q, fake = make_q()
+    q.put_entry(_reg("reg-good"))
+    fake.blobs["queue/entries/reg-partial.json"] = b'{"reg_id": "reg-partial"}'
+    fake.blobs["queue/entries/reg-corrupt.json"] = b"\xff\xfe\x00bad-bytes"
+
+    assert [r.reg_id for r in q.list_entries()] == ["reg-good"]
+    assert unreadable_entry_ids(q) == frozenset({"reg-partial", "reg-corrupt"})
+
+    del fake.blobs["queue/entries/reg-partial.json"], fake.blobs["queue/entries/reg-corrupt.json"]
+    q.list_entries()
+    assert unreadable_entry_ids(q) == frozenset()  # per listing, never sticky
+
+
+def test_unreadable_entry_ids_is_empty_for_a_store_that_never_skips(tmp_path: Path):
+    from lab.scheduler.queue import LocalQueueStore, unreadable_entry_ids
+
+    assert unreadable_entry_ids(LocalQueueStore(tmp_path / "q")) == frozenset()
+
+
 def test_list_entries_degrades_per_entry_without_losing_concurrent_siblings(capsys):
     """The concurrency-specific half of the degrade: with many keys in flight, the one bad blob
     must cost exactly one entry, not the batch it shared a pool with."""

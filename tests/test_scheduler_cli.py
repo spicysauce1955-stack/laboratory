@@ -81,7 +81,9 @@ def test_queue_gc_cli(tmp_path: Path):
     live_key = q.get_entry(out["reg_id"]).bundle_key
     src = tmp_path / "orphan.tar.gz"
     src.write_bytes(b"x")
-    orphan_key = q.put_bundle("orphan", src)  # referenced by no entry -> orphaned
+    # referenced by no entry, and older than GC's minimum age (read from the reg-id timestamp) ->
+    # orphaned. A *fresh* unreferenced bundle is kept: its register may not have committed yet.
+    orphan_key = q.put_bundle("reg-20200101-000000-0a1b2c", src)
 
     dry = json.loads(runner.invoke(app, ["queue", "gc"], env=env).stdout)
     assert dry["orphaned"] == [orphan_key] and dry["deleted"] == [] and dry["applied"] is False

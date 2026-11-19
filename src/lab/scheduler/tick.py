@@ -23,7 +23,7 @@ from lab.models import JobManifest, JobState, ResourceRequest
 from lab.scheduler.bundle import extract_bundle
 from lab.scheduler.models import ControlConfig, Registration, RegState, TickReport
 from lab.scheduler.price import PriceFeed
-from lab.scheduler.queue import QueueStore
+from lab.scheduler.queue import QueueStore, unreadable_entry_ids
 from lab.scheduler.skew import HEARTBEAT_VERSION_KEY
 from lab.store import JobStore
 
@@ -159,11 +159,20 @@ class Scheduler:
         tick_count = int((self.queue.read_heartbeat() or {}).get("tick_count", 0)) + 1
         self._price_cache: dict[tuple[str | None, str | None], float | None] = {}
         self._best_hourly_seen: dict[str, float] = {}
+        self._unreadable: frozenset[str] = frozenset()
         control: ControlConfig | None = None
         try:
             control = self.queue.read_control()
             if not control.paused:
                 entries = self.queue.list_entries()
+                # Entries the listing had to skip. They exist -- they just could not be read this
+                # tick -- so nothing may treat them as missing (see `_trigger_block`).
+                self._unreadable = unreadable_entry_ids(self.queue)
+                if self._unreadable:
+                    rep.errors.append(
+                        "unreadable queue entries this tick (skipped, not treated as missing): "
+                        + ", ".join(sorted(self._unreadable))
+                    )
                 # Read once, use for the whole tick (see MarkerSnapshot). Paused ticks skip it:
                 # they launch and sync nothing, so there is no question to answer and no reason
                 # to pay.
@@ -612,6 +621,8 @@ class Scheduler:
             return f"outside window {t.window.start}-{t.window.end} {t.window.tz}"
         for dep_id in t.after:  # dead deps cancel immediately, even behind waiting ones
             dep = by_id.get(dep_id)
+            if dep is None and dep_id in self._unreadable:
+                continue  # exists but unreadable this tick: waiting (below), never "missing"
             if dep is None or dep.state in (
                 RegState.failed,
                 RegState.expired,
@@ -622,6 +633,8 @@ class Scheduler:
                 rep.cancelled.append(reg.reg_id)
                 return ""
         for dep_id in t.after:
+            if dep_id not in by_id:  # unreadable (a cancel is irreversible; a wait costs a tick)
+                return f"waiting on dependency {dep_id} (entry unreadable this tick)"
             dep_state = by_id[dep_id].state
             if dep_state is not RegState.succeeded:
                 return f"waiting on dependency {dep_id} ({dep_state.value})"
