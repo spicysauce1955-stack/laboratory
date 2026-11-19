@@ -539,6 +539,57 @@ def test_bare_provider_key_shapes_are_masked_in_prose(secret: str) -> None:
     assert sanitize_params({"msg": f"failed with key {secret} during connect"})["msg"] == out
 
 
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        # A glued env-style prefix: `PGPASSWORD`, `MYSQLPASSWORD` have no segment boundary in
+        # front of `password`, so the segment test alone never saw them (stress run 2026-11-19).
+        ("PGPASSWORD=s3cretpass python t.py", "s3cretpass"),
+        ("env MYSQLPASSWORD=s3cretpass ./load", "s3cretpass"),
+        ("python t.py db.password=hunter2", "hunter2"),
+        ("password=Tr0ub4dor&3 python t.py", "&3"),  # the tail after `&` used to survive
+        ("--grid password=a,b", ",b"),  # ...and after `,`
+        ("Settings(password='hunter2', user='x') failed to validate", "hunter2"),
+        ("the config said password: hunter2 and it was wrong", "hunter2"),
+        ("db_password = hunter2 in settings.ini", "hunter2"),
+    ],
+)
+def test_a_value_named_like_a_credential_is_masked_in_argv_params_and_notes(
+    text: str, secret: str
+) -> None:
+    for out in (
+        sanitize_params({"command": text})["command"],
+        sanitize_argv(["submit", "-c", text])[2],
+        mask_text(text),
+    ):
+        assert secret not in out, out
+        assert MASK in out
+
+
+def test_the_ledger_and_the_log_share_one_name_test() -> None:
+    """M3 asked for `redact` to learn credential names; a second list would drift from the
+    sanitizer's. There is one: the sanitizer's own name test, now living in `lab.redact`."""
+    from lab.events import sanitize
+    from lab.redact import sensitive_name
+
+    assert sanitize._sensitive_name is sensitive_name
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Spaced `=` and `name:` are prose-shaped, so they need a *qualified* name: a bare
+        # `key`/`token` there is the subject of a sentence far more often than a credential.
+        "the key: it was the accelerator name, not the price",
+        "token = the unit the tokenizer emits; key = the dict key",
+        "if api_key == expected: return",
+        "lr=0.1 seed=3 max_tokens=512 model.key_dim=64",
+    ],
+)
+def test_prose_about_keys_and_tokens_is_left_alone(text: str) -> None:
+    assert mask_text(text) == text
+
+
 def test_masking_is_idempotent_on_the_new_shapes() -> None:
     text = (
         f"DB_PASSWORD=hunter2 python t.py --wandb_key {WANDB} "

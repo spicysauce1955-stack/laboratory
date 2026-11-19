@@ -307,3 +307,70 @@ def test_the_log_writer_masks_a_key_block_that_arrives_line_by_line() -> None:
         assert body not in out
     assert out.splitlines()[0] == "before" and out.splitlines()[-1] == "after the key"
     assert "-----END RSA PRIVATE KEY-----" in out
+
+
+# --- a secret-ish NAME says its value is a credential, whatever the value looks like ----------
+#
+# `password=hunter2` has no shape at all; only the name says what it is. The name test is the
+# ledger sanitizer's own (`lab.redact.sensitive_name`, which `lab.events.sanitize` imports), so
+# a log and a ledger record can never disagree about what counts as a credential's name.
+
+NAMED = [
+    ("AWS_SECRET_ACCESS_KEY=FAKEwJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "FAKEwJalrXUtnFEMI"),
+    ("password=hunter2-fake-password", "hunter2"),
+    ("export DB_PASSWORD=hunter2", "hunter2"),
+    ("PGPASSWORD=s3cretpass psql -h db.internal", "s3cretpass"),
+    ("SMTP_PASS=hunter2 ./send", "hunter2"),
+    ("password=Tr0ub4dor&3", "&3"),  # `&` inside a value is not a query separator here
+    ("db.password: hunter2", "hunter2"),  # YAML / Hydra config dump
+    ("  api_key: abc123def", "abc123def"),
+    ('wandb_api_key: "two words"', "two words"),
+    ("Settings(password='hunter2', user='x')", "hunter2"),
+    ("password = hunter2", "hunter2"),  # INI / TOML
+    ("--db-password hunter2 --epochs 3", "hunter2"),
+    ("--hf-token=hf_short --epochs 3", "hf_short"),
+    ("postgres://user:Sup3rS3cret@db.example.com:5432/x", "Sup3rS3cret"),
+    ('{"db_password": "hunter2", "user": "x"}', "hunter2"),
+    ("{'wandb_key': 'abc123', 'n': 3}", "abc123"),
+]
+
+
+@pytest.mark.parametrize(("line", "secret"), NAMED, ids=[n for n, _ in NAMED])
+def test_redact_masks_a_value_its_name_calls_a_credential(line: str, secret: str) -> None:
+    out = redact(line)
+    assert secret not in out, out
+    assert "REDACTED" in out
+    assert redact(out) == out
+
+
+def test_redact_keeps_the_name_and_the_rest_of_the_line() -> None:
+    out = redact("Settings(password='hunter2', user='x') db.password: hunter2 seed=3")
+    assert out == "Settings(password='…REDACTED…', user='x') db.password: …REDACTED… seed=3"
+    assert redact("?password=x&user=y") == "?password=…REDACTED…&user=y"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # Hyperparameters that merely mention a secret word: `key`/`token` not as the last
+        # segment, plurals, and words that only contain one.
+        "max_tokens=512 model.key_dim=64 tokenizer=bert keyboard=us pass_rate=0.9 bypass=1",
+        "num_keys: 4  token_budget: 5  monkey: 3",
+        # A *bare* `key`/`token` in a log is a dict key or a word far more often than a
+        # credential (`key=train/loss`, a tokenizer's `token=hello`): in the only copy of a
+        # run's output, masking it destroys data. A qualified name (`api_key`) still masks.
+        "sorted by key=train/loss, token=hello, key: alpha",
+        "if api_key == expected:",  # a comparison, not an assignment
+        "Error: password incorrect for user bob",  # names a password, does not carry one
+        "time: 12:30 elapsed: 3.2s url: https://example.com/a/b",
+    ],
+)
+def test_redact_leaves_names_that_are_not_credentials_alone(line: str) -> None:
+    assert redact(line) == line
+
+
+def test_a_flag_named_like_a_credential_masks_the_token_after_it() -> None:
+    """A log line cannot tell prose from a command echo, and guessing wrong is a leak — so a
+    credential-named flag masks the next token even in a sentence (the ledger already did)."""
+    assert redact("the --password flag is documented") == "the --password …REDACTED… is documented"
+    assert redact("run --epochs 3 --lr 0.1") == "run --epochs 3 --lr 0.1"
