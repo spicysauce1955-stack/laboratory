@@ -230,6 +230,184 @@ def test_aggregate_row_key_override_for_pre_existing_plans(tmp_path: Path):
     assert lab.sweep_plan(sweep_id).cells[0].row_key == ["seed", "alpha"]
 
 
+def _write_hits(lab: Lab, job_id: str, text: str) -> None:
+    out = lab.store.output_dir(job_id)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "hits.jsonl").write_text(text)
+
+
+def _hits(path: Path) -> list[dict]:
+    import json as _json
+
+    return [_json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_aggregate_concatenates_shard_hits_beside_the_csv(tmp_path: Path):
+    """lab.search writes hits.jsonl per shard; the cell gets one concatenated hits.jsonl next
+    to its results.csv aggregate, every hit stamped with the shard's terminal state."""
+    lab = _lab(tmp_path)
+    sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0-3", shard_size=2)
+    cell = lab.sweep_plan(sweep_id).cells[0]
+    _write_hits(lab, cell.shard_job_ids[0], '{"seed": 0, "g": 1}\n{"seed": 1, "g": 1}\n')
+    _write_hits(lab, cell.shard_job_ids[1], '{"seed": 3, "g": 2}\n')
+    _write_shard_result(lab, cell.shard_job_ids[0], [0, 1])
+    _write_partial_result(lab, cell.shard_job_ids[1], [2, 3], JobState.timed_out)
+
+    c = lab.aggregate_sweep(sweep_id).cells[0]
+    hits_path = Path(c.aggregate_ref).parent / "hits.jsonl"
+    assert c.hits_ref == str(hits_path)
+    assert _hits(hits_path) == [
+        {"seed": 0, "g": 1, "_shard_status": "succeeded"},
+        {"seed": 1, "g": 1, "_shard_status": "succeeded"},
+        {"seed": 3, "g": 2, "_shard_status": "timed_out"},
+    ]
+    assert c.hits == 3
+    view = lab.sweep_plan(sweep_id).view()["cells"][0]  # persisted, and in the shells' view
+    assert view["hits"] == 3 and view["hits_ref"] == str(hits_path)
+
+
+def test_aggregate_hits_follow_the_csv_inclusion_rules(tmp_path: Path):
+    """Strict drops partial shards' hits; running shards and unconsumed-config shards are never
+    read — the same three rules the CSV rows obey."""
+    import json as _json
+
+    lab = _lab(tmp_path)
+    sweep_id, _ = lab.sweep("true N=1000", {}, seeds="0-3", shard_size=1)
+    ok, partial, running, wrong_config = lab.sweep_plan(sweep_id).cells[0].shard_job_ids
+    for jid, seed in zip((ok, partial, running, wrong_config), range(4)):
+        _write_hits(lab, jid, f'{{"seed": {seed}}}\n')
+        (lab.store.output_dir(jid) / "effective_config.json").write_text(
+            _json.dumps({"seeds": str(seed), "N": 1000})
+        )
+    _write_shard_result(lab, ok, [0])
+    _write_partial_result(lab, partial, [1], JobState.failed)
+    lab.store.update_manifest(running, status=JobState.running)
+    (lab.store.output_dir(wrong_config) / "effective_config.json").write_text(
+        _json.dumps({"seeds": "3"})  # never consumed N
+    )
+    assert lab.store.update_manifest(wrong_config, status=JobState.timed_out).unconsumed_config
+
+    c = lab.aggregate_sweep(sweep_id).cells[0]
+    assert [h["seed"] for h in _hits(Path(c.hits_ref))] == [0, 1]
+
+    c = lab.aggregate_sweep(sweep_id, include_partial=False).cells[0]
+    assert _hits(Path(c.hits_ref)) == [{"seed": 0, "_shard_status": "succeeded"}]
+    assert c.hits == 1
+
+
+def test_aggregate_without_any_hits_file_writes_none_and_clears_a_stale_one(tmp_path: Path):
+    """No included shard searched -> no cell hits.jsonl and hits=None. A hits aggregate left by
+    an earlier, wider aggregate (here: non-strict) is removed rather than left to be exported."""
+    lab = _lab(tmp_path)
+    sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0-1", shard_size=1)
+    cell = lab.sweep_plan(sweep_id).cells[0]
+    _write_shard_result(lab, cell.shard_job_ids[0], [0])
+    _write_hits(lab, cell.shard_job_ids[1], '{"seed": 1}\n')
+    _write_partial_result(lab, cell.shard_job_ids[1], [1], JobState.timed_out)
+
+    c = lab.aggregate_sweep(sweep_id).cells[0]
+    stale = Path(c.hits_ref)
+    assert stale.exists()
+
+    c = lab.aggregate_sweep(sweep_id, include_partial=False).cells[0]
+    assert c.hits is None and c.hits_ref is None
+    assert not stale.exists()
+    assert lab.sweep_plan(sweep_id).view()["cells"][0]["hits"] is None
+
+
+def test_aggregate_empty_hits_file_means_searched_and_nothing_passed(tmp_path: Path):
+    lab = _lab(tmp_path)
+    sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0", shard_size=1)
+    cell = lab.sweep_plan(sweep_id).cells[0]
+    _write_hits(lab, cell.shard_job_ids[0], "")
+    _write_shard_result(lab, cell.shard_job_ids[0], [0])
+
+    c = lab.aggregate_sweep(sweep_id).cells[0]
+    assert c.hits == 0
+    assert Path(c.hits_ref).read_text() == ""
+
+
+def test_aggregate_hits_never_count_a_seed_as_present(tmp_path: Path):
+    """Seed presence is judged by results.csv alone: a shard that left hits but no result rows
+    still has its seeds missing, so sweep-retry buys them back."""
+    lab = _lab(tmp_path)
+    sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0-1", shard_size=1)
+    cell = lab.sweep_plan(sweep_id).cells[0]
+    _write_shard_result(lab, cell.shard_job_ids[0], [0])
+    _write_hits(lab, cell.shard_job_ids[1], '{"seed": 1, "g": 1}\n')
+    lab.store.update_manifest(cell.shard_job_ids[1], status=JobState.timed_out)
+
+    c = lab.aggregate_sweep(sweep_id).cells[0]
+    assert c.seeds_present == [0] and c.missing_seeds == [1] and c.status == "incomplete"
+    assert c.hits == 1
+
+
+def test_aggregate_succeeded_shard_with_torn_hits_fails_loud(tmp_path: Path):
+    import pytest as _pytest
+
+    lab = _lab(tmp_path)
+    sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0", shard_size=1)
+    cell = lab.sweep_plan(sweep_id).cells[0]
+    _write_hits(lab, cell.shard_job_ids[0], '{"seed": 0}\n{"se')
+    _write_shard_result(lab, cell.shard_job_ids[0], [0])
+    with _pytest.raises(ValueError, match="succeeded"):
+        lab.aggregate_sweep(sweep_id)
+
+
+def test_aggregate_mirrors_cell_hits_to_r2_best_effort(tmp_path: Path, monkeypatch):
+    """Same best-effort mirror as the CSV aggregate, under the cell's own prefix; a failed
+    upload keeps the local copy and the aggregate still completes."""
+    import lab.core as core_mod
+
+    uploads: list[str] = []
+    fail = {"on": False}
+
+    class _FakeR2:
+        @classmethod
+        def from_env(cls) -> "_FakeR2":
+            return cls()
+
+        def upload_file(self, local: Path, key: str) -> None:
+            if fail["on"]:
+                raise RuntimeError("r2 boom")
+            assert Path(local).exists()
+            uploads.append(key)
+
+        def download_dir(self, prefix: str, dest: Path) -> None:
+            pass
+
+    lab = _lab(tmp_path)
+    sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0", shard_size=1)
+    cell = lab.sweep_plan(sweep_id).cells[0]
+    _write_hits(lab, cell.shard_job_ids[0], '{"seed": 0}\n')
+    _write_shard_result(lab, cell.shard_job_ids[0], [0])
+    monkeypatch.setattr(core_mod, "r2_enabled", lambda: True)
+    monkeypatch.setattr(core_mod, "R2Store", _FakeR2)
+
+    lab.aggregate_sweep(sweep_id)
+    prefix = f"{sweep_id}/cells/{cell.cell_id}"
+    assert f"{prefix}/hits.jsonl" in uploads and f"{prefix}/results.csv" in uploads
+
+    fail["on"] = True
+    c = lab.aggregate_sweep(sweep_id).cells[0]
+    assert c.hits == 1 and Path(c.hits_ref).exists()
+
+
+def test_old_plan_json_without_hits_fields_still_reads(tmp_path: Path):
+    import json as _json
+
+    lab = _lab(tmp_path)
+    sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0-1", shard_size=1)
+    p = lab.store.sweep_plan_path(sweep_id)
+    raw = _json.loads(p.read_text())
+    for c in raw["cells"]:
+        c.pop("hits", None)
+        c.pop("hits_ref", None)
+    p.write_text(_json.dumps(raw))
+    cell = lab.sweep_plan(sweep_id).cells[0]
+    assert cell.hits is None and cell.hits_ref is None
+
+
 def test_aggregate_row_key_override_must_contain_seed_column(tmp_path: Path):
     import pytest as _pytest
 

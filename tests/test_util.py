@@ -110,6 +110,15 @@ def test_infer_artifact_type():
     assert infer_artifact_type("noext") == "other"
 
 
+def test_infer_artifact_type_jsonl_is_a_table():
+    """One JSON object per line is a row-structured table, the same class the mid-run mirror
+    (`lab.partials.MIRROR_PATTERNS`) already treats it as. As "other" it was filed as a blob, so
+    `lab export` dropped `lab.search`'s hits.jsonl and every metrics.jsonl from the bundle."""
+    assert infer_artifact_type("hits.jsonl") == "table"
+    assert infer_artifact_type("metrics.jsonl") == "table"
+    assert infer_artifact_type("sub/HITS.JSONL") == "table"
+
+
 def test_parse_duration_accepts_numbers():
     from lab._util import parse_duration
 

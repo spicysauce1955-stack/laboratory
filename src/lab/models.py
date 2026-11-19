@@ -210,6 +210,11 @@ class SweepCell(BaseModel):
     seeds_partial: list[int] = Field(default_factory=list)
     missing_seeds: list[int] = Field(default_factory=list)
     status: Literal["pending", "complete", "incomplete"] = "pending"
+    # The cell's concatenated `lab.search` hits.jsonl, beside the result aggregate, and how many
+    # hits it holds. Both None when no aggregated shard wrote a hits.jsonl (no search ran) — 0 is
+    # "searched and nothing passed". Optional so plans written before them still read.
+    hits_ref: str | None = None
+    hits: int | None = None
 
 
 class SweepPlan(BaseModel):
@@ -236,6 +241,8 @@ class SweepPlan(BaseModel):
                     "seeds_partial": c.seeds_partial,  # full list — actionable, like missing
                     "missing_seeds": c.missing_seeds,
                     "status": c.status,
+                    "hits_ref": c.hits_ref,
+                    "hits": c.hits,
                 }
                 for c in self.cells
             ],

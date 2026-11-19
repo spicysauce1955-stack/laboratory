@@ -17,9 +17,13 @@ _UNIT_ORDER = ("d", "h", "m", "s")
 _COMPOUND = re.compile(r"(?:\d+(?:\.\d+)?[smhd]\s*)+")
 _COMPOUND_PART = re.compile(r"(\d+(?:\.\d+)?)([smhd])")
 
+#: ``jsonl`` (one JSON object per line) is a table: row-structured and line-appended, the class
+#: ``lab.partials.MIRROR_PATTERNS`` already mirrors as one. As "other" it was filed as a blob, so
+#: ``lab export`` dropped ``hits.jsonl`` (``lab.search``) and ``metrics.jsonl`` from the bundle;
+#: the export size cap still bounds a chatty one.
 _ARTIFACT_EXT = {
     "png": "figure", "pdf": "figure", "svg": "figure", "jpg": "figure", "jpeg": "figure",
-    "csv": "table", "tsv": "table", "json": "table", "parquet": "table",
+    "csv": "table", "tsv": "table", "json": "table", "jsonl": "table", "parquet": "table",
     "ckpt": "checkpoint", "pt": "checkpoint", "pth": "checkpoint", "safetensors": "checkpoint",
     "log": "log", "txt": "log",
 }

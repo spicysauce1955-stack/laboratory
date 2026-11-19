@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from lab.aggregate import merge_seed_rows
+from lab.aggregate import merge_hits, merge_seed_rows
 
 
 def test_merge_concatenates_sorts_and_stamps_status():
@@ -165,3 +167,138 @@ def test_merge_default_row_key_unchanged():
     a = "seed,acc\n0,0.9\n0,0.8\n"
     with pytest.raises(ValueError, match="duplicate"):
         merge_seed_rows([(a, "succeeded")], "seed")
+
+
+# ---------------------------------------------------------------------------
+# merge_hits: lab.search's hits.jsonl, concatenated across a cell's shards
+# ---------------------------------------------------------------------------
+
+
+def _jl(*objs: dict) -> str:
+    return "".join(json.dumps(o) + "\n" for o in objs)
+
+
+def _parse(text: str) -> list[dict]:
+    return [json.loads(line) for line in text.splitlines()]
+
+
+def test_merge_hits_concatenates_in_shard_then_line_order_and_stamps_status():
+    a = _jl({"seed": 0, "gain": 2.0}, {"seed": 0, "gain": 1.0})
+    b = _jl({"seed": 1, "gain": 0.5})
+    merged, n = merge_hits([(a, "succeeded"), (b, "succeeded")])
+    assert _parse(merged) == [
+        {"seed": 0, "gain": 2.0, "_shard_status": "succeeded"},
+        {"seed": 0, "gain": 1.0, "_shard_status": "succeeded"},
+        {"seed": 1, "gain": 0.5, "_shard_status": "succeeded"},
+    ]
+    assert n == 3
+    assert merged.endswith("\n")
+
+
+def test_merge_hits_empty():
+    assert merge_hits([]) == ("", 0)
+    # A shard that searched and found nothing writes an empty file: still nothing to merge.
+    assert merge_hits([("", "succeeded"), ("\n", "timed_out")]) == ("", 0)
+
+
+def test_merge_hits_is_deterministic():
+    shards = [(_jl({"g": 1}, {"g": 2}), "timed_out"), (_jl({"g": 2}, {"g": 3}), "succeeded")]
+    assert merge_hits(shards) == merge_hits(list(shards))
+
+
+def test_merge_hits_whole_object_identity_prefers_succeeded_over_partial():
+    """No row_key: a hit is the whole object. A timed-out shard's hit that a succeeded retry
+    found again is reported once, as the retry's; the timed-out shard's other hit survives."""
+    cut = _jl({"seed": 3, "gain": 1.0}, {"seed": 2, "gain": 1.0})
+    retry = _jl({"seed": 3, "gain": 1.0})
+    merged, n = merge_hits([(cut, "timed_out"), (retry, "succeeded")])
+    assert _parse(merged) == [
+        {"seed": 2, "gain": 1.0, "_shard_status": "timed_out"},
+        {"seed": 3, "gain": 1.0, "_shard_status": "succeeded"},
+    ]
+    assert n == 2
+
+
+def test_merge_hits_succeeded_wins_even_when_submitted_first():
+    ok = _jl({"g": 1})
+    later_partial = _jl({"g": 1})
+    merged, _ = merge_hits([(ok, "succeeded"), (later_partial, "failed")])
+    assert _parse(merged) == [{"g": 1, "_shard_status": "succeeded"}]
+
+
+def test_merge_hits_later_submitted_wins_among_equals():
+    merged, _ = merge_hits([(_jl({"g": 1}), "failed"), (_jl({"g": 1}), "timed_out")])
+    assert _parse(merged) == [{"g": 1, "_shard_status": "timed_out"}]
+    # Two succeeded shards with an identical hit are not a contract violation: without a seed
+    # in the object, two seeds passing the same combination look exactly like this.
+    merged, n = merge_hits([(_jl({"g": 1}), "succeeded"), (_jl({"g": 1}), "succeeded")])
+    assert n == 1
+
+
+def test_merge_hits_identity_ignores_key_order_and_an_existing_status_field():
+    a = _jl({"a": 1, "b": 2})
+    b = _jl({"b": 2, "a": 1, "_shard_status": "stale"})
+    merged, n = merge_hits([(a, "timed_out"), (b, "succeeded")])
+    assert n == 1
+    assert _parse(merged) == [{"b": 2, "a": 1, "_shard_status": "succeeded"}]
+
+
+def test_merge_hits_row_key_resolves_per_key_and_keeps_every_hit_of_the_winner():
+    """row_key names the unit of work a hit belongs to. A search finds many passing
+    combinations per (seed, alpha), so the key picks which shard's hits stand for it and all
+    of that shard's hits for the key are kept: a partial shard's 2 hits for seed 3 give way to
+    the succeeded retry's 3, while its seed-2 hit (never re-run) survives."""
+    cut = _jl(
+        {"seed": 2, "alpha": 0.5, "K": 10},
+        {"seed": 3, "alpha": 0.5, "K": 10},
+        {"seed": 3, "alpha": 0.5, "K": 20},
+    )
+    retry = _jl(
+        {"seed": 3, "alpha": 0.5, "K": 10},
+        {"seed": 3, "alpha": 0.5, "K": 20},
+        {"seed": 3, "alpha": 0.5, "K": 30},
+    )
+    merged, n = merge_hits([(cut, "timed_out"), (retry, "succeeded")], row_key=["seed", "alpha"])
+    got = _parse(merged)
+    assert n == 4
+    assert got[0] == {"seed": 2, "alpha": 0.5, "K": 10, "_shard_status": "timed_out"}
+    assert [h["K"] for h in got[1:]] == [10, 20, 30]
+    assert {h["_shard_status"] for h in got[1:]} == {"succeeded"}
+
+
+def test_merge_hits_row_key_field_missing_falls_back_to_whole_object():
+    """The cell's row_key is declared for results.csv; a search's hits need not carry those
+    fields. Such a hit is identified by its whole object — never collapsed onto other hits,
+    and never a reason to refuse the cell (seed presence is results.csv's job)."""
+    a = _jl({"gain": 1.0}, {"gain": 2.0})
+    b = _jl({"gain": 2.0}, {"gain": 3.0})
+    merged, n = merge_hits([(a, "timed_out"), (b, "succeeded")], row_key=["seed", "alpha"])
+    assert _parse(merged) == [
+        {"gain": 1.0, "_shard_status": "timed_out"},
+        {"gain": 2.0, "_shard_status": "succeeded"},
+        {"gain": 3.0, "_shard_status": "succeeded"},
+    ]
+    assert n == 3
+
+
+def test_merge_hits_torn_line_skipped_for_partial_shard_fatal_for_succeeded():
+    """rsync can copy a hits.jsonl mid-append: a non-succeeded shard's torn tail is skipped and
+    the rest kept; a succeeded shard's file should be whole, so a bad line there fails loud."""
+    torn = _jl({"g": 1}) + '{"g": 2, "ta'
+    merged, n = merge_hits([(torn, "timed_out")])
+    assert _parse(merged) == [{"g": 1, "_shard_status": "timed_out"}]
+    assert n == 1
+    with pytest.raises(ValueError, match="succeeded"):
+        merge_hits([(torn, "succeeded")])
+
+
+def test_merge_hits_non_object_line_is_unparseable():
+    _, n = merge_hits([(_jl({"g": 1}) + "[1, 2]\n", "failed")])
+    assert n == 1
+    with pytest.raises(ValueError):
+        merge_hits([("[1, 2]\n", "succeeded")])
+
+
+def test_merge_hits_last_line_without_newline_is_kept():
+    _, n = merge_hits([('{"g": 1}\n{"g": 2}', "succeeded")])
+    assert n == 2

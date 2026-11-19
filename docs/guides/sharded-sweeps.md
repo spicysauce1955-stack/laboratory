@@ -125,6 +125,18 @@ than you asked for).
 uv run lab sweep-aggregate <sweep_id> --strict    # succeeded shards only
 ```
 
+**Search hits.** If your entrypoint uses `lab.search.grid_search`, each shard writes the
+combinations that passed to `hits.jsonl`. When any aggregated shard has one, the cell also gets a
+concatenated `hits.jsonl` beside its `results.csv` (path in the cell's `hits_ref`, count in
+`hits`; both `null` when no shard searched, `0` when it searched and nothing passed). It follows
+the same inclusion rules as the rows, and every hit carries `_shard_status`. Where a partial
+shard and the retry that re-ran its seed both report hits, the retry's stand: with `--row-key`,
+all hits sharing a row-key value come from one shard (succeeded first, then the latest); without
+one, or for a hit that lacks a row-key field, identical objects are reported once. So without the
+seed in the hit, one combination passing for two seeds is reported once — put the seed in the
+grid or return it as a column if you need per-seed counts. Hits never make a seed present; that
+is `results.csv`'s job.
+
 ### Retry missing seeds
 
 If some shards failed or timed out, buy back only what is missing:
