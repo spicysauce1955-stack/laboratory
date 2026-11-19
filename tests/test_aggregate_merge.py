@@ -80,14 +80,63 @@ def test_merge_returns_partial_seeds():
 def test_merge_tolerates_truncated_tail_in_partial_shard_only():
     """A heartbeat-rsynced CSV can end mid-row: skip the bad tail for non-succeeded shards,
     still fail loud for succeeded ones (a bad row there is an entrypoint bug)."""
-    really_cut = "seed,acc\n0,0.5\n1"  # row too short — seed unparseable? no: seed=1 col ok
+    really_cut = "seed,acc\n0,0.5\n1"  # the seed column parses; the row is still a fragment
     bad = "seed,acc\nnotint,0.5\n"
     merged, present, partial = merge_seed_rows([(bad, "timed_out")], "seed")
     assert (merged, present, partial) == ("", [], [])  # unparseable rows skipped, not fatal
     with pytest.raises(ValueError):
         merge_seed_rows([(bad, "succeeded")], "seed")
     m2, p2, _ = merge_seed_rows([(really_cut, "timed_out")], "seed")
-    assert p2 == [0, 1]  # short-but-parseable tail row kept
+    # A fragment whose seed parses used to be kept, counting seed 1 as present with no value —
+    # and a present seed is never re-bought by sweep-retry. It is dropped now.
+    assert p2 == [0]
+
+
+# ---------------------------------------------------------------------------
+# Truncated rows (review 2026-11): a fragment must never count as a present seed
+# ---------------------------------------------------------------------------
+
+
+def test_truncated_tail_with_a_parseable_seed_is_not_counted_present():
+    """`3,0.4` cut from `3,0.4123,100`: the seed parses, so seed 3 read as present — with a wrong
+    value — and sweep-retry never re-bought it."""
+    cut = "seed,acc,n\n1,0.1,10\n3,0.4"
+    merged, present, partial = merge_seed_rows([(cut, "timed_out")], "seed")
+    assert present == [1]
+    assert "0.4" not in merged
+
+
+def test_unterminated_last_line_of_a_partial_shard_is_dropped_even_at_full_width():
+    """`3,0.4123,10` cut from `3,0.4123,100` has every field — and a wrong one. A heartbeat-synced
+    file is only trustworthy up to its last newline."""
+    cut = "seed,acc,n\n1,0.1,10\n3,0.4123,10"
+    _, present, _ = merge_seed_rows([(cut, "timed_out")], "seed")
+    assert present == [1]
+
+
+def test_terminated_rows_of_a_partial_shard_are_all_kept():
+    whole = "seed,acc,n\n1,0.1,10\n3,0.4123,100\n"
+    _, present, partial = merge_seed_rows([(whole, "timed_out")], "seed")
+    assert present == [1, 3] and partial == [1, 3]
+
+
+def test_a_wrong_width_row_inside_a_partial_shard_is_skipped():
+    text = "seed,acc,n\n1,0.1\n2,0.2,20,extra\n3,0.3,30\n"
+    _, present, _ = merge_seed_rows([(text, "failed")], "seed")
+    assert present == [3]
+
+
+@pytest.mark.parametrize("row", ["1,0.1", "1,0.1,10,extra"])
+def test_a_wrong_width_row_in_a_succeeded_shard_is_fatal(row: str):
+    text = f"seed,acc,n\n0,0.0,0\n{row}\n"
+    with pytest.raises(ValueError, match="field"):
+        merge_seed_rows([(text, "succeeded")], "seed")
+
+
+def test_a_succeeded_shard_without_a_trailing_newline_is_whole():
+    """A finished file is complete whatever its last byte; only a partial one can be torn."""
+    _, present, partial = merge_seed_rows([("seed,acc\n0,0.1\n1,0.2", "succeeded")], "seed")
+    assert present == [0, 1] and partial == []
 
 
 def test_merge_preserves_embedded_comma_value():
