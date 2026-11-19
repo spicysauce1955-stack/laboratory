@@ -667,14 +667,15 @@ def build_server(lab: Lab) -> FastMCP:
         )
         queue = default_queue()
         try:
+            # The hold is written before the entry (the commit point), inside `register`, exactly
+            # as `lab register --hold` does: a hold written afterwards left an R2 blip's worth of
+            # window in which an unheld, eligible registration could launch.
             reg = sched_register(
                 lab.repo, queue, spec, triggers,
-                Guardrails(expires_at=expires_at, max_cost_usd=max_cost),
+                Guardrails(expires_at=expires_at, max_cost_usd=max_cost), hold=hold,
             )
         except Exception as e:  # noqa: BLE001
             raise ToolError(str(e)) from e
-        if hold:  # as `lab register --hold` does; keep the two in step if that ordering changes
-            queue.hold(reg.reg_id)
         return {
             "reg_id": reg.reg_id,
             "state": "held" if hold else reg.state.value,
