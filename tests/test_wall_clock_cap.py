@@ -55,10 +55,13 @@ class TestDeadlineIsAnchoredToTheStart:
 
         assert 25400 <= remaining <= 25550, remaining  # 7h + 300s grace
 
-    def test_a_missing_timeout_falls_back_to_the_documented_default(self):
+    def test_a_missing_timeout_gets_no_local_budget(self):
+        """An uncapped job asked for no wall-clock bound. The 3600s default this used to invent
+        failed every uncapped job older than 65 minutes whose log stream dropped (review 2026-11;
+        see test_supervisor_wall_deadline.py)."""
         remaining = runner.remaining_wall_budget(timeout=None, started=now())
 
-        assert 3800 <= remaining <= 3950, remaining  # 3600 default + 300 grace
+        assert remaining == float("inf")
 
     def test_an_unknown_start_does_not_hand_out_unbounded_time(self):
         """`started_at` can be absent on a malformed manifest; that must not disable the cap."""

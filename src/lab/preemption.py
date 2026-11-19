@@ -48,9 +48,13 @@ def classify_terminal(
     use_spot: bool,
     cluster_gone: bool,
     reached_terminal: bool,
+    wall_clock_exceeded: bool = False,
 ) -> JobState:
+    """``wall_clock_exceeded``: the supervisor's local deadline passed with the remote job still
+    RUNNING, so the supervisor is about to end it. That is the wall-clock cap being enforced —
+    ``timed_out`` — and never ``failed``: a still-running remote job is not evidence of failure."""
     # An explicit, authoritative outcome always wins over inference.
-    if timed_out:
+    if timed_out or wall_clock_exceeded:
         return JobState.timed_out
     if cancel_requested:
         return JobState.cancelled

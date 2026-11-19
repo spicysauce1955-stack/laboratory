@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import contextvars
+import math
 import os
 import re
 import signal
@@ -32,6 +33,7 @@ from lab.backends.skypilot import (
     REMOTE_RUN_DIR,
     TIMEOUT_SENTINEL,
     ProvisionTimeout,
+    boot_allowance_s,
     build_task,
     cluster_name_for,
     confirm_success,
@@ -123,11 +125,17 @@ supervisor dying. This grace covers the gap between the remote kill and the supe
 it — it is not a second budget.
 """
 
+POLL_S = 10.0
+"""How often :func:`_wait_terminal` asks the cluster's job queue. Module-level so tests can
+shorten it without re-plumbing every caller."""
 
-def remaining_wall_budget(timeout: str | None, started: datetime | None) -> float:
-    """Local wall-clock budget still owed to a job that started at ``started``.
 
-    Anchored to the job's *start*, never to "now", which is the whole point. The previous code
+def remaining_wall_budget(
+    timeout: str | None, started: datetime | None, *, boot_s: float = 0.0
+) -> float:
+    """Local wall-clock budget still owed to a job whose run phase was anchored at ``started``.
+
+    Anchored to a fixed moment, never to "now", which is the whole point. The previous code
     computed ``max_wait = timeout + 300`` immediately before the poll loop — but the unbounded
     ``sky.tail_logs(..., follow=True)`` sits in front of that line and blocks for essentially the
     entire run. The budget therefore did not begin until streaming returned, making the effective
@@ -135,11 +143,24 @@ def remaining_wall_budget(timeout: str | None, started: datetime | None) -> floa
     hung. On 2026-08-20 four jobs with a 7h timeout ran 703 minutes on that arithmetic and were
     stopped by an external watchdog rather than by the lab.
 
+    ``boot_s`` is the boot allowance the on-box watchdog grants before the entrypoint starts
+    (:func:`~lab.backends.skypilot.boot_allowance_s`). The box's own cap wraps only the
+    entrypoint, so a backstop that does not grant the same allowance fires on a healthy run whose
+    ``uv sync`` was slow — and records it ``failed``.
+
+    **No timeout means no local budget** (``math.inf``): a job submitted without ``--timeout``
+    asked for no wall-clock bound, and the 3600s this used to invent killed every uncapped job
+    older than 65 minutes the moment its log stream dropped. It is bounded by the remote job
+    ending, autostop and ``lab reconcile``, exactly as :func:`lifetime_bound_s` documents.
+
     Returns ``0.0`` once the cap is spent — a blown cap must never hand out more time — and the
     full budget when ``started`` is unknown, which is the only safe reading of a malformed
     manifest (refusing to wait at all would abandon a live machine).
     """
-    total = (parse_duration(timeout) or 3600.0) + WALL_CLOCK_GRACE_S
+    wall = parse_duration(timeout)
+    if not wall:
+        return math.inf
+    total = wall + WALL_CLOCK_GRACE_S + boot_s
     if started is None:
         return total
     spent = duration_seconds(started, now()) or 0.0
@@ -152,12 +173,17 @@ def _wait_terminal(
     sky_job_id: int | None,
     max_wait: float,
     *,
-    poll_s: float = 10.0,
+    poll_s: float | None = None,
     heartbeat_s: float | None = None,
     on_heartbeat: Callable[[], None] | None = None,
 ) -> tuple[JobState, bool, str | None]:
     """Poll the remote job until terminal — sky.launch (0.12) returns at submit time, not
     completion, so we must wait before fetching artifacts and tearing down.
+
+    ``max_wait`` may be ``math.inf`` (an uncapped job): the loop then ends only on a terminal
+    status or a definitively lost cluster. A non-terminal status at a finite deadline comes back
+    as itself (``running``/``queued``, ``reached_terminal=False``) — the caller decides what an
+    exhausted backstop means, and it is never "the job failed".
 
     If ``heartbeat_s``/``on_heartbeat`` are given, ``on_heartbeat`` is called roughly every
     ``heartbeat_s`` of polling so the supervisor can fetch partial results mid-run; a callback
@@ -174,6 +200,7 @@ def _wait_terminal(
     longer exists, in which case it carries sky's message and the state is ``failed``. Only that
     one answer ends the wait early — see :func:`_cluster_lost_reason`.
     """
+    poll_s = POLL_S if poll_s is None else poll_s
     deadline = time.time() + max_wait
     name: str | None = None
     # Real elapsed time, not accumulated nominal sleep. `since_beat += poll_s` made the heartbeat
@@ -1437,6 +1464,24 @@ def _teardown_on_abort(
         _emit(f"[lab] teardown after abort ({why}) failed: {type(e).__name__}: {e}\n")
 
 
+def _provision_budget_s(res: ResourceRequest, cloud: str) -> float:
+    """Seconds one launch attempt gets to come up — ``--provision-timeout``, else the calibrated
+    per-cloud budget (larger when pinned). One definition for the launch path and the adopt path's
+    wall-clock fallback, so the two cannot disagree about how long provisioning may take."""
+    pinned = bool(res.region or res.zone)
+    return parse_duration(res.provision_timeout) or provision_timeout_min(cloud, pinned=pinned) * 60
+
+
+def _parse_anchor(value: Any) -> datetime | None:
+    """The ``run_anchor_at`` a supervisor recorded in ``_runtime.json``, or ``None``."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 def run_job(job_dir: Path, adopt: bool = False) -> int:
     job_dir = Path(job_dir)
     store = JobStore(job_dir.parent)
@@ -1495,6 +1540,13 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         # except-branch returns, so the post-try read is always bound. Declared here so that
         # stays true no matter how the try grows.
         lost_reason: str | None = None
+        # True when the local backstop's deadline passed with the remote job still RUNNING. That
+        # is a cap the supervisor enforced (`timed_out`), never evidence the job failed.
+        still_running_at_deadline = False
+        # When the run phase began: provisioning complete, the box UP. The local deadline is
+        # anchored here rather than at `started` (the launch request) — see
+        # `remaining_wall_budget`. Recorded in `_runtime.json` so an adopting supervisor keeps it.
+        run_anchor: datetime | None = None
 
         # The partial-results net (§6c). Constructed before the try so that every exit path —
         # including the provision-failure branches, which return straight to teardown — can stop
@@ -1550,7 +1602,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                 # know which case it is in or it kills healthy pinned hosts.
                 pinned = bool(manifest.resources.region or manifest.resources.zone)
                 explicit_s = parse_duration(manifest.resources.provision_timeout)
-                provision_s = explicit_s or provision_timeout_min(cloud, pinned=pinned) * 60
+                provision_s = _provision_budget_s(manifest.resources, cloud)
                 if warning := wasteful_provision_timeout_warning(
                     explicit_s, cloud, pinned=pinned
                 ):
@@ -1669,6 +1721,11 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                             attempt=rotation.attempt,
                         )
                         _rotate_to(nxt)
+                # The box is UP and the job submitted: the run phase starts here, and so does the
+                # local wall-clock deadline. Durable, so a supervisor restart (`--adopt`) budgets
+                # from the same moment instead of from the launch request.
+                run_anchor = now()
+                store.write_runtime(job_id, run_anchor_at=run_anchor.isoformat())
                 # Record cost up-front so a running job already shows it (FR-I2). The host is UP now,
                 # so the Vast rental exists — bill at its real dph_total, not SkyPilot's low catalog
                 # estimate.
@@ -1718,6 +1775,17 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                         update={"estimated_usd": manifest.cost.estimated_usd}
                     )
                 sky_job_id = None  # match any job in the cluster queue
+                run_anchor = _parse_anchor(store.read_runtime(job_id).get("run_anchor_at"))
+
+            boot_s = float(boot_allowance_s(manifest))
+            if run_anchor is None:
+                # Adopted from a supervisor that never recorded when the box came up: budget from
+                # the launch request, and charge it every provisioning attempt the job may have
+                # spent. Generous on purpose — the box bounds its own lifetime, so a late
+                # backstop costs a little rental, while an early one ends a healthy run.
+                attempts = LaunchRotation.for_manifest(manifest).max_attempts
+                boot_s += _provision_budget_s(manifest.resources, cloud) * attempts
+            anchor = run_anchor or started
 
             # Wait for the run to actually finish before fetching artifacts / tearing down.
             # `tail_logs` blocks for the whole run and has no timeout of its own. That single
@@ -1736,7 +1804,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             except Exception as e:  # noqa: BLE001
                 print(f"[lab] tail_logs issue: {e}")
 
-            max_wait = remaining_wall_budget(manifest.resources.timeout, started)
+            max_wait = remaining_wall_budget(manifest.resources.timeout, anchor, boot_s=boot_s)
             if max_wait <= 0:
                 print(
                     "[lab] wall-clock cap already spent when streaming returned — not waiting "
@@ -1757,6 +1825,14 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                 on_heartbeat=partials.beat,
             )
             final = raw_final
+            # Only a finite deadline can end the wait on a live job; an uncapped one keeps
+            # polling until the remote job ends or its cluster is definitively gone.
+            still_running_at_deadline = (
+                lost_reason is None
+                and not reached_terminal
+                and math.isfinite(max_wait)
+                and raw_final in (JobState.running, JobState.queued)
+            )
         except ProvisionTimeout:
             _remember_capacity(store, job_id, manifest, cloud, error_text="")
             store.update_manifest(
@@ -1866,6 +1942,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             use_spot=use_spot,
             cluster_gone=cluster_gone,
             reached_terminal=reached_terminal,
+            wall_clock_exceeded=still_running_at_deadline,
         )
 
         # The other kind of dead host: one that boots, advertises a GPU, and has none. It fails
@@ -1899,6 +1976,11 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         if final is JobState.timed_out:
             wall = int(parse_duration(manifest.resources.timeout) or 0)
             end_reason = timeout_reason(wall)
+            if still_running_at_deadline:
+                # The box should have ended it itself; say that it did not, without changing the
+                # documented prefix callers match on.
+                end_reason += " (still running at the supervisor's deadline; it was stopped there)"
+                events.note("wall_clock.backstop", cluster=cluster, wall_s=wall)
         else:
             end_reason = final.value
 
