@@ -39,6 +39,13 @@ def _invoke(*args: str) -> Result:
 def _ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LAB_EVENTS_DIR", str(tmp_path / "events"))
     monkeypatch.delenv("LAB_EVENTS", raising=False)
+    # The fixture's events are pinned to NOW (2026-08-18). Every real CLI call runs the ledger's
+    # retention, which deletes day files older than LAB_EVENTS_MAX_AGE_DAYS (90): from 2026-11-16
+    # these tests deleted their own fixture before reading it (whichever test ran the day's first
+    # prune lost). Retention is tested elsewhere; here it must stay out of the way. The
+    # subprocess tests inherit these through os.environ.
+    monkeypatch.setenv("LAB_EVENTS_MAX_AGE_DAYS", "100000")
+    monkeypatch.setenv("LAB_EVENTS_SUCCESS_TTL_DAYS", "100000")
     store.append({"id": "a", "ts": NOW.isoformat(), "phase": "open", "session": "s", "seq": 0,
                   "surface": "cli", "action": "submit", "params": {"backend": "cpu"},
                   "project": {"name": "capacity"}, "lab_version": "0.5.1"}, when=NOW)
