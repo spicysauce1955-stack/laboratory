@@ -182,7 +182,7 @@ _LAB_ID = re.compile(r"(?<![0-9])[0-9]{8}-[0-9]{6}-[0-9a-f]{6}(?![0-9a-f])")
 _LAB_NAME = re.compile(r"lab(?:-[a-z0-9]+)+")
 #: A content digest says what it is: ``sha256:<hex>``, optionally behind an image reference.
 _DIGEST = re.compile(
-    r"(?:[\w./:-]*@)?(?:sha1|sha224|sha256|sha384|sha512|md5|blake2[bs]):[0-9a-f]{32,128}"
+    r"(?P<ref>[\w./:-]*@)?(?:sha1|sha224|sha256|sha384|sha512|md5|blake2[bs]):[0-9a-f]{32,128}"
 )
 _URL_SCHEME = re.compile(r"[a-z][a-z0-9+.-]*://")
 _URL_USERINFO = re.compile(r"://[^/\s]*:[^/\s]*@")
@@ -217,8 +217,9 @@ def _structured(word: str) -> bool:
     call site, by design.
     """
     core = word.strip(_EDGES)
-    if _DIGEST.fullmatch(core):
-        return True
+    digest = _DIGEST.fullmatch(core)
+    if digest is not None:  # the hex is the digest; only the image reference in front is judged
+        return not _credential_run(digest.group("ref") or "")
     if _credential_run(core) or _URL_USERINFO.search(core):
         return False
     if _LAB_ID.search(core) or _LAB_NAME.fullmatch(core) or "`" in word:

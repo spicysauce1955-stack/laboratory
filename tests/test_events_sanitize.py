@@ -673,8 +673,10 @@ MUST_MASK = [
      "xYz12AbC34dEf56GhI78jKl9"),
     ("lab-aB3dE5gH7jK9mN1pQ3sT5vX7zZ0qR2wY4", "aB3dE5gH7jK9mN1pQ3sT5vX7zZ0qR2wY4"),
     ("see `aB3dE5gH7jK9mN1pQ3sT5vX7zZ0qR2wY4` for the key", "aB3dE5gH7jK9mN1pQ3sT5vX7zZ0qR2wY4"),
-    # a URL is exempt only without credentials in it
+    # a URL is exempt only without credentials in it, and a digest only for its own hex
     ("clone https://user:pa55w0rd@github.com/org/repo.git", "pa55w0rd"),
+    ("pull aB3dE5gH7jK9mN1pQ3@sha256:"
+     "bfc4f36ac542595781161b3a000ba322ae35f82e0f575a4cdb9b0014065bd9c8", "aB3dE5gH7jK9mN1pQ3"),
     # names, and vendor shapes
     ("PGPASSWORD=s3cretpass psql", "s3cretpass"),
     ("token ghp_" + "aZ3kQ9xW2mP7vB4nR8tY1cL6jH5gF0dSe2Wq" + " used", "aZ3kQ9xW2mP7vB4nR8tY1cL"),
