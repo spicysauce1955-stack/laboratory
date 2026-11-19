@@ -1491,8 +1491,13 @@ class Lab:
 
         A missing vastai-sdk (a DO/GCP-only install) skips the Vast-direct pass — the report
         carries ``vast_pass`` explaining why — while the cloud-agnostic ``sky.status`` pass and
-        the DO volume pass still run. Any other listing failure raises :class:`LabError`: when
-        the SDK *is* present there is no safe degraded mode for a leak-detection command.
+        the DO volume pass still run. Any other listing failure is a *blind* pass, never a clean
+        one. On a dry run it raises :class:`LabError` (exit 2): nothing was destroyed, and a
+        report that read clean while blind would be a lie. Under ``apply`` it does not raise —
+        raising there discarded the report of destroys other passes had already made, including
+        unknown-outcome ones, and lost their exit 5 — so the failed pass is skipped, named in
+        ``pass_errors`` (and its ``*_pass`` field), and listed in ``destroy_outcomes`` as
+        ``unknown``: whatever it covers may still be billing, and the CLI exits 5.
 
         A non-terminal skypilot job whose supervisor pid is dead (past a short grace window) does
         NOT protect its cluster: the canonical leak is a supervisor crash that freezes the
@@ -1521,6 +1526,19 @@ class Lab:
         from lab.backends.skypilot import GcpNotConfigured, list_do_volumes, list_gcp_disks
         from lab.backends.skypilot import list_gcp_instances
 
+        # Per-pass listing failures, keyed by the orphan field the pass fills. See the docstring:
+        # a dry run raises on the first one; `apply` records them and carries on.
+        pass_errors: dict[str, str] = {}
+
+        def _blind(pass_name: str, message: str, exc: BaseException) -> str:
+            """A pass whose listing failed. Raises on a dry run; under `apply`, records it and
+            returns the ``*_pass`` value naming why the pass did not run."""
+            if not apply:
+                raise LabError(message) from exc
+            pass_errors[pass_name] = message
+            print(f"[lab] reconcile {pass_name}: {message} — this pass did not run", file=sys.stderr)
+            return f"failed ({message})"
+
         # Every provider snapshot is taken BEFORE the protected set is read below, never after.
         # A job's manifest is created before its launch is requested, so any machine visible in
         # a snapshot belongs to a manifest that already existed when the snapshot was taken — and
@@ -1534,14 +1552,21 @@ class Lab:
             instances = []
             vast_pass = "skipped (vastai-sdk not installed)"
         except Exception as e:  # noqa: BLE001
-            raise LabError(f"could not list Vast.ai rentals: {e}") from e
+            vast_pass = _blind("orphans", f"could not list Vast.ai rentals: {e}", e)
+            instances = []
 
         # DO/GCP ground truth for the ghost pass (and the sky orphan pass): Vast has the
         # provider-direct rental listing above; for DO/GCP SkyPilot's own tracked state is the
         # signal. Fetched once and shared — a second live `sky.status()` round-trip per reconcile
         # is pure waste, and `sky` talks to a local API server this call is not otherwise gated
         # on. Under skew it is not fetched at all (see `sky_live` below).
-        sky_status_recs: list[Any] = self._sky_status_records() if sky_ok else []
+        sky_status_recs: list[Any] = []
+        if sky_ok:
+            try:
+                sky_status_recs = self._sky_status_records()
+            except LabError as e:
+                sky_pass = _blind("sky_orphans", str(e), e)
+                sky_ok = False  # no answer: no sky orphans, and no ghost verdicts from it
 
         # DO block volumes (best-effort): skipped silently when DO isn't configured (no doctl),
         # since not every account uses DigitalOcean.
@@ -1555,15 +1580,16 @@ class Lab:
             list[dict[str, Any]] | None, str
         ]:
             """Run one GCP listing, distinguishing "GCP isn't set up here" (skip, and say so in
-            the report) from "the API failed" (raise — a leak pass that swallows an API error
-            reports clean while blind). The two passes are independent: an instance-API hiccup
-            must not also hide leaked disks, which are the slow, quiet leak."""
+            the report) from "the API failed" (a blind pass — a leak pass that swallows an API
+            error reports clean while blind; see :func:`_blind`). The two passes are independent:
+            an instance-API hiccup must not also hide leaked disks, the slow, quiet leak."""
             try:
                 return lister(), "ran"
             except GcpNotConfigured as e:
                 return None, f"skipped ({e})"
             except Exception as e:  # noqa: BLE001
-                raise LabError(f"could not list GCP {what}: {e}") from e
+                field = "gcp_orphans" if what == "instances" else "gcp_disk_orphans"
+                return None, _blind(field, f"could not list GCP {what}: {e}", e)
 
         gcp_instances, gcp_pass = _gcp_list("instances", list_gcp_instances)
         gcp_disks, gcp_disk_pass = _gcp_list("disks", list_gcp_disks)
@@ -1786,13 +1812,16 @@ class Lab:
         if apply and orphans:
             from lab.backends.skypilot import _get_vast_client
 
-            client = _get_vast_client()
+            vast_client: Any = None
             for orph in orphans:
                 inst_id = orph["id"]
                 if inst_id is None or not _approved("orphans", orph):
                     continue
                 try:
-                    client.destroy_instance(id=int(inst_id))
+                    # Built inside the guard: a client that cannot be constructed is a destroy
+                    # that did not happen, not a crash that discards every earlier pass's report.
+                    vast_client = vast_client or _get_vast_client()
+                    vast_client.destroy_instance(id=int(inst_id))
                     destroyed.append(int(inst_id))
                 except Exception as e:  # noqa: BLE001
                     _unconfirmed("orphans", orph, e)
@@ -1832,6 +1861,8 @@ class Lab:
                     continue  # SkyPilot itself confirms this cluster is still live
                 reason = f"no matching SkyPilot-tracked cluster (cloud={cloud})"
             else:
+                if "orphans" in pass_errors:
+                    continue  # the rental listing failed: absence from it proves nothing
                 reason = "no matching Vast rental label"
             ghosts.append(cluster)
             ghost_reasons[cluster] = reason
@@ -1875,13 +1906,14 @@ class Lab:
             if apply and do_volume_orphans:
                 from lab.backends.skypilot import _get_do_client
 
-                client = _get_do_client()
+                do_client: Any = None
                 for vol in do_volume_orphans:
                     vol_id = vol.get("id")
                     if vol_id is None or not _approved("do_volume_orphans", vol):
                         continue
                     try:
-                        client.volumes.delete(volume_id=vol_id)
+                        do_client = do_client or _get_do_client()  # see the Vast pass
+                        do_client.volumes.delete(volume_id=vol_id)
                         do_volumes_destroyed.append(vol_id)
                     except Exception as e:  # noqa: BLE001
                         _unconfirmed("do_volume_orphans", vol, e)
@@ -1953,6 +1985,21 @@ class Lab:
                         file=sys.stderr,
                     )
 
+        # A pass that could not list under `apply` destroyed nothing, and nothing it covers was
+        # looked at: that is a cleanup this run cannot vouch for, the same verdict as a destroy
+        # whose outcome is unreadable. Listed with them so the CLI's exit 5 covers it.
+        for field, message in pass_errors.items():
+            destroy_outcomes.append(
+                {
+                    "pass": field,
+                    "resource": f"(entire {field} pass)",
+                    "outcome": "unknown",
+                    "detail": "the listing failed, so this pass examined and destroyed nothing; "
+                    "anything it covers may still be billing — verify against the provider",
+                    "error": message,
+                }
+            )
+
         return {
             "vast_pass": vast_pass,
             # "ran" or why it did not — a skewed client cannot read a destroy's result, so the
@@ -1989,6 +2036,9 @@ class Lab:
             # (nothing was attempted) and on a fully-confirmed cleanup. Non-empty means the cloud
             # is in a state this tool cannot vouch for — the CLI exits 5 and says to verify.
             "destroy_outcomes": destroy_outcomes,
+            # Additive: orphan field -> why its listing failed. Only ever non-empty under
+            # `apply` (a dry run raises instead); each entry is also in `destroy_outcomes`.
+            "pass_errors": pass_errors,
             "applied": apply,
         }
 
