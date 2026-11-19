@@ -127,8 +127,12 @@ overrides were never consumed (no `effective_config.json`, or the file omits sub
 is **flipped to `failed`** at the succeeded transition — a typo'd or stale key must not
 silently run a different experiment than requested. `allow_unknown_config=true`
 (CLI `--allow-unknown-config`) opts a legacy entrypoint out; better, pre-check it with
-`uv run lab lint -c "<cmd>" --grid k=v` (heuristic grep for override keys the script never
-references; exits 1 on findings).
+`uv run lab lint -c "<cmd>" --grid k=v [--seeds 0-31]` before a sweep. When the script declares
+its keys with `get_overrides(known={...})`, lint checks the grid keys (and the `seeds=` key a
+sharded sweep appends) against that declaration — exactly what the job will refuse at runtime
+(`check: "declared"`); otherwise it greps for keys the source never mentions (`check:
+"heuristic"`). Exits 1 on findings. A grid `seed` key is refused like any other by a script whose
+`known` omits it.
 
 A metric line is `{"name": "...", "value": <float>, "step": <int>, "wall_time": <float>}`.
 The lab tolerates a half-written trailing line, so you can write line-by-line
@@ -826,6 +830,7 @@ past its cause costs real time. Each row below is a rule that was once right.
 | "`lab <cmd> --help` exits non-deterministically, so `--help` rows in `lab history` are noise." | That was `rich` raising on a closed stdout pipe; `--help` exits 0. A `usage_error` row is now a real usage error. | v0.7.0 |
 | "`--price-cap` is a hard ceiling." | **Still not true, and worth knowing exactly how.** SkyPilot applies it to its own catalog, which under-reports Vast ~4x. Since v0.8.0 the cheapest *live* Vast offer is checked before renting (an impossible cap fails the submit for free) and the *billed* rate is compared after boot and recorded as `cost.over_cap`. The optimizer can still land above the cheapest offer, so pass `--price-cap-strict` if the ceiling must hold, and bound real exposure with `--timeout`. | v0.8.0 |
 | "`reconcile`'s `ghosts` list is Vast-only — a healthy DO/GCP job may show up there as a false positive, so don't trust it for those backends." | Ghost detection now cross-checks every cloud's own SkyPilot-tracked state, not just Vast rental labels; a healthy DO/GCP job is no longer misreported. Each entry's cause is named in the additive `ghost_reasons`. | v0.10.0 |
+| "`lab lint` passing means the sweep's keys will be accepted." | It used to be a grep: `--grid gain=2` passed on a script that mentions `gain` everywhere (as a search axis) and the job then died with "unknown config override". Lint now reads `get_overrides(known={...})` and checks against it, and `--seeds` checks the `seeds=` key; only a script with no readable declaration still gets the grep (`check: "heuristic"`). | v0.13.0 |
 | "`mcp__lab__list` / `lab list` return every job." | They return the **newest 100** (`limit`/`--limit`, `0` = all) and count the rest in `jobs_omitted`; `spend` still covers every job. 10k jobs measured 1.24 MB over MCP. | v0.13.0 |
 | "`mcp__lab__metrics` / `lab metrics` return every point of every series." | They return the **newest 200 points per series** by default and name what they cut in `truncated` (`{name: {returned, omitted}}`). `max_points=0` (`--max-points 0`) returns everything; `downsample=true` (`--downsample`) spreads the cap over the whole run. One unbounded read measured 27.7 MB over MCP. | v0.13.0 |
 | "There's no way to see what's actually running right now except `lab list` (this project only) or eyeballing `reconcile`'s rental counts." | `lab ps` / `mcp__lab__ps` gives a project-agnostic, machine-wide "what's running" view — closes a real gap found live, when both of the above were checked during an incident and neither surfaced jobs running in a *different* project. | v0.10.0 |

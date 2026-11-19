@@ -663,13 +663,20 @@ def lint(
     command: str = typer.Option(..., "--command", "-c", help="entrypoint, e.g. 'python experiments/x.py'"),
     grid: list[str] = typer.Option([], "--grid", "-g", help="key=v1,v2,... (repeatable)"),
     key: list[str] = typer.Option([], "--key", help="extra override key(s) to check (repeatable)"),
+    seeds: str | None = typer.Option(
+        None, "--seeds",
+        help="the --seeds a sharded sweep will use; checks the seeds= key it appends to each shard",
+    ),
 ) -> None:
-    """Pre-submit check: warn about override keys the entrypoint source never references.
+    """Pre-submit check: will the entrypoint accept the override keys a sweep passes?
 
-    A heuristic grep for legacy entrypoints that don't write effective_config.json — catches the
-    silent-dropped-override trap (field-report #1) before money is spent. Exits 1 on findings.
+    When the script declares its keys with `get_overrides(known={...})`, lint checks against that
+    declaration — the keys it will refuse at runtime (`check: "declared"`). Otherwise it falls
+    back to a grep for keys the source never mentions (`check: "heuristic"`), the
+    silent-dropped-override trap (field-report #1). Exits 1 on findings.
     """
-    from lab.experiment import unreferenced_keys
+    from lab.lint import lint_keys
+    from lab.sharding import parse_seeds
 
     script = next((tok for tok in command.split() if tok.endswith(".py")), None)
     if script is None or not Path(script).exists():
@@ -677,10 +684,17 @@ def lint(
         _emit({"error": msg})
         _fail(2, msg)
     keys = list(_parse_grid(grid)) + list(key)
-    missing = unreferenced_keys(Path(script).read_text(), keys)
-    _emit({"script": script, "checked_keys": sorted(keys), "missing_keys": missing})
-    if missing:
-        _fail(1, f"lint: {len(missing)} unreferenced config key(s): {missing}")
+    if seeds is not None:
+        try:
+            parse_seeds(seeds)
+        except ValueError as e:
+            raise typer.BadParameter(f"bad --seeds {seeds!r}: {e}") from e
+        keys.append("seeds")  # what `lab sweep --seeds` appends to every shard (seed axis key)
+    result = lint_keys(Path(script).read_text(), keys)
+    _emit({"script": script, "checked_keys": sorted(set(keys)), **result})
+    if missing := result["missing_keys"]:
+        what = "undeclared" if result["check"] == "declared" else "unreferenced"
+        _fail(1, f"lint: {len(missing)} {what} config key(s): {missing}")
 
 
 @app.command()
