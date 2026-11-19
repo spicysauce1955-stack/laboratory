@@ -20,7 +20,7 @@ from lab._util import infer_artifact_type, now, pid_alive, process_start_time
 from lab.manifest import sha256_file
 from lab.metrics import METRICS_FILE, read_points
 from lab.models import ArtifactRecord, JobManifest, JobState
-from lab.runner import stop_group
+from lab.runner import group_alive, group_is_ours, stop_group
 from lab.store import JobStore
 
 _TERMINAL = {
@@ -99,14 +99,62 @@ class LocalBackend:
             if rt.get("runner_pid") and not pid_alive(
                 rt["runner_pid"], start_time=rt.get("runner_start_time")
             ):
-                return self.store.update_manifest(
-                    job_id,
-                    only_if_active=True,  # the runner may have recorded its verdict, then exited
-                    status=JobState.failed,
-                    ended_at=now(),
-                    end_reason="runner exited without recording status",
-                ).status
+                return self._finalize_dead_runner(job_id, rt)
         return m.status
+
+    def _finalize_dead_runner(self, job_id: str, rt: dict[str, Any]) -> JobState:
+        """Record ``failed`` for a job whose runner died without a verdict, and stop the
+        experiment it was supervising if that is provably still running.
+
+        The experiment runs in its own session (so it can be killed as a group), which also means
+        it survives its runner: a SIGKILLed runner left it running with nobody enforcing its
+        wall-clock cap, while ``cancel`` refused it as already terminal (stress run 2026-11-19).
+        So the recorded group is stopped (:func:`~lab.runner.stop_group`: SIGTERM, a grace, then
+        SIGKILL) — but only when it is provably still the job's: the leader's start time must have
+        been recorded, and :func:`~lab.runner.group_is_ours` must accept it. A runtime file from
+        before start times were recorded is never signalled from here; a status poll is not the
+        place to guess.
+
+        **The verdict stays ``failed`` even when the experiment had already exited.** A runner
+        that dies between its experiment exiting and recording the outcome leaves outputs that may
+        well be complete, but the exit code is gone and nothing else proves success. Calling it
+        ``succeeded`` would be the one wrong answer that is never revisited; ``failed`` costs
+        little, because ``sweep-aggregate`` still reads a failed shard's rows (as partial, stamped
+        ``_shard_status``) and ``sweep-retry`` only re-buys seeds that are actually missing. The
+        ``end_reason`` says which case this was, and that the outputs were kept.
+        """
+        base = "runner exited without recording status"
+        pgid = rt.get("command_pgid")
+        leader_start = rt.get("command_start_time")
+        stop_pgid: int | None = None
+        if not pgid:
+            reason = base  # died before launching its command: nothing ran
+        elif not group_alive(pgid):
+            reason = (
+                f"{base}; the experiment had already exited, but its exit code was never "
+                "recorded — not marked succeeded (outputs kept)"
+            )
+        elif leader_start is None or not group_is_ours(pgid, leader_start):
+            reason = (
+                f"{base}; its experiment may still be running (process group {pgid}) but could "
+                "not be proven to be this job's — not signalled"
+            )
+        else:
+            stop_pgid = int(pgid)
+            reason = f"{base}; its experiment was still running and has been stopped"
+        final = self.store.update_manifest(
+            job_id,
+            only_if_active=True,  # the runner may have recorded its verdict, then exited
+            status=JobState.failed,
+            ended_at=now(),
+            end_reason=reason,
+        )
+        if stop_pgid is not None:
+            # After the verdict, like `cancel`: whatever the group writes on its way down lands
+            # under a terminal manifest. A no-op if the runner did record a verdict first — its
+            # group has exited by then, and `stop_group` re-checks the identity itself.
+            stop_group(stop_pgid, leader_start_time=leader_start)
+        return final.status
 
     def tail_logs(
         self, job_id: str, tail: int | None = None, follow: bool = False

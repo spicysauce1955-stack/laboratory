@@ -283,7 +283,9 @@ real gap: both were checked during an incident and neither surfaced real
 running jobs in a *different* project). `supervised` is `local` (a live local
 supervisor), `starting` (just launched, not yet visible), `unsupervised` (the
 local supervisor died — the job may still be billing with nobody watching it),
-or `n/a` for non-SkyPilot backends. Run this before anything that could
+or `n/a` for any other backend. Local jobs are checked too: their runner is
+their supervisor (`lab status <id>` then finalizes the job and stops its
+experiment). Run this before anything that could
 disturb a live job, not just `reconcile`/`queue list` — see §6.H.
 
 ### `mcp__lab__metrics`

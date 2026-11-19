@@ -1654,7 +1654,11 @@ class Lab:
             if manifest.status in _TERMINAL_STATES:
                 continue
             supervised = "n/a"
-            if manifest.backend.provisioner == "skypilot":
+            # A local job's runner is its supervisor just as a skypilot job's is: when it dies,
+            # nothing enforces the wall-clock cap and nothing will record a verdict. `ps` used to
+            # check skypilot only, so such a job read `running`/`n/a`. Read-only here, as for
+            # skypilot: the next `status`/`wait` on the job finalizes it and stops its group.
+            if manifest.backend.provisioner in ("skypilot", "local"):
                 runtime = store.read_runtime(kj.job_id)
                 alive = pid_alive(
                     runtime.get("runner_pid"), start_time=runtime.get("runner_start_time")
