@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from lab.events.models import Event
 from lab.events.stats import signature, stats, stats_dict
 
@@ -51,6 +53,115 @@ def test_signature_collapses_a_path_even_when_a_segment_looks_like_a_sha() -> No
     assert signature(a) == signature(b)
     assert "<path>" in signature(a)
     assert "config.yaml" not in signature(a)
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "placeholder"),
+    [
+        # A real job id is `YYYYMMDD-HHMMSS-<6 hex>`. Only the legacy `j-…` shape used to be
+        # recognised, so the date became `<sha>`, the time `<n>`, and the hex suffix survived —
+        # every "unknown job id" was its own signature.
+        ("20261119-102456-7486e1", "20261120-081512-a0b1c2", "<job>"),
+        ("20261119-102456-748612", "20261120-081512-abcdef", "<job>"),  # all-digit / all-alpha
+        ("sweep-20261119-102809-b2ca49", "sweep-20261121-000000-ffee00", "<sweep>"),
+        ("reg-20261119-102809-b2ca49", "reg-20261121-000000-ffee00", "<reg>"),
+        (
+            "lab-proj-20261119-102456-7486e1",
+            "lab-proj-20261120-081512-a0b1c2",
+            "<cluster>",
+        ),
+        ("lab-20261119-102456-7486e1", "lab-20261120-081512-a0b1c2", "<cluster>"),  # legacy
+        (
+            "lab-tempotron-capacity-20261119-102456-7486e1-head-1a2b3c4d-compute",
+            "lab-tempotron-capacity-20261120-081512-a0b1c2-head-c0h9pkx0-compute",
+            "<cluster>",
+        ),
+        (  # GCP truncates past 35 chars: no job id survives, only the node suffix
+            "lab-laboratory-20260820-ef-3dd12990-head-c0h9pkx0-compute",
+            "lab-laboratory-20260821-a1-77aa0011-worker-zz00yy11-tpu",
+            "<cluster>",
+        ),
+    ],
+)
+def test_signature_normalizes_lab_ids_and_cluster_names(
+    first: str, second: str, placeholder: str
+) -> None:
+    """The next run has a different id. A signature that keeps any of it can never recur, so
+    `lab report` gets one triage row per failure and a note filed on it never fires again."""
+    for template in (
+        "unknown job id '{}' — not in local runs/",
+        "teardown of {} did not confirm",
+        "{}: sky.down raised ClusterNotUpError",
+    ):
+        a = signature({"type": "Exit", "message": template.format(first)})
+        b = signature({"type": "Exit", "message": template.format(second)})
+        assert a == b, (a, b)
+        assert placeholder in a, a
+
+
+def test_signature_still_tells_a_job_id_from_ordinary_numbers() -> None:
+    """Normalising ids must not collapse the message around them: two different failures about
+    the same job stay two signatures."""
+    job = "20261119-102456-7486e1"
+    a = signature({"type": "Exit", "message": f"unknown job id '{job}'"})
+    b = signature({"type": "Exit", "message": f"job '{job}' is still running"})
+    assert a != b
+    assert signature({"type": "Exit", "message": f"unknown job id '{job}'"}) == (
+        "Exit: unknown job id '<job>'"
+    )
+
+
+@pytest.mark.parametrize(
+    ("legacy", "message"),
+    [
+        # Signatures the pre-fix normaliser produced (and notes were filed under), each next to
+        # a message the same failure produces for a *different* job today.
+        (
+            "Exit: unknown job id '<sha>-<n>-7486e1' — not in local runs/",
+            "unknown job id '20261120-081512-a0b1c2' — not in local runs/",
+        ),
+        (
+            "Exit: unknown job id '<sha>-<n>-<n>' — not in local runs/",
+            "unknown job id '20261120-081512-a0b1c2' — not in local runs/",
+        ),
+        (
+            "Exit: teardown of lab-proj-<sha>-<n>-7486e1 did not confirm",
+            "teardown of lab-proj-20261120-081512-a0b1c2 did not confirm",
+        ),
+        (
+            "Exit: sweep sweep-<sha>-<n>-b2ca49 has no plan",
+            "sweep sweep-20261121-000000-ffee00 has no plan",
+        ),
+        (
+            "Exit: lab-proj-<sha>-<n>-7486e1-head-<sha>-compute is gone",
+            "lab-proj-20261120-081512-a0b1c2-head-c0h9pkx0-compute is gone",
+        ),
+        (
+            "Exit: lab-laboratory-<sha>-ef-<sha>-head-c0h9pkx0-compute is gone",
+            "lab-laboratory-20260821-a1-77aa0011-head-zz00yy11-compute is gone",
+        ),
+        (
+            "Exit: registration reg-<sha>-<n>-<n> not found",
+            "registration reg-20261121-000000-ffee00 not found",
+        ),
+    ],
+)
+def test_a_legacy_signature_upgrades_onto_todays(legacy: str, message: str) -> None:
+    """Notes store the signature they were filed under. Upgrading the stored key — rather than
+    leaving it — is what lets a note written against the old normaliser fire for the next job."""
+    from lab.events.stats import upgrade_signature
+
+    current = signature({"type": "Exit", "message": message})
+    assert upgrade_signature(legacy) == current
+    assert upgrade_signature(current) == current  # idempotent on today's form
+
+
+def test_upgrading_leaves_a_signature_with_no_ids_alone() -> None:
+    from lab.events.stats import upgrade_signature
+
+    sig = signature({"type": "ProvisionTimeout", "message": "host never reached UP in 20m"})
+    assert upgrade_signature(sig) == sig
+    assert upgrade_signature("unknown") == "unknown"
 
 
 def test_stats_counts_calls_failures_and_failure_rate() -> None:

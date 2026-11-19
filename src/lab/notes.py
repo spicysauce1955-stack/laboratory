@@ -393,7 +393,13 @@ def match(
     live = [n for n in search() if n.retired is None]
     hits: list[Note] = []
     if signature:
-        hits = [n for n in live if n.signature and n.signature == signature]
+        # Through `same_signature`, not `==`: a note keeps the key it was filed under forever
+        # (the index is append-only), and a key from before lab ids were normalised names the
+        # one job it was written about. Upgrading it on read is what lets that note fire for
+        # the next job — the only reader a signature match exists for.
+        from lab.events.stats import same_signature
+
+        hits = [n for n in live if n.signature and same_signature(n.signature, signature)]
     elif facets:
         wanted = {k: v for k, v in facets.items() if v is not None}
         if _REQUIRED_FACET not in wanted:
