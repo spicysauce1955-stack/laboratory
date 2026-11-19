@@ -79,6 +79,44 @@ def test_export_size_threshold_skips_and_records(tmp_path):
     assert "size" in index["jobs"][0]["skipped"][0]["reason"]
 
 
+def test_export_includes_hits_jsonl_under_output(tmp_path):
+    """`lab.search.grid_search` writes its answer to hits.jsonl; a bundle without it has the
+    manifest of a search but not what the search found."""
+    lab = _lab(tmp_path)
+    hits = '{"gain": 1.0, "tau": 10.0}\n{"gain": 2.0, "tau": 10.0}\n'
+    _job(lab, "jh", files={"hits.jsonl": hits, "results.csv": "seed,acc\n0,0.9\n"})
+    dest = tmp_path / "bundle"
+
+    index = lab.export("jh", dest)
+
+    assert (dest / "jh" / "output" / "hits.jsonl").read_text() == hits
+    entry = index["jobs"][0]
+    assert "output/hits.jsonl" in entry["files"]
+    assert "hits.jsonl" not in {s["file"] for s in entry["skipped"]}
+    # The manifest's artifact record agrees with the bundle about what the file is.
+    types = {a.name: a.type for a in lab.manifest("jh").artifacts}
+    assert types["hits.jsonl"] == "table"
+
+
+def test_export_includes_metrics_jsonl_but_size_cap_still_applies(tmp_path):
+    """metrics.jsonl is the only copy of a run's metric series (the manifest keeps final values
+    only), so it travels as a table — and, like any table, an oversized one is skipped and named,
+    never silently dropped."""
+    lab = _lab(tmp_path)
+    small = '{"name": "acc", "value": 0.9, "step": 0}\n'
+    _job(lab, "jm", files={"metrics.jsonl": small})
+    _job(lab, "jbig", files={"metrics.jsonl": small * 100})
+
+    index = lab.export("jm", tmp_path / "b1")
+    assert (tmp_path / "b1" / "jm" / "output" / "metrics.jsonl").read_text() == small
+    assert index["jobs"][0]["skipped"] == []
+
+    index = lab.export("jbig", tmp_path / "b2", max_file_mb=0.001)  # ~1 KB cap
+    assert not (tmp_path / "b2" / "jbig" / "output" / "metrics.jsonl").exists()
+    [skip] = index["jobs"][0]["skipped"]
+    assert skip["file"] == "metrics.jsonl" and "size" in skip["reason"]
+
+
 def test_export_logs_opt_in(tmp_path):
     lab = _lab(tmp_path)
     _job(lab, "j4", files={"results.csv": "seed,acc\n0,0.9\n"})
