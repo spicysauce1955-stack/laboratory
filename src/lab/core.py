@@ -1804,6 +1804,10 @@ class Lab:
                     # answer before touching a live job.
                     age = (now() - (manifest.started_at or manifest.created_at)).total_seconds()
                     supervised = "starting" if age <= UNSUPERVISED_GRACE_S else "unsupervised"
+                    if manifest.backend.provisioner == "local" and runtime.get("runner_pid"):
+                        # A local runner records its pid before `submit` returns, so a recorded
+                        # pid that is dead is a dead runner at any age, not one still starting.
+                        supervised = "unsupervised"
             jobs.append(
                 {
                     "job_id": kj.job_id,

@@ -209,6 +209,17 @@ class TestPsChecksLocalRunners:
         assert job["backend"] == "local"
         assert job["supervised"] == "unsupervised"
 
+    def test_a_young_local_job_whose_recorded_runner_died_is_not_starting(
+        self, tmp_path: Path
+    ) -> None:
+        """The grace covers a runner that has not recorded its pid yet. A local runner's pid is
+        recorded before `submit` returns, so a recorded pid that is dead is a dead runner."""
+        lab = self._lab(tmp_path / "proj")
+        pid, start = _dead_pid()
+        self._seed(lab, "ps-young-dead", started_ago_s=2.0, runner_pid=pid, runner_start_time=start)
+        (job,) = lab.ps()["jobs"]
+        assert job["supervised"] == "unsupervised"
+
     def test_a_local_job_with_a_live_runner_is_supervised(self, tmp_path: Path) -> None:
         lab = self._lab(tmp_path / "proj")
         me = os.getpid()
