@@ -161,7 +161,10 @@ the same command, config, and per-shard resources recorded in the sweep plan. Se
 recovered are never discarded and never paid for twice.
 
 It is also safe to run repeatedly: seeds already covered by an in-flight retry (a shard job still
-queued or running) are skipped, so you cannot stack duplicate jobs on the same seeds. After the new
+queued or running) are skipped, so you cannot stack duplicate jobs on the same seeds. That holds
+for concurrent calls too — `sweep-retry` and `sweep-aggregate` on one sweep take turns on a
+per-sweep lock (`runs/<sweep_id>/.plan.lock`), so a second retry waits for the first and then sees
+its shards in flight, and every shard a retry launches is recorded in the plan as it launches. After the new
 shards finish, run `sweep-aggregate` again — or just re-run `sweep-retry`, which ends with an
 aggregate.
 
@@ -196,7 +199,9 @@ uv run lab sweep-aggregate <sweep_id>
 
 This re-aggregates from current shard states and returns the full cell view (including
 `seeds_present`, `seeds_expected`, `seeds_partial`, `missing_seeds`, and `status` per cell). Run it
-whenever you want to check which seeds have landed so far.
+whenever you want to check which seeds have landed so far. A cell whose included shards have not
+changed since the last aggregate (same shards, states, and result/hits files' size and mtime) is
+not re-merged or re-written, so repeating it on a finished sweep is cheap.
 
 `lab sweep-status <sweep_id>` is a separate command that returns the outcome/cost summary
 (job states, preemption count, per-point spend) — it does not show per-cell seed coverage.
