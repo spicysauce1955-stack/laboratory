@@ -1598,6 +1598,17 @@ def install_signal_handlers() -> list[str]:
     return installed
 
 
+def _user_cancel_in_flight(store: JobStore, job_id: str) -> bool:
+    """Has ``lab cancel`` recorded its intent? It writes ``cancelling`` to ``_runtime.json``
+    *before* it SIGTERMs the supervisor (R9), so this is what tells a cancel from any other
+    signal. An unreadable runtime file is "no": a real interruption must never be misfiled as a
+    deliberate one."""
+    try:
+        return bool(store.read_runtime(job_id).get("cancelling"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # The default ladder is 5+15+30+60+120 = 230s of `sky.down` retries before the provider-direct
 # fallback even starts. A process that has been signalled cannot count on that much time — a
 # system shutdown SIGKILLs 90s later by default — and the fallback is the half that actually asks
@@ -2270,7 +2281,18 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         outcome is durable in the other place that matters — `tear_down_and_record` writes
         `teardown_status` on the manifest, which is what `lab wait` (exit 3/6) and `lab reconcile`
         read.
+
+        A SIGTERM sent by ``lab cancel`` is the supervisor doing what it was asked, not failing:
+        it closes ``ok`` with ``cancelled_by_user`` in the call's result (job F, 2026-11-19, was
+        listed among ``lab history --failures`` as ``SupervisorTerminated``). The ``cancelling``
+        intent that ``lab cancel`` writes *before* signalling is the only evidence accepted — the
+        same signal from anything else stays ``interrupted``, a failure.
         """
+        if isinstance(exc, SupervisorTerminated) and _user_cancel_in_flight(store, job_id):
+            call.result(cancelled_by_user=True, signal=exc.signal_name)
+            outcome, error = "ok", None
+        else:
+            error = events.error_dict(exc)
         # `teardown` is what this abort is about to *do*, not merely whether a machine was ever
         # asked for: a rotated job reaches here with its abandoned attempt already destroyed, and
         # a ledger that claimed a teardown either way could not be used to audit this path.
@@ -2281,7 +2303,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             teardown=machine_requested and not attempt_torn_down,
         )
         exit_code = exc.code if isinstance(exc, SystemExit) and isinstance(exc.code, int) else None
-        events.finish(call, outcome=outcome, exit_code=exit_code, error=events.error_dict(exc))
+        events.finish(call, outcome=outcome, exit_code=exit_code, error=error)
         _teardown_on_abort(
             store,
             job_id,
