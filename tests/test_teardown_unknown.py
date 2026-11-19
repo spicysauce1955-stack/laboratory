@@ -237,6 +237,36 @@ class TestWaitExitCodes:
 
         assert runner.invoke(app, ["wait", "j1"]).exit_code == 0
 
+    # A `--timeout` that elapses with one job still running must not hide a money signal already
+    # recorded on a job that *did* finish: exit 1 ("gave up") reads as "nothing known yet", while
+    # the finished job's machine is billing now. Same precedence the fail-fast branch applies.
+    def test_a_confirmed_leak_outranks_a_timeout(self, monkeypatch, tmp_path):
+        _patch_wait(
+            monkeypatch, tmp_path,
+            all_terminal=False, pending=["j2"], teardown_leaks=["j1"],
+        )
+
+        result = runner.invoke(app, ["wait", "j1", "j2", "--timeout", "3"])
+
+        assert result.exit_code == 3, result.output
+
+    def test_an_unknown_teardown_outranks_a_timeout(self, monkeypatch, tmp_path):
+        _patch_wait(
+            monkeypatch, tmp_path,
+            all_terminal=False, pending=["j2"], teardown_unknown=["j1"],
+        )
+
+        result = runner.invoke(app, ["wait", "j1", "j2", "--timeout", "3"])
+
+        assert result.exit_code == 6, result.output
+
+    def test_a_timeout_with_no_money_signal_still_exits_1(self, monkeypatch, tmp_path):
+        _patch_wait(monkeypatch, tmp_path, all_terminal=False, pending=["j2"])
+
+        result = runner.invoke(app, ["wait", "j1", "j2", "--timeout", "3"])
+
+        assert result.exit_code == 1, result.output
+
     def test_a_null_teardown_still_only_warns(self, monkeypatch, tmp_path):
         """`None` means nothing was ever recorded -- weaker than `unknown`, unchanged behaviour."""
         _patch_wait(monkeypatch, tmp_path, teardown_unconfirmed=["j1"])

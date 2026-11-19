@@ -24,8 +24,10 @@ upgrade note.
   would bill over it. A price feed that cannot answer never blocks, so this does not fail
   closed on a Vast API outage.
 
-  On `lab wait`, 3 outranks 6 outranks 4: a *confirmed* leak is the most urgent signal, an
-  unverifiable one is still a money signal, and both outrank the fail-fast notice. Exit 5 and 6
+  On `lab wait`, 3 outranks 6 outranks 4 outranks 1: a *confirmed* leak is the most urgent
+  signal, an unverifiable one is still a money signal, and both outrank the fail-fast notice and
+  the `--timeout` give-up — a job that already finished with a leaked teardown is billing whether
+  or not another job in the same wait is still running (that case used to exit 1). Exit 5 and 6
   were added in v0.7.0; a caller that treats "non-zero" as failure is unaffected, one that
   enumerates codes must learn them.
 

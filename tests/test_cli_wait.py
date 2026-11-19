@@ -350,6 +350,36 @@ def test_cli_wait_fail_fast_with_confirmed_leak_exits_3(monkeypatch, tmp_path):
     assert result.exit_code == 3  # leak alarm wins over fail-fast's 4
 
 
+def test_cli_wait_timeout_does_not_mask_a_leak_on_a_finished_job(monkeypatch, tmp_path):
+    """The reviewer's repro: `lab wait A B --timeout 3` with A already terminal and leaked, B still
+    running. `lab wait A` alone exits 3; adding a still-running B used to turn that into exit 1
+    ("gave up on --timeout") — the leak was in the summary but the exit code said nothing was
+    known yet, which is the code a background-task hook acts on."""
+    leaked = make_manifest("A", "python x.py").model_copy(
+        update={"status": JobState.succeeded, "backend": BackendInfo(provisioner="skypilot"),
+                "teardown_status": "failed"}
+    )
+    running = make_manifest("B", "python x.py").model_copy(
+        update={"status": JobState.running, "backend": BackendInfo(provisioner="skypilot")}
+    )
+
+    class _FakeLab(_SummaryMixin):
+        wait = Lab.wait  # the real poll loop: B never finishes, so the deadline ends the wait
+
+        def status(self, job_id):
+            return leaked.status if job_id == "A" else running.status
+
+        def manifest(self, job_id):
+            return leaked if job_id == "A" else running
+
+    _patch_store(monkeypatch, tmp_path, _FakeLab())
+    result = CliRunner().invoke(app, ["wait", "A", "B", "--timeout", "0.2", "--interval", "0.05"])
+    assert result.exit_code == 3, result.output
+    summary = json.loads(result.stdout)
+    assert summary["all_terminal"] is False and summary["pending"] == ["B"]
+    assert summary["teardown_leaks"] == ["A"]
+
+
 def test_wait_summary_settles_offender_teardown_on_fail_fast(monkeypatch, tmp_path):
     """On the fail-fast path the offender's lagging teardown_status must still settle —
     a merely-lagging null would otherwise read as unconfirmed instead of its real value."""

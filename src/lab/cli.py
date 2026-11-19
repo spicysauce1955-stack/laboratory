@@ -1148,7 +1148,9 @@ def wait(
 
     Run as a Claude Code background task — its completion is the push signal the session acts on,
     so the agent need not poll. Exit codes: 0 clean; 1 gave up on --timeout; 2 bad args;
-    3 teardown leaked (a paid machine may still bill); 4 --fail-fast tripped.
+    3 teardown leaked (a paid machine may still bill); 4 --fail-fast tripped; 6 teardown outcome
+    unknown (verify with the provider). When several apply, 3 > 6 > 4 > 1: a leak on a job that
+    already finished is reported even if another job is still running at --timeout.
 
     Scheduler-launched (deferred) job ids work too: they have no local runs/ record, so they are
     read from the scheduler queue's mirrored manifest — the same fallback `lab status` uses — and
@@ -1204,24 +1206,21 @@ def wait(
             "block volume is still billing.",
             err=True,
         )
+    # Precedence 3 > 6 > 4 > 1 (docs/COMPATIBILITY.md). Money outranks everything: exit 3 is the
+    # documented URGENT "a paid machine may still be billing — run `lab reconcile` now" alarm
+    # (FR-C2), and exit 6 is the same concern without the certainty — an unverified machine costs
+    # the same as a verified one (R10). Both are checked before the fail-fast *and* the timeout
+    # exits: a job that already finished with a leaked teardown is billing now, whether or not
+    # some other job in the same wait is still running. Checking the timeout first used to report
+    # that as exit 1 ("gave up"), while `lab wait <that job>` alone exited 3.
+    if teardown_leaks:
+        _fail(3, "teardown leaked on at least one job")
+    if teardown_unknown:
+        _fail(6, "teardown outcome unknown on at least one job — verify with the provider")
     if summary["failed_fast"]:
-        # Money outranks the fail-fast signal. Exit 3 is the documented URGENT "a paid machine
-        # may still be billing — run `lab reconcile` now" alarm (FR-C2); exit 6 is the same
-        # concern without the certainty, and it still outranks 4 because an unverified machine
-        # costs the same as a verified one (R10).
-        if teardown_leaks:
-            _fail(3, "fail-fast: teardown leaked")
-        if teardown_unknown:
-            _fail(6, "fail-fast: teardown outcome unknown")
         _fail(4, "fail-fast: a job failed/timed out")
     if not all_terminal:
         _fail(1, "gave up: --timeout elapsed before all jobs reached a terminal state")
-    if teardown_leaks:
-        # all terminal but at least one cluster may still be billing
-        _fail(3, "teardown leaked on at least one job")
-    if teardown_unknown:
-        # all terminal, nothing confirmed leaked, but at least one outcome is unreadable
-        _fail(6, "teardown outcome unknown on at least one job — verify with the provider")
 
 
 @app.command()
