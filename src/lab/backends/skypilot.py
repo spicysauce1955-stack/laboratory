@@ -1007,18 +1007,44 @@ def gcp_name_matches(cluster: str, name: str) -> bool:
         return False
 
 
+def _labelled_job_id(inst: dict[str, Any]) -> str | None:
+    """The ``lab-job-id`` label :func:`project_labels` stamped on a GCE instance, or ``None``."""
+    labels = inst.get("labels")
+    if not isinstance(labels, dict):
+        return None
+    value = str(labels.get("lab-job-id") or "").strip().lower()
+    return value or None
+
+
+def gcp_instance_matches(cluster: str, inst: dict[str, Any]) -> bool:
+    """Whether GCE instance ``inst`` belongs to cluster ``cluster``.
+
+    The ``lab-job-id`` label decides whenever the instance carries one. The name cannot: past
+    GCP's 35-character limit, :func:`gcp_name_fragment` keeps only ``YYYYMM`` of a slugged job id
+    plus SkyPilot's 2-hex digest, so two jobs of one project in one month collide with p~1/256 —
+    and a collision let job A's gcp-direct teardown delete sibling B's *running* VM and report
+    ``succeeded``. A label is not truncated, so equality with the job id the cluster name ends in
+    is exact. The name fragment is the fallback only for unlabelled (pre-label) instances.
+    """
+    job = _labelled_job_id(inst)
+    if job is None:
+        return gcp_name_matches(cluster, str(inst.get("name", "")))
+    # `cluster_name_for` always ends in `-<sanitised job id>`, the same value the label holds.
+    return cluster.strip().lower().endswith(f"-{job}")
+
+
 def gcp_instance_orphans(
     instances: list[dict[str, Any]], running_clusters: set[str]
 ) -> list[dict[str, Any]]:
     """Lab-cluster GCE instances not tied to any running cluster — the out-of-band GCP analogue of
-    the Vast rental pass (SkyPilot names instances after their cluster — see
-    :func:`gcp_name_matches` for why that is not a plain substring test)."""
+    the Vast rental pass (see :func:`gcp_instance_matches` for how an instance is tied to its
+    cluster: by label, falling back to the truncated name)."""
     orphans: list[dict[str, Any]] = []
     for inst in instances:
         name = str(inst.get("name", ""))
         if not is_lab_cluster_node(name):
             continue  # not ours — leave it alone
-        if any(gcp_name_matches(c, name) for c in running_clusters):
+        if any(gcp_instance_matches(c, inst) for c in running_clusters):
             continue  # backs a live job
         orphans.append(inst)
     return orphans
@@ -1106,7 +1132,7 @@ def delete_gcp_disk(
 
 
 def _gcp_destroy_matching(cluster: str) -> tuple[list[str], list[str]]:
-    """Destroy every GCE instance belonging to ``cluster`` (see :func:`gcp_name_matches`).
+    """Destroy every GCE instance belonging to ``cluster`` (see :func:`gcp_instance_matches`).
 
     Returns ``(destroyed, failures)``. We keep going after a failure — the next instance might
     still die — but the failures are **returned, not just printed**: a destroy we attempted and
@@ -1117,7 +1143,7 @@ def _gcp_destroy_matching(cluster: str) -> tuple[list[str], list[str]]:
     destroyed: list[str] = []
     failures: list[str] = []
     for inst in list_gcp_instances(compute, project):
-        if not gcp_name_matches(cluster, str(inst["name"])):
+        if not gcp_instance_matches(cluster, inst):
             continue
         try:
             delete_gcp_instance(inst["name"], inst["zone"], compute, project)
@@ -1152,7 +1178,7 @@ def confirm_no_instance(cluster: str) -> bool:
         instances = list_gcp_instances()
     except Exception:  # noqa: BLE001 — uncertainty must read as "still maybe billing"
         return False
-    return not any(gcp_name_matches(cluster, str(inst.get("name", ""))) for inst in instances)
+    return not any(gcp_instance_matches(cluster, inst) for inst in instances)
 
 
 def gcp_preemption_state(cluster: str) -> JobState | None:
@@ -1168,9 +1194,7 @@ def gcp_preemption_state(cluster: str) -> JobState | None:
         instances = list_gcp_instances()
     except Exception:  # noqa: BLE001 — no answer is a valid answer here; inference still applies
         return None
-    return gcp_terminal_state(
-        [i for i in instances if gcp_name_matches(cluster, str(i.get("name", "")))]
-    )
+    return gcp_terminal_state([i for i in instances if gcp_instance_matches(cluster, i)])
 
 
 def preempted_teardown_confirmed(cloud: str, cluster: str) -> bool:
