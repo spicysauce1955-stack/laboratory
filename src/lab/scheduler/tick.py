@@ -6,9 +6,11 @@ Every tick re-derives everything from the QueueStore; a crashed tick costs nothi
 
 from __future__ import annotations
 
+import contextlib
 import os
 import platform
 import signal
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -67,6 +69,7 @@ class Scheduler:
         host: str | None = None,
         price_feed: PriceFeed | None = None,
         reconcile_every: int = 30,
+        reconcile_budget_s: float | None = None,
     ) -> None:
         self.queue = queue
         self.home = Path(home)
@@ -76,6 +79,9 @@ class Scheduler:
         self.store = JobStore(self.home)
         self.price_feed = price_feed
         self.reconcile_every = reconcile_every
+        self.reconcile_budget_s = (
+            self.RECONCILE_BUDGET_S if reconcile_budget_s is None else reconcile_budget_s
+        )
 
     def make_lab(self, repo: Path) -> Lab:
         """Lab over the launch backend, rooted at an extracted bundle. Test seam."""
@@ -153,20 +159,75 @@ class Scheduler:
         tick_count = int((self.queue.read_heartbeat() or {}).get("tick_count", 0)) + 1
         self._price_cache: dict[tuple[str | None, str | None], float | None] = {}
         self._best_hourly_seen: dict[str, float] = {}
-        control = self.queue.read_control()
-        if not control.paused:
-            entries = self.queue.list_entries()
-            # Read once, use for the whole tick (see MarkerSnapshot). Paused ticks skip it: they
-            # launch and sync nothing, so there is no question to answer and no reason to pay.
-            markers = MarkerSnapshot.read(self.queue)
-            self._sync(entries, rep, markers)            # Task 7
-            self._expire(entries, rep)
-            self._evaluate_and_launch(entries, control, rep, markers)  # Task 6 (+8, 9)
-            if tick_count % self.reconcile_every == 0:
-                try:
-                    rep.reconcile = self._reconcile(control.auto_reconcile)
-                except Exception as e:  # noqa: BLE001
-                    rep.errors.append(f"reconcile sweep: {e}")
+        control: ControlConfig | None = None
+        try:
+            control = self.queue.read_control()
+            if not control.paused:
+                entries = self.queue.list_entries()
+                # Read once, use for the whole tick (see MarkerSnapshot). Paused ticks skip it:
+                # they launch and sync nothing, so there is no question to answer and no reason
+                # to pay.
+                markers = MarkerSnapshot.read(self.queue)
+                self._sync(entries, rep, markers)            # Task 7
+                self._expire(entries, rep)
+                self._evaluate_and_launch(entries, control, rep, markers)  # Task 6 (+8, 9)
+                if tick_count % self.reconcile_every == 0:
+                    # Persist this tick's count BEFORE the sweep: it is the slow, killable part
+                    # of the tick (TimeoutStartSec, OOM), and a tick killed with its count
+                    # unwritten is re-run as the same reconcile tick, forever -- the heartbeat
+                    # then goes stale for good and the deploy preflight refuses the redeploy
+                    # that would fix it.
+                    self._write_heartbeat(rep, tick_count, control)
+                    self._run_reconcile(control.auto_reconcile, rep)
+        except Exception as e:
+            # A tick that raises still leaves the host visibly alive-but-failing (fresh
+            # heartbeat, the error in it) rather than indistinguishable from a dead one -- and
+            # still advances tick_count. Best-effort: never mask the original error.
+            rep.errors.append(f"tick aborted: {type(e).__name__}: {e}"[:300])
+            with contextlib.suppress(Exception):
+                self._write_heartbeat(rep, tick_count, control)
+            raise
+        self._write_heartbeat(rep, tick_count, control)
+        return rep
+
+    RECONCILE_BUDGET_S = 150.0
+    """Wall-clock budget for the periodic reconcile sweep, inside the unit's TimeoutStartSec=300:
+    the rest of the tick (sync, evaluate, launch) keeps the other half."""
+
+    def _run_reconcile(self, apply: bool, rep: TickReport) -> None:
+        """Run the FR-C2 sweep with its own time budget; abandon it (never wait) when it overruns.
+
+        On a daemon thread, so an overrun returns control to the tick, which writes its heartbeat
+        and exits; the abandoned sweep dies with the process -- no worse than the systemd kill it
+        replaces, and with the tick's own bookkeeping already durable. The next sweep is
+        ``reconcile_every`` ticks away, not the next tick.
+        """
+        outcome: dict[str, object] = {}
+
+        def _sweep() -> None:
+            try:
+                outcome["result"] = self._reconcile(apply)
+            except BaseException as e:  # noqa: BLE001 — reported by the tick, never re-raised here
+                outcome["error"] = e
+
+        worker = threading.Thread(target=_sweep, name="lab-reconcile-sweep", daemon=True)
+        worker.start()
+        worker.join(self.reconcile_budget_s)
+        if worker.is_alive():
+            rep.errors.append(
+                f"reconcile sweep: exceeded its {self.reconcile_budget_s:.0f}s budget; abandoned "
+                f"(next sweep in {self.reconcile_every} ticks)"
+            )
+            return
+        if "error" in outcome:
+            rep.errors.append(f"reconcile sweep: {outcome['error']}")
+            return
+        result = outcome.get("result")
+        rep.reconcile = result if isinstance(result, dict) else None
+
+    def _write_heartbeat(
+        self, rep: TickReport, tick_count: int, control: ControlConfig | None
+    ) -> None:
         self.queue.write_heartbeat(
             {
                 "at": rep.at.isoformat(),
@@ -183,10 +244,10 @@ class Scheduler:
                 # `control.paused` alone only proves a write landed, not that a running scheduler
                 # (possibly mid-tick, already past its own `read_control()`) has honored it -- a
                 # cutover confirming this against a *completed* tick's heartbeat is the real ack.
-                "paused": control.paused,
+                # None when the control read itself failed: no pause was observed.
+                "paused": control.paused if control is not None else None,
             }
         )
-        return rep
 
     _TERMINAL_MAP = {
         JobState.succeeded: RegState.succeeded,

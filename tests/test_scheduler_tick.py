@@ -600,6 +600,79 @@ def test_reconcile_sweep_every_n_ticks(tmp_path: Path):
     assert calls[-1] is True
 
 
+def test_the_new_tick_count_is_persisted_before_the_reconcile_sweep_starts(tmp_path: Path):
+    """The reconcile tick is the slow one (sky.status + provider APIs). If systemd kills it at
+    TimeoutStartSec (or it OOMs) after the heartbeat was meant to be written at the *end*, the
+    tick_count never advanced: every later tick was the same reconcile tick, killed the same way,
+    and the heartbeat went stale for good -- so the deploy preflight refused the very redeploy
+    that would have fixed it."""
+    sched, q = _watchdog_sched(tmp_path)
+    q.write_heartbeat({"tick_count": 29, "at": utc_now().isoformat()})
+    seen: list[int] = []
+
+    def reconcile(apply: bool) -> dict[str, object]:
+        hb = q.read_heartbeat()
+        seen.append(hb["tick_count"] if hb else -1)
+        return {"orphans": []}
+
+    sched._reconcile = reconcile  # type: ignore[method-assign]
+    sched.tick()
+    assert seen == [30]  # already durable while the sweep runs
+
+
+def test_a_reconcile_sweep_that_overruns_its_budget_is_abandoned_not_waited_on(tmp_path: Path):
+    """The sweep gets its own time budget inside TimeoutStartSec: a hung sweep must not take the
+    whole tick down with it, and must not be retried on the next tick."""
+    import threading
+    import time
+
+    sched, q = _watchdog_sched(tmp_path, reconcile_budget_s=0.2)
+    q.write_heartbeat({"tick_count": 29, "at": utc_now().isoformat()})
+    release = threading.Event()
+    calls: list[bool] = []
+
+    def hung(apply: bool) -> dict[str, object]:
+        calls.append(apply)
+        release.wait(30)
+        return {}
+
+    sched._reconcile = hung  # type: ignore[method-assign]
+    try:
+        t0 = time.monotonic()
+        rep = sched.tick()
+        assert time.monotonic() - t0 < 10
+        assert any("budget" in e for e in rep.errors)
+        hb = q.read_heartbeat()
+        assert hb is not None and hb["tick_count"] == 30
+        assert any("budget" in e for e in hb["errors"])
+        sched.tick()  # tick 31: not a reconcile tick
+        assert calls == [False]
+    finally:
+        release.set()
+
+
+def test_a_tick_that_crashes_still_advances_and_reports_its_heartbeat(tmp_path: Path):
+    """A bug that raises out of the tick every minute must leave the host visibly alive-but-
+    failing (fresh heartbeat, the error in it), not indistinguishable from a dead one -- the
+    deploy preflight reads heartbeat age, and a host that can never be redeployed can never be
+    fixed."""
+    sched, q = _watchdog_sched(tmp_path)
+
+    def boom(*a: object, **k: object) -> None:
+        raise RuntimeError("evaluate exploded")
+
+    sched._evaluate_and_launch = boom  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        sched.tick()
+    hb = q.read_heartbeat()
+    assert hb is not None and hb["tick_count"] == 1
+    assert any("evaluate exploded" in e for e in hb["errors"])
+    with pytest.raises(RuntimeError):
+        sched.tick()
+    hb = q.read_heartbeat()
+    assert hb is not None and hb["tick_count"] == 2
+
+
 def test_local_watchdog_fails_dead_runner(tmp_path: Path):
     """A dead local runner must not leave the reg `launched` forever (slot starvation)."""
     sched, q = _watchdog_sched(tmp_path)
