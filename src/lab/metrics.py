@@ -32,6 +32,28 @@ def log_metric(name: str, value: float, step: int, *, run_dir: str | Path | None
         f.write(line + "\n")
 
 
+def _coerce_step(raw: Any) -> int | float | None:
+    """A point's ``step`` as a finite number, or ``None`` to skip the point.
+
+    The file is written by user code, so ``"3"`` (coerced), ``"late"``, ``true``, an object or a
+    non-finite float all arrive here; any of them used to reach a ``<=`` comparison and crash
+    every read of the series. Integral values come back as ``int``.
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if not isinstance(raw, (float, str)):
+        return None
+    try:
+        num = float(raw)
+    except ValueError:
+        return None
+    if not math.isfinite(num):
+        return None
+    return int(num) if num.is_integer() else num
+
+
 def read_points(
     metrics_file: str | Path,
     names: Iterable[str] | None = None,
@@ -39,7 +61,9 @@ def read_points(
 ) -> list[dict[str, Any]]:
     """Parse metric points, filtered by ``names`` and ``since_step`` (exclusive).
 
-    Tolerant of a malformed final line so it can be read while the file is being written.
+    Tolerant of a malformed final line so it can be read while the file is being written, and of
+    any line that is not a point (a non-object JSON value, a non-string ``name``, a ``step`` that
+    is not a finite number) — skipped, never a crash.
     """
     p = Path(metrics_file)
     if not p.exists():
@@ -54,8 +78,10 @@ def read_points(
             obj = json.loads(raw)
         except json.JSONDecodeError:
             continue  # half-written trailing line during a live read
-        name, step = obj.get("name"), obj.get("step")
-        if name is None or step is None:
+        if not isinstance(obj, dict):
+            continue
+        name, step = obj.get("name"), _coerce_step(obj.get("step"))
+        if not isinstance(name, str) or step is None:
             continue
         if name_set is not None and name not in name_set:
             continue

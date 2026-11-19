@@ -75,3 +75,46 @@ def test_final_values_round_trips_through_the_manifest_model(tmp_path: Path):
     log_metric("loss", float("nan"), 1, run_dir=tmp_path)
     dumped = M(final_metrics=snapshot_final_metrics(tmp_path)).model_dump_json()
     assert M.model_validate_json(dumped).final_metrics == {"loss": 0.5}
+
+
+# --- read_points: the file is written by user code, so every line is untrusted ---------------
+
+
+def test_valid_json_that_is_not_an_object_is_skipped(tmp_path: Path):
+    """`7`, `[1]`, `"x"`, `null` all parse — and then `.get` crashed every read of the series."""
+    f = tmp_path / METRICS_FILE
+    good = json.dumps({"name": "loss", "value": 1.0, "step": 0})
+    f.write_text("\n".join([good, "7", "[1, 2]", '"x"', "null", good.replace("0}", "1}")]) + "\n")
+
+    pts = read_points(f)
+
+    assert [p["step"] for p in pts] == [0, 1]
+
+
+def test_a_string_step_is_coerced_or_skipped_never_a_crash(tmp_path: Path):
+    from lab.metrics import final_values
+
+    f = tmp_path / METRICS_FILE
+    lines = [
+        {"name": "loss", "value": 1, "step": 0},
+        {"name": "loss", "value": 2, "step": "3"},  # coercible
+        {"name": "loss", "value": 9, "step": "late"},  # not
+        {"name": "loss", "value": 9, "step": {"x": 1}},
+        {"name": "loss", "value": 9, "step": True},
+        {"name": {"un": "hashable"}, "value": 9, "step": 5},
+    ]
+    f.write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+
+    assert [p["step"] for p in read_points(f)] == [0, 3]
+    assert [p["step"] for p in read_points(f, since_step=1)] == [3]
+    assert [p["step"] for p in read_points(f, names=["loss"])] == [0, 3]
+    assert final_values(read_points(f)) == {"loss": 2.0}
+
+
+def test_a_non_finite_step_is_skipped(tmp_path: Path):
+    f = tmp_path / METRICS_FILE
+    f.write_text(
+        '{"name": "x", "value": 1, "step": NaN}\n{"name": "x", "value": 2, "step": Infinity}\n'
+        '{"name": "x", "value": 3, "step": 4}\n'
+    )
+    assert [p["step"] for p in read_points(f, since_step=0)] == [4]
