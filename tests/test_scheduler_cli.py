@@ -28,6 +28,28 @@ def _register(tmp_path: Path, repo: Path, *extra: str) -> dict:
     return json.loads(res.stdout)
 
 
+def test_register_hold_is_held_from_the_moment_it_is_committed(tmp_path: Path, monkeypatch):
+    """`--hold` must be in place before the entry exists: the CLI used to write it after."""
+    repo = _make_repo(tmp_path)
+    order: list[str] = []
+    real_hold, real_put = LocalQueueStore.hold, LocalQueueStore.put_entry
+
+    def _hold(self: LocalQueueStore, reg_id: str) -> None:
+        order.append("hold")
+        real_hold(self, reg_id)
+
+    def _put(self: LocalQueueStore, reg) -> None:  # type: ignore[no-untyped-def]
+        order.append("entry")
+        real_put(self, reg)
+
+    monkeypatch.setattr(LocalQueueStore, "hold", _hold)
+    monkeypatch.setattr(LocalQueueStore, "put_entry", _put)
+    out = _register(tmp_path, repo, "--hold")
+    assert out["state"] == "held"
+    assert order == ["hold", "entry"]
+    assert LocalQueueStore(tmp_path / "queue").held(out["reg_id"])
+
+
 def test_register_and_list(tmp_path: Path):
     repo = _make_repo(tmp_path)
     out = _register(tmp_path, repo, "--max-hourly", "0.25")
@@ -81,7 +103,9 @@ def test_queue_gc_cli(tmp_path: Path):
     live_key = q.get_entry(out["reg_id"]).bundle_key
     src = tmp_path / "orphan.tar.gz"
     src.write_bytes(b"x")
-    orphan_key = q.put_bundle("orphan", src)  # referenced by no entry -> orphaned
+    # referenced by no entry, and older than GC's minimum age (read from the reg-id timestamp) ->
+    # orphaned. A *fresh* unreferenced bundle is kept: its register may not have committed yet.
+    orphan_key = q.put_bundle("reg-20200101-000000-0a1b2c", src)
 
     dry = json.loads(runner.invoke(app, ["queue", "gc"], env=env).stdout)
     assert dry["orphaned"] == [orphan_key] and dry["deleted"] == [] and dry["applied"] is False

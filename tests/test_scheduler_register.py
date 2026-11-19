@@ -43,6 +43,56 @@ def test_register_failed_bundle_leaves_no_entry(tmp_path: Path, monkeypatch):
     assert q.list_entries() == []  # entry is the commit point (spec §5)
 
 
+class _OrderedQueue(LocalQueueStore):
+    """Records the order of the writes `register` makes; can make the hold write fail."""
+
+    def __init__(self, root: Path, *, hold_fails: bool = False) -> None:
+        super().__init__(root)
+        self.writes: list[str] = []
+        self.hold_fails = hold_fails
+
+    def hold(self, reg_id: str) -> None:
+        if self.hold_fails:
+            raise ConnectionError("R2 blip")
+        self.writes.append("hold")
+        super().hold(reg_id)
+
+    def put_entry(self, reg) -> None:  # type: ignore[no-untyped-def]
+        self.writes.append("entry")
+        super().put_entry(reg)
+
+
+def test_register_held_writes_the_hold_before_the_commit_point(tmp_path: Path):
+    """`lab register --hold` used to write the entry (the commit point -- the scheduler may launch
+    it from then on) and only then the hold marker, so an R2 blip between the two left an
+    unheld, eligible registration the operator had asked to hold."""
+    repo = _make_repo(tmp_path)
+    q = _OrderedQueue(tmp_path / "q")
+    reg = register(repo, q, JobSpec(command="x"), Triggers(),
+                   Guardrails(expires_at=datetime.now(timezone.utc) + timedelta(days=1)),
+                   hold=True)
+    assert q.writes == ["hold", "entry"]
+    assert q.held(reg.reg_id)
+
+
+def test_register_held_with_a_failing_hold_write_commits_nothing(tmp_path: Path):
+    repo = _make_repo(tmp_path)
+    q = _OrderedQueue(tmp_path / "q", hold_fails=True)
+    with pytest.raises(ConnectionError):
+        register(repo, q, JobSpec(command="x"), Triggers(),
+                 Guardrails(expires_at=datetime.now(timezone.utc) + timedelta(days=1)),
+                 hold=True)
+    assert q.list_entries() == []  # never eligible, because never committed
+
+
+def test_register_unheld_writes_no_hold(tmp_path: Path):
+    repo = _make_repo(tmp_path)
+    q = _OrderedQueue(tmp_path / "q")
+    register(repo, q, JobSpec(command="x"), Triggers(),
+             Guardrails(expires_at=datetime.now(timezone.utc) + timedelta(days=1)))
+    assert q.writes == ["entry"]
+
+
 def test_worst_case_cost():
     t = Triggers(max_hourly_usd=0.25)
     r = ResourceRequest(timeout="2h")

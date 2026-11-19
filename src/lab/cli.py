@@ -1570,12 +1570,11 @@ def register(
         submitted_by="human",
     )
     try:
-        reg = sched_register(repo_root(), queue, spec, triggers, guardrails)
+        # The hold is written before the entry (the commit point), inside `register`.
+        reg = sched_register(repo_root(), queue, spec, triggers, guardrails, hold=hold)
     except LabError as e:  # fail-loud, actionable (FR-F3)
         _emit({"error": str(e)})
         _fail(1, e)
-    if hold:
-        queue.hold(reg.reg_id)
     _emit(
         {
             "reg_id": reg.reg_id,

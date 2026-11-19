@@ -129,6 +129,39 @@ def test_raises_at_timeout_if_no_read_ever_succeeded(tmp_path: Path) -> None:
         wait_for_queue_drain(q, interval=0.01, timeout=0.05)
 
 
+class _UnreadableEntryStore:
+    """A listing that skipped one entry it could not read (what R2QueueStore does)."""
+
+    def __init__(self, inner: LocalQueueStore, unreadable: set[str], clears_after: int) -> None:
+        self._inner = inner
+        self._unreadable = unreadable
+        self._left = clears_after
+        self.last_unreadable: frozenset[str] = frozenset()
+
+    def list_entries(self) -> list[Registration]:
+        self.last_unreadable = frozenset(self._unreadable) if self._left > 0 else frozenset()
+        self._left -= 1
+        return self._inner.list_entries()
+
+
+def test_an_unreadable_entry_is_not_a_drained_one(tmp_path: Path) -> None:
+    """The drain gate is what deploy.sh pauses production on. An entry the listing skipped may be
+    `launched` -- a clean drain must not be reported until it can actually be read."""
+    import pytest
+
+    from lab.scheduler.queue import UnreadableEntriesError
+
+    q = _UnreadableEntryStore(LocalQueueStore(tmp_path / "queue"), {"reg-x"}, clears_after=10**6)
+    with pytest.raises(UnreadableEntriesError) as exc:
+        wait_for_queue_drain(q, interval=0.01, timeout=0.05)
+    assert "reg-x" in str(exc.value)
+
+
+def test_a_briefly_unreadable_entry_only_delays_the_drain(tmp_path: Path) -> None:
+    q = _UnreadableEntryStore(LocalQueueStore(tmp_path / "queue"), {"reg-x"}, clears_after=2)
+    assert wait_for_queue_drain(q, interval=0.01, timeout=2.0) == []
+
+
 def test_does_not_overrun_timeout_when_interval_is_larger(tmp_path: Path) -> None:
     q = LocalQueueStore(tmp_path / "queue")
     q.put_entry(_reg("r1", RegState.launched))

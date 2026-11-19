@@ -21,6 +21,10 @@ export AWS_SECRET_ACCESS_KEY="fixture-secret-do-not-reuse"
 # there instead of its base64 form -- this fixture is the regression test for that class of bug.
 export VAST_API_KEY='fixture-vast-key"with`dangerous$chars\and'\''quotes'
 export VAST_API_KEY_B64="$(printf '%s' "$VAST_API_KEY" | base64 | tr -d '\n')"
+# Same shape deploy.sh renders: a minimal doctl config for the `lab` user (fixture token only).
+DOCTL_CONFIG="$(printf 'access-token: %s\ncontext: default\n' "dop_v1_fixturefixturefixture")"
+DOCTL_CONFIG_B64="$(printf '%s\n' "$DOCTL_CONFIG" | base64 | tr -d '\n')"
+export DOCTL_CONFIG_B64
 
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
@@ -28,7 +32,7 @@ envsubst < cloud-init.yaml.tmpl > "$OUT"
 
 fail=0
 for value in "$TAG" "$DROPLET_NAME" "$LAB_R2_ENDPOINT" "$LAB_R2_BUCKET" \
-             "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$VAST_API_KEY_B64"; do
+             "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$VAST_API_KEY_B64" "$DOCTL_CONFIG_B64"; do
   grep -qF -- "$value" "$OUT" || {
     echo "FAIL: fixture value '$value' never appears in rendered output -- envsubst silently dropped it" >&2
     fail=1
@@ -52,6 +56,23 @@ b64 = re.search(r'\\"([A-Za-z0-9+/=]+)\\"', line)
 assert b64, f"FAIL: could not find a quoted base64 blob on the base64-decode line: {line!r}"
 got = base64.b64decode(b64.group(1)).decode()
 assert got == want, f"FAIL: base64 round-trip mismatch -- got {got!r}, want {want!r}"
+EOF
+
+# The `lab` user's doctl config: SkyPilot's DO provisioner reads only this file, so a template
+# that stops writing it would make every `--cloud do` launch on the new host fail (deploy.sh's
+# own smoke job included). It must decode to the exact config deploy.sh rendered.
+python3 - "$OUT" "$DOCTL_CONFIG" <<'EOF'
+import base64
+import re
+import sys
+
+rendered, want = open(sys.argv[1]).read(), sys.argv[2] + "\n"
+m = re.search(r'echo \\"([A-Za-z0-9+/=]+)\\" \| base64 -d > /home/lab/\.config/doctl/config\.yaml', rendered)
+assert m, "FAIL: runcmd never writes /home/lab/.config/doctl/config.yaml from $DOCTL_CONFIG_B64"
+got = base64.b64decode(m.group(1)).decode()
+assert got == want, f"FAIL: doctl config round-trip mismatch -- got {got!r}, want {want!r}"
+line = [l for l in rendered.splitlines() if "base64 -d > /home/lab/.config/doctl/" in l][0]
+assert "umask 077" in line, "FAIL: the doctl config must be written under umask 077"
 EOF
 
 python3 -c "import yaml, sys; yaml.safe_load(open(sys.argv[1]))" "$OUT" || {

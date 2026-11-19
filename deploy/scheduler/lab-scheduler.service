@@ -17,6 +17,9 @@ EnvironmentFile=/etc/lab/scheduler.env
 # installing user's ~/.local/bin, and /root is mode 0700 — a /root/... path here fails as
 # systemd status=203/EXEC even though the file exists. Install the tool AS this user.
 ExecStart=/home/lab/.local/bin/lab scheduler tick --backend skypilot
+# The periodic reconcile sweep runs inside this with its own 150s budget
+# (Scheduler.RECONCILE_BUDGET_S), and the tick persists its heartbeat before starting it, so a
+# tick killed here never re-runs as the same reconcile tick.
 TimeoutStartSec=300
 # The tick spawns detached sky_runner supervisors that must OUTLIVE this
 # oneshot. Default KillMode=control-group SIGKILLs the whole cgroup the

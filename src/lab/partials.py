@@ -46,6 +46,8 @@ rows out of four hours — against the alternative on the table, which is all of
 from __future__ import annotations
 
 import json
+import os
+import stat
 import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -84,10 +86,15 @@ def whole_lines(data: bytes) -> bytes:
 
 
 def eligible(out_dir: Path) -> list[Path]:
-    """The files in ``out_dir`` worth mirroring, sorted by name. Never raises.
+    """The regular files in ``out_dir`` worth mirroring, sorted by name. Never raises.
 
     A missing, unreadable or empty directory yields ``[]`` — this runs beside a live rsync and
     must treat "not there yet" as ordinary.
+
+    Symlinks are never eligible, even one pointing back inside the dir. The dir is rsynced from a
+    rented box we do not control and ``rsync -a`` recreates links verbatim, so following one would
+    let a hostile host plant ``results.csv -> ~/.ssh/sky-key`` and have the supervisor upload its
+    own private key. The test is ``lstat``-based, so FIFOs and device nodes are out too.
     """
     try:
         if not out_dir.is_dir():
@@ -95,14 +102,37 @@ def eligible(out_dir: Path) -> list[Path]:
         found: dict[str, Path] = {}
         for pattern in MIRROR_PATTERNS:
             for f in out_dir.glob(pattern):
-                if not f.is_file() or f.name.startswith(".") or f.name == PARTIAL_MARKER:
+                if f.name.startswith(".") or f.name == PARTIAL_MARKER:
                     continue
-                if f.stat().st_size > MIRROR_MAX_BYTES:
+                st = f.lstat()
+                if not stat.S_ISREG(st.st_mode) or st.st_size > MIRROR_MAX_BYTES:
                     continue
                 found[f.name] = f
         return [found[name] for name in sorted(found)]
     except OSError:
         return []
+
+
+def read_regular_file(path: Path, *, max_bytes: int = MIRROR_MAX_BYTES) -> bytes | None:
+    """``path``'s bytes, or ``None`` if it is not (any longer) a small regular file.
+
+    :func:`eligible` lists, this reads, and rsync runs between mirrors — so the check is repeated
+    on the open descriptor itself: ``O_NOFOLLOW`` refuses a file swapped for a link after listing,
+    ``O_NONBLOCK`` keeps a FIFO swapped in from hanging the open, and ``fstat`` rejects anything
+    that is not a regular file or has grown past the cap.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            return fh.read(max_bytes + 1)[:max_bytes]
+    finally:
+        os.close(fd)
 
 
 def fingerprint(files: Iterable[Path]) -> tuple[tuple[str, int, int], ...]:
@@ -115,7 +145,7 @@ def fingerprint(files: Iterable[Path]) -> tuple[tuple[str, int, int], ...]:
     out: list[tuple[str, int, int]] = []
     for f in files:
         try:
-            st = f.stat()
+            st = f.lstat()  # never through a link (see `eligible`)
         except OSError:
             continue
         out.append((f.name, st.st_size, st.st_mtime_ns))
@@ -245,7 +275,10 @@ class PartialMirror:
         count = 0
         total = 0
         for f in files:
-            body = whole_lines(f.read_bytes())
+            raw = read_regular_file(f)
+            if raw is None:
+                continue  # replaced by a link/FIFO since listing, or vanished — never followed
+            body = whole_lines(raw)
             if not body:
                 continue  # nothing complete yet — a header still being written
             r2.put_bytes(partial_key(self._job_id, f.name), body)

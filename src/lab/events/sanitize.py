@@ -22,7 +22,44 @@ _SECRET_VALUE = (
     re.compile(r"^ya29\."),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     _BASE64_BLOB,
+    # Provider key shapes too short (or too low-entropy) for the generic bar below. Anchored at
+    # the start and closed with a no-more-key-characters guard, so they fire on one *word*
+    # (`_mask_word`) and never mask a whole sentence that merely contains one.
+    re.compile(r"^(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Za-z])"),  # AWS access key id
+    re.compile(r"^AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"),  # Google API key
+    re.compile(r"^dop_v1_[0-9a-f]{64}(?![0-9a-f])"),  # DigitalOcean personal access token
 )
+# The name segment that says "the value next to me is a credential". Matched against a name that
+# has been lower-cased with camelCase split into `_` segments (see `_sensitive_name`), with
+# *alphanumeric-only* boundaries: `_`, `-` and `.` separate segments, so `--wandb_key`,
+# `--api_key`, `DB_PASSWORD` and `apiKey` match, while `keyboard`, `monkey`, `tokenizer`,
+# `keyword` and `max_tokens` (a count, not a credential — hence singular `token` only) do not.
+# `\b` is the bug this replaces: `_` is a word character, so `\bkey\b` never matched `--wandb_key`.
+# It must also be the name's LAST segment (or be followed only by `_id`, as in
+# `aws_access_key_id`): a credential is what the name *is*, while `key_dim`, `token_budget` or
+# `model.key_dim=64` merely describe something else, and masking a hyperparameter protects nothing.
+_NAME_WORD = re.compile(
+    r"(?<![a-z0-9])"
+    r"(?:(?:api|access|secret|private|auth|client|session|refresh|bearer)?(?:key|token)"
+    r"|secret|passw(?:or)?d|passphrase|credentials?|signature|authorization)"
+    r"(?:[_.-]+id)?$"
+)
+# `pass` alone is a count as often as a password (`--pass 3`, `pass_rate`), so it only counts as
+# the *last* segment of a compound name: `DB_PASS`, `SMTP_PASS`, `--db-pass`.
+_TRAILING_PASS = re.compile(r"[a-z0-9][_.-]+pass$")
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+
+def _sensitive_name(name: str) -> bool:
+    """Does a flag / env-var / field / query-param *name* say its value is a credential?"""
+    norm = _CAMEL_BOUNDARY.sub("_", name).lower()
+    return bool(_NAME_WORD.search(norm) or _TRAILING_PASS.search(norm))
+
+
+def _sensitive_key(key: str) -> bool:
+    """The dict-key / argv-flag test: the historical broad substring match, plus the bounded name
+    test (which adds what the substring missed — `DB_PASS`, `passwd`, `signature`)."""
+    return bool(_SECRET_KEY.search(key)) or _sensitive_name(key)
 _HEXISH = re.compile(r"^[0-9a-f-]+$", re.IGNORECASE)  # commits, cell ids, job ids — not secrets
 # A `--flag=value` or `--flag value` pair anywhere inside a larger string. Matched directly
 # against the raw text (see `_mask_command_line`) rather than by tokenizing it — free text is not
@@ -61,19 +98,34 @@ _INLINE_FLAG = re.compile(
     """,
     re.VERBOSE,
 )
-# Flag names treated as "this looks like it holds a secret" by `_mask_flag` below — deliberately
-# narrower than `_SECRET_KEY` (which stays as-is for dict keys in `_walk` and real argv tokens in
-# `_mask_tokens`, both different, less ambiguous contexts). `_SECRET_KEY` includes "auth", which
-# also matches plenty of ordinary, non-secret-bearing flag names that just *mention* auth
-# (`--basic-auth`, `--no-auth`) with nothing secret-shaped following — "auth" alone is too weak a
-# signal once it's being matched against arbitrary prose rather than a known argv key. Word-
-# boundary anchored so "keyword" (one glued-together word, no separator) does not match "key" the
-# way "--api-key" (a real hyphen-separated segment) does.
-_SENSITIVE_FLAG_NAME = re.compile(r"\b(?:key|token|secret|password|credential)\b", re.IGNORECASE)
+# Flag names treated as "this looks like it holds a secret" by `_mask_flag` below are judged by
+# `_sensitive_name` — deliberately narrower than `_SECRET_KEY` (which stays as-is for dict keys in
+# `_walk` and real argv tokens in `_mask_tokens`, both different, less ambiguous contexts).
+# `_SECRET_KEY` includes "auth", which also matches plenty of ordinary, non-secret-bearing flag
+# names that just *mention* auth (`--basic-auth`, `--no-auth`) with nothing secret-shaped
+# following — "auth" alone is too weak a signal once it's being matched against arbitrary prose
+# rather than a known argv key. Segment-bounded so "keyword" (one glued-together word, no
+# separator) does not match "key" the way "--api-key" and "--api_key" do.
 # A free-standing word, for the pass that catches a secret with no flag in front of it at all
 # (e.g. "failed with key AKIA... during connect"). Applied only to text `_INLINE_FLAG` did not
 # already consume/mask, via a second, independent sweep — see `_mask_command_line`.
 _WORD = re.compile(r"\S+")
+
+# Named values that are not `--flag`s, matched anywhere in a string (no whitespace needed — a
+# compact JSON body or a URL is one "word"). Each is masked only when its *name* passes
+# `_sensitive_name`, so `lr=0.1` and `{"seed": 3}` are untouched:
+#   - `NAME=value`: an env-var prefix (`DB_PASSWORD=hunter2 python t.py`), a query parameter
+#     (`?access_token=...`), a `key=value` config override. Not glued to a preceding word or dash,
+#     so the `--flag=value` form stays `_INLINE_FLAG`'s.
+_ASSIGNMENT = re.compile(r"(?<![\w-])([A-Za-z_][A-Za-z0-9_.-]{0,63})(=)([^\s\"'&,;]+)")
+#   - `"name": "value"` / `'name': 'value'`: JSON or a Python dict repr inside an error message.
+_FIELD = re.compile(
+    r"""(["'])([^"'\\\n]{1,64})\1(\s*:\s*)(["'])((?:(?!\4)[^\\\n]|\\.){0,512})\4"""
+)
+#   - URL userinfo: `scheme://user:password@host`.
+_USERINFO = re.compile(r"(://[^/\s:@]{1,128}:)([^/\s@]{1,256})(@)")
+#   - A bearer token with no `Authorization:` in front of it (that form is `redact()`'s).
+_BEARER = re.compile(r"(?i)(\bbearer\s+)([A-Za-z0-9._~+/=-]+)")
 
 
 #: An object-store key, and nothing else: ``[A-Za-z0-9._-]`` segments joined by ``/``, at least
@@ -193,9 +245,9 @@ def _mask_tokens(tokens: Sequence[str]) -> list[str]:
             continue
         if token.startswith("-") and "=" in token:
             flag, _, value = token.partition("=")
-            out.append(f"{flag}={MASK}" if _SECRET_KEY.search(flag) else f"{flag}={_scalar(value)}")
+            out.append(f"{flag}={MASK}" if _sensitive_key(flag) else f"{flag}={_scalar(value)}")
             continue
-        if token.startswith("-") and _SECRET_KEY.search(token):
+        if token.startswith("-") and _sensitive_key(token):
             mask_next = True
         out.append(str(_scalar(token)))
     return out
@@ -248,7 +300,7 @@ def _mask_command_line(text: str) -> str:
         # (`--basic-auth flag`, `--keyword search`).
         quoted = len(value) >= 2 and value[0] == '"' and value[-1] == '"'
         stripped = value[1:-1] if quoted else value
-        if _looks_secret(stripped) or _SENSITIVE_FLAG_NAME.search(flag):
+        if _looks_secret(stripped) or _sensitive_name(flag):
             return f"{flag}{sep}{MASK}"
         return m.group(0)
 
@@ -260,12 +312,34 @@ def _mask_command_line(text: str) -> str:
     return _WORD.sub(_mask_word, text)
 
 
+def _mask_named_values(text: str) -> str:
+    """Mask values whose *name* marks them as credentials, wherever they sit in ``text``:
+    ``NAME=value`` assignments, JSON / dict-repr fields, URL userinfo and bare bearer tokens.
+    Needs no whitespace, so it covers a compact JSON body or a URL that is one "word". Leaves every
+    other character alone, and is idempotent (the mask has no ``=``, quote or ``@``)."""
+
+    def _assignment(m: re.Match[str]) -> str:
+        return f"{m.group(1)}={MASK}" if _sensitive_name(m.group(1)) else m.group(0)
+
+    def _field(m: re.Match[str]) -> str:
+        q1, name, sep, q2 = m.group(1), m.group(2), m.group(3), m.group(4)
+        if not _sensitive_name(name):
+            return m.group(0)
+        return f"{q1}{name}{q1}{sep}{q2}{MASK}{q2}"
+
+    text = _FIELD.sub(_field, text)
+    text = _ASSIGNMENT.sub(_assignment, text)
+    text = _USERINFO.sub(rf"\g<1>{MASK}\g<3>", text)
+    return _BEARER.sub(rf"\g<1>{MASK}", text)
+
+
 def _mask_secrets(value: str) -> str:
     """Secret-masking only, no length cap: the piece of ``_scalar`` a caller whose whole point
     is holding free text in full (``lab.notes``) needs on its own — the 512-char cap right after
     this belongs to the ledger's argv/param records, not to a note body."""
     if _looks_secret(value):
         return MASK
+    value = _mask_named_values(value)
     if re.search(r"\s", value):
         value = _mask_command_line(value)
     return redact(value)
@@ -303,7 +377,7 @@ def _walk(value: Any, *, key: str | None = None) -> Any:
     # object key — a diagnostic that has to misname its subject to keep it is no better off.
     if isinstance(value, ObjectKey):
         return _vetted_object_key(value)
-    if key is not None and _SECRET_KEY.search(key):
+    if key is not None and _sensitive_key(key):
         return MASK
     if isinstance(value, Mapping):
         return {str(k): _walk(v, key=str(k)) for k, v in value.items()}

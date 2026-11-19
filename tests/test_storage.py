@@ -110,3 +110,51 @@ def test_r2_round_trip(tmp_path: Path):
 
     for key in (f"{prefix}/a.txt", f"{prefix}/sub/b.txt"):
         store._s3.delete_object(Bucket=store.bucket, Key=key)
+
+
+class _ClientError(Exception):
+    """botocore's ClientError shape without importing botocore: `.response["Error"]["Code"]`."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(f"An error occurred ({code}) when calling the HeadObject operation")
+        self.response = {"Error": {"Code": code}}
+
+
+def _head_raising(exc: Exception) -> R2Store:
+    class Client:
+        def head_object(self, Bucket: str, Key: str) -> dict:
+            raise exc
+
+    return R2Store("https://example.test", "bucket", client=Client())
+
+
+@pytest.mark.parametrize("code", ["404", "NoSuchKey", "NotFound"])
+def test_exists_is_false_only_for_a_real_not_found(code: str):
+    assert _head_raising(_ClientError(code)).exists("queue/cancelled/reg-a") is False
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ConnectionError("Could not connect to the endpoint URL"),  # a network blip
+        _ClientError("403"),  # HeadObject permission missing on the token
+        _ClientError("AccessDenied"),
+        _ClientError("SlowDown"),
+        _ResponseLessError("transient failure"),
+        _ResponseIsBareStringError(),
+    ],
+)
+def test_exists_reraises_anything_that_is_not_a_not_found(exc: Exception):
+    """`exists()` answers the scheduler's race-critical pre-submit cancel/hold re-checks. "I could
+    not ask" read as "no marker" made both fail OPEN: a cancel that landed during a network blip,
+    or on a token without HeadObject, rented the machine anyway."""
+    with pytest.raises(type(exc)):
+        _head_raising(exc).exists("queue/cancelled/reg-a")
+
+
+def test_exists_is_true_when_head_succeeds():
+    class Client:
+        def head_object(self, Bucket: str, Key: str) -> dict:
+            return {}
+
+    assert R2Store("https://example.test", "bucket", client=Client()).exists("k") is True

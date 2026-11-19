@@ -44,9 +44,19 @@ _PATTERNS = (
     # GCP JSON credential fields (OAuth responses, ADC files, service-account keys). The value
     # class excludes `"` so the match stops at the closing quote and re-masks idempotently.
     re.compile(
-        r'("(?:access_token|refresh_token|client_secret|id_token|private_key)"\s*:\s*")[^"]+',
+        r'("(?:access_token|refresh_token|client_secret|id_token|private_key'
+        r'|password|passwd|secret|token|api_?key)"\s*:\s*")[^"]+',
         re.IGNORECASE,
     ),
+    # Credential-bearing query params the `_key=` pattern above does not cover: bearer/session
+    # tokens, passwords, and Azure-style `sig=` signatures.
+    re.compile(
+        r"([?&](?:[\w-]*?[_-])?(?:token|secret|password|passwd|signature|sig)=)[^&\s\"']+",
+        re.IGNORECASE,
+    ),
+    # S3/R2 presigned-URL credentials, the twin of the GCS pattern below: the signature grants
+    # access until expiry, the credential names the access key id, the session token is a key.
+    re.compile(r"(X-Amz-(?:Signature|Credential|Security-Token)=)[^&\s\"']+", re.IGNORECASE),
     # Bare OAuth2 access tokens (gcloud logs them outside JSON too, e.g. in curl commands).
     re.compile(r"(ya29\.)[0-9A-Za-z_\-.]+"),
     # GCS V4 signed-URL credentials, which SkyPilot's bucket staging can emit into logs. The

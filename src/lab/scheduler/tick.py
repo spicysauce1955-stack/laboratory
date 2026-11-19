@@ -6,9 +6,11 @@ Every tick re-derives everything from the QueueStore; a crashed tick costs nothi
 
 from __future__ import annotations
 
+import contextlib
 import os
 import platform
 import signal
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -21,7 +23,7 @@ from lab.models import JobManifest, JobState, ResourceRequest
 from lab.scheduler.bundle import extract_bundle
 from lab.scheduler.models import ControlConfig, Registration, RegState, TickReport
 from lab.scheduler.price import PriceFeed
-from lab.scheduler.queue import QueueStore
+from lab.scheduler.queue import QueueStore, unreadable_entry_ids
 from lab.scheduler.skew import HEARTBEAT_VERSION_KEY
 from lab.store import JobStore
 
@@ -67,6 +69,7 @@ class Scheduler:
         host: str | None = None,
         price_feed: PriceFeed | None = None,
         reconcile_every: int = 30,
+        reconcile_budget_s: float | None = None,
     ) -> None:
         self.queue = queue
         self.home = Path(home)
@@ -76,6 +79,13 @@ class Scheduler:
         self.store = JobStore(self.home)
         self.price_feed = price_feed
         self.reconcile_every = reconcile_every
+        self.reconcile_budget_s = (
+            self.RECONCILE_BUDGET_S if reconcile_budget_s is None else reconcile_budget_s
+        )
+        # Per-tick state, reset at the top of every `tick()`; initialised here too so a helper
+        # driven directly (tests, a future caller) never meets a missing attribute.
+        self._unreadable: frozenset[str] = frozenset()
+        self._written: set[str] = set()
 
     def make_lab(self, repo: Path) -> Lab:
         """Lab over the launch backend, rooted at an extracted bundle. Test seam."""
@@ -149,24 +159,88 @@ class Scheduler:
 
     def tick(self) -> TickReport:
         rep = TickReport(at=self.now_fn())
-        self._rep = rep  # used by _relaunch_preempted (single-arg, reuses _launch)
         tick_count = int((self.queue.read_heartbeat() or {}).get("tick_count", 0)) + 1
         self._price_cache: dict[tuple[str | None, str | None], float | None] = {}
         self._best_hourly_seen: dict[str, float] = {}
-        control = self.queue.read_control()
-        if not control.paused:
-            entries = self.queue.list_entries()
-            # Read once, use for the whole tick (see MarkerSnapshot). Paused ticks skip it: they
-            # launch and sync nothing, so there is no question to answer and no reason to pay.
-            markers = MarkerSnapshot.read(self.queue)
-            self._sync(entries, rep, markers)            # Task 7
-            self._expire(entries, rep)
-            self._evaluate_and_launch(entries, control, rep, markers)  # Task 6 (+8, 9)
-            if tick_count % self.reconcile_every == 0:
-                try:
-                    rep.reconcile = self._reconcile(control.auto_reconcile)
-                except Exception as e:  # noqa: BLE001
-                    rep.errors.append(f"reconcile sweep: {e}")
+        self._unreadable = frozenset()
+        self._written = set()  # reg_ids this tick wrote (see `_put`)
+        control: ControlConfig | None = None
+        try:
+            control = self.queue.read_control()
+            if not control.paused:
+                entries = self.queue.list_entries()
+                # Entries the listing had to skip. They exist -- they just could not be read this
+                # tick -- so nothing may treat them as missing (see `_trigger_block`).
+                self._unreadable = unreadable_entry_ids(self.queue)
+                if self._unreadable:
+                    rep.errors.append(
+                        "unreadable queue entries this tick (skipped, not treated as missing): "
+                        + ", ".join(sorted(self._unreadable))
+                    )
+                # Read once, use for the whole tick (see MarkerSnapshot). Paused ticks skip it:
+                # they launch and sync nothing, so there is no question to answer and no reason
+                # to pay.
+                markers = MarkerSnapshot.read(self.queue)
+                self._sync(entries, rep, markers)            # Task 7
+                self._expire(entries, rep)
+                self._evaluate_and_launch(entries, control, rep, markers)  # Task 6 (+8, 9)
+                if tick_count % self.reconcile_every == 0:
+                    # Persist this tick's count BEFORE the sweep: it is the slow, killable part
+                    # of the tick (TimeoutStartSec, OOM), and a tick killed with its count
+                    # unwritten is re-run as the same reconcile tick, forever -- the heartbeat
+                    # then goes stale for good and the deploy preflight refuses the redeploy
+                    # that would fix it.
+                    self._write_heartbeat(rep, tick_count, control)
+                    self._run_reconcile(control.auto_reconcile, rep)
+        except Exception as e:
+            # A tick that raises still leaves the host visibly alive-but-failing (fresh
+            # heartbeat, the error in it) rather than indistinguishable from a dead one -- and
+            # still advances tick_count. Best-effort: never mask the original error.
+            rep.errors.append(f"tick aborted: {type(e).__name__}: {e}"[:300])
+            with contextlib.suppress(Exception):
+                self._write_heartbeat(rep, tick_count, control)
+            raise
+        self._write_heartbeat(rep, tick_count, control)
+        return rep
+
+    RECONCILE_BUDGET_S = 150.0
+    """Wall-clock budget for the periodic reconcile sweep, inside the unit's TimeoutStartSec=300:
+    the rest of the tick (sync, evaluate, launch) keeps the other half."""
+
+    def _run_reconcile(self, apply: bool, rep: TickReport) -> None:
+        """Run the FR-C2 sweep with its own time budget; abandon it (never wait) when it overruns.
+
+        On a daemon thread, so an overrun returns control to the tick, which writes its heartbeat
+        and exits; the abandoned sweep dies with the process -- no worse than the systemd kill it
+        replaces, and with the tick's own bookkeeping already durable. The next sweep is
+        ``reconcile_every`` ticks away, not the next tick.
+        """
+        outcome: dict[str, object] = {}
+
+        def _sweep() -> None:
+            try:
+                outcome["result"] = self._reconcile(apply)
+            except BaseException as e:  # noqa: BLE001 — reported by the tick, never re-raised here
+                outcome["error"] = e
+
+        worker = threading.Thread(target=_sweep, name="lab-reconcile-sweep", daemon=True)
+        worker.start()
+        worker.join(self.reconcile_budget_s)
+        if worker.is_alive():
+            rep.errors.append(
+                f"reconcile sweep: exceeded its {self.reconcile_budget_s:.0f}s budget; abandoned "
+                f"(next sweep in {self.reconcile_every} ticks)"
+            )
+            return
+        if "error" in outcome:
+            rep.errors.append(f"reconcile sweep: {outcome['error']}")
+            return
+        result = outcome.get("result")
+        rep.reconcile = result if isinstance(result, dict) else None
+
+    def _write_heartbeat(
+        self, rep: TickReport, tick_count: int, control: ControlConfig | None
+    ) -> None:
         self.queue.write_heartbeat(
             {
                 "at": rep.at.isoformat(),
@@ -183,10 +257,10 @@ class Scheduler:
                 # `control.paused` alone only proves a write landed, not that a running scheduler
                 # (possibly mid-tick, already past its own `read_control()`) has honored it -- a
                 # cutover confirming this against a *completed* tick's heartbeat is the real ack.
-                "paused": control.paused,
+                # None when the control read itself failed: no pause was observed.
+                "paused": control.paused if control is not None else None,
             }
         )
-        return rep
 
     _TERMINAL_MAP = {
         JobState.succeeded: RegState.succeeded,
@@ -256,8 +330,17 @@ class Scheduler:
         return hourly * secs / 3600.0
 
     def _skip(self, reg: Registration, rep: TickReport, reason: str) -> None:
-        self.queue.put_entry(reg.model_copy(update={"last_skip_reason": reason}))
+        # Only a *changed* reason is worth a write. A waiting entry is skipped every tick with
+        # the same reason, and rewriting it cost one PUT per waiting entry per tick against R2
+        # (~100 sequential round trips/minute at 100 waiting entries) to record nothing new.
+        if reg.last_skip_reason != reason:
+            self._put(reg.model_copy(update={"last_skip_reason": reason}))
         rep.skipped[reg.reg_id] = reason
+
+    def _put(self, reg: Registration) -> None:
+        """Every entry write in a tick goes through here, so the tick knows what it changed."""
+        self.queue.put_entry(reg)
+        self._written.add(reg.reg_id)
 
     # ------------------------------------------------------------------ phases
     RE_MIRROR_TERMINAL_S = 900.0  # late manifest fields (teardown_status) land post-terminal
@@ -437,7 +520,12 @@ class Scheduler:
             return
 
         # Resubmit: carry the incremented counter + accumulated spend forward so the NEXT
-        # preemption sees them.
+        # preemption sees them, and requeue as `pending`. The relaunch itself is NOT done here:
+        # `_evaluate_and_launch` runs later in this same tick over these same `entries`, and
+        # puts the reg through every gate a launch must pass -- max_concurrent, the daily budget,
+        # the per-job cap, the window, not_before, the price trigger, holds and cancels. Calling
+        # `_launch` from here bypassed all of them, and the relaunched reg stayed `pending` in
+        # `entries`, so it was not even counted against max_concurrent.
         updated = reg.model_copy(
             update={
                 "preempt_count": reg.preempt_count + 1,
@@ -449,27 +537,17 @@ class Scheduler:
                 "last_skip_reason": "resubmitting after spot preemption",
             }
         )
-        self.queue.put_entry(updated)
+        self._put(updated)
         entries[entries.index(reg)] = updated  # rest of the tick sees the pending, counter-bumped reg
-        try:
-            self._relaunch_preempted(updated)
-        except Exception as e:  # noqa: BLE001 — a bad entry must not kill the tick (spec §5)
-            rep.errors.append(f"{reg.reg_id}: relaunch error: {e}"[:300])
         rep.synced[reg.reg_id] = "resubmitted (preempted)"
-
-    def _relaunch_preempted(self, reg: Registration) -> None:
-        """Relaunch a counter-bumped, pending reg via the SAME path as a normal launch.
-
-        ``_launch`` model_copies from the passed reg, so the incremented ``preempt_count`` and
-        accumulated ``cumulative_usd`` carried by ``reg`` survive the launched transition.
-        """
-        self._launch(reg, self._rep)
 
     def _expire(self, entries: list[Registration], rep: TickReport) -> None:
         nowt = self.now_fn()
-        for reg in entries:
+        for i, reg in enumerate(entries):
             if reg.state is RegState.pending and nowt >= reg.guardrails.expires_at:
-                self._transition(reg, RegState.expired, reason="expired (run-by deadline passed)")
+                entries[i] = self._transition(
+                    reg, RegState.expired, reason="expired (run-by deadline passed)"
+                )
                 rep.expired.append(reg.reg_id)
 
     def _evaluate_and_launch(
@@ -495,7 +573,12 @@ class Scheduler:
                 continue
             if reg.state is not RegState.pending:
                 continue
-            reg = self.queue.get_entry(reg.reg_id)  # fresh copy (expiry may have written)
+            # Re-read only an entry this tick has itself written: entries are scheduler-owned
+            # (the laptop writes markers, never an existing entry), so the listed copy of anything
+            # untouched is already current, and a fresh GET per waiting entry per tick was ~100
+            # sequential R2 round trips a minute buying nothing.
+            if reg.reg_id in self._written:
+                reg = self.queue.get_entry(reg.reg_id)
             if reg.state is not RegState.pending:
                 continue
             if reg.reg_id in markers.cancelled:
@@ -551,6 +634,8 @@ class Scheduler:
             return f"outside window {t.window.start}-{t.window.end} {t.window.tz}"
         for dep_id in t.after:  # dead deps cancel immediately, even behind waiting ones
             dep = by_id.get(dep_id)
+            if dep is None and dep_id in self._unreadable:
+                continue  # exists but unreadable this tick: waiting (below), never "missing"
             if dep is None or dep.state in (
                 RegState.failed,
                 RegState.expired,
@@ -561,6 +646,8 @@ class Scheduler:
                 rep.cancelled.append(reg.reg_id)
                 return ""
         for dep_id in t.after:
+            if dep_id not in by_id:  # unreadable (a cancel is irreversible; a wait costs a tick)
+                return f"waiting on dependency {dep_id} (entry unreadable this tick)"
             dep_state = by_id[dep_id].state
             if dep_state is not RegState.succeeded:
                 return f"waiting on dependency {dep_id} ({dep_state.value})"
@@ -587,7 +674,15 @@ class Scheduler:
         # Deliberately a FRESH single read, never the tick's MarkerSnapshot: its entire purpose is
         # to observe a cancel that landed after the evaluation loop began, and the next statement
         # after it rents a machine. Bounded by launches per tick, not by queue size.
-        if self.queue.cancel_requested(reg.reg_id):  # spec §5 cancel race: re-check pre-submit
+        # Both re-checks fail CLOSED: a marker read that errors (network blip, a token without
+        # HeadObject) is "don't launch this tick", never "no marker" — the next statement after
+        # them spends money, and the entry simply retries on the next tick.
+        try:
+            cancelled = self.queue.cancel_requested(reg.reg_id)  # spec §5 cancel race
+        except Exception as e:  # noqa: BLE001 — a bad read must not kill the tick (§5)
+            self._marker_check_failed(reg, rep, "cancel", e)
+            return
+        if cancelled:
             self._transition(reg, RegState.cancelled, reason="cancelled by user")
             rep.cancelled.append(reg.reg_id)
             return
@@ -597,7 +692,12 @@ class Scheduler:
         # A hold that does not hold spends money the operator just said not to spend. Back to
         # `pending`, never `cancelled` — a hold is reversible, and `lab queue release` must be able
         # to launch this entry later.
-        if self.queue.held(reg.reg_id):
+        try:
+            held = self.queue.held(reg.reg_id)
+        except Exception as e:  # noqa: BLE001 — a bad read must not kill the tick (§5)
+            self._marker_check_failed(reg, rep, "hold", e)
+            return
+        if held:
             self._transition(reg, RegState.pending, reason="held")
             rep.skipped[reg.reg_id] = "held"
             return
@@ -629,19 +729,33 @@ class Scheduler:
         except Exception as e:  # noqa: BLE001 — mirroring is best-effort visibility, not launch
             rep.errors.append(f"{reg.reg_id}: initial mirror failed: {e}"[:300])
 
+    def _marker_check_failed(
+        self, reg: Registration, rep: TickReport, kind: str, error: Exception
+    ) -> None:
+        """A pre-submit marker re-check could not be read: back to `pending`, nothing rented."""
+        reason = f"pre-submit {kind} marker check failed, retrying next tick: {error}"[:300]
+        self._transition(reg, RegState.pending, reason=reason)
+        rep.skipped[reg.reg_id] = reason
+        rep.errors.append(f"{reg.reg_id}: {reason}"[:300])
+
     def _repair_launching(self, reg: Registration, rep: TickReport) -> None:
         """A tick crashed mid-launch (spec §5): decide from evidence, after a grace period."""
         changed = reg.state_changed_at or reg.created_at
         if (self.now_fn() - changed).total_seconds() < self.LAUNCHING_ORPHAN_S:
             return
-        job = next(
-            (
-                m
-                for j in self.store.list_job_ids()
-                if (m := self.store.read_manifest(j)).registration_id == reg.reg_id
-            ),
-            None,
-        )
+        # Only a job submitted by THIS launch is evidence: `_launch` writes `launching` (stamping
+        # `state_changed_at`) before it submits, so this attempt's manifest was created at or
+        # after that instant. A reg that was relaunched (price-verify rollback, preemption) also
+        # has earlier attempts on file under the same registration_id -- adopting the oldest
+        # bound it to a stale cancelled/preempted job, and the next sync mirrored that onto a reg
+        # whose real attempt was still running. Newest wins if there are several.
+        candidates = [
+            m
+            for j in self.store.list_job_ids()
+            if (m := self.store.read_manifest(j)).registration_id == reg.reg_id
+            and m.created_at >= changed
+        ]
+        job = max(candidates, key=lambda m: m.created_at) if candidates else None
         if job is not None:  # the submit happened -> repair forward
             self._transition(
                 reg, RegState.launched, reason="repaired: launch had completed",
@@ -662,5 +776,5 @@ class Scheduler:
                 **extra,
             }
         )
-        self.queue.put_entry(updated)
+        self._put(updated)
         return updated
