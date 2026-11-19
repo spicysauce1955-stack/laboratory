@@ -603,6 +603,11 @@ def affordable_under_cap(res: ResourceRequest, accelerators: str) -> bool:
       the price band, because an admission check that under-estimates admits jobs it should
       refuse. Here the question is *feasibility* — "is there any region where this fits?" — and
       checking the ceiling would refuse a rotation the cap actually permits.
+
+    And **compute only**, because that is what the cap is a cap on: ``--price-cap`` becomes
+    ``sky.Resources(max_hourly_cost=)``, which SkyPilot's catalog filters against the instance
+    price (``catalog.common``: ``df[price] <= max_hourly_cost``), never the disk. Comparing compute
+    + storage refused accelerators whose compute fits the cap.
     """
     cap = res.max_hourly_usd
     if cap is None:
@@ -615,7 +620,7 @@ def affordable_under_cap(res: ResourceRequest, accelerators: str) -> bool:
     est = estimate(probe)
     if est is None:
         return True  # the catalog cannot say; SkyPilot will enforce the cap
-    return est.best_hourly_usd <= cap
+    return est.low_usd <= cap
 
 
 def next_accelerator(
