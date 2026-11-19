@@ -17,6 +17,7 @@ import math
 import platform
 import re
 import shlex
+import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterable
@@ -41,6 +42,7 @@ from lab.manifest import (
     git_work_tree,
     is_dirty,
     repo_root,
+    resolve_commit,
     uv_lock_sha256,
 )
 from lab import events, placement, pricing
@@ -570,7 +572,25 @@ class Lab:
 
         ``code`` overrides git introspection — used by the scheduler, which submits from an
         extracted bundle (not a git repo) with provenance captured at registration time.
+
+        ``spec.code_ref`` other than the current commit runs *that* commit's committed tree: it
+        is snapshotted (``_code_ref_tree``) and launched from there with ``code`` pinned to it —
+        the mechanism ``confirm`` uses. It used to be accepted and silently ignored, so the
+        working tree ran while the caller believed another commit had.
         """
+        if code is None:
+            pinned = self._code_ref_commit(spec.code_ref)
+            if pinned is not None:
+                return self._sibling_lab(self._code_ref_tree(pinned)).submit(
+                    spec,
+                    allow_dirty=allow_dirty,
+                    sweep_id=sweep_id,
+                    cell_id=cell_id,
+                    code=CodeRef(git_commit=pinned, git_dirty=False),
+                    registration_id=registration_id,
+                    confirms=confirms,
+                    preflight=preflight,
+                )
         if preflight:
             self.preflight(spec)
         # Before a job id exists, let alone a manifest or a rental: a cap nothing on offer can
@@ -678,17 +698,59 @@ class Lab:
         self.backend.submit(manifest)
         return job_id
 
+    def _code_ref_commit(self, code_ref: str) -> str | None:
+        """The commit a non-HEAD ``code_ref`` pins, or ``None`` when the ordinary working-tree
+        path applies (``HEAD``, or a ref that names the current commit). Raises
+        :class:`LabError` for a ref that names no commit — never falls back to running HEAD."""
+        if code_ref.strip() in ("", "HEAD"):
+            return None
+        pinned = resolve_commit(self.repo, code_ref.strip())
+        if pinned is None:
+            raise LabError(
+                f"code_ref {code_ref!r} is not a commit in {self.repo} — pass a commit SHA, "
+                "branch or tag that exists there (e.g. after `git fetch`), or omit it for HEAD"
+            )
+        return None if pinned == current_commit(self.repo) else pinned
+
+    def _code_ref_tree(self, commit: str) -> Path:
+        """The committed tree of ``commit``, extracted once under ``<home>/_code_ref/<sha>``.
+
+        Built with the same bundle mechanism ``confirm`` uses (committed tree only, never the
+        working tree's dirt), into a temp dir then renamed into place, so a tree a running job
+        may be executing from is never rewritten under it and concurrent submits of one commit
+        (a sweep's points) share a single snapshot.
+        """
+        from lab.scheduler.bundle import create_bundle, extract_bundle  # avoid import cycle
+
+        root = self.home / "_code_ref"
+        dest = root / commit
+        if dest.is_dir():
+            return dest
+        root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=root, prefix=".build-") as td:
+            tar, _ = create_bundle(self.repo, Path(td), commit=commit, include_dirty=False)
+            tree = extract_bundle(tar, Path(td) / "tree")
+            try:
+                tree.rename(dest)
+            except OSError:
+                if not dest.is_dir():  # not a lost race with another submit: a real failure
+                    raise
+        return dest
+
     def find_cached(self, spec: JobSpec, *, require_clean: bool = True) -> str | None:
         """Return a prior SUCCEEDED job with the same commit+command+config+seed, else None (FR-B5).
 
         With ``require_clean`` (default), a dirty working tree disables caching and only clean-tree
         jobs are eligible — a dirty commit doesn't fully capture the code, so reusing its result
-        isn't safe.
+        isn't safe. A ``code_ref`` pinning another commit is keyed on that commit (whose committed
+        tree is what would run, so the working tree's state is irrelevant).
         """
-        if require_clean and is_dirty(self.repo):
+        pinned = self._code_ref_commit(spec.code_ref)
+        if pinned is None and require_clean and is_dirty(self.repo):
             return None
         seed = spec.seed if spec.seed is not None else 0
-        key = cache_key(current_commit(self.repo), spec.command, spec.config, seed)
+        commit = pinned if pinned is not None else current_commit(self.repo)
+        key = cache_key(commit, spec.command, spec.config, seed)
         for m in self.list_jobs():
             if m.status is not JobState.succeeded or (require_clean and m.code.git_dirty):
                 continue
