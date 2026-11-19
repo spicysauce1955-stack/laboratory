@@ -159,11 +159,20 @@ upgrade note.
   This **changes a default**: a caller that read every point from `series` now gets the newest
   200 of each series, and `truncated` says so — check it, or pass `--max-points 0` /
   `max_points=0` for the old behaviour. Likewise `jobs` holds at most 100 rows unless you pass
-  `--limit 0` / `limit=0`; `jobs_omitted` is non-zero whenever rows were left out. `since_step` keeps its meaning (points with a larger
-  step) and composes with the cap; it is now answered from the end of the file, stopping a
-  series at its first step at or below `since_step`. That is exact for a series whose steps
-  never go backwards; a series the reader sees go backwards is read in full, and a counter reset
-  far back in the file (a restarted run) yields the newest run's points past `since_step`.
+  `--limit 0` / `limit=0`; `jobs_omitted` is non-zero whenever rows were left out.
+  `since_step` keeps its meaning (points with a larger step) and composes with the cap; it is
+  now answered from the end of the file, stopping a series at its first step at or below
+  `since_step`. That is exact for a series whose steps never go backwards; a series the reader
+  sees go backwards is read in full, and a counter reset far back in the file (a restarted run)
+  yields the newest run's points past `since_step`.
+
+  Also additive, CLI-only: `lab dashboard --limit N` (`-n`; the most recent 40 jobs by default,
+  `0` = all); `lab lint --seeds SPEC`, which checks the `seeds=` key a sharded sweep appends, and
+  two new output fields — `check` (`"declared"` when the entrypoint's `get_overrides(known=…)`
+  could be read and was checked against, `"heuristic"` for the old grep) and `declared_keys`.
+  `lab lint` can now exit 1 where it used to pass: a key the entrypoint does not declare is a
+  finding even when its name appears in the source, because the job would refuse it at runtime.
+  `lab init`'s report gained `skyignore_uploads` (see *What `lab init` owns*).
 
   `lab submit` / `lab sweep` / `lab register` / `lab register-sweep` and the `submit`/`sweep` MCP
   tools (v0.12.0) gained additive `--accelerator-pool` / `--max-launch-attempts`. Both default to
