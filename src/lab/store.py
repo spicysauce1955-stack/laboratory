@@ -262,6 +262,34 @@ class JobStore:
     def read_sweep_plan(self, sweep_id: str) -> SweepPlan:
         return SweepPlan.model_validate_json(self.sweep_plan_path(sweep_id).read_text())
 
+    def sweep_lock_path(self, sweep_id: str) -> Path:
+        # Beside plan.json, as a dot-file: `atomic_write_text` replaces plan.json's inode on every
+        # write, and a lock held on a replaced inode excludes nobody.
+        return self.home / sweep_id / ".plan.lock"
+
+    @contextmanager
+    def sweep_lock(self, sweep_id: str) -> Iterator[None]:
+        """Exclusive per-sweep ``flock`` around a plan read-modify-write (incl. what happens
+        between the read and the write — for ``sweep-retry``, the shard submits).
+
+        Without it, N concurrent ``sweep-retry`` calls each read the plan, each saw no in-flight
+        retry, each bought a shard and each wrote its own copy back: 8 retries launched 8 shards
+        and recorded 1, and the other 7 — paid for, on a remote backend — were invisible to
+        ``sweep-aggregate`` and to the next retry's in-flight check (stress run 2026-11-19). An
+        aggregate whose read predated a retry's write lost that shard the same way.
+
+        Same shape as :meth:`_manifest_lock`: one open+flock per critical section, released by
+        closing the descriptor, so it also excludes other threads of one process (an MCP server).
+        Raises ``FileNotFoundError`` when the sweep has no directory, rather than creating one
+        for an id that names nothing; callers check :meth:`has_sweep_plan` first.
+        """
+        fd = os.open(self.sweep_lock_path(sweep_id), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)  # closing the descriptor releases the lock
+
     def list_job_ids(self) -> list[str]:
         if not self.home.exists():
             return []

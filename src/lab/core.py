@@ -1059,7 +1059,25 @@ class Lab:
         ``hits`` on the cell. Seed presence is judged by the result table alone — a hit never
         makes a seed present. When no included shard has one, a cell hits file left by an earlier
         aggregate is removed, so the plan, the file and an export bundle cannot disagree.
+
+        Runs under the sweep's plan lock (:meth:`JobStore.sweep_lock`), so it can neither write
+        back a plan read before a concurrent ``sweep-retry`` recorded its shards nor interleave
+        with another aggregate.
         """
+        self.sweep_plan(sweep_id)  # unknown sweep: LabError, before a lock file can be created
+        with self.store.sweep_lock(sweep_id):
+            return self._aggregate_sweep_locked(
+                sweep_id, include_partial=include_partial, row_key=row_key
+            )
+
+    def _aggregate_sweep_locked(
+        self,
+        sweep_id: str,
+        *,
+        include_partial: bool = True,
+        row_key: str | list[str] | None = None,
+    ) -> SweepPlan:
+        """:meth:`aggregate_sweep`'s body; the caller holds the sweep's plan lock."""
         from lab.search import HITS_FILE  # local: lab.search imports numpy; keep it off CLI startup
 
         plan = self.sweep_plan(sweep_id)
@@ -1126,29 +1144,38 @@ class Lab:
 
         Safe to call repeatedly: if a prior retry's job for a given seed subset is still in a
         non-terminal state (queued/running), that shard is skipped — no duplicate in-flight jobs.
+        That holds for *concurrent* calls too: the whole read -> submit -> write runs under the
+        sweep's plan lock (:meth:`JobStore.sweep_lock`), so a second retry waits for the first
+        and then sees its shards in the plan, in flight.
         """
-        plan = self.aggregate_sweep(sweep_id)  # refresh present/missing from current shard states
-        launched: list[str] = []
-        try:
-            self._retry_cells(plan, launched, allow_dirty=allow_dirty)
-        except BaseException as e:
-            if not launched:
-                raise
-            # Same rule as `sweep`: what launched is persisted, so a re-run of retry sees it as
-            # in flight instead of buying it a second time, and the caller learns the ids.
+        self.sweep_plan(sweep_id)  # unknown sweep: LabError, before a lock file can be created
+        with self.store.sweep_lock(sweep_id):
+            # Refresh present/missing from current shard states.
+            plan = self._aggregate_sweep_locked(sweep_id)
+            launched: list[str] = []
+            try:
+                self._retry_cells(plan, launched, allow_dirty=allow_dirty)
+            except BaseException as e:
+                if not launched:
+                    raise
+                # Same rule as `sweep`: what launched is persisted, so a re-run of retry sees it
+                # as in flight instead of buying it a second time, and the caller learns the ids.
+                self.store.write_sweep_plan(plan)
+                if not isinstance(e, Exception):
+                    raise
+                raise _partial_sweep_error(
+                    sweep_id, launched, None, e,
+                    next_step=f"`lab sweep-retry {sweep_id}` resumes once that is fixed",
+                ) from e
             self.store.write_sweep_plan(plan)
-            if not isinstance(e, Exception):
-                raise
-            raise _partial_sweep_error(
-                sweep_id, launched, None, e,
-                next_step=f"`lab sweep-retry {sweep_id}` resumes once that is fixed",
-            ) from e
-        self.store.write_sweep_plan(plan)
-        return self.aggregate_sweep(sweep_id)
+            return self._aggregate_sweep_locked(sweep_id)
 
     def _retry_cells(self, plan: SweepPlan, launched: list[str], *, allow_dirty: bool) -> None:
-        """:meth:`retry_sweep`'s submit loop. Appends each launched id to its cell *and* to
-        ``launched`` as it goes, so a refusal partway leaves both accurate."""
+        """:meth:`retry_sweep`'s submit loop (the caller holds the sweep's plan lock). Appends
+        each launched id to its cell *and* to ``launched`` as it goes, and persists the plan after
+        every launch — so a refusal partway leaves both accurate, and so does a retry killed
+        outright (SIGKILL runs no ``except``), which used to leave its launched shards in no
+        plan at all."""
         sweep_id = plan.sweep_id
         any_shard = next((j for c in plan.cells for j in c.shard_job_ids), None)
         for cell in plan.cells:
@@ -1203,6 +1230,7 @@ class Lab:
                 )
                 cell.shard_job_ids.append(jid)
                 launched.append(jid)
+                self.store.write_sweep_plan(plan)
 
     def _lab_on(self, provisioner: str) -> Lab:
         """This Lab, or one sharing its repo/home/store that launches through ``provisioner``.
