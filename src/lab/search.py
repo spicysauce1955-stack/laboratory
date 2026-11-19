@@ -31,6 +31,7 @@ import csv
 import itertools
 import json
 import math
+import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -40,11 +41,20 @@ from typing import Any, NamedTuple
 import numpy as np
 
 from lab.experiment import _resolve_run_dir
+from lab.metrics import log_metric
 
 HITS_FILE = "hits.jsonl"
 HIT_KEY = "hit"
 SUMMARY_FILE = "results.csv"
 """Written only with ``summary_axis``; the default ``--results-file`` that sweep-aggregate reads."""
+
+TESTED_METRIC = "search/tested"
+HITS_METRIC = "search/hits"
+PROGRESS_INTERVAL_S = 10.0
+"""Least wall-clock time between two progress records in ``metrics.jsonl``."""
+
+_clock: Callable[[], float] = time.monotonic
+"""Read once per evaluate call; tests replace it to move time without sleeping."""
 
 Outcome = tuple[bool, dict[str, Any]]
 
@@ -282,6 +292,36 @@ class _Summary:
         self.written = done
 
 
+class _Progress:
+    """Combinations tested and hits so far, as ``search/tested`` and ``search/hits`` points.
+
+    ``hits.jsonl`` only grows on a pass, so a long search with few hits would otherwise look idle
+    in ``lab metrics``. The first answer is logged at once (the search is alive), then at most one
+    pair every :data:`PROGRESS_INTERVAL_S`, then the final count. The step is the number of
+    combinations tested so far in this call.
+    """
+
+    def __init__(self, run_dir: Path) -> None:
+        self.run_dir = run_dir
+        self.last_time = -math.inf
+        self.last_step = 0
+
+    def update(self, tested: int, hits: int) -> None:
+        now = _clock()
+        if now - self.last_time >= PROGRESS_INTERVAL_S:
+            self._log(tested, hits)
+            self.last_time = now
+
+    def finish(self, tested: int, hits: int) -> None:
+        if tested != self.last_step:
+            self._log(tested, hits)
+
+    def _log(self, tested: int, hits: int) -> None:
+        log_metric(TESTED_METRIC, tested, tested, run_dir=self.run_dir)
+        log_metric(HITS_METRIC, hits, tested, run_dir=self.run_dir)
+        self.last_step = tested
+
+
 def grid_search(
     evaluate: Callable[..., Any],
     grid: Mapping[str, Iterable[Any]],
@@ -329,6 +369,7 @@ def grid_search(
     if summary is not None:
         summary.start()
 
+    progress = _Progress(base)
     names = list(axes)
     combinations = itertools.product(*axes.values())
     tested = hits = 0
@@ -352,6 +393,8 @@ def grid_search(
         hits += len(lines)
         if summary is not None:
             summary.advance(tested)
+        progress.update(tested, hits)
+    progress.finish(tested, hits)
     if summary is None:
         return SearchResult(tested=tested, hits=hits, hits_path=path)
     return SearchResult(

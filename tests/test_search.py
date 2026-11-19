@@ -9,7 +9,9 @@ from typing import Any
 import numpy as np
 import pytest
 
+import lab.search as search
 from lab.aggregate import merge_seed_rows
+from lab.metrics import METRICS_FILE, log_metric, read_points
 from lab.search import (
     HITS_FILE,
     SUMMARY_FILE,
@@ -416,6 +418,77 @@ def test_append_writes_a_header_into_an_empty_summary(tmp_path):
         lambda seed: True, {"seed": [0]}, summary_axis="seed", append=True, run_dir=tmp_path
     )
     assert (tmp_path / SUMMARY_FILE).read_text() == "seed,tested,hits\n0,1,1\n"
+
+
+# --- progress in metrics.jsonl -------------------------------------------------------------------
+
+
+@pytest.fixture
+def clock(monkeypatch) -> list[float]:
+    """A wall clock the test moves by hand: ``clock[0] += 4.0`` is four seconds passing."""
+    now = [0.0]
+    monkeypatch.setattr(search, "_clock", lambda: now[0])
+    return now
+
+
+def progress(run_dir: Path) -> dict[str, list[tuple[int, float]]]:
+    points = read_points(run_dir / METRICS_FILE)
+    return {
+        name: [(p["step"], p["value"]) for p in points if p["name"] == name]
+        for name in ("search/tested", "search/hits")
+    }
+
+
+def test_progress_is_logged_at_most_once_per_interval_and_at_the_end(tmp_path, clock):
+    assert search.PROGRESS_INTERVAL_S == 10.0
+
+    def evaluate(a: int) -> bool:
+        clock[0] += 4.0  # each answer takes four seconds
+        return a % 3 == 0
+
+    grid_search(evaluate, {"a": list(range(1, 11))}, run_dir=tmp_path)
+
+    # t=4 (first answer), 16, 28 (each >= 10 s after the last), 40 (the end)
+    assert progress(tmp_path) == {
+        "search/tested": [(1, 1.0), (4, 4.0), (7, 7.0), (10, 10.0)],
+        "search/hits": [(1, 0.0), (4, 1.0), (7, 2.0), (10, 3.0)],
+    }
+
+
+def test_a_fast_search_logs_its_first_answer_and_its_final_count(tmp_path, clock):
+    grid_search(lambda a: a > 7, {"a": list(range(10))}, run_dir=tmp_path)
+    assert progress(tmp_path) == {
+        "search/tested": [(1, 1.0), (10, 10.0)],
+        "search/hits": [(1, 0.0), (10, 2.0)],
+    }
+
+
+def test_the_final_count_is_not_logged_twice(tmp_path, clock):
+    grid_search(lambda a: True, {"a": [1]}, run_dir=tmp_path)
+    assert progress(tmp_path) == {"search/tested": [(1, 1.0)], "search/hits": [(1, 1.0)]}
+
+
+def test_progress_steps_count_combinations_not_batches(tmp_path, clock):
+    grid_search(
+        lambda a: [x > 7 for x in a], {"a": list(range(10))}, batch_size=4, run_dir=tmp_path
+    )
+    assert progress(tmp_path)["search/tested"] == [(4, 4.0), (10, 10.0)]
+
+
+def test_progress_defaults_to_the_run_directory(tmp_path, monkeypatch, clock):
+    monkeypatch.setenv("LAB_RUN_DIR", str(tmp_path))
+    grid_search(lambda a: True, {"a": [1, 2]})
+    assert progress(tmp_path)["search/hits"] == [(1, 1.0), (2, 2.0)]
+
+
+def test_progress_is_added_to_the_metrics_already_there(tmp_path, clock):
+    log_metric("loss", 0.5, 0, run_dir=tmp_path)
+    grid_search(lambda a: True, {"a": [1]}, run_dir=tmp_path)
+    assert [p["name"] for p in read_points(tmp_path / METRICS_FILE)] == [
+        "loss",
+        "search/tested",
+        "search/hits",
+    ]
 
 
 # --- refusing results that would corrupt the log -------------------------------------------------
