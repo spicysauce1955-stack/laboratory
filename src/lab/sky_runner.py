@@ -1868,7 +1868,9 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                     # teardown — and a supervisor killed in that window leaves it there for good.
                     # Rotation only continues after a *confirmed* teardown, so no alarm is lost.
                     if store.read_manifest(job_id).teardown_status is not None:
-                        store.update_manifest(job_id, teardown_status=None)
+                        # The detail goes with it: evidence about a box that no longer exists
+                        # beside a status that has been cleared would read as this one's.
+                        store.update_manifest(job_id, teardown_status=None, teardown_detail=None)
                     request_id = _launch_with_retry(sky, task, cluster)
                     inflight_request = request_id
 
@@ -2248,9 +2250,12 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             # The instance vanished (preemption inferred), but we can't confirm the Vast rental is
             # actually gone — flag it so `lab wait` exits 3 and the operator can run `lab reconcile`
             # before any auto-resubmitter builds on a potentially-still-billing orphan (FR-C2).
+            detail = dict(store.read_manifest(job_id).teardown_detail or {})
+            detail["overridden"] = "preempted but the provider teardown is unconfirmed"
             store.update_manifest(
                 job_id,
                 teardown_status="failed",
+                teardown_detail=detail,
                 end_reason="preempted but teardown unconfirmed — see `lab reconcile`",
             )
             teardown_ok = False

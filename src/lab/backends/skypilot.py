@@ -1920,6 +1920,54 @@ def robust_teardown(
         }
 
 
+# Caps that keep `teardown_detail` compact: a manifest is read on every `lab status`.
+_DETAIL_MAX_ITEMS = 50
+_DETAIL_MAX_TEXT = 600
+
+
+def _compact(value: Any) -> Any:
+    """Bound a JSON-able value for the manifest: long lists cut, long strings flattened and cut."""
+    if isinstance(value, str):
+        return _one_line(value, _DETAIL_MAX_TEXT)
+    if isinstance(value, list | tuple):
+        return [_compact(v) for v in list(value)[:_DETAIL_MAX_ITEMS]]
+    if isinstance(value, dict):
+        items = list(value.items())[:_DETAIL_MAX_ITEMS]
+        return {str(k): _compact(v) for k, v in items}
+    return value
+
+
+def teardown_detail(outcome: dict[str, Any], cloud: str) -> dict[str, Any]:
+    """The compact record of one teardown persisted as ``JobManifest.teardown_detail``.
+
+    Everything :func:`robust_teardown` learned, not just its verdict: on 2026-11-19 a false
+    ``succeeded`` (job E) left nothing behind to explain it, because the outcome's details were
+    dropped and the ledger's notes are only flushed when a call fails.
+    """
+    if outcome.get("vast_fallback_used"):
+        via, destroyed = "vast-direct", outcome.get("vast_destroyed")
+    elif outcome.get("gcp_fallback_used"):
+        via, destroyed = "gcp-direct", outcome.get("gcp_destroyed")
+    elif outcome.get("do_fallback_used"):
+        via, destroyed = "do-direct", outcome.get("do_destroyed")
+    else:
+        via, destroyed = "sky.down", None
+    detail: dict[str, Any] = {
+        "at": now().isoformat(),
+        "cloud": cloud,
+        "status": outcome.get("status"),
+        "via": via,
+        "attempts": outcome.get("attempts"),
+        "error": outcome.get("error"),
+    }
+    if destroyed is not None:
+        detail["destroyed"] = destroyed
+    if outcome.get("do_volumes") is not None:
+        detail["do_volumes"] = outcome["do_volumes"]
+    compact: dict[str, Any] = _compact(detail)
+    return compact
+
+
 def tear_down_and_record(
     sky_mod: Any,
     cluster: str,
@@ -1968,7 +2016,10 @@ def tear_down_and_record(
         )
     succeeded: bool = outcome["status"] == "succeeded"
     unknown: bool = outcome["status"] == "unknown"
-    fields: dict[str, Any] = {"teardown_status": outcome["status"]}
+    fields: dict[str, Any] = {
+        "teardown_status": outcome["status"],
+        "teardown_detail": teardown_detail(outcome, cloud),
+    }
     annotation: str | None = None
     if unknown:
         # Not an alarm and not an all-clear. Say plainly that the answer is unreadable and name
@@ -2497,7 +2548,17 @@ class SkyPilotBackend:
                     )
                 except Exception as e:  # noqa: BLE001 — the alarm must survive a crashed attempt
                     print(f"[lab] teardown attempt for dead-supervisor job {job_id} crashed: {e}")
-                    self.store.update_manifest(job_id, teardown_status="failed")
+                    self.store.update_manifest(
+                        job_id,
+                        teardown_status="failed",
+                        teardown_detail=teardown_detail(
+                            {
+                                "status": "failed",
+                                "error": f"teardown attempt crashed: {type(e).__name__}: {e}",
+                            },
+                            m.resources.cloud or "vast",
+                        ),
+                    )
                 # Attribute the outcome honestly. A job whose cancel was interrupted is
                 # `cancelled` -- someone asked for it; calling that a crash would misreport a
                 # deliberate act and, worse, make a cancel indistinguishable from the supervisor
