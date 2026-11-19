@@ -138,8 +138,9 @@ def _new_job_id() -> str:
     return f"{now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
 
 
-# Draws before a submit gives up on finding an unclaimed id. A collision is ~1e-7 per draw, so
-# reaching this means the run dir cannot be created at all (or `_new_job_id` is stuck).
+# Draws before a submit gives up on finding an unclaimed id. A draw only collides with an id
+# taken in the same second with the same 24-bit suffix, so sixteen collisions in a row mean
+# `_new_job_id` is stuck, not unlucky.
 _JOB_ID_ATTEMPTS = 16
 
 
@@ -849,7 +850,7 @@ class Lab:
         and its manifest replaced the first (stress run 2026-11-19). The id is widened nowhere —
         it is stamped into cluster names that GCP truncates — so a collision draws again instead.
         """
-        return self._claim_id(lambda: _new_job_id(), "job")
+        return self._claim_id(_new_job_id, "job")
 
     def _claim_sweep_id(self) -> str:
         """A sharded sweep's id, claimed like a job id (:meth:`_claim_job_id`): its dir holds
