@@ -296,6 +296,9 @@ def main(argv: list[str]) -> int:
             return doctl(state, args)
         if tool == "lab":
             return lab(state, args)
+        if tool == "git" and args[:1] == ["ls-remote"]:
+            # Is the scheduler's project repo clonable? (preflight; never the real network)
+            return 0 if state["scenario"].get("project_repo_ok", True) else 2
         print(f"world: unknown tool {tool}", file=sys.stderr)
         return 99
     finally:

@@ -12,6 +12,7 @@ cd "$(dirname "$0")"
 
 export TAG="v9.9.9-test"
 export DROPLET_NAME="lab-scheduler-test-fixture"
+export PROJECT_REPO="https://example.invalid/fixture/project.git"
 export LAB_R2_ENDPOINT="https://example.r2.cloudflarestorage.com"
 export LAB_R2_BUCKET="lab-artifacts-test"
 export AWS_ACCESS_KEY_ID="AKIAFIXTUREFIXTURE"
@@ -31,7 +32,7 @@ trap 'rm -f "$OUT"' EXIT
 envsubst < cloud-init.yaml.tmpl > "$OUT"
 
 fail=0
-for value in "$TAG" "$DROPLET_NAME" "$LAB_R2_ENDPOINT" "$LAB_R2_BUCKET" \
+for value in "$TAG" "$DROPLET_NAME" "$PROJECT_REPO" "$LAB_R2_ENDPOINT" "$LAB_R2_BUCKET" \
              "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$VAST_API_KEY_B64" "$DOCTL_CONFIG_B64"; do
   grep -qF -- "$value" "$OUT" || {
     echo "FAIL: fixture value '$value' never appears in rendered output -- envsubst silently dropped it" >&2

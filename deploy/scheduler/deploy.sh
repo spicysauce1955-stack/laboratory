@@ -69,6 +69,12 @@ json_field() { python3 -c "import json,sys; print(json.load(sys.stdin).get(sys.a
 control_paused() { python3 -c "import json,sys; print(json.load(sys.stdin)['control']['paused'])" 2>/dev/null; }
 
 DROPLET_NAME="lab-scheduler-$(date -u +%Y%m%dT%H%M%SZ)"
+# The experiment project the scheduler serves. cloud-init clones it anonymously into
+# /opt/tempotron-capacity (the path the unit file, fetched from the tag, pins). The second real
+# deploy (2026-11-19) built a droplet that could never tick: this repo no longer existed, the clone
+# failed silently inside cloud-init, and 20 minutes later step 4 timed out. Preflight now refuses
+# an unclonable repo before anything is touched.
+PROJECT_REPO="${LAB_DEPLOY_PROJECT_REPO:-https://github.com/spicysauce1955-stack/tempotron-capacity.git}"
 REGION="nyc3"
 SIZE="s-1vcpu-1gb"
 DRAIN_TIMEOUT="${LAB_DEPLOY_DRAIN_TIMEOUT:-30m}"
@@ -366,6 +372,12 @@ command -v python3 >/dev/null || { echo "python3 not found on PATH" >&2; exit 1;
 command -v envsubst >/dev/null || { echo "envsubst not found on PATH" >&2; exit 1; }
 command -v base64 >/dev/null || { echo "base64 not found on PATH" >&2; exit 1; }
 command -v uv >/dev/null || { echo "uv not found on PATH" >&2; exit 1; }
+command -v git >/dev/null || { echo "git not found on PATH" >&2; exit 1; }
+if ! GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code "$PROJECT_REPO" HEAD >/dev/null 2>&1; then
+  echo "preflight: REFUSING -- the scheduler's project repo $PROJECT_REPO cannot be cloned anonymously, so the new droplet could never tick (cloud-init's clone would fail silently and step 4 would time out). Point LAB_DEPLOY_PROJECT_REPO at the experiment project the scheduler serves. Nothing was touched." >&2
+  exit 1
+fi
+echo "preflight: project repo $PROJECT_REPO is clonable"
 VAST_KEY_FILE="${HOME}/.config/vastai/vast_api_key"
 R2_CRED_FILE="${HOME}/.cloudflare/r2.credentials"
 [[ -f "$VAST_KEY_FILE" ]] || { echo "missing $VAST_KEY_FILE" >&2; exit 1; }
@@ -538,7 +550,7 @@ fi
 
 say "3. create new droplet"
 RENDERED="$(mktemp)"
-TAG="$TAG" DROPLET_NAME="$DROPLET_NAME" LAB_R2_ENDPOINT="$LAB_R2_ENDPOINT" \
+TAG="$TAG" DROPLET_NAME="$DROPLET_NAME" PROJECT_REPO="$PROJECT_REPO" LAB_R2_ENDPOINT="$LAB_R2_ENDPOINT" \
   LAB_R2_BUCKET="$LAB_R2_BUCKET" AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
   AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" VAST_API_KEY="$VAST_API_KEY" \
   VAST_API_KEY_B64="$VAST_API_KEY_B64" DOCTL_CONFIG_B64="$DOCTL_CONFIG_B64" \

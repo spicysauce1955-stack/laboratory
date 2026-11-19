@@ -102,6 +102,12 @@ def world(tmp_path: Path):  # type: ignore[no-untyped-def]
         'echo "uv shim: unexpected run $*" >&2; exit 98\n',
     )
     _shim(
+        bin_dir / "git",
+        # `git ls-remote` (preflight's clonability check) -> the world; anything else -> real git.
+        f'if [[ "$1" == ls-remote ]]; then exec "{py}" "{WORLD}" git "$@"; fi\n'
+        'exec /usr/bin/git "$@"\n',
+    )
+    _shim(
         bin_dir / "sleep",
         'c=$(cat "$DEPLOY_WORLD_CLOCK"); n=${1%%.*}; echo $(( c + ${n:-0} )) > "$DEPLOY_WORLD_CLOCK"\n',
     )
@@ -416,3 +422,22 @@ def test_a_legacy_host_resumed_after_a_failure_is_confirmed_ticking(world) -> No
     r = world(scenario={"legacy_old_host": True, "on_pause_launch": {"reg_id": "reg-late"}})
     assert "ZERO TICKERS" not in r.err, r.err
     assert "ticking unpaused again" in r.out
+
+
+def test_an_unclonable_project_repo_refuses_before_touching_anything(world) -> None:  # type: ignore[no-untyped-def]
+    """The second real deploy (2026-11-19) built a droplet whose cloud-init clone of the project
+    failed silently (the repo no longer existed), so it never ticked and step 4 timed out 20
+    minutes later. Preflight must catch that before any pause, droplet or spend."""
+    r = world(scenario={"project_repo_ok": False})
+    assert r.rc != 0
+    assert "cannot be cloned anonymously" in r.err
+    assert r.droplet("new") is None and not r.paused
+    assert not any(c["tool"] == "lab" and c["args"][:2] == ["queue", "pause"] for c in r.calls)
+
+
+def test_the_rendered_cloud_init_clones_the_configured_project(world) -> None:  # type: ignore[no-untyped-def]
+    r = world(env_extra={"LAB_DEPLOY_PROJECT_REPO": "https://example.invalid/me/my-project.git"})
+    assert r.rc == 0, r.err
+    assert "git clone https://example.invalid/me/my-project.git /opt/tempotron-capacity" in (
+        r.state["user_data"]
+    )
