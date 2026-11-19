@@ -12,17 +12,46 @@ walks the combinations and records the ones that passed::
 
     grid_search(evaluate, {"gain": [0.5, 1.0, 2.0], "tau": [10.0, 20.0]})
 
-To log more than the parameters, return a mapping: ``{"hit": passed, "latency": t}``. An evaluator
-that handles many combinations at once passes ``batch_size``; it then receives equal-length lists
-and returns one answer per combination.
+To log more than the parameters, return a mapping: ``{"hit": passed, "latency": t}``. Extra values
+may be numbers, strings, booleans, lists, or NumPy/tensor values (a one-element array is logged as
+a number, a larger one as a list); anything else is refused at the first answer, naming the
+column. An evaluator that handles many combinations at once passes ``batch_size``; it then
+receives equal-length lists and returns one answer per combination.
 
-Hits go to ``$LAB_RUN_DIR/hits.jsonl``, one JSON object per line, written as they are found so a
-crashed job keeps them. Being a top-level ``*.jsonl``, the file is also picked up by the mid-run
-mirror (:mod:`lab.partials`). It is deliberately not ``results.csv``: ``sweep-aggregate`` reads any
-row there as "this seed is present", so a seed with no hits would look missing.
+What it writes, all in ``$LAB_RUN_DIR``:
 
-An empty file means the search ran and nothing passed. Like :mod:`lab.experiment`, this module
-imports nothing from ``lab.store`` or ``lab.core``.
+- ``hits.jsonl`` -- one JSON object per passing combination, appended as they are found so a
+  crashed job keeps them, and picked up by the mid-run mirror (:mod:`lab.partials`) like any
+  top-level ``*.jsonl``. A new search replaces it unless ``append=True``.
+- ``metrics.jsonl`` -- ``search/tested`` and ``search/hits`` progress points (step = combinations
+  tested so far), at most one pair every :data:`PROGRESS_INTERVAL_S` plus the final count, so
+  ``lab metrics`` shows a search with few hits moving.
+- ``results.csv`` -- only with ``summary_axis``: one ``<axis>,tested,hits`` row per value of that
+  grid key, zero-hit values included, replaced like ``hits.jsonl``. ``sweep-aggregate`` judges a
+  seed present only by its rows in ``results.csv`` (and reads the seed as an integer), so an
+  entrypoint writing hits alone leaves every seed "missing" and ``sweep-retry`` buys them again.
+
+**An empty** ``hits.jsonl`` **means "nothing passed" only if the job succeeded.** A job that
+crashed, timed out or was cancelled leaves the same empty (or short) file; check the job's status
+before reading absence as a result.
+
+Seeds: make the seed a grid key and summarise on it, rather than calling ``grid_search`` once per
+seed. In a sharded sweep each shard is told its seeds as ``seeds=0,1,2,3``::
+
+    seeds = [int(s) for s in get_overrides()["seeds"].split(",")]  # from lab.experiment
+    grid_search(evaluate, {"seed": seeds, "gain": gains}, summary_axis="seed")
+
+Put the seed first, as here: values of the first grid key finish one after another, so each
+seed's row is written the moment it is done and a job killed at its wall-clock cap keeps the seeds
+it finished. A later key's rows can only be written when the whole search ends. If you must loop
+over seeds yourself, pass ``append=True``, or each call erases the previous seed's hits.
+
+:func:`find_boundary` bisects one numeric parameter for where the answer flips. **It assumes a
+single False-to-True transition in the range and cannot detect more**: given several, it returns
+one of them without warning. Map the range with a coarse ``grid_search`` first if unsure. **It
+writes nothing to** ``hits.jsonl`` (or anywhere): its return value is its only output.
+
+Like :mod:`lab.experiment`, this module imports nothing from ``lab.store`` or ``lab.core``.
 """
 
 from __future__ import annotations
@@ -141,9 +170,6 @@ def _split(answer: Any) -> tuple[Any, dict[str, Any]]:
     return answer[HIT_KEY], {name: value for name, value in answer.items() if name != HIT_KEY}
 
 
-_ONE_AT_A_TIME = "no batch_size in grid_search, batched=False in find_boundary"
-
-
 def _single_answer(answer: Any, params: Mapping[str, Any]) -> bool:
     """The answer of an evaluator called with one combination, refusing a batch's worth."""
     plain = _plain(answer)
@@ -174,7 +200,7 @@ def _per_combination(column: Any, name: str, count: int) -> list[Any]:
             f"evaluate is called in batch mode with {count} combination(s) per call, so {what} "
             f"must hold one {noun} per combination (a list or array), but it returned the single "
             f"value {column!r}. Return one {noun} per combination, or evaluate one combination "
-            f"at a time ({_ONE_AT_A_TIME})"
+            "at a time (no batch_size in grid_search, batched=False in find_boundary)"
         )
     if len(values) != count:
         raise ValueError(
@@ -417,9 +443,16 @@ def find_boundary(
 ) -> float:
     """The smallest value of ``param`` in ``[lo, hi]`` that passes, to within ``tol``.
 
-    A True/False answer has no gradient, so this bisects. It assumes a single False-to-True
-    transition inside the range, and it refuses a range whose ends do not show one. Pass
-    ``batched=True`` if ``evaluate`` takes lists, as it does with ``grid_search(batch_size=...)``.
+    A True/False answer has no gradient, so this bisects. **It assumes a single False-to-True
+    transition inside the range and cannot detect more**: it only ever looks at a handful of
+    points, so with several transitions (False, True, False, True) it returns one of them, not
+    necessarily the smallest, and says nothing. It refuses a range whose ends are not False then
+    True, but cannot check what lies between. If unsure, map the range with a coarse
+    :func:`grid_search` first.
+
+    **It writes nothing** -- no ``hits.jsonl`` row, no metric: the returned value is its only
+    output, so log it yourself if you need it. Pass ``batched=True`` if ``evaluate`` takes lists,
+    as it does with ``grid_search(batch_size=...)``.
     """
     if not lo < hi:
         raise ValueError(f"need lo < hi, got lo={lo}, hi={hi}")
