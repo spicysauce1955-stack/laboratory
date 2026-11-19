@@ -20,19 +20,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import IO, Any
 
+import fastmcp
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
 from mcp.types import CallToolRequestParams
 
-from lab import events
-from lab._util import parse_duration, wrap_with_extras
+from lab import __version__, events
+from lab._util import parse_duration, unwritable_dest_message, wrap_with_extras
 from lab.core import Lab, LabError, default_lab, job_status_view, resolve_backend_profile
 from lab.env import load_lab_env
 from lab.events import store as events_store
 from lab.events.annotate import digest_of, refs_from
+from lab.list_view import DEFAULT_LIST_LIMIT, list_view
 from lab.manifest import repo_root
+from lab.metrics import DEFAULT_MAX_POINTS
 from lab.models import JobManifest, JobSpec, ResourceRequest
 from lab.queue_view import queue_list_view
 from lab.store import JobStore
@@ -86,7 +89,9 @@ def run_stdio(server: FastMCP) -> None:
     transport = os.fdopen(os.dup(sys.stdout.fileno()), "wb")
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
     sys.stdout = _StdoutForDiagnostics(transport)
-    server.run()
+    # No banner: FastMCP's start-up banner is decoration for a human terminal, and rendering it
+    # is what asks PyPI for a newer FastMCP — a network call on every agent session's start.
+    server.run(show_banner=False)
 
 
 def _since_cutoff(since: str | None) -> datetime | None:
@@ -149,7 +154,12 @@ class EventMiddleware(Middleware):
 
 
 def build_server(lab: Lab) -> FastMCP:
-    mcp: FastMCP = FastMCP("laboratory")
+    # Belt and braces with `run_stdio`'s show_banner=False: the update check is the banner's
+    # only network call, and a stdio server for an agent must make none on start.
+    fastmcp.settings.check_for_updates = "off"
+    # serverInfo.version is how a client tells which lab it is talking to; FastMCP otherwise
+    # reports its own version there.
+    mcp: FastMCP = FastMCP("laboratory", version=__version__)
     mcp.add_middleware(EventMiddleware())
     home = lab.home
     store = JobStore(home)
@@ -436,6 +446,10 @@ def build_server(lab: Lab) -> FastMCP:
             return lab.export(job_or_sweep_id, Path(to), include_logs=include_logs)
         except LabError as e:
             raise ToolError(str(e)) from e
+        except OSError as e:
+            if (msg := unwritable_dest_message(to, e)) is None:
+                raise
+            raise ToolError(f"export: {msg}") from e
 
     @mcp.tool
     def reconcile() -> dict[str, Any]:
@@ -456,12 +470,12 @@ def build_server(lab: Lab) -> FastMCP:
         use_spot: bool = False,
         use_cache: bool = True,
     ) -> dict[str, Any]:
-        """Check whether a launch on this cloud would work, BEFORE it costs a provision — run this when a submit fails to provision, or before the first job on a new cloud/shape. Returns {cloud, ok, checks:[{name,status,detail,fix}], blocking:[...]} where status is ok|warn|fail|skip. Verifies credentials (including SkyPilot's API-server daemon, which does not inherit .env), project, billing, enabled APIs, IAM permissions, and quota for the requested shape, then reports the catalog's instance type and price band. GCP GPU quota is checked at both levels Google enforces: a project can hold regional NVIDIA_*_GPUS quota and still be blocked by a global GPUS_ALL_REGIONS of 0. status="skip" means the check could not answer and is never a blocker; only "fail" is a definitive negative. use_cache=False re-runs every check instead of reusing cached results (e.g. right after fixing credentials or quota)."""
-        from lab.core import default_disk_gb, validate_cloud
-        from lab.doctor import doctor_view, run_checks
+        """Check whether a launch on this cloud would work, BEFORE it costs a provision — run this when a submit fails to provision, or before the first job on a new cloud/shape. Returns {cloud, ok, checks:[{name,status,detail,fix}], blocking:[...]} where status is ok|warn|fail|skip. cloud="local" (the default backend) returns a trivial ok report: nothing there can fail. Verifies credentials (including SkyPilot's API-server daemon, which does not inherit .env), project, billing, enabled APIs, IAM permissions, and quota for the requested shape, then reports the catalog's instance type and price band. GCP GPU quota is checked at both levels Google enforces: a project can hold regional NVIDIA_*_GPUS quota and still be blocked by a global GPUS_ALL_REGIONS of 0. status="skip" means the check could not answer and is never a blocker; only "fail" is a definitive negative. use_cache=False re-runs every check instead of reusing cached results (e.g. right after fixing credentials or quota)."""
+        from lab.core import default_disk_gb
+        from lab.doctor import doctor_view, run_checks, validate_doctor_cloud
 
         try:
-            validate_cloud(cloud)
+            validate_doctor_cloud(cloud)
         except LabError as e:
             raise ToolError(str(e)) from e
         resources = ResourceRequest(
@@ -473,15 +487,21 @@ def build_server(lab: Lab) -> FastMCP:
 
     @mcp.tool
     def metrics(
-        job_id: str, names: list[str] | None = None, since_step: int | None = None
+        job_id: str,
+        names: list[str] | None = None,
+        since_step: int | None = None,
+        max_points: int = DEFAULT_MAX_POINTS,
+        downsample: bool = False,
     ) -> dict[str, Any]:
-        """Query incremental metric series; returns {series:{name:[{step,value,wall_time}]}}
-        (FR-D2). Scheduler-launched (deferred) jobs fall back to the mirrored manifest (spec
-        §4.3), matching `status`; since their logs/metrics only live durably on the scheduler
-        host, this may legitimately return an empty series rather than an error."""
+        """Query incremental metric series; returns {series:{name:[{step,value,wall_time}]}, max_points, truncated} (FR-D2). BOUNDED by default: each series returns its newest max_points (200) points, and `truncated` names every series that had more as {name: {returned, omitted}} — read it before concluding a run is short. Poll with since_step=<last step seen> for only what is new (cheap: the file is read from the end); downsample=True spreads max_points evenly over the whole series (always keeping the newest point) to see a run's shape; max_points=0 returns every point (can be tens of MB on a long run). Non-finite values (a diverged loss) come back as null. Scheduler-launched (deferred) jobs fall back to the mirrored manifest (spec §4.3), matching `status`; since their logs/metrics only live durably on the scheduler host, this may legitimately return an empty series rather than an error."""
+        if max_points < 0:
+            raise ToolError(f"max_points must be >= 0 (0 = every point), got {max_points}")
         the_lab, tmp_home = _lab_for_any(job_id)
         try:
-            return {"series": the_lab.metrics(job_id, names=names, since_step=since_step)}
+            return the_lab.metrics_view(
+                job_id, names=names, since_step=since_step,
+                max_points=max_points, downsample=downsample,
+            )
         finally:
             # The server is long-lived (unlike the CLI's atexit sweep) — a mirrored job's
             # throwaway JobStore dir must be removed right after this call, not left to leak.
@@ -573,22 +593,14 @@ def build_server(lab: Lab) -> FastMCP:
             raise ToolError(str(e)) from e
 
     @mcp.tool(name="list")
-    def list_jobs(spend_alert: float | None = None) -> dict[str, Any]:
-        """List jobs; returns {jobs: [...], spend: {...}} (FR-H1, FR-I2). `spend` is this project's realized USD so far, derived from the job manifests on every read (there is no meter): landed jobs at their recorded actual cost, still-running jobs at rate x elapsed-so-far (that part is `running_usd`, and it is included in `realized_usd`) BOUNDED by each job's own --timeout (24h when it declares none), because a manifest left at `running` by a dead supervisor would otherwise add money nobody spent on every read; jobs that hit that bound are named in `unsupervised_suspect_jobs` (probably orphaned — confirm with `reconcile`) and the total is a lower bound for them. Jobs whose rate was never readable are named in `unknown_cost_jobs` and left OUT of the total — never counted as $0. `scope` states exactly what is and is not included; read it before quoting the number. spend_alert=<usd> sets a threshold: `spend.alert` stays null until the total reaches it, then carries {threshold_usd, realized_usd, over_by_usd, message}."""
-        the_lab = _lab()
-        jobs = the_lab.list_jobs()
-        return {
-            "jobs": [
-                {
-                    "job_id": j.job_id,
-                    "sweep_id": j.sweep_id,
-                    "status": j.status.value,
-                    "created_at": _iso(j.created_at),
-                }
-                for j in jobs
-            ],
-            "spend": the_lab.spend(jobs, alert_usd=spend_alert),
-        }
+    def list_jobs(
+        spend_alert: float | None = None, limit: int = DEFAULT_LIST_LIMIT
+    ) -> dict[str, Any]:
+        """List jobs; returns {jobs: [...], jobs_total, jobs_omitted, limit, spend: {...}} (FR-H1, FR-I2). BOUNDED: `jobs` is the newest `limit` (default 100) jobs, oldest-to-newest; `jobs_omitted` says how many older ones were left out, and limit=0 returns every job. `spend` always covers every job, not just the page. `spend` is this project's realized USD so far, derived from the job manifests on every read (there is no meter): landed jobs at their recorded actual cost, still-running jobs at rate x elapsed-so-far (that part is `running_usd`, and it is included in `realized_usd`) BOUNDED by each job's own --timeout (24h when it declares none), because a manifest left at `running` by a dead supervisor would otherwise add money nobody spent on every read; jobs that hit that bound are named in `unsupervised_suspect_jobs` (probably orphaned — confirm with `reconcile`) and the total is a lower bound for them. Jobs whose rate was never readable are named in `unknown_cost_jobs` and left OUT of the total — never counted as $0. `scope` states exactly what is and is not included; read it before quoting the number. spend_alert=<usd> sets a threshold: `spend.alert` stays null until the total reaches it, then carries {threshold_usd, realized_usd, over_by_usd, message}."""
+        try:
+            return list_view(_lab(), limit=limit, spend_alert=spend_alert)
+        except ValueError as e:
+            raise ToolError(str(e)) from e
 
     @mcp.tool(name="ps")
     def ps() -> dict[str, Any]:

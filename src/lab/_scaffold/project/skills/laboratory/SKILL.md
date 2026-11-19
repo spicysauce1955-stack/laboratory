@@ -69,6 +69,14 @@ provenance and under whose `runs/` results land.
   `uv run lab init`. Opening the project in Claude Code should offer the `lab`
   server; once enabled, the tools below appear as `mcp__lab__submit`, etc. If
   they are missing, run `uv run lab init --check`.
+- **Git-ignored a secret? Re-run `uv run lab init`.** SkyPilot uploads the
+  working tree minus `.skyignore` — and reads *only* that file once it exists,
+  never `.gitignore`. A `.skyignore` that `lab init` created (first line
+  `# lab-init: managed …`) is kept in step with the git-ignore each time
+  `lab init` runs, and `lab init --check` fails until it is. A `.skyignore`
+  without that line is the user's and is never edited; `lab init` then names
+  the git-ignored paths it uploads (`skyignore_uploads`) — read that list before
+  a remote run.
 - **Dirty trees are captured, not lost (fail-closed provenance, FR-B1).**
   Manifests pin `HEAD`; if the tree is dirty the lab **auto-snapshots the
   uncommitted changes** (tracked diff + untracked files) and records a
@@ -119,8 +127,12 @@ overrides were never consumed (no `effective_config.json`, or the file omits sub
 is **flipped to `failed`** at the succeeded transition — a typo'd or stale key must not
 silently run a different experiment than requested. `allow_unknown_config=true`
 (CLI `--allow-unknown-config`) opts a legacy entrypoint out; better, pre-check it with
-`uv run lab lint -c "<cmd>" --grid k=v` (heuristic grep for override keys the script never
-references; exits 1 on findings).
+`uv run lab lint -c "<cmd>" --grid k=v [--seeds 0-31]` before a sweep. When the script declares
+its keys with `get_overrides(known={...})`, lint checks the grid keys (and the `seeds=` key a
+sharded sweep appends) against that declaration — exactly what the job will refuse at runtime
+(`check: "declared"`); otherwise it greps for keys the source never mentions (`check:
+"heuristic"`). Exits 1 on findings. A grid `seed` key is refused like any other by a script whose
+`known` omits it.
 
 A metric line is `{"name": "...", "value": <float>, "step": <int>, "wall_time": <float>}`.
 The lab tolerates a half-written trailing line, so you can write line-by-line
@@ -287,9 +299,20 @@ or `n/a` for non-SkyPilot backends. Run this before anything that could
 disturb a live job, not just `reconcile`/`queue list` — see §6.H.
 
 ### `mcp__lab__metrics`
-`{job_id, names?, since_step?}` → `{"series": {name: [{step, value, wall_time}, ...]}}`.
+`{job_id, names?, since_step?, max_points=200, downsample=false}` →
+`{"series": {name: [{step, value, wall_time}, ...]}, "max_points": 200, "truncated": {...}}`.
 Incremental — pass `since_step=<last_step_seen>` to fetch only new points.
-Designed for live polling at ~5–15s cadence (the early-kill loop).
+Designed for live polling at ~5–15s cadence (the early-kill loop); the file is
+read from the end, so a poll stays cheap however long the run gets.
+
+**Bounded by default.** Each series returns its **newest 200 points**;
+`truncated` names every series that had more, as `{name: {returned, omitted}}`
+(`{}` when nothing was cut). Read it before concluding a run is short or a curve
+starts where the payload does. `downsample=true` spreads the cap evenly over the
+whole series (newest point always kept) — use it to see a run's shape;
+`max_points=0` returns every point, which can be tens of MB on a long run. A
+diverged value (NaN/±Infinity) comes back as `null`. CLI: `uv run lab metrics
+<job> --max-points N --downsample --since-step S -n loss`.
 
 ### `mcp__lab__logs`
 `{job_id, tail=100}` → `{"lines": [...]}`. The stdout/stderr of the job.
@@ -331,11 +354,14 @@ the local output is empty (e.g. after a fresh clone).
 `{job_id}` → `{"state": "cancelled"}`. Stops the job and tears the machine down.
 
 ### `mcp__lab__list`
-`{spend_alert?}` → `{"jobs": [{job_id, sweep_id, status, created_at}, ...],
+`{spend_alert?, limit=100}` → `{"jobs": [{job_id, sweep_id, status, created_at}, ...],
+"jobs_total", "jobs_omitted", "limit",
 "spend": {realized_usd, jobs_counted, running_usd, running_jobs,
-unknown_cost_jobs, unsupervised_suspect_jobs, scope, alert}}`. All jobs in
-`runs/`, plus **realized spend
-so far** — derived from the manifests on every read, so there is no meter to
+unknown_cost_jobs, unsupervised_suspect_jobs, scope, alert}}`. The **newest
+`limit` jobs** in `runs/` (oldest-to-newest; `jobs_omitted` counts the older
+ones left out, `limit=0` returns all — for one sweep use `sweep_status`
+instead), plus **realized spend
+so far** over *every* job, not just the page — derived from the manifests on every read, so there is no meter to
 drift. `running_usd` counts live jobs at rate x elapsed, so the total moves
 *before* a landing rather than after it — **bounded by each job's own
 `--timeout`** (24h if it declares none), so a manifest a dead supervisor left at
@@ -438,8 +464,9 @@ declined **or** there was no tty to ask at (nothing was destroyed).
 
 ### `uv run lab dashboard` — live terminal view
 
-Live table of all jobs with state, cost, latest metric, and a **`teardown`**
-column that flags `LEAK` rows loudly. Ctrl-C to exit.
+Live table of the most recent jobs (`--limit 40` by default, `0` for all; a
+caption says how many more exist) with state, cost, latest metric, and a
+**`teardown`** column that flags `LEAK` rows loudly. Ctrl-C to exit.
 
 ### `uv run lab note` — tell us what went wrong (and tell the next run)
 
@@ -803,6 +830,9 @@ past its cause costs real time. Each row below is a rule that was once right.
 | "`lab <cmd> --help` exits non-deterministically, so `--help` rows in `lab history` are noise." | That was `rich` raising on a closed stdout pipe; `--help` exits 0. A `usage_error` row is now a real usage error. | v0.7.0 |
 | "`--price-cap` is a hard ceiling." | **Still not true, and worth knowing exactly how.** SkyPilot applies it to its own catalog, which under-reports Vast ~4x. Since v0.8.0 the cheapest *live* Vast offer is checked before renting (an impossible cap fails the submit for free) and the *billed* rate is compared after boot and recorded as `cost.over_cap`. The optimizer can still land above the cheapest offer, so pass `--price-cap-strict` if the ceiling must hold, and bound real exposure with `--timeout`. | v0.8.0 |
 | "`reconcile`'s `ghosts` list is Vast-only — a healthy DO/GCP job may show up there as a false positive, so don't trust it for those backends." | Ghost detection now cross-checks every cloud's own SkyPilot-tracked state, not just Vast rental labels; a healthy DO/GCP job is no longer misreported. Each entry's cause is named in the additive `ghost_reasons`. | v0.10.0 |
+| "`lab lint` passing means the sweep's keys will be accepted." | It used to be a grep: `--grid gain=2` passed on a script that mentions `gain` everywhere (as a search axis) and the job then died with "unknown config override". Lint now reads `get_overrides(known={...})` and checks against it, and `--seeds` checks the `seeds=` key; only a script with no readable declaration still gets the grep (`check: "heuristic"`). | v0.13.0 |
+| "`mcp__lab__list` / `lab list` return every job." | They return the **newest 100** (`limit`/`--limit`, `0` = all) and count the rest in `jobs_omitted`; `spend` still covers every job. 10k jobs measured 1.24 MB over MCP. | v0.13.0 |
+| "`mcp__lab__metrics` / `lab metrics` return every point of every series." | They return the **newest 200 points per series** by default and name what they cut in `truncated` (`{name: {returned, omitted}}`). `max_points=0` (`--max-points 0`) returns everything; `downsample=true` (`--downsample`) spreads the cap over the whole run. One unbounded read measured 27.7 MB over MCP. | v0.13.0 |
 | "There's no way to see what's actually running right now except `lab list` (this project only) or eyeballing `reconcile`'s rental counts." | `lab ps` / `mcp__lab__ps` gives a project-agnostic, machine-wide "what's running" view — closes a real gap found live, when both of the above were checked during an incident and neither surfaced jobs running in a *different* project. | v0.10.0 |
 | "`lab fetch`/`lab metrics`/`lab logs` don't work from the laptop for scheduler-launched jobs — only `lab status` reads the mirror." | The three now fall back to the mirrored manifest too (built over an ephemeral job store, never the real local one, so `cancel`/`reconcile` still correctly treat the job as not locally supervised). | v0.11.0 |
 | "`lab wait` can't watch a scheduler-launched job, so polling `lab status` in a shell loop is the only way to know when a deferred job finishes." | `lab wait <deferred_job_id>` (and `mcp__lab__wait`) now resolve the mirrored manifest, exactly like `lab status`. Hand-rolled poll loops were costing ~1,050 `lab status` calls/hour — 98,654 in one five-day campaign, which also blew the event ledger past its size cap and destroyed a day of forensic records. An all-mirrored wait polls at most every 30s and lists those ids under `mirrored` in the summary/`--done-file`. `lab cancel` is still deliberately local-only (`lab queue cancel <reg_id>` is the way). | v0.12.0 |

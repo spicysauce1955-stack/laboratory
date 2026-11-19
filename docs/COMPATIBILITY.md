@@ -121,6 +121,16 @@ upgrade note.
   MCP tool always returned, instead of Python's `str()` form with a space; both parse with
   `datetime.fromisoformat`.
 
+  The same change now covers **every** timestamp the CLI prints as JSON (`lab list`'s
+  `created_at`, `lab status`'s `started_at`/`ended_at`, `--done-file` snapshots, …): ISO-8601
+  with a `T`, identical to the MCP tools. And CLI JSON is now **strict**: a non-finite float (a
+  diverged loss logged as `NaN`/`Infinity`) prints as `null`, as the MCP tools always returned it,
+  instead of the bare `NaN`/`Infinity` tokens a strict parser (`jq`, `JSON.parse`) rejects along
+  with the whole payload. Neither is a frozen surface — the CLI's frozen part is its names, flags
+  and exit codes — and a caller using `datetime.fromisoformat` / Python's `json` is unaffected.
+  `lab logs` still prints the log tail as plain text (the MCP tool wraps the same lines in
+  `{"lines": […]}`); that has always been the command's documented behaviour.
+
   `no_heartbeat` means the queue holds **no heartbeat object at all** — no tick has ever completed
   against it — and is deliberately **silent**: with nothing published there is no host to call
   old, and the absence is already reported as `heartbeat_age_s: null`. It replaces the `unknown` a
@@ -137,11 +147,42 @@ upgrade note.
   date means the start of that day in UTC, never local time. Durations are still tried first, so
   `--since 20260906` keeps its old meaning of 20,260,906 seconds.
 
+  **Agent-facing reads are bounded by default** (after v0.12.0). One unbounded read measured
+  27.7 MB over MCP and 199 MB on the CLI, which no agent context survives:
+
+  | Command / tool | New flag / argument | Default | Opt out | Payload |
+  |---|---|---|---|---|
+  | `lab metrics` / `metrics` | `--max-points N` / `max_points` | `200` per series, the **newest** | `0` = every point | `series` unchanged; gained `max_points` and `truncated: {name: {returned, omitted}}` (`{}` when nothing was cut) |
+  | `lab metrics` / `metrics` | `--downsample` / `downsample` | off | — | the cap spread evenly over the whole series, newest point always kept |
+  | `lab list` / `list` | `--limit N` (`-n`) / `limit` | the **newest** `100` jobs, rows still oldest-to-newest | `0` = every job | gained `jobs_total`, `jobs_omitted`, `limit`; `spend` still covers every job |
+
+  This **changes a default**: a caller that read every point from `series` now gets the newest
+  200 of each series, and `truncated` says so — check it, or pass `--max-points 0` /
+  `max_points=0` for the old behaviour. Likewise `jobs` holds at most 100 rows unless you pass
+  `--limit 0` / `limit=0`; `jobs_omitted` is non-zero whenever rows were left out.
+  `since_step` keeps its meaning (points with a larger step) and composes with the cap; it is
+  now answered from the end of the file, stopping a series at its first step at or below
+  `since_step`. That is exact for a series whose steps never go backwards; a series the reader
+  sees go backwards is read in full, and a counter reset far back in the file (a restarted run)
+  yields the newest run's points past `since_step`.
+
+  Also additive, CLI-only: `lab dashboard --limit N` (`-n`; the most recent 40 jobs by default,
+  `0` = all); `lab lint --seeds SPEC`, which checks the `seeds=` key a sharded sweep appends, and
+  two new output fields — `check` (`"declared"` when the entrypoint's `get_overrides(known=…)`
+  could be read and was checked against, `"heuristic"` for the old grep) and `declared_keys`.
+  `lab lint` can now exit 1 where it used to pass: a key the entrypoint does not declare is a
+  finding even when its name appears in the source, because the job would refuse it at runtime.
+  `lab init`'s report gained `skyignore_uploads` (see *What `lab init` owns*).
+
   `lab submit` / `lab sweep` / `lab register` / `lab register-sweep` and the `submit`/`sweep` MCP
   tools (v0.12.0) gained additive `--accelerator-pool` / `--max-launch-attempts`. Both default to
   off, so launch behaviour is unchanged unless you pass them, and rotation never raises
   `--price-cap`. `--backend cpu` refuses a pool the same way it already refuses `--accelerators`.
-- **MCP** — tool names, argument names, and the shape of returned JSON.
+- **MCP** — tool names, argument names, and the shape of returned JSON. After v0.12.0 the
+  server's `serverInfo.version` is the lab's version (it reported FastMCP's), and `lab mcp`
+  starts without FastMCP's banner or its PyPI update check — no network call on start.
+  `doctor(cloud="local")` / `lab doctor --cloud local` now return a one-check ok report instead
+  of refusing `local` as an unknown cloud (a loosening).
 - **Notes** — `lab note` / `lab notes`, their flags, and the record shape in
   `runs/<job_id>/notes.jsonl` and `~/.lab/notes/index.jsonl` (every line carries `v`, currently
   `1`). The per-job file is part of the `runs/<job_id>/` layout below and is copied into
@@ -191,6 +232,18 @@ you changed — it writes `<file>.new` beside it and warns. It never touches `py
 
 Commit `.lab-scaffold.json`: without it, `lab init` cannot tell a file it wrote from one you
 edited, and treats everything as yours.
+
+`.skyignore` is special because SkyPilot reads **only** it once it exists, so anything git-ignored
+but missing from it is rsynced to the remote box. A `.skyignore` that `lab init` created starts
+with a `# lab-init: managed …` line; while that line is there, `lab init` adds whatever the
+project has git-ignored since (patterns, plus anchored paths for what only a nested
+`.gitignore` hides), and `lab init --check` reports the file as stale until it has. Delete the
+line to manage the file by hand — `.lab-scaffold.json` then records it as yours (`"skyignore":
+"user"`) and `lab init` never edits it again. A `.skyignore` you wrote yourself is never
+rewritten: it is often there precisely to upload git-ignored data, so `lab init` warns on stderr
+and lists what it uploads in the report's `skyignore_uploads`, but does not fail `--check` for it.
+A `.skyignore` created by an earlier `lab init` (no marker, no ownership recorded) is recognised
+by the header it carries and gets the marker on the next run.
 
 ## Upgrading
 

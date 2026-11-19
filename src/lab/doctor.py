@@ -62,7 +62,7 @@ QUICK_CHECKS = ("adc", "project", "apis", "iam", "quota_cpu", "quota_gpu", "quot
 #     checks read — a cached verdict carries the answer but not the side effect, which silently
 #     left every downstream check credential-less;
 #   * they are local anyway (a file read and a catalog lookup), so caching buys nothing.
-_NEVER_CACHE = frozenset({"adc", "project", "catalog"})
+_NEVER_CACHE = frozenset({"adc", "project", "catalog", "local"})
 
 # Checks whose verdict depends on the *shape* being launched, not just the account. Their cache
 # key carries a fingerprint of that shape; without it a `--cpus 4` run's disk verdict was served
@@ -747,8 +747,28 @@ _REGISTRY: dict[str, tuple[tuple[str, Any], ...]] = {
     ),
     "vast": (("balance", check_vast_balance), ("catalog", check_catalog)),
     "do": (("token", check_do_token), ("catalog", check_catalog)),
-    "local": (),
+    "local": (("local", lambda _res, _ctx: check_local()),),
 }
+
+
+def check_local() -> CheckResult:
+    """The whole report for the local backend: there is nothing that could fail."""
+    return _ok(
+        "local",
+        "the local backend runs jobs as subprocesses on this machine: no credentials, "
+        "quota or billing to check",
+    )
+
+
+def validate_doctor_cloud(cloud: str | None) -> str | None:
+    """The clouds `doctor` answers for: every launchable cloud (``validate_cloud``) plus
+    ``local``, the default backend — refusing it as "unknown" sent an agent asking a sensible
+    question off to work around an error. Raises ``LabError`` for anything else."""
+    if cloud == "local":
+        return cloud
+    from lab.core import validate_cloud  # lab.core imports this module
+
+    return validate_cloud(cloud)
 
 def run_checks(
     cloud: str | None,

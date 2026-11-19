@@ -34,11 +34,15 @@ job_id = res["job_id"]
 The `metrics` tool returns
 
 ```jsonc
-{"series": {"loss": [{"step": 0, "value": 1.23, "wall_time": ...}, ...]}}
+{"series": {"loss": [{"step": 0, "value": 1.23, "wall_time": ...}, ...]},
+ "max_points": 200, "truncated": {}}
 ```
 
 `since_step` is **exclusive** — pass the last step you've already seen and
-you'll only get new points. This makes polling at ~10s essentially free.
+you'll only get new points. This makes polling at ~10s essentially free (the
+file is read from the end). Each series is capped at its newest `max_points`
+(200) points; if more than that arrived since your last poll, `truncated`
+says how many were left out — the newest are always the ones returned.
 
 ```python
 import time

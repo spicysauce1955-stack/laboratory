@@ -57,6 +57,7 @@ uv run lab list
 uv run lab status <job_id>
 uv run lab logs <job_id>
 uv run lab metrics <job_id> --since-step 7   # live incremental series (early-kill loop)
+uv run lab metrics <job_id> --downsample     # whole-run shape; newest 200/series by default, --max-points 0 = all
 uv run lab fetch <job_id>
 uv run lab sweep -c "python experiments/example_capacity.py" -g "seed=1,2,3"   # grid → job-per-point
 uv run lab wait --sweep <sweep_id>           # block until done; run in background → push-notify (FR-G1)

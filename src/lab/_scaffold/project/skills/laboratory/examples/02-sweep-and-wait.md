@@ -67,7 +67,7 @@ To pull every succeeded job's artifacts + metrics:
 ```python
 for j in succeeded:
     mcp__lab__fetch_artifacts(job_id=j["job_id"])
-    mcp__lab__metrics(job_id=j["job_id"])
+    mcp__lab__metrics(job_id=j["job_id"], downsample=True)  # whole-run shape, 200 pts/series
 ```
 
 To find the sweep again later (or in a new session):

@@ -303,3 +303,32 @@ def pid_alive(pid: int | None, *, start_time: int | None = None) -> bool:
     if current is None:
         return True  # cannot tell -> assume alive, never destroy on a guess
     return current == start_time
+
+
+def unwritable_dest_message(dest: Path | str, err: OSError) -> str | None:
+    """What to tell a caller whose ``--to``/``to`` directory could not be written, or ``None``
+    when ``err`` is about some other path (a source file) and should propagate unchanged.
+
+    ``export`` to a path it cannot create used to surface as a bare ``[Errno 2] No such file or
+    directory: '/proc/nope'`` over MCP — no hint that the *destination* was the problem, nor
+    that a relative path resolves against the server's working directory, not the caller's.
+    """
+    target = Path(dest).expanduser()
+    resolved = target if target.is_absolute() else Path.cwd() / target
+    failed = Path(str(err.filename)) if err.filename else None
+    if failed is not None and failed != resolved and resolved not in failed.parents and (
+        failed not in resolved.parents
+    ):
+        return None
+    reason = err.strerror or type(err).__name__
+    at = f" (at {failed})" if failed is not None and failed != resolved else ""
+    relative = (
+        f"; {str(dest)!r} is relative, so it resolved against {Path.cwd()}"
+        if not target.is_absolute()
+        else ""
+    )
+    return (
+        f"cannot write the bundle to {resolved}: {reason}{at}{relative}. Pass a directory "
+        "you can write (it is created if missing, so its nearest existing parent must be a "
+        "writable directory), e.g. an absolute path inside this project."
+    )
