@@ -903,6 +903,7 @@ class Lab:
         non-terminal state (queued/running), that shard is skipped — no duplicate in-flight jobs.
         """
         plan = self.aggregate_sweep(sweep_id)  # refresh present/missing from current shard states
+        submitted = 0
         for cell in plan.cells:
             if cell.status != "incomplete":
                 continue
@@ -924,6 +925,12 @@ class Lab:
             # [0] is safe: an incomplete cell always has >=1 shard (seeds_expected is non-empty)
             base_manifest = self.manifest(cell.shard_job_ids[0])
             base_resources = base_manifest.resources
+            # Launch where the sweep ran. Both shells build a local-backend Lab for sweep-retry
+            # whatever the sweep used, so `self.submit` turned a retried cpu/skypilot shard into a
+            # local subprocess that still carried the remote resources (`provisioner=local
+            # cloud=do`) — work silently moved off the box it was sized for.
+            launcher = self._lab_on(base_manifest.backend.provisioner)
+            stagger = _submit_stagger_s() if launcher.backend.name != "local" else 0.0
             for shard in cell.shard_seeds:
                 # Partial recovery (field-report #2): resubmit only the seeds still missing from
                 # this shard — a timed-out shard's recovered rows are kept, not re-bought.
@@ -938,12 +945,32 @@ class Lab:
                     plan.command, point, seed=shard_missing[0], resources=base_resources,
                     allow_unknown_config=base_manifest.run.allow_unknown_config,
                 )
-                jid = self.submit(
+                if submitted and stagger:
+                    time.sleep(stagger)  # same API-server cold-start guard as `sweep`
+                jid = launcher.submit(
                     spec, allow_dirty=allow_dirty, sweep_id=sweep_id, cell_id=cell.cell_id
                 )
+                submitted += 1
                 cell.shard_job_ids.append(jid)
         self.store.write_sweep_plan(plan)
         return self.aggregate_sweep(sweep_id)
+
+    def _lab_on(self, provisioner: str) -> Lab:
+        """This Lab, or one sharing its repo/home/store that launches through ``provisioner``.
+
+        The launch-side twin of :meth:`_backend_for`: for re-launching work (``retry_sweep``)
+        under the backend that ran it, rather than whichever backend the calling shell built.
+        """
+        if provisioner == self.backend.name:
+            return self
+        try:
+            backend = self._backend_for(provisioner)
+        except ImportError as e:  # e.g. the skypilot extra is not installed on this machine
+            raise LabError(
+                f"this work ran on the {provisioner!r} backend, which cannot be loaded here "
+                f"({e}); install that extra to relaunch it"
+            ) from e
+        return Lab(backend=backend, repo=self.repo, home=self.home)
 
     def _sibling_lab(self, repo: Path) -> Lab:
         """A Lab rooted at ``repo`` (e.g. an extracted bundle) over the same backend kind, sharing
