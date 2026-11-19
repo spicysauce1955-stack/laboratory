@@ -156,6 +156,24 @@ def test_a_legacy_signature_upgrades_onto_todays(legacy: str, message: str) -> N
     assert upgrade_signature(current) == current  # idempotent on today's form
 
 
+def test_a_word_the_old_sanitizer_masked_matches_whatever_signs_there_now() -> None:
+    """The ledger signs the *sanitized* message. Before the sanitizer learned to spare cluster
+    names and run paths, they were masked to `…REDACTED…` and the signature kept the mask; now
+    they reach the normaliser and sign as `<cluster>` / `<path>`. A note keyed on the old form
+    must still find the failure — and only that failure."""
+    from lab.events.stats import same_signature
+
+    stored = "Exit: teardown of …REDACTED… did not confirm"
+    now = signature({"type": "Exit", "message":
+                     "teardown of lab-proj-20261120-081512-a0b1c2 did not confirm"})
+    assert now == "Exit: teardown of <cluster> did not confirm"
+    assert same_signature(stored, now)
+    assert not same_signature(stored, "Exit: teardown of <cluster> confirmed late")
+    assert not same_signature(stored, "Exit: teardown of two words did not confirm")
+    # A mask in today's signature is literal text too (a real secret is still masked).
+    assert same_signature(stored, stored)
+
+
 def test_upgrading_leaves_a_signature_with_no_ids_alone() -> None:
     from lab.events.stats import upgrade_signature
 

@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Any
 
 from lab.events.models import ActionStat, Event, SignatureStat, StatsView
+from lab.events.sanitize import MASK
 
 #: A lab job id, exactly as ``lab.core._new_job_id`` mints it: ``%Y%m%d-%H%M%S`` + 6 hex. Sweep
 #: and registration ids are the same thing behind a ``sweep-``/``reg-`` prefix, and a cluster is
@@ -93,12 +94,17 @@ def upgrade_signature(sig: str) -> str:
 def same_signature(stored: str, current: str) -> bool:
     """Does a note filed under ``stored`` speak to a failure signed ``current`` today?
 
-    Exact match, or a match after :func:`upgrade_signature`. One more case: the old normaliser
-    left ~13 characters more per id, so a long message reached the :data:`MAX_MESSAGE` cap
-    *earlier* — its upgraded key is then a strict prefix of today's. That prefix is only
-    accepted when the stored message sits exactly at the cap (it was cut) and the upgrade
-    actually rewrote an id (it is a legacy key at all), so an ordinary short signature can
-    never match a longer one by prefix.
+    Exact match, or a match after :func:`upgrade_signature`. Two more legacy cases:
+
+    * The old normaliser left ~13 characters more per id, so a long message reached the
+      :data:`MAX_MESSAGE` cap *earlier* — its upgraded key is then a strict prefix of today's.
+      That prefix is only accepted when the stored message sits exactly at the cap (it was cut)
+      and the upgrade actually changed something (it is a legacy key at all), so an ordinary
+      short signature can never match a longer one by prefix.
+    * The ledger signs the *sanitized* message, and the sanitizer used to mask cluster names,
+      run paths and object URLs whole (``…REDACTED…``) where they now reach the normaliser and
+      sign as ``<cluster>``/``<path>``. A mask in a stored key therefore matches any one word in
+      the same place — never more than one, and everything around it must still agree.
     """
     if stored == current:
         return True
@@ -106,12 +112,13 @@ def same_signature(stored: str, current: str) -> bool:
     if upgraded == current:
         return True
     _type, sep, message = stored.partition(": ")
-    return (
-        bool(sep)
-        and len(message) == MAX_MESSAGE
-        and upgraded != stored
-        and current.startswith(upgraded)
-    )
+    cut = bool(sep) and len(message) == MAX_MESSAGE
+    if cut and upgraded != stored and current.startswith(upgraded):
+        return True
+    if MASK not in upgraded:
+        return False
+    pattern = r"\S+".join(re.escape(part) for part in upgraded.split(MASK))
+    return (re.match if cut else re.fullmatch)(pattern, current) is not None
 
 
 _ACTION_SEPARATORS = re.compile(r"[\s_-]+")
