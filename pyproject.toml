@@ -114,7 +114,7 @@ line-length = 100
 # aren't lab source. Keep correctness checks (undefined names, syntax) but waive the import- and
 # statement-style rules `src/lab` is held to.
 "experiments/*" = ["E4", "E7", "F401", "F541", "F841"]
-# `experiments/` now holds a single file — example_capacity.py, the lab's own contract fixture.
+# `experiments/` holds the lab's own contract fixtures: example_capacity.py and example_search.py.
 # The analysis scratch that needed the wider waiver left with tempotron-capacity.
 ".claude/**" = ["E4", "E7", "F401", "F541", "F841"]
 
