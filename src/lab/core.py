@@ -138,6 +138,11 @@ def _new_job_id() -> str:
     return f"{now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
 
 
+# Draws before a submit gives up on finding an unclaimed id. A collision is ~1e-7 per draw, so
+# reaching this means the run dir cannot be created at all (or `_new_job_id` is stuck).
+_JOB_ID_ATTEMPTS = 16
+
+
 def _gcp_identity(resource: dict[str, Any]) -> str:
     """A GCE resource's identity for attribution — from its labels when they are there.
 
@@ -699,7 +704,7 @@ class Lab:
         _check_price_cap_admission(
             spec.resources.cloud, spec.resources.accelerators, spec.resources.max_hourly_usd
         )
-        job_id = _new_job_id()
+        dirty = False
         if code is None:
             try:
                 dirty = is_dirty(self.repo)
@@ -717,42 +722,6 @@ class Lab:
                 raise
             if dirty and not allow_dirty:
                 raise LabError("working tree is dirty; commit or pass allow_dirty=True (FR-B1)")
-            diff_ref: str | None = None
-            if dirty:
-                # Capture into the job dir, then mirror to R2 (if enabled) for durability — the
-                # local runs/ dir is git-ignored and may be lost. diff_ref points at the durable
-                # copy when one exists, else the local path.
-                self.store.job_dir(job_id).mkdir(parents=True, exist_ok=True)
-                blob = capture_diff(self.repo, self.store.job_dir(job_id))
-                if blob is None:
-                    # is_dirty said dirty but capture found nothing — the tree changed under us
-                    # (e.g. a concurrent stash/checkout). Fail loud rather than write a Gap-B
-                    # manifest (which would surface as a raw ValueError at create) (FR-B1).
-                    raise LabError(
-                        "working tree changed during submit (no diff to capture); retry (FR-B1)"
-                    )
-                diff_ref = blob
-                try:
-                    diff_bytes: int | None = Path(blob).stat().st_size
-                except OSError:
-                    diff_bytes = None
-                events.note("core.dirty_snapshot", diff_ref=diff_ref, bytes=diff_bytes)
-                if r2_enabled():
-                    r2 = R2Store.from_env()
-                    if r2 is not None:
-                        rel = f"{job_id}/code_diff.tar.gz"
-                        try:
-                            r2.upload_file(Path(blob), rel)
-                            diff_ref = r2.uri(rel)
-                        except Exception as e:  # noqa: BLE001 — local diff_ref stays fail-closed
-                            print(
-                                f"[lab] diff R2 upload failed, keeping local copy: {e}",
-                                file=sys.stderr,
-                            )
-                            events.note("storage.upload_failed", key=rel, error=str(e))
-            code = CodeRef(
-                git_commit=current_commit(self.repo), git_dirty=dirty, diff_ref=diff_ref
-            )
         elif code.git_dirty and not allow_dirty:
             raise LabError("bundle captured a dirty tree but allow_dirty=False (FR-B1)")
         seed = spec.seed if spec.seed is not None else 0  # explicit + recorded (FR-B4)
@@ -770,34 +739,106 @@ class Lab:
                 "provably matches yours (FR-B2). Run `uv lock` in this project first "
                 "(`uv init` first if it is not uv-managed yet)."
             ) from e
-        manifest = JobManifest(
-            job_id=job_id,
-            sweep_id=sweep_id,
-            cell_id=cell_id,
-            registration_id=registration_id,
-            confirms=confirms,
-            created_at=now(),
-            submitted_by=spec.submitted_by,
-            code=code,
-            env=EnvInfo(
-                uv_lock_sha256=lock_sha,
-                python_version=platform.python_version(),
-            ),
-            run=RunSpec(
-                entrypoint_command=spec.command,
-                resolved_config=spec.config or {},
-                seed=seed,
-                allow_unknown_config=spec.allow_unknown_config,
-                # What the unconsumed-config audit may judge: config keys that ride the argv.
-                config_overrides=injected_override_keys(spec.command, spec.config),
-            ),
-            resources=spec.resources,
-            backend=BackendInfo(provisioner=self.backend.name),
-            status=JobState.queued,
-        )
-        self.store.create(manifest)
+        # Every refusal that needs no job id has run: only now is an id claimed, so a refused
+        # submit leaves no run dir behind.
+        job_id = self._claim_job_id()
+        try:
+            if code is None:
+                code = self._snapshot_code(job_id, dirty=dirty)
+            manifest = JobManifest(
+                job_id=job_id,
+                sweep_id=sweep_id,
+                cell_id=cell_id,
+                registration_id=registration_id,
+                confirms=confirms,
+                created_at=now(),
+                submitted_by=spec.submitted_by,
+                code=code,
+                env=EnvInfo(
+                    uv_lock_sha256=lock_sha,
+                    python_version=platform.python_version(),
+                ),
+                run=RunSpec(
+                    entrypoint_command=spec.command,
+                    resolved_config=spec.config or {},
+                    seed=seed,
+                    allow_unknown_config=spec.allow_unknown_config,
+                    # What the unconsumed-config audit may judge: config keys that ride the argv.
+                    config_overrides=injected_override_keys(spec.command, spec.config),
+                ),
+                resources=spec.resources,
+                backend=BackendInfo(provisioner=self.backend.name),
+                status=JobState.queued,
+            )
+            self.store.create(manifest)
+        except BaseException:
+            self.store.release_dir(job_id)  # ours, and holding no manifest: nothing ran
+            raise
         self.backend.submit(manifest)
         return job_id
+
+    def _claim_job_id(self) -> str:
+        """A fresh job id whose run dir this call created — exclusively.
+
+        Ids are a one-second timestamp plus a 24-bit random suffix, so two submits in the same
+        second can draw the same one (~0.2% somewhere in a 1000-shard sweep), and the run dir used
+        to be made with ``exist_ok=True``: the second job silently took over the first one's dir
+        and its manifest replaced the first (stress run 2026-11-19). The id is widened nowhere —
+        it is stamped into cluster names that GCP truncates — so a collision draws again instead.
+        """
+        return self._claim_id(lambda: _new_job_id(), "job")
+
+    def _claim_sweep_id(self) -> str:
+        """A sharded sweep's id, claimed like a job id (:meth:`_claim_job_id`): its dir holds
+        plan.json, and a second sweep drawing the same id would have replaced the first's plan."""
+        return self._claim_id(lambda: f"sweep-{_new_job_id()}", "sweep")
+
+    def _claim_id(self, draw: Callable[[], str], kind: str) -> str:
+        for _ in range(_JOB_ID_ATTEMPTS):
+            new_id = draw()
+            if self.store.claim_dir(new_id):
+                return new_id
+            events.note("core.id_collision", id_kind=kind, id=new_id)
+        raise LabError(
+            f"could not claim a fresh {kind} id in {self.home} after {_JOB_ID_ATTEMPTS} attempts"
+        )
+
+    def _snapshot_code(self, job_id: str, *, dirty: bool) -> CodeRef:
+        """The submit's :class:`CodeRef`: the current commit, plus — for a dirty tree — the diff
+        captured into the (already claimed) job dir and mirrored to R2 when enabled (FR-B1)."""
+        diff_ref: str | None = None
+        if dirty:
+            # Capture into the job dir, then mirror to R2 (if enabled) for durability — the
+            # local runs/ dir is git-ignored and may be lost. diff_ref points at the durable
+            # copy when one exists, else the local path.
+            blob = capture_diff(self.repo, self.store.job_dir(job_id))
+            if blob is None:
+                # is_dirty said dirty but capture found nothing — the tree changed under us
+                # (e.g. a concurrent stash/checkout). Fail loud rather than write a Gap-B
+                # manifest (which would surface as a raw ValueError at create) (FR-B1).
+                raise LabError(
+                    "working tree changed during submit (no diff to capture); retry (FR-B1)"
+                )
+            diff_ref = blob
+            try:
+                diff_bytes: int | None = Path(blob).stat().st_size
+            except OSError:
+                diff_bytes = None
+            events.note("core.dirty_snapshot", diff_ref=diff_ref, bytes=diff_bytes)
+            if r2_enabled():
+                r2 = R2Store.from_env()
+                if r2 is not None:
+                    rel = f"{job_id}/code_diff.tar.gz"
+                    try:
+                        r2.upload_file(Path(blob), rel)
+                        diff_ref = r2.uri(rel)
+                    except Exception as e:  # noqa: BLE001 — local diff_ref stays fail-closed
+                        print(
+                            f"[lab] diff R2 upload failed, keeping local copy: {e}",
+                            file=sys.stderr,
+                        )
+                        events.note("storage.upload_failed", key=rel, error=str(e))
+        return CodeRef(git_commit=current_commit(self.repo), git_dirty=dirty, diff_ref=diff_ref)
 
     def _code_ref_commit(self, code_ref: str) -> str | None:
         """The commit a non-HEAD ``code_ref`` pins, or ``None`` when the ordinary working-tree
@@ -938,7 +979,7 @@ class Lab:
             n_points=n_jobs, per_point_cap=per_point_cap,
             daily_budget=daily_budget, committed=committed,
         )
-        sweep_id = f"sweep-{_new_job_id()}"
+        sweep_id = self._claim_sweep_id()  # its dir will hold plan.json: never share one
         all_job_ids: list[str] = []
         plan_cells: list[SweepCell] = []
         for cell in cells:
@@ -981,6 +1022,7 @@ class Lab:
                     all_job_ids.append(jid)
         except BaseException as e:
             if not all_job_ids:
+                self.store.release_dir(sweep_id)  # claimed above, still empty
                 raise  # nothing launched: there is no sweep to report, just the refusal
             # Persist what launched, so aggregate/retry/export see these jobs and `sweep-retry`
             # can submit the rest once the cause is fixed.

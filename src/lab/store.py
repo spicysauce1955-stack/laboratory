@@ -14,6 +14,8 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -83,6 +85,24 @@ class JobStore:
     def runtime_path(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "_runtime.json"
 
+    def claim_dir(self, name: str) -> bool:
+        """Create ``<home>/<name>`` exclusively: ``True`` if this call made it, ``False`` if it
+        already existed (another job or sweep holds that id — draw another)."""
+        self.home.mkdir(parents=True, exist_ok=True)
+        try:
+            (self.home / name).mkdir()
+        except FileExistsError:
+            return False
+        return True
+
+    def release_dir(self, name: str) -> None:
+        """Undo :meth:`claim_dir` for a submit/sweep refused before it recorded anything. Never
+        touches a dir holding a manifest or a plan — that is a real job's or sweep's record."""
+        d = self.home / name
+        if (d / "manifest.json").exists() or (d / "plan.json").exists():
+            return
+        shutil.rmtree(d, ignore_errors=True)
+
     def create(self, manifest: JobManifest) -> Path:
         """Create the run dir (incl. output/) and persist the initial manifest.
 
@@ -90,13 +110,21 @@ class JobStore:
         not in ``write_manifest``: ``code`` is immutable after create, so validating once at
         creation prevents any new Gap-B manifest, while later status ``update_manifest`` writes
         (including on legacy Gap-B manifests already on disk) never re-validate and so never
-        crash (FR-B1)."""
+        crash (FR-B1).
+
+        The manifest is published exclusively: ``FileExistsError`` if the job id already has
+        one, which is left untouched. ``Lab.submit`` claims a fresh id first
+        (:meth:`claim_dir`), so this is the backstop that makes a collision loud instead of one
+        job silently replacing another's record."""
         manifest.code.assert_fail_closed()
         if manifest.lab_version is None:
             manifest.lab_version = __version__
+        self.job_dir(manifest.job_id).mkdir(parents=True, exist_ok=True)
+        self._create_exclusive(
+            self.manifest_path(manifest.job_id), manifest.model_dump_json(indent=2)
+        )
         self.output_dir(manifest.job_id).mkdir(parents=True, exist_ok=True)
         self.logs_path(manifest.job_id).touch()
-        self.write_manifest(manifest)
         # Claim this job in the machine-wide index, so a `reconcile` run from *any* project can
         # tell whose `lab-*` cloud resources it is looking at. Deliberately after the fail-closed
         # guard and the manifest write: a rejected job must not appear in the index. Never raises,
@@ -307,3 +335,22 @@ class JobStore:
     @staticmethod
     def _atomic_write(path: Path, text: str) -> None:
         atomic_write_text(path, text)
+
+    @staticmethod
+    def _create_exclusive(path: Path, text: str) -> None:
+        """Write ``path`` whole, but only if it does not exist yet (``FileExistsError`` if it
+        does). The content goes to a temp name first and is published with ``link``, which —
+        unlike ``replace`` — refuses an existing target; a reader never sees a partial file."""
+        tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.new")
+        atomic_write_text(tmp, text)
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            raise
+        except OSError:
+            # No hard links on this filesystem: claim the name with O_EXCL, then fill it. A
+            # reader can see it empty for that moment, which `list_jobs` already tolerates.
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644))
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
