@@ -1014,6 +1014,9 @@ class Lab:
             seed=m.run.seed,
             resources=m.resources,
             submitted_by="agent",
+            # The original's own opt-out: without it a run that legitimately succeeded with
+            # unconsumed keys re-runs under the fail-closed audit and always "fails" to confirm.
+            allow_unknown_config=m.run.allow_unknown_config,
         )
         confirm_id = bundle_lab.submit(
             spec,
@@ -1024,7 +1027,11 @@ class Lab:
         if not wait:
             result["verdict"] = "pending"
             return result
-        (rerun,) = self.wait([confirm_id], timeout=timeout)
+        # A local re-run's manifest is a free filesystem read and usually lands within a second,
+        # so wait's 10s default would leave every local confirm idle for a whole interval. Remote
+        # re-runs keep the 10s cadence: provisioning alone takes minutes.
+        interval = 0.5 if bundle_lab.backend.name == "local" else 10.0
+        (rerun,) = self.wait([confirm_id], timeout=timeout, interval=interval)
         if rerun.status not in _TERMINAL_STATES:
             # wait gave up before the re-run finished — it's still alive (and, on a remote backend,
             # still billing until it tears down). Don't call a running job failed.
