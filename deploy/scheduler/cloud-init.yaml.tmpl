@@ -77,7 +77,7 @@ runcmd:
 
   # Clone the experiment project the scheduler runs jobs against.
   - install -d -o lab -g lab /opt/tempotron-capacity
-  - sudo -u lab -H git clone https://github.com/spicysauce1955-stack/tempotron-capacity.git /opt/tempotron-capacity
+  - sudo -u lab -H git clone $PROJECT_REPO /opt/tempotron-capacity
 
   # Fetch the systemd units FRESH from the pinned tag — never duplicated into this template.
   # They have not needed any path substitution since v0.5.0 (WorkingDirectory/ExecStart are

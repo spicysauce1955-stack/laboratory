@@ -13,6 +13,11 @@ from helpers import wait_terminal
 
 from lab.core import Lab, LabError, SweepSubmitError
 
+# Restored by hand rather than with `monkeypatch.undo()`, which reverts conftest's isolation too:
+# the rest of the test then wrote 105 job-index entries and their ledger records into the
+# developer's real ~/.lab (2026-11-19).
+_REAL_SUBMIT = Lab.submit
+
 
 def _refuse_on(monkeypatch, n: int) -> dict[str, int]:
     real = Lab.submit
@@ -51,7 +56,7 @@ def test_sharded_sweep_refused_partway_keeps_a_plan_and_names_its_jobs(
         assert lab.manifest(jid).sweep_id == err.sweep_id
 
     # The launched shards land their rows; sweep-retry then submits only what never launched.
-    monkeypatch.undo()
+    monkeypatch.setattr(Lab, "submit", _REAL_SUBMIT)  # not undo(): see _REAL_SUBMIT
     monkeypatch.chdir(repo)
     for jid, seeds in zip(err.job_ids, ([0, 1], [2, 3])):
         wait_terminal(lab.backend, jid)
@@ -73,7 +78,7 @@ def test_retry_fills_a_cell_the_failed_sweep_never_reached(tmp_path: Path, monke
     plan = lab.sweep_plan(ei.value.sweep_id)
     assert [len(c.shard_job_ids) for c in plan.cells] == [1, 0]
 
-    monkeypatch.undo()
+    monkeypatch.setattr(Lab, "submit", _REAL_SUBMIT)  # not undo(): see _REAL_SUBMIT
     monkeypatch.chdir(repo)
     after = lab.retry_sweep(ei.value.sweep_id)
     assert all(c.shard_job_ids for c in after.cells)

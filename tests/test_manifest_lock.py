@@ -46,7 +46,9 @@ def test_a_concurrent_writer_cannot_be_overwritten_by_a_stale_read(tmp_path: Pat
         ArtifactRecord(name="a.csv", path="/x/a.csv", sha256="0" * 64, bytes=1)
     ])
     supervisor["t"].join(timeout=10)
-    monkeypatch.undo()
+    # Restore only what this test patched: `monkeypatch.undo()` also reverts conftest's isolation
+    # (ledger/index dirs, the cloud-client guards) for the rest of the test.
+    monkeypatch.setattr(JobStore, "read_manifest", real_read)
 
     final = store.read_manifest("j")
     assert final.status is JobState.succeeded
