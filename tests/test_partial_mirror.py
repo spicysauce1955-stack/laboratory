@@ -35,7 +35,7 @@ from helpers import make_manifest
 import lab.partials as P
 import lab.sky_runner as runner_mod
 from lab._util import now
-from lab.models import CostInfo, JobState
+from lab.models import BackendInfo, CostInfo, JobState
 from lab.store import JobStore
 
 
@@ -468,7 +468,13 @@ class TestSalvage:
         store = JobStore(home)
         store.create(
             make_manifest("pm4", "python x.py", timeout="1h").model_copy(
-                update={"status": JobState.timed_out, "started_at": now()}
+                update={
+                    "status": JobState.timed_out,
+                    "started_at": now(),
+                    # The partial mirror is a remote-supervisor feature; a local-backend job
+                    # never has anything in R2, so fetch_artifacts doesn't ask.
+                    "backend": BackendInfo(provisioner="skypilot"),
+                }
             )
         )
 

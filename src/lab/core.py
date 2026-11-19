@@ -1069,25 +1069,48 @@ class Lab:
         out = self.store.output_dir(job_id)
         has_local = out.exists() and any(out.iterdir())
         if not has_local and r2_enabled():  # local copy gone — pull the durable copy from R2
-            try:
-                manifest = self.store.read_manifest(job_id)
-                r2 = R2Store.from_env()
-                if manifest.artifacts_uri and r2 is not None:
-                    r2.download_dir(job_id, out)
-                if r2 is not None and not (out.exists() and any(out.iterdir())):
-                    # Nothing durable from the end-of-run upload — which is the *normal* state of
-                    # a job whose supervisor died, since `artifacts_uri` is written on the same
-                    # line as that upload. The mid-run mirror (`lab.partials`) is then the only
-                    # copy of rows that were paid for, so fall back to it. It lands the
-                    # `_PARTIAL.json` marker alongside the tables, so what arrives is
-                    # self-describing: `sweep-aggregate` still stamps these rows from the
-                    # producing job's own (non-succeeded) status, exactly as for a partial shard.
-                    r2.download_dir(f"{job_id}/{PARTIAL_DIR}", out)
-            except ImportError as e:
-                # R2 env configured but the `r2` extra isn't installed — the fallback is
-                # best-effort recovery, never a reason to fail a local operation.
-                print(f"[lab] R2 fallback unavailable ({e}); using local state only", file=sys.stderr)
+            self._r2_fallback(job_id, out)
         return self.backend.collect_artifacts(job_id, dest or str(self.store.job_dir(job_id)))
+
+    def _r2_fallback(self, job_id: str, out: Path) -> None:
+        """Best-effort recovery of a job's outputs from R2 when the local copy is missing.
+
+        Never raises for an R2 problem: ``sweep-aggregate``/``sweep-retry`` call this per shard,
+        and one shard's network or credential error used to abort the whole sweep with a
+        traceback and empty stdout. A failure is a stderr line plus a ledger note, and the
+        caller carries on with local state (an absent results file reads as missing seeds).
+
+        Skipped outright for a local-backend job: nothing on that path uploads to R2, so there
+        is nothing to recover, and asking would only spend a network round trip (or fail).
+        """
+        manifest = self.store.read_manifest(job_id)
+        if manifest.backend.provisioner == "local":
+            return
+        try:
+            r2 = R2Store.from_env()
+            if manifest.artifacts_uri and r2 is not None:
+                r2.download_dir(job_id, out)
+            if r2 is not None and not (out.exists() and any(out.iterdir())):
+                # Nothing durable from the end-of-run upload — which is the *normal* state of
+                # a job whose supervisor died, since `artifacts_uri` is written on the same
+                # line as that upload. The mid-run mirror (`lab.partials`) is then the only
+                # copy of rows that were paid for, so fall back to it. It lands the
+                # `_PARTIAL.json` marker alongside the tables, so what arrives is
+                # self-describing: `sweep-aggregate` still stamps these rows from the
+                # producing job's own (non-succeeded) status, exactly as for a partial shard.
+                r2.download_dir(f"{job_id}/{PARTIAL_DIR}", out)
+        except ImportError as e:
+            # R2 env configured but the `r2` extra isn't installed — the fallback is
+            # best-effort recovery, never a reason to fail a local operation.
+            print(f"[lab] R2 fallback unavailable ({e}); using local state only", file=sys.stderr)
+            events.note("storage.fallback_unavailable", job_id=job_id, error=str(e))
+        except Exception as e:  # noqa: BLE001 — network/credential errors: same best-effort rule
+            print(
+                f"[lab] R2 fallback for {job_id} failed ({type(e).__name__}: {e}); "
+                "using local state only",
+                file=sys.stderr,
+            )
+            events.note("storage.fallback_failed", job_id=job_id, error=str(e))
 
     def manifest(self, job_id: str) -> JobManifest:
         return self.store.read_manifest(job_id)
