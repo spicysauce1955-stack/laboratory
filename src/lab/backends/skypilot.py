@@ -784,16 +784,65 @@ def _do_destroy_matching(cluster: str) -> tuple[list[Any], list[str]]:
         except Exception as e:  # noqa: BLE001 — a box we found and could not kill must alarm
             failures.append(f"droplet {d.get('name')}: {type(e).__name__}: {e}")
 
-    for v in list_do_volumes(client):
-        if not str(v.get("name", "")).lower().startswith(prefix):
-            continue
-        try:
-            client.volumes.delete(volume_id=str(v["id"]))
-            destroyed.append(v["id"])
-        except Exception as e:  # noqa: BLE001
-            failures.append(f"volume {v.get('name')}: {type(e).__name__}: {e}")
-
+    # The volume goes through the same detach ladder as the success path. Deleting it in the
+    # same instant its droplet was destroyed is the 2026-08-23 race: DO detaches asynchronously,
+    # refuses the delete for a volume seconds from deletable, and a fallback that *worked* was
+    # recorded `failed` (exit 3). When a droplet would not die its volume stays attached however
+    # long we wait, so the ladder is skipped and the real alarm is not delayed by a minute.
+    swept, leftovers = _do_sweep_leftover_volumes(
+        cluster, backoffs=() if failures else _VOLUME_DETACH_BACKOFFS
+    )
+    destroyed.extend(swept)
+    failures.extend(leftovers)
     return destroyed, failures
+
+
+def delete_do_volumes(
+    volume_ids: list[Any],
+    *,
+    client: Any | None = None,
+    backoffs: tuple[int, ...] = _VOLUME_DETACH_BACKOFFS,
+) -> tuple[list[Any], dict[Any, BaseException]]:
+    """Delete exactly these DO volumes, riding out the asynchronous detach. Returns
+    ``(gone, failures_by_id)``; raises only if no client can be built.
+
+    The id-addressed sibling of :func:`_do_sweep_leftover_volumes`, for ``lab reconcile``, which
+    may only touch the volumes the operator approved rather than everything under a prefix. Same
+    rules, same reasons (2026-08-23): only the detach message is retried; every pass re-lists, and
+    a volume that vanished counts as gone — reconcile's sky pass has usually just destroyed the
+    droplet, and SkyPilot deletes the volume itself moments later. A volume still attached after
+    the whole ladder keeps its error: its droplet is alive, and that is a real alarm.
+    """
+    if client is None:
+        client = _get_do_client()
+    gone: list[Any] = []
+    failed: dict[Any, BaseException] = {}
+    pending = list(volume_ids)
+    for attempt, delay in enumerate((0, *backoffs)):
+        if not pending:
+            break
+        if delay:
+            time.sleep(delay)
+        if attempt:
+            try:
+                listed: set[str] | None = {str(v.get("id")) for v in list_do_volumes(client)}
+            except Exception:  # noqa: BLE001 — cannot tell; the delete below still answers
+                listed = None
+            if listed is not None:
+                vanished = [v for v in pending if str(v) not in listed]
+                gone.extend(vanished)
+                pending = [v for v in pending if v not in vanished]
+        detaching: list[Any] = []
+        for vol_id in pending:
+            try:
+                client.volumes.delete(volume_id=vol_id)
+                gone.append(vol_id)
+            except Exception as e:  # noqa: BLE001 — classified: retry "not yet", report "never"
+                failed[vol_id] = e
+                if _VOLUME_DETACH_MARKER in f"{type(e).__name__}: {e}".lower():
+                    detaching.append(vol_id)
+        pending = detaching
+    return gone, {k: e for k, e in failed.items() if k not in gone}
 
 
 class GcpNotConfigured(RuntimeError):
@@ -1007,18 +1056,44 @@ def gcp_name_matches(cluster: str, name: str) -> bool:
         return False
 
 
+def _labelled_job_id(inst: dict[str, Any]) -> str | None:
+    """The ``lab-job-id`` label :func:`project_labels` stamped on a GCE instance, or ``None``."""
+    labels = inst.get("labels")
+    if not isinstance(labels, dict):
+        return None
+    value = str(labels.get("lab-job-id") or "").strip().lower()
+    return value or None
+
+
+def gcp_instance_matches(cluster: str, inst: dict[str, Any]) -> bool:
+    """Whether GCE instance ``inst`` belongs to cluster ``cluster``.
+
+    The ``lab-job-id`` label decides whenever the instance carries one. The name cannot: past
+    GCP's 35-character limit, :func:`gcp_name_fragment` keeps only ``YYYYMM`` of a slugged job id
+    plus SkyPilot's 2-hex digest, so two jobs of one project in one month collide with p~1/256 —
+    and a collision let job A's gcp-direct teardown delete sibling B's *running* VM and report
+    ``succeeded``. A label is not truncated, so equality with the job id the cluster name ends in
+    is exact. The name fragment is the fallback only for unlabelled (pre-label) instances.
+    """
+    job = _labelled_job_id(inst)
+    if job is None:
+        return gcp_name_matches(cluster, str(inst.get("name", "")))
+    # `cluster_name_for` always ends in `-<sanitised job id>`, the same value the label holds.
+    return cluster.strip().lower().endswith(f"-{job}")
+
+
 def gcp_instance_orphans(
     instances: list[dict[str, Any]], running_clusters: set[str]
 ) -> list[dict[str, Any]]:
     """Lab-cluster GCE instances not tied to any running cluster — the out-of-band GCP analogue of
-    the Vast rental pass (SkyPilot names instances after their cluster — see
-    :func:`gcp_name_matches` for why that is not a plain substring test)."""
+    the Vast rental pass (see :func:`gcp_instance_matches` for how an instance is tied to its
+    cluster: by label, falling back to the truncated name)."""
     orphans: list[dict[str, Any]] = []
     for inst in instances:
         name = str(inst.get("name", ""))
         if not is_lab_cluster_node(name):
             continue  # not ours — leave it alone
-        if any(gcp_name_matches(c, name) for c in running_clusters):
+        if any(gcp_instance_matches(c, inst) for c in running_clusters):
             continue  # backs a live job
         orphans.append(inst)
     return orphans
@@ -1061,6 +1136,18 @@ def gcp_unmatched_lab_names(*resource_lists: list[dict[str, Any]]) -> list[str]:
     )
 
 
+class GcpOperationPending(RuntimeError):
+    """GCE accepted the operation and has not finished it — neither success nor failure.
+
+    Distinct from a definitive GCE error so callers can record ``unknown`` rather than
+    ``failed``: the delete is in flight, and only GCE can say how it ends (R10)."""
+
+
+# `zoneOperations.wait` blocks server-side for up to ~2 minutes per call. GCE deletes take 30-60s
+# normally, so one call is the common case; the re-polls are for a slow zone, not a stuck one.
+_GCE_OPERATION_WAITS = 3
+
+
 def _await_zone_operation(compute: Any, project: str, zone: str, operation: dict[str, Any]) -> None:
     """Block until a zonal operation finishes and raise if it failed.
 
@@ -1069,18 +1156,24 @@ def _await_zone_operation(compute: Any, project: str, zone: str, operation: dict
     on the disk detach, a stuck zonal op). Treating the accepted request as a destroyed VM writes
     ``teardown_status="succeeded"`` while the instance still bills — so we wait for the real
     outcome (FR-C2). ``zoneOperations.wait`` blocks server-side (~2 min max) and returns the
-    operation whether or not it is DONE.
+    operation whether or not it is DONE, so it is re-polled; an operation still not DONE after
+    :data:`_GCE_OPERATION_WAITS` waits raises :class:`GcpOperationPending` — an unfinished delete,
+    which used to be recorded as a definitive failure.
     """
     name = operation.get("name")
     if not name:  # nothing to poll (a fake, or an API that already returned a completed op)
         return
-    done = compute.zoneOperations().wait(project=project, zone=zone, operation=name).execute()
-    error = (done or {}).get("error")
-    if error:
-        errors = "; ".join(str(e.get("message", e)) for e in error.get("errors", [error]))
-        raise RuntimeError(f"operation {name} failed: {errors}")
-    if (done or {}).get("status") != "DONE":
-        raise RuntimeError(f"operation {name} did not complete (status={done.get('status')})")
+    status = None
+    for _ in range(_GCE_OPERATION_WAITS):
+        done = compute.zoneOperations().wait(project=project, zone=zone, operation=name).execute()
+        error = (done or {}).get("error")
+        if error:
+            errors = "; ".join(str(e.get("message", e)) for e in error.get("errors", [error]))
+            raise RuntimeError(f"operation {name} failed: {errors}")
+        status = (done or {}).get("status")
+        if status == "DONE":
+            return
+    raise GcpOperationPending(f"operation {name} did not complete (status={status})")
 
 
 def delete_gcp_instance(
@@ -1105,28 +1198,33 @@ def delete_gcp_disk(
     _await_zone_operation(compute, project, zone, op or {})
 
 
-def _gcp_destroy_matching(cluster: str) -> tuple[list[str], list[str]]:
-    """Destroy every GCE instance belonging to ``cluster`` (see :func:`gcp_name_matches`).
+def _gcp_destroy_matching(cluster: str) -> tuple[list[str], list[str], list[str]]:
+    """Destroy every GCE instance belonging to ``cluster`` (see :func:`gcp_instance_matches`).
 
-    Returns ``(destroyed, failures)``. We keep going after a failure — the next instance might
-    still die — but the failures are **returned, not just printed**: a destroy we attempted and
-    could not complete is a live, billing box, and the caller must not report that as a clean
-    teardown (FR-C2).
+    Returns ``(destroyed, failures, pending)``. We keep going after a failure — the next instance
+    might still die — but the failures are **returned, not just printed**: a destroy we attempted
+    and could not complete is a live, billing box, and the caller must not report that as a clean
+    teardown (FR-C2). ``pending`` is the third case: a delete GCE accepted and had not finished
+    (:class:`GcpOperationPending`) — not a refusal, so not ``failed``.
     """
     compute, project = _get_gcp_compute()
     destroyed: list[str] = []
     failures: list[str] = []
+    pending: list[str] = []
     for inst in list_gcp_instances(compute, project):
-        if not gcp_name_matches(cluster, str(inst["name"])):
+        if not gcp_instance_matches(cluster, inst):
             continue
         try:
             delete_gcp_instance(inst["name"], inst["zone"], compute, project)
             destroyed.append(inst["name"])
             print(f"[lab] gcp-direct destroyed instance {inst['name']} (cluster={cluster})")
+        except GcpOperationPending as e:
+            pending.append(f"{inst['name']}: {e}")
+            print(f"[lab] gcp-direct destroy {inst['name']} still in progress: {e}")
         except Exception as e:  # noqa: BLE001 — best-effort; the next instance might still go
             failures.append(f"{inst['name']}: {type(e).__name__}: {e}")
             print(f"[lab] gcp-direct destroy {inst['name']} failed: {e}")
-    return destroyed, failures
+    return destroyed, failures, pending
 
 
 def confirm_no_rental(cluster: str) -> bool:
@@ -1152,7 +1250,7 @@ def confirm_no_instance(cluster: str) -> bool:
         instances = list_gcp_instances()
     except Exception:  # noqa: BLE001 — uncertainty must read as "still maybe billing"
         return False
-    return not any(gcp_name_matches(cluster, str(inst.get("name", ""))) for inst in instances)
+    return not any(gcp_instance_matches(cluster, inst) for inst in instances)
 
 
 def gcp_preemption_state(cluster: str) -> JobState | None:
@@ -1168,9 +1266,7 @@ def gcp_preemption_state(cluster: str) -> JobState | None:
         instances = list_gcp_instances()
     except Exception:  # noqa: BLE001 — no answer is a valid answer here; inference still applies
         return None
-    return gcp_terminal_state(
-        [i for i in instances if gcp_name_matches(cluster, str(i.get("name", "")))]
-    )
+    return gcp_terminal_state([i for i in instances if gcp_instance_matches(cluster, i)])
 
 
 def preempted_teardown_confirmed(cloud: str, cluster: str) -> bool:
@@ -1334,7 +1430,12 @@ def robust_teardown(
     reports the attempts actually made, which is no longer always ``1 + len(backoffs)``.
     """
     last_err: str | None = None
-    last_undecodable = False
+    # Was every sky.down attempt a *definitive* refusal (sky rejected the request rather than
+    # performing it)? Only then may a fallback that cannot answer be read as a confirmed leak
+    # (`failed`). A timeout, a transport error or an undecodable reply means sky may well have
+    # destroyed the cluster — one such attempt is enough — and with no provider-direct answer
+    # either, the honest verdict is `unknown` (R10: `failed` is kept rare on purpose).
+    all_refused = True
     delays = (0, *backoffs)  # first try has no delay
     attempts_made = 0
     for attempt, delay in enumerate(delays, start=1):
@@ -1380,7 +1481,7 @@ def robust_teardown(
             # acted on here: a provider-direct fallback below can still settle it outright.
             from lab._skycompat import classify_sky_error, is_retryable_sky_error
 
-            last_undecodable = classify_sky_error(e).outcome == "undecodable_response"
+            all_refused = all_refused and classify_sky_error(e).outcome == "failed"
             print(
                 f"[lab] sky.down attempt {attempt}/{len(delays)} for {cluster} failed: {last_err}"
             )
@@ -1409,20 +1510,23 @@ def robust_teardown(
         # Talk to the GCP compute API directly — bypasses SkyPilot's registry.
         print(f"[lab] sky.down exhausted for {cluster}; falling back to gcp-direct destroy")
         try:
-            gcp_destroyed, gcp_failures = _gcp_destroy_matching(cluster)
+            gcp_destroyed, gcp_failures, *rest = _gcp_destroy_matching(cluster)
+            gcp_pending: list[str] = rest[0] if rest else []
             events.note("teardown.fallback", cluster=cluster, via="gcp", ok=not gcp_failures)
+            unsettled = gcp_failures + gcp_pending
             return {
                 # Destroyed-or-none-found are both safe. Found-and-failed-to-destroy is not: that
-                # is a live box we know about and could not kill, so it must alarm (FR-C2).
-                "status": "failed" if gcp_failures else "succeeded",
+                # is a live box we know about and could not kill, so it must alarm (FR-C2). A
+                # delete GCE accepted and has not finished is neither: `unknown`, not `failed`.
+                "status": "failed" if gcp_failures else "unknown" if gcp_pending else "succeeded",
                 "attempts": attempts_made,
                 "vast_fallback_used": False,
                 "vast_destroyed": [],
                 "gcp_fallback_used": True,
                 "gcp_destroyed": gcp_destroyed,  # report what DID die even when we alarm
                 "error": (
-                    f"sky.down: {last_err}; gcp-direct: {'; '.join(gcp_failures)}"
-                    if gcp_failures
+                    f"sky.down: {last_err}; gcp-direct: {'; '.join(unsettled)}"
+                    if unsettled
                     else last_err
                 ),
             }
@@ -1430,7 +1534,7 @@ def robust_teardown(
             events.note("teardown.fallback", cluster=cluster, via="gcp", ok=False)
             return {
                 # sky could not tell us and GCP could not either: genuinely unknown (R10).
-                "status": "unknown" if last_undecodable else "failed",
+                "status": "failed" if all_refused else "unknown",
                 "attempts": attempts_made,
                 "vast_fallback_used": False,
                 "vast_destroyed": [],
@@ -1463,7 +1567,7 @@ def robust_teardown(
             events.note("teardown.fallback", cluster=cluster, via="do", ok=False)
             return {
                 # sky could not tell us and DO could not either: genuinely unknown (R10).
-                "status": "unknown" if last_undecodable else "failed",
+                "status": "failed" if all_refused else "unknown",
                 "attempts": attempts_made,
                 "vast_fallback_used": False,
                 "vast_destroyed": [],
@@ -1478,7 +1582,7 @@ def robust_teardown(
         # cannot stand behind — a `failed` that is usually wrong teaches operators to ignore
         # the one signal that matters (R10).
         return {
-            "status": "unknown" if last_undecodable else "failed",
+            "status": "failed" if all_refused else "unknown",
             "attempts": attempts_made,
             "vast_fallback_used": False,
             "vast_destroyed": [],
@@ -1506,7 +1610,7 @@ def robust_teardown(
         events.note("teardown.fallback", cluster=cluster, via="vast", ok=False)
         return {
             # sky could not tell us and Vast could not either: genuinely unknown (R10).
-            "status": "unknown" if last_undecodable else "failed",
+            "status": "failed" if all_refused else "unknown",
             "attempts": attempts_made,
             "vast_fallback_used": True,
             "vast_destroyed": [],

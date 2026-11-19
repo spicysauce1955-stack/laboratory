@@ -250,7 +250,19 @@ class TestGcpAttributionUsesLabels:
             "status": "RUNNING",
             "labels": {"lab-project": "laboratory", "lab-job-id": "20260820-071905-771110"},
         }
-        monkeypatch.setattr("lab.core.attribute_jobs", lambda ids: {})
+        from lab.attribution import Attribution
+
+        # The label is what recovers the job id; the registry entry naming *this* runs_dir is
+        # what proves the job store (a matching project slug alone no longer does — two clones,
+        # or the scheduler host, share it; see test_reconcile_store_ownership.py).
+        monkeypatch.setattr(
+            "lab.core.attribute_jobs",
+            lambda ids: {
+                j: Attribution(j, "laboratory", tmp_path, "registry")
+                for j in ids
+                if j == "20260820-071905-771110"
+            },
+        )
         monkeypatch.setattr("lab.core.local_project", lambda: "laboratory")
         monkeypatch.setattr("lab.backends.skypilot.list_vast_instances", lambda *a, **k: [])
         monkeypatch.setattr("lab.backends.skypilot.list_do_volumes", lambda *a, **k: [])
@@ -263,6 +275,12 @@ class TestGcpAttributionUsesLabels:
 
         assert [o["name"] for o in report["gcp_orphans"]] == [truncated]
         assert report["unattributed"] == []
+
+        # Same instance, no proof of which store launched it: reported, never destroyable.
+        monkeypatch.setattr("lab.core.attribute_jobs", lambda ids: {})
+        report = lab.reconcile(apply=False)
+        assert report["gcp_orphans"] == []
+        assert report["unattributed"] == ["lab-laboratory-20260820-071905-771110"]
 
     def test_another_projects_label_is_protected(self, tmp_path, monkeypatch):
         from lab.backends.local import LocalBackend

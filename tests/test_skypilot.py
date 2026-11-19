@@ -159,6 +159,11 @@ class _FakeSky:
             raise self.exc(f"transient #{self.get_calls}")
 
 
+class ApiServerConnectionError(Exception):
+    """Matched by type name, as ``lab._skycompat`` does: sky refused before acting (definitive).
+    A bare ``ConnectionError`` is a transport error — its outcome is *unknown*, not refused."""
+
+
 class _FakeVast:
     def __init__(self, instances: list[dict] | None = None) -> None:
         self.instances = instances or []
@@ -287,7 +292,10 @@ def test_robust_teardown_vast_matching_rental_without_an_id_is_failed(
 def test_robust_teardown_failed_when_both_sky_and_vast_error(
     _no_sleep, monkeypatch: pytest.MonkeyPatch
 ):
-    sky = _FakeSky(fail_times=99)
+    # Every sky.down definitively refused, and Vast cannot be asked: nothing can have destroyed
+    # the rental. (A transport error here instead is `unknown` — test_teardown_unfinished_is_
+    # unknown.py — because the server may have run the destroy.)
+    sky = _FakeSky(fail_times=99, exc=ApiServerConnectionError)
 
     class _BrokenVast:
         def show_instances(self) -> list[dict]:
@@ -309,7 +317,7 @@ def test_tear_down_and_record_records_failure_loudly(
     m = make_manifest("job-1", "python x.py")
     store.create(m)
     store.update_manifest("job-1", end_reason="some prior reason")  # confirm we append, not clobber
-    sky = _FakeSky(fail_times=99)
+    sky = _FakeSky(fail_times=99, exc=ApiServerConnectionError)  # definitive: see the test above
 
     class _BrokenVast:
         def show_instances(self) -> list[dict]:

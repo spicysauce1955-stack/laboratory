@@ -124,6 +124,9 @@ class TestDoDirectFallback:
 
     def test_a_volume_that_will_not_delete_still_alarms(self, monkeypatch):
         """The detached-volume leak is quieter than a droplet but it bills all the same."""
+        # The fallback now rides out the detach race (test_do_detach_race_everywhere.py); a
+        # volume that never detaches still alarms, just after the ladder — which need not be real.
+        monkeypatch.setattr(m.time, "sleep", lambda s: None)
         _patch(
             monkeypatch,
             _Client(
@@ -155,12 +158,20 @@ class TestDoDirectFallback:
         assert client.droplets.destroyed == [1], "only the named cluster's droplet may die"
 
     def test_an_unreachable_do_api_alarms_rather_than_claiming_success(self, monkeypatch):
+        """With sky's refusal definitive, nothing can have destroyed the droplet: `failed`. (An
+        uncertain sky error here is `unknown` — test_teardown_unfinished_is_unknown.py.)"""
+
+        class ClusterDoesNotExist(Exception):
+            """Matched by type name, as lab._skycompat does: a definitive refusal."""
+
         def _boom():
             raise RuntimeError("401 Unauthorized")
 
         monkeypatch.setattr(m, "_get_do_client", _boom)
 
-        out = m.robust_teardown(_Sky(), CLUSTER, cloud="do", backoffs=(0,))
+        out = m.robust_teardown(
+            _Sky(ClusterDoesNotExist("Cluster does not exist.")), CLUSTER, cloud="do", backoffs=(0,)
+        )
 
         assert out["status"] == "failed"
         assert "401" in (out["error"] or "")
