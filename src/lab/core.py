@@ -65,6 +65,7 @@ from lab.models import (
 )
 from lab.aggregate import merge_seed_rows
 from lab.partials import PARTIAL_DIR
+from lab.redact import redact
 from lab.sharding import parse_seeds, partition_seeds, seeds_to_arg
 from lab.store import JobStore, cell_id_for, injected_override_keys
 
@@ -306,6 +307,48 @@ def check_sweep_admission(
             "narrow the grid, lower --max-cost, or raise the budget"
         )
     return worst
+
+
+def _mask_command_secrets(command: str) -> str:
+    """``command`` with inline secrets masked, for copies that leave the store (``lab export``).
+
+    The manifest records the command verbatim, so ``HF_TOKEN=hf_… python x.py`` or
+    ``--api-key …`` would land in a bundle that exists to be committed (FR-J1). Every judgement
+    is the event ledger's own (:mod:`lab.events.sanitize`), applied per shell token:
+
+    * ``NAME=value`` in env-variable form (upper-case identifier, i.e. an env prefix): masked if
+      the name is secret-shaped (``*TOKEN``, ``*_KEY``, …) or the value is.
+    * any other ``k=v`` (a config override): masked only if the value itself is secret-shaped —
+      a hyperparameter named ``max_tokens`` is not a credential.
+    * ``--flag=value`` / ``--flag value``: masked as the ledger masks argv.
+
+    A command with nothing to mask comes back byte-identical (no re-quoting); one that cannot be
+    tokenized falls back to the ledger's free-text masking.
+    """
+    from lab.events.sanitize import mask_text, sanitize_argv, sanitize_params
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return mask_text(command)
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        name, eq, value = tok.partition("=")
+        if tok.startswith("-"):
+            if eq or i + 1 == len(tokens) or tokens[i + 1].startswith("-"):
+                out.append(sanitize_argv([tok])[0])
+            else:  # `--flag value`: judge the value together with the flag that names it
+                out.extend([tok, str(sanitize_argv([tok, tokens[i + 1]])[1])])
+                i += 1
+        elif eq and name.isidentifier():
+            judged_as = name if name.isupper() else "value"
+            out.append(f"{name}={sanitize_params({judged_as: value})[judged_as]}")
+        else:
+            out.append(tok)
+        i += 1
+    return command if out == tokens else redact(shlex.join(out))
 
 
 def _parse_row_key(row_key: str | list[str], seed_column: str) -> list[str]:
@@ -1601,7 +1644,7 @@ class Lab:
                 )
             jdir = dest / jid
             jdir.mkdir(parents=True, exist_ok=True)
-            (jdir / "manifest.json").write_text(self.store.manifest_path(jid).read_text())
+            (jdir / "manifest.json").write_text(self._exportable_manifest_json(jid))
             (jdir / "resolved_config.json").write_text(
                 json.dumps(m.run.resolved_config, indent=2, sort_keys=True, default=str)
             )
@@ -1611,8 +1654,8 @@ class Lab:
                 (jdir / "code_diff.tar.gz").write_bytes(diff.read_bytes())
                 files.append("code_diff.tar.gz")
             if include_logs and self.store.logs_path(jid).exists():
-                (jdir / "logs.txt").write_text(
-                    self.store.logs_path(jid).read_text(errors="replace")
+                (jdir / "logs.txt").write_text(  # FR-J1: the bundle is meant to be committed
+                    redact(self.store.logs_path(jid).read_text(errors="replace"))
                 )
                 files.append("logs.txt")
             # Notes travel with the run. `runs/` is git-ignored, so the bundle is the only route
@@ -1681,6 +1724,18 @@ class Lab:
         }
         atomic_write_text(dest / "index.json", json.dumps(index, indent=2, default=str))
         return index
+
+    def _exportable_manifest_json(self, job_id: str) -> str:
+        """The stored manifest as ``export`` writes it: verbatim, except an inline secret in
+        ``entrypoint_command`` is masked (see :func:`_mask_command_secrets`). The stored manifest
+        is never touched — it stays the reproducibility record."""
+        raw = self.store.manifest_path(job_id).read_text()
+        m = self.manifest(job_id)
+        masked = _mask_command_secrets(m.run.entrypoint_command)
+        if masked == m.run.entrypoint_command:
+            return raw  # nothing secret-shaped: byte-identical copy, as before
+        run = m.run.model_copy(update={"entrypoint_command": masked})
+        return m.model_copy(update={"run": run}).model_dump_json(indent=2)
 
     def sweep_summary(self, sweep_id: str) -> dict[str, Any]:
         """Aggregate a sweep's outcomes for trustworthy reporting (preemptions, fallback, spend)."""
