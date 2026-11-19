@@ -39,6 +39,7 @@ from lab.env import load_lab_env
 from lab.events import store as events_store
 from lab.events.annotate import digest_of, refs_from
 from lab.events.sanitize import sanitize_argv
+from lab.dashboard import DEFAULT_DASHBOARD_ROWS
 from lab.list_view import DEFAULT_LIST_LIMIT, list_view
 from lab.manifest import git_work_tree, repo_root
 from lab.metrics import DEFAULT_MAX_POINTS
@@ -1295,13 +1296,20 @@ def wait(
 def dashboard(
     sweep: str | None = typer.Option(None, "--sweep", help="only jobs in this sweep_id"),
     interval: float = typer.Option(2.0, help="refresh seconds"),
+    limit: int = typer.Option(
+        DEFAULT_DASHBOARD_ROWS, "--limit", "-n", min=0,
+        help="show the most recent N jobs (0 = every job)",
+    ),
 ) -> None:
-    """Live terminal dashboard of job status + cost + latest metrics (FR-D3). Ctrl-C to exit."""
+    """Live terminal dashboard of job status + cost + latest metrics (FR-D3). Ctrl-C to exit.
+
+    Shows the most recent --limit (40) jobs; a caption says how many more there are.
+    """
     from lab.dashboard import run_dashboard
 
     lab = _lab()
     ids = lab.jobs_in_sweep(sweep) if sweep else None
-    run_dashboard(lab, ids, interval=interval)
+    run_dashboard(lab, ids, interval=interval, limit=limit)
 
 
 # Every orphan list `reconcile` can report. The dry-run leak alarm reads the UNION: each pass

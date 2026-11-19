@@ -55,6 +55,27 @@ def _coerce_step(raw: Any) -> int | float | None:
     return int(num) if num.is_integer() else num
 
 
+def parse_point(line: str | bytes) -> dict[str, Any] | None:
+    """One ``metrics.jsonl`` line as ``{name, value, step, wall_time}``, or ``None`` when it is
+    not a point: blank, half-written (a live writer's last line), not a JSON object, a non-string
+    ``name``, or a ``step`` that is not a finite number. Never raises for what the line holds."""
+    if isinstance(line, bytes):
+        line = line.decode("utf-8", "replace")
+    raw = line.strip()
+    if not raw:
+        return None
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    name, step = obj.get("name"), _coerce_step(obj.get("step"))
+    if not isinstance(name, str) or step is None:
+        return None
+    return {"name": name, "value": obj.get("value"), "step": step, "wall_time": obj.get("wall_time")}
+
+
 def iter_points(
     metrics_file: str | Path,
     names: Iterable[str] | None = None,
@@ -78,28 +99,14 @@ def iter_points(
         return
     with f:
         for raw in f:
-            raw = raw.strip()
-            if not raw:
+            pt = parse_point(raw)
+            if pt is None:
                 continue
-            try:
-                obj = json.loads(raw)
-            except json.JSONDecodeError:
-                continue  # half-written trailing line during a live read
-            if not isinstance(obj, dict):
+            if name_set is not None and pt["name"] not in name_set:
                 continue
-            name, step = obj.get("name"), _coerce_step(obj.get("step"))
-            if not isinstance(name, str) or step is None:
+            if since_step is not None and pt["step"] <= since_step:
                 continue
-            if name_set is not None and name not in name_set:
-                continue
-            if since_step is not None and step <= since_step:
-                continue
-            yield {
-                "name": name,
-                "value": obj.get("value"),
-                "step": step,
-                "wall_time": obj.get("wall_time"),
-            }
+            yield pt
 
 
 def read_points(
@@ -199,6 +206,20 @@ def _reverse_chunks(fh: IO[bytes], size: int) -> Iterator[tuple[int, bytes]]:
             yield start + cut + 1, data[cut + 1 :]
 
 
+def last_line_boundary(metrics_file: str | Path, size: int) -> int:
+    """The offset just past the last newline at or before ``size`` (0 if none in the final
+    block): where an incremental reader can resume without splitting a line. A line longer than a
+    block resumes mid-line, and that one line is then skipped as malformed — never a crash."""
+    try:
+        with Path(metrics_file).open("rb") as fh:
+            start = max(0, size - _BLOCK)
+            fh.seek(start)
+            cut = fh.read(size - start).rfind(b"\n")
+    except OSError:
+        return 0
+    return start + cut + 1 if cut >= 0 else start
+
+
 class _Series:
     """What the reverse scan knows about one series."""
 
@@ -284,18 +305,10 @@ def series_view(
 
     def consider(line: bytes, offset: int) -> bool:
         """Fold one line in; True when it finished a series (worth re-trying a skip)."""
-        raw = line.strip()
-        if not raw:
+        pt = parse_point(line)
+        if pt is None:
             return False
-        try:
-            obj = json.loads(raw.decode("utf-8", "replace"))
-        except json.JSONDecodeError:
-            return False  # half-written trailing line during a live read
-        if not isinstance(obj, dict):
-            return False
-        name, step = obj.get("name"), _coerce_step(obj.get("step"))
-        if not isinstance(name, str) or step is None:
-            return False
+        name, step = pt.pop("name"), pt["step"]
         if wanted is not None and name not in wanted:
             return False
         s = state.get(name)
@@ -311,7 +324,7 @@ def series_view(
                 return True
             return False
         first_seen[name] = offset  # series are ordered by their first in-range point
-        point = {"step": step, "value": obj.get("value"), "wall_time": obj.get("wall_time")}
+        point = {"step": step, "value": pt["value"], "wall_time": pt["wall_time"]}
         if not capped:
             s.kept.append(point)
         elif downsample:

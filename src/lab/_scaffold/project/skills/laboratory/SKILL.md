@@ -452,8 +452,9 @@ declined **or** there was no tty to ask at (nothing was destroyed).
 
 ### `uv run lab dashboard` — live terminal view
 
-Live table of all jobs with state, cost, latest metric, and a **`teardown`**
-column that flags `LEAK` rows loudly. Ctrl-C to exit.
+Live table of the most recent jobs (`--limit 40` by default, `0` for all; a
+caption says how many more exist) with state, cost, latest metric, and a
+**`teardown`** column that flags `LEAK` rows loudly. Ctrl-C to exit.
 
 ### `uv run lab note` — tell us what went wrong (and tell the next run)
 
