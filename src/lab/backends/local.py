@@ -20,6 +20,7 @@ from lab._util import infer_artifact_type, now, pid_alive, process_start_time
 from lab.manifest import sha256_file
 from lab.metrics import METRICS_FILE, read_points
 from lab.models import ArtifactRecord, JobManifest, JobState
+from lab.runner import stop_group
 from lab.store import JobStore
 
 _TERMINAL = {
@@ -92,9 +93,14 @@ class LocalBackend:
         )
         rt = self.store.read_runtime(job_id)
         if rt.get("command_pgid"):
-            _kill(rt["command_pgid"], group=True)
-        if rt.get("runner_pid"):
-            _kill(rt["runner_pid"], group=False)
+            # SIGTERM, a grace, then SIGKILL — an experiment that ignores SIGTERM must not outlive
+            # the `cancelled` just recorded. Skipped if the group id now belongs to someone else.
+            stop_group(rt["command_pgid"], leader_start_time=rt.get("command_start_time"))
+        runner_pid = rt.get("runner_pid")
+        if runner_pid and pid_alive(runner_pid, start_time=rt.get("runner_start_time")):
+            # Only the runner we launched: a bare PID may have been recycled by now, and this
+            # used to SIGTERM whatever held the number.
+            _kill(runner_pid, group=False)
         return JobState.cancelled
 
     def collect_artifacts(self, job_id: str, dest: str) -> list[ArtifactRecord]:
