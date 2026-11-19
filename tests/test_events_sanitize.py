@@ -389,3 +389,304 @@ def test_argv_and_note_text_are_untouched_by_the_wrapper() -> None:
         "lab", "queue", "list", MASK,
     ]
     assert mask_text(f"failed on {REAL_KEY}") == f"failed on {MASK}"
+
+
+# --- adversarial: secrets the word-boundary bug let through ------------------------------------
+#
+# `_SENSITIVE_FLAG_NAME` used `\b`, and `_` is a word character, so `--wandb_key`, `--api_key`
+# and `--db_password` never matched; and a W&B key is 40 hex, which the commit-SHA exemption lets
+# through on shape alone. The flag name is the only signal for a short or SHA-shaped secret, so
+# the name test has to see `_`-separated (and camelCase, and env-style) names.
+
+WANDB = "3f2a9c1be0d47a65f8c2b19d3e0a7c6f5b4d2e19"  # 40 hex: W&B API key shape (== a commit SHA)
+R2_ID = "8c1f3a9e2b7d4c6f0a5e9b3d1c7f2a4e"  # 32 hex: R2 access key id shape
+R2_SECRET = "9" + "a3f1c8e2b7d4" * 5 + "0f1"  # 64 hex: R2 secret / Vast API key shape
+AKIA = "AKIAIOSFODNN7EXAMPLE"  # AWS access key id
+AWS_SECRET = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"  # AWS secret access key (40, base64-ish)
+GCP_API_KEY = "AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI"
+DO_TOKEN = "dop_v1_" + "4c6f0a5e9b3d1c7f" * 4
+
+
+@pytest.mark.parametrize(
+    "command, secret",
+    [
+        (f"python train.py --wandb_key {WANDB} --lr 0.1", WANDB),
+        (f"python train.py --wandb_key={WANDB} --lr 0.1", WANDB),
+        ("python t.py --db_password hunter2 --epochs 3", "hunter2"),
+        ("python t.py --api_key s3cr3tv4lue --x 1", "s3cr3tv4lue"),
+        ("python t.py --apikey s3cr3tv4lue --x 1", "s3cr3tv4lue"),
+        ("python t.py --apiKey s3cr3tv4lue --x 1", "s3cr3tv4lue"),
+        ("python t.py --auth_token s3cr3tv4lue", "s3cr3tv4lue"),
+        ("python t.py --hf-token hf_short", "hf_short"),
+        ("python t.py --db-pass hunter2", "hunter2"),
+        (f"WANDB_API_KEY={WANDB} python t.py", WANDB),
+        ("DB_PASSWORD=hunter2 python t.py", "hunter2"),
+        ("SMTP_PASS=hunter2 python t.py", "hunter2"),
+        (f"env AWS_SECRET_ACCESS_KEY={AWS_SECRET} AWS_ACCESS_KEY_ID={R2_ID} python t.py", R2_ID),
+        (f"env AWS_SECRET_ACCESS_KEY={AWS_SECRET} python t.py", AWS_SECRET),
+    ],
+)
+def test_a_secret_behind_an_underscored_or_env_style_name_is_masked(
+    command: str, secret: str
+) -> None:
+    for out in (
+        sanitize_params({"command": command})["command"],
+        sanitize_argv(["submit", "-c", command])[2],
+        mask_text(command),
+    ):
+        assert secret not in out, out
+        assert MASK in out
+        assert "python" in out or "aws" in out  # the rest of the line stays readable
+
+
+def test_the_separate_token_argv_path_still_masks_underscored_flags() -> None:
+    assert sanitize_argv(["submit", "--wandb_key", WANDB]) == ["submit", "--wandb_key", MASK]
+    assert sanitize_argv(["submit", "--db_password=hunter2"]) == ["submit", f"--db_password={MASK}"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "the keyboard layout broke the monkey patch in the tokenizer",
+        "python t.py --keyboard qwerty --tokenizer bert-base --monkey 3",
+        "python t.py --max_tokens 512 --num_keys 4 --pass_rate 0.9 --keyword search",
+        "python t.py --seed 3 --lr=0.1 --model=bert TOKENIZERS_PARALLELISM=false",
+        "TOKENIZERS_PARALLELISM=false KEYBOARD=us python t.py",
+        "python t.py model.key_dim=64 optim.token_budget=5 --key-dim 64 --secret-sauce v2",
+        '{"tokenizer": "bert", "keyboard": "us", "max_tokens": 512}',
+        "commit a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0 at j-20260908-1a2b3c4d",
+        "it's a re-authorized, bypass-free change; she said \"looks fine\"",
+    ],
+)
+def test_ordinary_words_that_contain_a_secret_word_are_not_masked(text: str) -> None:
+    """The boundary must be a real one: `keyboard`, `monkey`, `tokenizer`, `max_tokens` and
+    `bypass` merely contain `key`/`token`/`pass`, and masking around them corrupts the record
+    while protecting nothing."""
+    assert mask_text(text) == text
+    assert sanitize_params({"command": text}) == {"command": text}
+
+
+@pytest.mark.parametrize(
+    "url, secret",
+    [
+        ("curl https://api.x.io/v1?token=abc123def456 -o out", "abc123def456"),
+        ("curl 'https://api.x.io/v1?a=1&access_token=zzz9&b=2'", "zzz9"),
+        ("psql https://admin:hunter2@db.example.com:5432/x", "hunter2"),
+        ("open https://u:pw@h/x", "pw"),
+        (
+            "curl 'https://acc.r2.cloudflarestorage.com/b/k?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+            f"&X-Amz-Credential={R2_ID}%2F20261119%2Fauto%2Fs3%2Faws4_request"
+            f"&X-Amz-Signature={'ab' * 32}'",
+            R2_ID,
+        ),
+    ],
+)
+def test_credentials_inside_urls_are_masked(url: str, secret: str) -> None:
+    for out in (sanitize_params({"command": url})["command"], mask_text(url)):
+        assert secret not in out, out
+
+
+def test_a_presigned_url_signature_is_masked_but_the_host_stays_readable() -> None:
+    url = f"https://acc.r2.cloudflarestorage.com/b/k?X-Amz-Signature={'cd' * 32}&x=1"
+    out = mask_text(f"fetch {url} failed")
+    assert "cd" * 32 not in out
+    assert "fetch" in out and "failed" in out
+
+
+@pytest.mark.parametrize(
+    "payload, secret",
+    [
+        ('{"user": "x", "password": "hunter2"}', "hunter2"),
+        ('{"user":"x","password":"hunter2"}', "hunter2"),
+        ('{"headers": {"Authorization": "Bearer abc123xyz"}}', "abc123xyz"),
+        ("{'api_key': 's3cr3t', 'n': 3}", "s3cr3t"),
+        ('{"wandb_key": "' + WANDB + '"}', WANDB),
+        ('{"aws_access_key_id": "' + R2_ID + '"}', R2_ID),
+        ("got 401 with header Bearer abc123xyz from upstream", "abc123xyz"),
+    ],
+)
+def test_json_and_dict_repr_inside_a_string_are_masked(payload: str, secret: str) -> None:
+    """Error text often embeds a request body or a Python dict repr; the field name is the only
+    signal for a short secret there, exactly as it is for a flag."""
+    for out in (sanitize_params({"payload": payload})["payload"], mask_text(payload)):
+        assert secret not in out, out
+
+
+def test_nested_dicts_and_lists_are_masked_by_name_at_every_depth() -> None:
+    out = sanitize_params(
+        {
+            "env": {"DB_PASS": "hunter2", "WANDB_API_KEY": WANDB, "PATH": "/usr/bin"},
+            "items": [{"name": "x", "db_password": "hunter2"}, {"apiKey": "s3cr3t"}],
+            "deep": {"a": {"b": {"c": {"client_secret": "x"}}}},
+        }
+    )
+    assert out["env"] == {"DB_PASS": MASK, "WANDB_API_KEY": MASK, "PATH": "/usr/bin"}
+    assert out["items"] == [{"name": "x", "db_password": MASK}, {"apiKey": MASK}]
+    assert out["deep"] == {"a": {"b": {"c": {"client_secret": MASK}}}}
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [AKIA, AWS_SECRET, R2_SECRET, GCP_API_KEY, DO_TOKEN, "ya29.a0AfH6SMBshort"],
+)
+def test_bare_provider_key_shapes_are_masked_in_prose(secret: str) -> None:
+    """No name in front at all — the shape of a pasted traceback. (A bare 40- or 32-hex value is
+    deliberately NOT here: it is indistinguishable from a commit SHA or a cell id, and only its
+    name can say otherwise — which the tests above cover.)"""
+    out = mask_text(f"failed with key {secret} during connect")
+    assert secret not in out
+    assert out.startswith("failed with key") and out.endswith("during connect")
+    assert sanitize_params({"msg": f"failed with key {secret} during connect"})["msg"] == out
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        # A glued env-style prefix: `PGPASSWORD`, `MYSQLPASSWORD` have no segment boundary in
+        # front of `password`, so the segment test alone never saw them (stress run 2026-11-19).
+        ("PGPASSWORD=s3cretpass python t.py", "s3cretpass"),
+        ("env MYSQLPASSWORD=s3cretpass ./load", "s3cretpass"),
+        ("python t.py db.password=hunter2", "hunter2"),
+        ("password=Tr0ub4dor&3 python t.py", "&3"),  # the tail after `&` used to survive
+        ("--grid password=a,b", ",b"),  # ...and after `,`
+        ("Settings(password='hunter2', user='x') failed to validate", "hunter2"),
+        ("the config said password: hunter2 and it was wrong", "hunter2"),
+        ("db_password = hunter2 in settings.ini", "hunter2"),
+    ],
+)
+def test_a_value_named_like_a_credential_is_masked_in_argv_params_and_notes(
+    text: str, secret: str
+) -> None:
+    for out in (
+        sanitize_params({"command": text})["command"],
+        sanitize_argv(["submit", "-c", text])[2],
+        mask_text(text),
+    ):
+        assert secret not in out, out
+        assert MASK in out
+
+
+def test_the_ledger_and_the_log_share_one_name_test() -> None:
+    """M3 asked for `redact` to learn credential names; a second list would drift from the
+    sanitizer's. There is one: the sanitizer's own name test, now living in `lab.redact`."""
+    from lab.events import sanitize
+    from lab.redact import sensitive_name
+
+    assert sanitize._sensitive_name is sensitive_name
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Spaced `=` and `name:` are prose-shaped, so they need a *qualified* name: a bare
+        # `key`/`token` there is the subject of a sentence far more often than a credential.
+        "the key: it was the accelerator name, not the price",
+        "token = the unit the tokenizer emits; key = the dict key",
+        "if api_key == expected: return",
+        "lr=0.1 seed=3 max_tokens=512 model.key_dim=64",
+    ],
+)
+def test_prose_about_keys_and_tokens_is_left_alone(text: str) -> None:
+    assert mask_text(text) == text
+
+
+def test_masking_is_idempotent_on_the_new_shapes() -> None:
+    text = (
+        f"DB_PASSWORD=hunter2 python t.py --wandb_key {WANDB} "
+        '{"password": "x"} https://u:pw@h/?token=t'
+    )
+    once = mask_text(text)
+    assert mask_text(once) == once
+
+
+# --- precision both ways (stress run 2026-11-19, M4) ------------------------------------------
+#
+# The entropy bar ("≥ 32 chars, > 3.5 bits") is right for an unknown credential — one long run
+# from a token alphabet — and wrong for anything *structured*: a run path, an object URL, a
+# digest, a cluster name, the lab's own hint text. Those were masked on sight, which cost the
+# ledger exactly the identifiers forensics needs (which output file, which bucket object, which
+# cluster to check is gone). The exemption is narrow on purpose:
+#
+#   * it only ever applies to a word the entropy bar would otherwise have masked;
+#   * the word must carry its own provenance — a lab id or `lab-` resource name, a digest
+#     prefix, a URL scheme, a filesystem root, a backtick (markdown/the lab's own text);
+#   * a path or URL must contain a character no standard-base64 credential can (`.` `-` `_` `:`
+#     `~`…), so an AWS-style secret that merely contains `/` never qualifies; and
+#   * no alphanumeric run in it may look like a credential (≥ 16 chars mixing letters and digits,
+#     or ≥ 32 of anything) — so a secret glued onto a lab id or hidden as a path segment fails.
+#
+# An *unanchored* relative object key (`queue/jobs/…json`) is deliberately still masked: that is
+# `ObjectKey`'s documented territory (a type, vetted at the call site), not a shape rule's.
+
+MUST_KEEP = [
+    "runs/20261119-102456-7486e1/output/hits.jsonl",
+    "20261119-102456-7486e1/output/hits.jsonl",
+    "/home/user/.superset/projects/laboratory/runs/x",
+    "~/papers/2026-capacity/bundles/sweep-final",
+    "r2://lab-artifacts/20261119-102456-7486e1/code_diff.tar.gz",
+    "gs://my-bucket/path/to/object.tar.gz",
+    "s3://bucket/experiments/run-03/metrics.jsonl",
+    "https://console.vast.ai/api/v0/instances/12345678/",
+    "sha256:bfc4f36ac542595781161b3a000ba322ae35f82e0f575a4cdb9b0014065bd9c8",
+    "ghcr.io/org/image@sha256:bfc4f36ac542595781161b3a000ba322ae35f82e0f575a4cdb9b0014065bd9c8",
+    "commit e18e4dbf6a12f0f71ccb868cd31fa8d1b2c0d381 (short e18e4db)",
+    "lab-proj-20261119-102456-7486e1-head-1a2b3c4d-compute",
+    "lab-tempotron-capacity-20261119-102456-7486e1",
+    "lab-laboratory-20260820-ef-3dd12990-head-c0h9pkx0-compute",  # GCP-truncated: no job id
+    "lab-agent-a-26cd-job-ghost-noted",
+    "sweep-20261119-102809-b2ca49 and reg-20261119-102809-b2ca49",
+    "unknown job id '20261119-102456-7486e1' — not in local runs/ and not in the scheduler's "
+    "mirrored queue either (for scheduler-launched jobs, `lab status`/`fetch`/`metrics`/`logs` "
+    "read the mirrored manifest)",
+    # ...and the earlier fixes, which must stay fixed.
+    "python t.py --keyboard qwerty --tokenizer bert-base max_tokens=512 model.key_dim=64",
+]
+
+
+@pytest.mark.parametrize("text", MUST_KEEP)
+def test_structured_non_secrets_survive_every_path(text: str) -> None:
+    assert mask_text(text) == text
+    assert sanitize_params({"msg": text}) == {"msg": text}
+    assert sanitize_argv(["note", "-m", text]) == ["note", "-m", text]
+
+
+def test_an_export_destination_survives_as_a_separate_argv_token() -> None:
+    argv = ["export", "sweep-20261119-102809-b2ca49", "--to",
+            "/home/user/.superset/projects/laboratory/out/s4-export"]
+    assert sanitize_argv(argv) == argv
+
+
+MUST_MASK = [
+    # earlier fixes: a name is the only signal for a SHA-shaped secret
+    (f"python train.py --wandb_key {WANDB}", WANDB),
+    (f"WANDB_API_KEY={WANDB} python t.py", WANDB),
+    # a bare 64-hex value is a Vast API key / R2 secret shape; only a digest *prefix* exempts one
+    (f"failed with key {R2_SECRET} during connect", R2_SECRET),
+    # path-shaped credentials: pure base64 (no `.`/`-`/`_`) never counts as a path, rooted or not
+    (f"creds {AWS_SECRET} loaded", AWS_SECRET),
+    ("creds /K7MDENGbPxRfiCYEX/wJalrXUtnFEMI9zQ loaded", "K7MDENGbPxRfiCYEX"),
+    # anchored, but a segment is credential-shaped
+    ("gs://bucket/AbC123dEf456GhI789jKl012MnO345pQr/x.json", "AbC123dEf456GhI789jKl012MnO345pQr"),
+    ("runs/20261119-102456-7486e1/aB3dE5gH7jK9mN1pQ3sT5vX7/out", "aB3dE5gH7jK9mN1pQ3sT5vX7"),
+    ("20261119-102456-7486e1-aB3dE5gH7jK9mN1pQ3sT5vX7zZ", "aB3dE5gH7jK9mN1pQ3sT5vX7zZ"),
+    ("https://hooks.slack.com/services/" "T0AAAAAAA/B0BBBBBBB/xYz12AbC34dEf56GhI78jKl9",
+     "xYz12AbC34dEf56GhI78jKl9"),
+    ("lab-aB3dE5gH7jK9mN1pQ3sT5vX7zZ0qR2wY4", "aB3dE5gH7jK9mN1pQ3sT5vX7zZ0qR2wY4"),
+    ("see `aB3dE5gH7jK9mN1pQ3sT5vX7zZ0qR2wY4` for the key", "aB3dE5gH7jK9mN1pQ3sT5vX7zZ0qR2wY4"),
+    # a URL is exempt only without credentials in it, and a digest only for its own hex
+    ("clone https://user:pa55w0rd@github.com/org/repo.git", "pa55w0rd"),
+    ("pull aB3dE5gH7jK9mN1pQ3@sha256:"
+     "bfc4f36ac542595781161b3a000ba322ae35f82e0f575a4cdb9b0014065bd9c8", "aB3dE5gH7jK9mN1pQ3"),
+    # names, and vendor shapes
+    ("PGPASSWORD=s3cretpass psql", "s3cretpass"),
+    ("token ghp_" + "aZ3kQ9xW2mP7vB4nR8tY1cL6jH5gF0dSe2Wq" + " used", "aZ3kQ9xW2mP7vB4nR8tY1cL"),
+    # the documented ObjectKey boundary: an unanchored relative key stays masked as a plain str
+    (f"failed on {REAL_KEY}", REAL_KEY),
+]
+
+
+@pytest.mark.parametrize(("text", "secret"), MUST_MASK, ids=[s[:24] for _, s in MUST_MASK])
+def test_credentials_stay_masked_whatever_they_hide_behind(text: str, secret: str) -> None:
+    for out in (mask_text(text), sanitize_params({"msg": text})["msg"],
+                sanitize_argv(["note", "-m", text])[2]):
+        assert secret not in out, out

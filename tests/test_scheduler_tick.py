@@ -260,6 +260,59 @@ def test_orphaned_launching_with_existing_job_repairs_to_launched(tmp_path: Path
     assert repaired.state is RegState.launched and repaired.job_id == job_id
 
 
+def _stuck_launching_with_attempts(
+    tmp_path: Path, attempts: list[tuple[str, JobState, timedelta]]
+) -> tuple[Scheduler, LocalQueueStore]:
+    """reg-a stuck in `launching` since 20 min ago, plus earlier/later job attempts for it."""
+    sched, q = _watchdog_sched(tmp_path)
+    put_reg(q, tmp_path, "reg-a", command="python x.py", expires=utc_now() + timedelta(days=1))
+    for job_id, status, created_ago in attempts:
+        sched.store.create(make_manifest(job_id, "python x.py").model_copy(update={
+            "status": status, "registration_id": "reg-a",
+            "created_at": utc_now() - created_ago}))
+    q.put_entry(q.get_entry("reg-a").model_copy(update={
+        "state": RegState.launching, "job_id": None,
+        "state_changed_at": utc_now() - timedelta(minutes=20)}))
+    sched._launch = lambda reg, rep: None  # type: ignore[method-assign]
+    return sched, q
+
+
+def test_repair_adopts_this_attempts_job_not_an_earlier_cancelled_one(tmp_path: Path):
+    """A reg that was relaunched (price-verify rollback, preemption) has an EARLIER attempt in the
+    store carrying the same registration_id. Adopting the oldest bound the reg to that cancelled
+    attempt -- and the next tick mirrored it to `cancelled` while this attempt was still running."""
+    sched, q = _stuck_launching_with_attempts(tmp_path, [
+        ("j-20260101-aaaa", JobState.cancelled, timedelta(hours=2)),  # before this launch began
+        ("j-20260102-bbbb", JobState.running, timedelta(minutes=19)),  # this launch's submit
+    ])
+    sched.tick()
+    e = q.get_entry("reg-a")
+    assert e.state is RegState.launched and e.job_id == "j-20260102-bbbb"
+    sched.tick()
+    assert q.get_entry("reg-a").state is RegState.launched  # never flipped to cancelled
+
+
+def test_repair_never_adopts_only_a_prior_attempt(tmp_path: Path):
+    """The only job on file predates this `launching`: this launch never submitted, so the reg
+    goes back to pending -- it must not inherit the old attempt's terminal state."""
+    sched, q = _stuck_launching_with_attempts(tmp_path, [
+        ("j-20260101-aaaa", JobState.preempted, timedelta(hours=2)),
+    ])
+    rep = sched.tick()
+    e = q.get_entry("reg-a")
+    assert e.state is RegState.pending and e.job_id is None
+    assert any("no job manifest" in err for err in rep.errors)
+
+
+def test_repair_picks_the_newest_attempt_after_the_launch_began(tmp_path: Path):
+    sched, q = _stuck_launching_with_attempts(tmp_path, [
+        ("j-20260102-cccc", JobState.running, timedelta(minutes=10)),
+        ("j-20260102-bbbb", JobState.failed, timedelta(minutes=19)),
+    ])
+    sched.tick()
+    assert q.get_entry("reg-a").job_id == "j-20260102-cccc"
+
+
 def test_sync_mirrors_terminal_state_and_manifest(tmp_path: Path):
     sched, q = make_sched(tmp_path)
     put_reg(q, tmp_path, "reg-a")
@@ -600,6 +653,79 @@ def test_reconcile_sweep_every_n_ticks(tmp_path: Path):
     assert calls[-1] is True
 
 
+def test_the_new_tick_count_is_persisted_before_the_reconcile_sweep_starts(tmp_path: Path):
+    """The reconcile tick is the slow one (sky.status + provider APIs). If systemd kills it at
+    TimeoutStartSec (or it OOMs) after the heartbeat was meant to be written at the *end*, the
+    tick_count never advanced: every later tick was the same reconcile tick, killed the same way,
+    and the heartbeat went stale for good -- so the deploy preflight refused the very redeploy
+    that would have fixed it."""
+    sched, q = _watchdog_sched(tmp_path)
+    q.write_heartbeat({"tick_count": 29, "at": utc_now().isoformat()})
+    seen: list[int] = []
+
+    def reconcile(apply: bool) -> dict[str, object]:
+        hb = q.read_heartbeat()
+        seen.append(hb["tick_count"] if hb else -1)
+        return {"orphans": []}
+
+    sched._reconcile = reconcile  # type: ignore[method-assign]
+    sched.tick()
+    assert seen == [30]  # already durable while the sweep runs
+
+
+def test_a_reconcile_sweep_that_overruns_its_budget_is_abandoned_not_waited_on(tmp_path: Path):
+    """The sweep gets its own time budget inside TimeoutStartSec: a hung sweep must not take the
+    whole tick down with it, and must not be retried on the next tick."""
+    import threading
+    import time
+
+    sched, q = _watchdog_sched(tmp_path, reconcile_budget_s=0.2)
+    q.write_heartbeat({"tick_count": 29, "at": utc_now().isoformat()})
+    release = threading.Event()
+    calls: list[bool] = []
+
+    def hung(apply: bool) -> dict[str, object]:
+        calls.append(apply)
+        release.wait(30)
+        return {}
+
+    sched._reconcile = hung  # type: ignore[method-assign]
+    try:
+        t0 = time.monotonic()
+        rep = sched.tick()
+        assert time.monotonic() - t0 < 10
+        assert any("budget" in e for e in rep.errors)
+        hb = q.read_heartbeat()
+        assert hb is not None and hb["tick_count"] == 30
+        assert any("budget" in e for e in hb["errors"])
+        sched.tick()  # tick 31: not a reconcile tick
+        assert calls == [False]
+    finally:
+        release.set()
+
+
+def test_a_tick_that_crashes_still_advances_and_reports_its_heartbeat(tmp_path: Path):
+    """A bug that raises out of the tick every minute must leave the host visibly alive-but-
+    failing (fresh heartbeat, the error in it), not indistinguishable from a dead one -- the
+    deploy preflight reads heartbeat age, and a host that can never be redeployed can never be
+    fixed."""
+    sched, q = _watchdog_sched(tmp_path)
+
+    def boom(*a: object, **k: object) -> None:
+        raise RuntimeError("evaluate exploded")
+
+    sched._evaluate_and_launch = boom  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        sched.tick()
+    hb = q.read_heartbeat()
+    assert hb is not None and hb["tick_count"] == 1
+    assert any("evaluate exploded" in e for e in hb["errors"])
+    with pytest.raises(RuntimeError):
+        sched.tick()
+    hb = q.read_heartbeat()
+    assert hb is not None and hb["tick_count"] == 2
+
+
 def test_local_watchdog_fails_dead_runner(tmp_path: Path):
     """A dead local runner must not leave the reg `launched` forever (slot starvation)."""
     sched, q = _watchdog_sched(tmp_path)
@@ -657,7 +783,7 @@ def test_preempted_registered_job_is_resubmitted_under_budget(tmp_path):
     q.put_entry(q.get_entry("reg-a").model_copy(update={
         "state": RegState.launched, "job_id": "j-spot", "launched_at": utc_now()}))
     relaunched: list[str] = []
-    sched._relaunch_preempted = lambda reg: relaunched.append(reg.reg_id)  # type: ignore[method-assign]
+    sched._launch = lambda reg, rep: relaunched.append(reg.reg_id)  # type: ignore[method-assign]
     sched.tick()
     e = q.get_entry("reg-a")
     assert relaunched == ["reg-a"]
@@ -676,7 +802,7 @@ def test_preempted_stops_at_retry_cap(tmp_path):
     q.put_entry(q.get_entry("reg-a").model_copy(update={
         "state": RegState.launched, "job_id": "j-spot", "launched_at": utc_now(),
         "preempt_count": 2}))  # cap reached (default max_preempt_retries=2)
-    sched._relaunch_preempted = lambda reg: (_ for _ in ()).throw(AssertionError("must not relaunch"))  # type: ignore[method-assign]
+    sched._launch = lambda reg, rep: (_ for _ in ()).throw(AssertionError("must not relaunch"))  # type: ignore[method-assign]
     rep = sched.tick()
     assert q.get_entry("reg-a").state is RegState.failed
     assert rep.synced["reg-a"] == "preempted (retry cap reached)"
@@ -696,7 +822,7 @@ def test_preempted_stops_when_budget_exhausted(tmp_path):
     sched.store.create(m)
     q.put_entry(q.get_entry("reg-a").model_copy(update={
         "state": RegState.launched, "job_id": "j-spot", "cumulative_usd": 0.0}))
-    sched._relaunch_preempted = lambda reg: (_ for _ in ()).throw(AssertionError("must not relaunch"))  # type: ignore[method-assign]
+    sched._launch = lambda reg, rep: (_ for _ in ()).throw(AssertionError("must not relaunch"))  # type: ignore[method-assign]
     rep = sched.tick()
     assert q.get_entry("reg-a").state is RegState.failed
     assert "budget" in rep.synced["reg-a"]
@@ -711,7 +837,7 @@ def test_preempted_with_failed_teardown_is_not_resubmitted(tmp_path):
     sched.store.create(m)
     q.put_entry(q.get_entry("reg-a").model_copy(update={
         "state": RegState.launched, "job_id": "j-spot"}))
-    sched._relaunch_preempted = lambda reg: (_ for _ in ()).throw(AssertionError("must not relaunch"))  # type: ignore[method-assign]
+    sched._launch = lambda reg, rep: (_ for _ in ()).throw(AssertionError("must not relaunch"))  # type: ignore[method-assign]
     rep = sched.tick()
     assert q.get_entry("reg-a").state is RegState.failed
     assert "teardown" in rep.synced["reg-a"]
@@ -727,14 +853,14 @@ def test_tick_report_lists_preempted(tmp_path):
     sched.store.create(m)
     q.put_entry(q.get_entry("reg-a").model_copy(update={
         "state": RegState.launched, "job_id": "j-spot", "launched_at": utc_now()}))
-    sched._relaunch_preempted = lambda reg: None  # type: ignore[method-assign]
+    sched._launch = lambda reg, rep: None  # type: ignore[method-assign]
     rep = sched.tick()
     assert "reg-a" in rep.preempted
 
 
 def test_preemption_resubmit_loop_accumulates_then_hits_retry_cap(tmp_path):
     """Drive preempt -> resubmit -> preempt -> resubmit -> retry-cap through the REAL
-    _handle_preempted (only _relaunch_preempted / _launch are stubbed, to stay deterministic):
+    _handle_preempted (only _launch is stubbed, to stay deterministic):
     preempt_count and cumulative_usd must accumulate across attempts, and the per-point retry cap
     (default 2) must stop the loop by FAILING the reg — never killing a running job."""
     sched, q = _watchdog_sched(tmp_path)
@@ -742,8 +868,8 @@ def test_preemption_resubmit_loop_accumulates_then_hits_retry_cap(tmp_path):
     put_reg(q, tmp_path, "reg-a", command="python x.py",
             expires=utc_now() + timedelta(days=1), max_cost=100.0)
     relaunched: list[str] = []
-    sched._relaunch_preempted = lambda reg: relaunched.append(reg.reg_id)  # type: ignore[method-assign]
-    sched._launch = lambda reg, rep: None  # type: ignore[method-assign]  # no real same-tick relaunch
+    # Records the gated relaunch without performing it (no real same-tick launch).
+    sched._launch = lambda reg, rep: relaunched.append(reg.reg_id)  # type: ignore[method-assign]
 
     def preempt(job_id: str, actual: float) -> None:
         """Point reg-a at a freshly-preempted attempt, preserving its accumulated counters."""
@@ -771,6 +897,90 @@ def test_preemption_resubmit_loop_accumulates_then_hits_retry_cap(tmp_path):
     assert e.state is RegState.failed and "retry cap" in rep.synced["reg-a"]
     assert relaunched == ["reg-a", "reg-a"]  # never relaunched a third time
     assert e.preempt_count == 2 and e.cumulative_usd == 0.7  # unchanged once the cap fires
+
+
+def _preempted_reg_a(sched: Scheduler, q: LocalQueueStore, tmp_path: Path, **kw: object) -> None:
+    put_reg(q, tmp_path, "reg-a", command="python x.py", expires=utc_now() + timedelta(days=1),
+            max_cost=100.0, **kw)  # type: ignore[arg-type]
+    sched.store.create(make_manifest("j-spot", "python x.py", timeout="1h").model_copy(update={
+        "status": JobState.preempted, "registration_id": "reg-a", "teardown_status": "succeeded",
+        "cost": CostInfo(actual_usd=0.4, hourly_usd=0.4, estimated_usd=0.4)}))
+    q.put_entry(q.get_entry("reg-a").model_copy(update={
+        "state": RegState.launched, "job_id": "j-spot", "launched_at": utc_now()}))
+
+
+def _recording_lab(sched: Scheduler) -> list[str]:
+    submitted: list[str] = []
+    n = iter(range(100))
+
+    class FakeLab:
+        def submit(self, spec, **kw):  # type: ignore[no-untyped-def]
+            jid = f"j-new-{next(n)}"
+            sched.store.create(make_manifest(jid, "python x.py", timeout="1h").model_copy(
+                update={"status": JobState.running, "registration_id": kw["registration_id"],
+                        "cost": CostInfo(estimated_usd=0.4)}))
+            submitted.append(kw["registration_id"])
+            return jid
+
+    sched.make_lab = lambda repo: FakeLab()  # type: ignore[method-assign,assignment,return-value]
+    return submitted
+
+
+def test_a_preempt_resubmit_respects_max_concurrent(tmp_path: Path):
+    """The resubmit used to call `_launch` straight from `_sync`, bypassing every gate in
+    `_evaluate_and_launch` -- and the relaunched reg stayed `pending` in the tick's entries, so
+    it was not even counted: two running jobs under max_concurrent=1."""
+    sched, q = _watchdog_sched(tmp_path)
+    q.write_control(ControlConfig(max_concurrent=1))
+    _preempted_reg_a(sched, q, tmp_path)
+    put_reg(q, tmp_path, "reg-b", command="python x.py", expires=utc_now() + timedelta(days=1))
+    submitted = _recording_lab(sched)
+
+    rep = sched.tick()
+
+    assert len(submitted) == 1, submitted
+    states = {r: q.get_entry(r).state for r in ("reg-a", "reg-b")}
+    assert sorted(s.value for s in states.values()) == ["launched", "pending"]
+    assert "max_concurrent" in rep.skipped[next(r for r, s in states.items() if s is RegState.pending)]
+
+
+def test_a_preempt_resubmit_waits_for_its_window(tmp_path: Path):
+    """Outside the registration's launch window, a preempted job waits for the window like any
+    other launch -- it does not relaunch at 2pm because it happened to be preempted at 2pm."""
+    from datetime import time as dtime
+
+    from lab.scheduler.models import DailyWindow
+
+    now_local = utc_now()
+    shut = DailyWindow(
+        start=dtime((now_local.hour + 2) % 24, 0), end=dtime((now_local.hour + 3) % 24, 0)
+    )
+    sched, q = _watchdog_sched(tmp_path)
+    _preempted_reg_a(sched, q, tmp_path, triggers=Triggers(window=shut))
+    submitted = _recording_lab(sched)
+
+    rep = sched.tick()
+
+    assert submitted == []
+    e = q.get_entry("reg-a")
+    assert e.state is RegState.pending and e.preempt_count == 1  # requeued, counted, waiting
+    assert "outside window" in rep.skipped["reg-a"]
+
+
+def test_a_preempt_resubmit_respects_the_daily_budget(tmp_path: Path, monkeypatch):
+    sched, q = _watchdog_sched(tmp_path)
+    q.write_control(ControlConfig(budget_usd_per_day=0.5))
+    _preempted_reg_a(sched, q, tmp_path)
+    q.put_entry(q.get_entry("reg-a").model_copy(update={"spec": q.get_entry("reg-a").spec.model_copy(
+        update={"resources": ResourceRequest(cloud="gcp", timeout="1h")})}))
+    monkeypatch.setattr(Scheduler, "_catalog_hourly", lambda self, res: 0.9)  # 0.9 > 0.5 budget
+    submitted = _recording_lab(sched)
+
+    rep = sched.tick()
+
+    assert submitted == []
+    assert "daily budget" in rep.skipped["reg-a"]
+    assert q.get_entry("reg-a").state is RegState.pending
 
 
 # ------------------------------------------------------------------ Task 12: sweep ceiling
@@ -983,8 +1193,8 @@ def test_cancel_landing_after_the_snapshot_is_still_caught_before_submit(
     """spec §5 cancel race: the pre-submit re-check must be a FRESH read, not the snapshot.
 
     The marker is written *after* the tick took its snapshot and *after* the evaluation loop began
-    -- by the loop's own per-entry `get_entry` re-read -- so only a fresh read immediately before
-    the submit can see it. Serving that check from the snapshot would rent a machine for a
+    -- from inside the loop's own per-entry trigger evaluation -- so only a fresh read immediately
+    before the submit can see it. Serving that check from the snapshot would rent a machine for a
     registration the user had already cancelled.
     """
     sched, q = make_sched(tmp_path)
@@ -992,16 +1202,17 @@ def test_cancel_landing_after_the_snapshot_is_still_caught_before_submit(
     real_get_entry = LocalQueueStore.get_entry
     fresh_reads: list[str] = []
     real_cancel_requested = LocalQueueStore.cancel_requested
+    real_trigger_block = Scheduler._trigger_block
 
-    def _cancel_then_read(self: LocalQueueStore, reg_id: str) -> Registration:
-        self.request_cancel(reg_id)  # lands mid-tick, after MarkerSnapshot.read()
-        return real_get_entry(self, reg_id)
+    def _cancel_then_evaluate(self: Scheduler, reg, by_id, rep):  # type: ignore[no-untyped-def]
+        self.queue.request_cancel(reg.reg_id)  # lands mid-tick, after MarkerSnapshot.read()
+        return real_trigger_block(self, reg, by_id, rep)
 
     def _counted(self: LocalQueueStore, reg_id: str) -> bool:
         fresh_reads.append(reg_id)
         return real_cancel_requested(self, reg_id)
 
-    monkeypatch.setattr(LocalQueueStore, "get_entry", _cancel_then_read)
+    monkeypatch.setattr(Scheduler, "_trigger_block", _cancel_then_evaluate)
     monkeypatch.setattr(LocalQueueStore, "cancel_requested", _counted)
 
     rep = sched.tick()
@@ -1026,12 +1237,13 @@ def test_a_hold_landing_after_the_snapshot_still_stops_the_launch(tmp_path: Path
     sched, q = make_sched(tmp_path)
     put_reg(q, tmp_path, "reg-a")
     real_get_entry = LocalQueueStore.get_entry
+    real_trigger_block = Scheduler._trigger_block
 
-    def _hold_then_read(self: LocalQueueStore, reg_id: str) -> Registration:
-        self.hold(reg_id)  # lands mid-tick, after MarkerSnapshot.read()
-        return real_get_entry(self, reg_id)
+    def _hold_then_evaluate(self: Scheduler, reg, by_id, rep):  # type: ignore[no-untyped-def]
+        self.queue.hold(reg.reg_id)  # lands mid-tick, after MarkerSnapshot.read()
+        return real_trigger_block(self, reg, by_id, rep)
 
-    monkeypatch.setattr(LocalQueueStore, "get_entry", _hold_then_read)
+    monkeypatch.setattr(Scheduler, "_trigger_block", _hold_then_evaluate)
 
     rep = sched.tick()
 

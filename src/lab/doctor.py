@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from lab import events
-from lab._util import atomic_write_text
+from lab._util import atomic_write_text, file_lock
 from lab.models import ResourceRequest
 from pydantic import BaseModel
 
@@ -62,7 +62,7 @@ QUICK_CHECKS = ("adc", "project", "apis", "iam", "quota_cpu", "quota_gpu", "quot
 #     checks read — a cached verdict carries the answer but not the side effect, which silently
 #     left every downstream check credential-less;
 #   * they are local anyway (a file read and a catalog lookup), so caching buys nothing.
-_NEVER_CACHE = frozenset({"adc", "project", "catalog"})
+_NEVER_CACHE = frozenset({"adc", "project", "catalog", "local"})
 
 # Checks whose verdict depends on the *shape* being launched, not just the account. Their cache
 # key carries a fingerprint of that shape; without it a `--cpus 4` run's disk verdict was served
@@ -77,11 +77,21 @@ def _shape_key(res: ResourceRequest) -> str:
     regions are *candidates*, and the quota checks ask about the cheapest candidates. Caught live —
     a `--price-cap 0.001` run left no candidates at all, fell back to checking us-central1, and
     cached that under the key an uncapped run of the same size would look up.
+
+    ``memory`` (and ``gpus``) belong for the same reason: they change the instance type the
+    catalog resolves, hence its vCPU count, hence the ``quota_cpu`` verdict.
     """
     return (
-        f"{res.cpus}/{res.disk_size}/{res.accelerators}/{res.region}/{res.zone}"
-        f"/{res.use_spot}/{res.spot_fallback}/{res.max_hourly_usd}"
+        f"{res.cpus}/{res.memory}/{res.gpus}/{res.disk_size}/{res.accelerators}/{res.region}"
+        f"/{res.zone}/{res.use_spot}/{res.spot_fallback}/{res.max_hourly_usd}"
     )
+
+
+# Only verdicts that let a launch proceed are cached. A ``fail`` is the one verdict the user is
+# about to act on — it carries a fix — so serving it from cache for 24h (apis/iam) or 1h (quota)
+# kept preflight refusing every submit after the fix had been applied. A ``skip`` means "could not
+# answer", which is not a finding worth remembering.
+_CACHEABLE: frozenset[Status] = frozenset({"ok", "warn"})
 
 
 # Project-level permissions SkyPilot needs on GCP. Verified against the live project: GCP's
@@ -105,6 +115,8 @@ GCP_REQUIRED_APIS = ("compute.googleapis.com", "cloudresourcemanager.googleapis.
 # How many of the cheapest candidate regions to check regional quota in. Quota is per-region and
 # the optimizer may pick any of ~40, so checking one proves little and checking all is far too
 # slow; a handful establishes whether the project has quota *somewhere* it would plausibly land.
+# A handful is evidence, not proof: "none of them has quota" blocks only when they are every
+# candidate (see _quota_regions), and is a warning otherwise.
 _QUOTA_REGIONS_TO_CHECK = 3
 
 
@@ -174,16 +186,21 @@ class CheckCache:
             name = str(entry["result"]["name"])
             if now_s - float(entry["at"]) >= _TTL_S.get(name, _DEFAULT_TTL_S):
                 return None
-            return CheckResult.model_validate(entry["result"])
+            result = CheckResult.model_validate(entry["result"])
         except Exception:  # noqa: BLE001
             return None
+        # An older version cached `fail` verdicts; never serve one (see _CACHEABLE).
+        return result if result.status in _CACHEABLE else None
 
     def put(self, key: str, result: CheckResult, *, now_s: float | None = None) -> None:
         now_s = time.time() if now_s is None else now_s
         try:
-            data = self._load()
-            data[key] = {"at": now_s, "result": result.model_dump()}
-            atomic_write_text(self.path, json.dumps(data, sort_keys=True))
+            # Locked load-modify-save: concurrent preflights (a sweep's shards) otherwise drop
+            # each other's entries.
+            with file_lock(self.path):
+                data = self._load()
+                data[key] = {"at": now_s, "result": result.model_dump()}
+                atomic_write_text(self.path, json.dumps(data, sort_keys=True))
         except Exception:  # noqa: BLE001 — a cache write must never fail a submit
             pass
 
@@ -368,17 +385,52 @@ def check_iam(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
     return _ok("iam", f"all {len(GCP_REQUIRED_PERMISSIONS)} required permissions present")
 
 
-def _quota_regions(res: ResourceRequest, ctx: dict[str, Any]) -> list[str]:
-    """The regions worth checking quota in: the pin, else the cheapest few candidates."""
+def _quota_regions(res: ResourceRequest, ctx: dict[str, Any]) -> tuple[list[str], bool]:
+    """``(regions to check, complete)``: the pin, else the cheapest few candidates.
+
+    ``complete`` says whether those are *every* region the launch could use. Only then is "no
+    checked region has quota" a definitive negative; otherwise SkyPilot can fail over to a region
+    nobody asked about, and blocking on a partial look would refuse a launch that works.
+    """
     if res.region:
-        return [res.region]
+        return [res.region], True
     if res.zone:
-        return [res.zone.rsplit("-", 1)[0]]
-    est = ctx.get("estimate")
-    cands = ctx.get("candidates") or []
-    if not cands and est is None:
-        return ["us-central1"]
-    return [c.region for c in cands[:_QUOTA_REGIONS_TO_CHECK]] or ["us-central1"]
+        return [res.zone.rsplit("-", 1)[0]], True
+    regions = list(dict.fromkeys(c.region for c in ctx.get("candidates") or []))
+    if not regions:
+        return ["us-central1"], False  # one region of ~40 proves nothing about the rest
+    return regions[:_QUOTA_REGIONS_TO_CHECK], len(regions) <= _QUOTA_REGIONS_TO_CHECK
+
+
+def _no_quota_verdict(
+    name: str,
+    found: dict[str, tuple[float, float] | None],
+    want: float,
+    what: str,
+    *,
+    complete: bool,
+    fix: str,
+) -> CheckResult:
+    """The verdict when no checked region has ``want`` free — ``fail`` only if that is definitive.
+
+    A metric a region does not report is "cannot tell" (a family metered under another name, or
+    not at all), never zero, so any such region makes the whole answer a ``skip``. Definite
+    numbers from only *some* of the usable regions are worth saying (``warn``), never blocking.
+    """
+    seen = ", ".join(
+        f"{r}={q[0] - q[1]:.0f} free" if q is not None else f"{r}=not reported"
+        for r, q in found.items()
+    )
+    if any(q is None for q in found.values()):
+        return _skip(name, f"quota not reported for {what}, cannot tell ({seen})")
+    if not complete:
+        return _warn(
+            name,
+            f"none of the {len(found)} cheapest region(s) checked has {want:.0f} {what} free "
+            f"({seen}); the launch may still land in a region not checked",
+            fix,
+        )
+    return _fail(name, f"no region this launch can use has {want:.0f} {what} free ({seen})", fix)
 
 
 def _region_quotas(compute: Any, project: str, region: str) -> dict[str, tuple[float, float]]:
@@ -418,6 +470,10 @@ def check_quota_gpu(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
     family = _gpu_family(res.accelerators)
     if family is None:
         return _skip("quota_gpu", "no accelerators requested")
+    if family.startswith("TPU"):
+        # TPUs are metered as TPU_* quotas and do not draw on GPUS_ALL_REGIONS; judging them by
+        # NVIDIA_*_GPUS failed every TPU request.
+        return _skip("quota_gpu", f"{res.accelerators} is a TPU; GPU quota does not apply")
     creds, project = ctx.get("creds"), ctx.get("project")
     if creds is None or not project:
         return _skip("quota_gpu", "no credentials to check with")
@@ -433,7 +489,7 @@ def check_quota_gpu(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
             ),
             None,
         )
-        regions = _quota_regions(res, ctx)
+        regions, complete = _quota_regions(res, ctx)
         metric = f"NVIDIA_{family}_GPUS"
         regional = {r: _region_quotas(compute, project, r).get(metric) for r in regions}
     except Exception as e:  # noqa: BLE001
@@ -449,13 +505,13 @@ def check_quota_gpu(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
         )
     usable = {r: q for r, q in regional.items() if q is not None and q[0] - q[1] >= want}
     if not usable:
-        seen = ", ".join(
-            f"{r}={q[0]:.0f}" if q else f"{r}=none" for r, q in regional.items()
-        )
-        return _fail(
+        return _no_quota_verdict(
             "quota_gpu",
-            f"no checked region has {want}x {family} free ({seen})",
-            f"request NVIDIA_{family}_GPUS quota in a region you intend to use",
+            regional,
+            want,
+            metric,
+            complete=complete,
+            fix=f"request {metric} quota in a region you intend to use",
         )
     where = ", ".join(f"{r} {q[0] - q[1]:.0f} free" for r, q in usable.items())
     detail = f"{family}x{want}: {where}"
@@ -499,41 +555,87 @@ def check_quota_cpu(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
         return _skip("quota_cpu", "no credentials to check with")
     try:
         compute = _build(creds, "compute", "v1")
-        regions = _quota_regions(res, ctx)
+        regions, complete = _quota_regions(res, ctx)
         quotas = {r: _region_quotas(compute, project, r).get("CPUS") for r in regions}
     except Exception as e:  # noqa: BLE001
         return _skip("quota_cpu", f"could not read CPU quota: {str(e)[:160]}")
     usable = {r: q for r, q in quotas.items() if q is not None and q[0] - q[1] >= want}
     if not usable:
-        return _fail(
+        return _no_quota_verdict(
             "quota_cpu",
-            f"no checked region has {want} vCPUs free ({', '.join(quotas)})",
-            "request a CPUS quota increase for the region you intend to use",
+            quotas,
+            want,
+            "vCPUs (CPUS)",
+            complete=complete,
+            fix="request a CPUS quota increase for the region you intend to use",
         )
     return _ok("quota_cpu", f"{want} vCPU: {', '.join(usable)} ok")
 
 
+# The regional quota metric each GCP persistent-disk type draws on. pd-balanced is metered with
+# pd-ssd, not with pd-standard. Hyperdisk types have their own quotas and are deliberately absent:
+# a type missing here is "cannot tell", never a guess.
+_DISK_TYPE_QUOTA_METRIC = {
+    "pd-standard": "DISKS_TOTAL_GB",
+    "pd-balanced": "SSD_TOTAL_GB",
+    "pd-ssd": "SSD_TOTAL_GB",
+}
+
+
+def _gcp_boot_disk_type(instance_type: str | None) -> str | None:
+    """The boot-disk type SkyPilot provisions for this instance type, or None if unknowable.
+
+    The lab never sets ``disk_tier``, so SkyPilot uses its default tier (MEDIUM): pd-balanced on
+    most series, hyperdisk-balanced on n4/a4/a3-ultragpu. Asked of SkyPilot's own mapping
+    (``sky.clouds.GCP._get_disk_type``) so a SkyPilot upgrade that changes it is followed, not
+    contradicted; a private API, hence the broad fallback to "unknown".
+    """
+    if not instance_type:
+        return None
+    try:
+        from sky.clouds import GCP
+
+        return str(GCP._get_disk_type(instance_type, None))
+    except Exception:  # noqa: BLE001 — no sky, or its internals moved: cannot tell
+        return None
+
+
 def check_quota_disk(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
+    """Regional disk quota for the boot disk, in the metric its disk *type* draws on.
+
+    This read ``DISKS_TOTAL_GB`` — pd-standard's quota — while SkyPilot provisions pd-balanced
+    (``SSD_TOTAL_GB``), so it judged every launch by a quota the launch never touches.
+    """
     want = res.disk_size or 0
     if not want:
         return _skip("quota_disk", "no explicit disk size requested")
     creds, project = ctx.get("creds"), ctx.get("project")
     if creds is None or not project:
         return _skip("quota_disk", "no credentials to check with")
+    disk_type = _gcp_boot_disk_type(getattr(ctx.get("estimate"), "instance_type", None))
+    metric = _DISK_TYPE_QUOTA_METRIC.get(disk_type or "")
+    if metric is None:
+        return _skip(
+            "quota_disk",
+            f"boot disk type {disk_type or 'unknown'} has no persistent-disk quota metric to check",
+        )
     try:
         compute = _build(creds, "compute", "v1")
-        regions = _quota_regions(res, ctx)
-        quotas = {r: _region_quotas(compute, project, r).get("DISKS_TOTAL_GB") for r in regions}
+        regions, complete = _quota_regions(res, ctx)
+        quotas = {r: _region_quotas(compute, project, r).get(metric) for r in regions}
     except Exception as e:  # noqa: BLE001
         return _skip("quota_disk", f"could not read disk quota: {str(e)[:160]}")
     usable = {r: q for r, q in quotas.items() if q is not None and q[0] - q[1] >= want}
     if not usable:
-        return _fail(
+        return _no_quota_verdict(
             "quota_disk",
-            f"no checked region has {want} GB of disk quota free",
-            "request a DISKS_TOTAL_GB increase for the region you intend to use",
+            quotas,
+            want,
+            f"GB of {disk_type} ({metric})",
+            complete=complete,
+            fix=f"request a {metric} increase for the region you intend to use",
         )
-    return _ok("quota_disk", f"{want} GB: {', '.join(usable)} ok")
+    return _ok("quota_disk", f"{want} GB {disk_type} ({metric}): {', '.join(usable)} ok")
 
 
 def check_catalog(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
@@ -582,14 +684,49 @@ def check_vast_balance(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult
     return _ok("balance", f"${bal:.2f}")
 
 
+def _do_credential_paths() -> list[Path]:
+    """Where SkyPilot looks for doctl's config — ``POSSIBLE_CREDENTIALS_PATHS`` in
+    ``sky/provision/do/utils.py``, replicated (it is computed at SkyPilot's import time) and
+    pinned to it by a drift test. Note what is *not* here: ``$DIGITALOCEAN_TOKEN`` (SkyPilot never
+    reads it), ``~/.config`` when ``$XDG_CONFIG_HOME`` points elsewhere, and the snap package's
+    ``~/snap/doctl/current/.config``."""
+    return [
+        Path(os.path.expanduser("~/Library/Application Support/doctl/config.yaml")),
+        Path(
+            os.path.expanduser(
+                os.path.join(os.getenv("XDG_CONFIG_HOME", "~/.config/"), "doctl/config.yaml")
+            )
+        ),
+    ]
+
+
 def check_do_token(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
-    path = Path.home() / ".config" / "doctl" / "config.yaml"
-    if os.environ.get("DIGITALOCEAN_TOKEN") or path.exists():
-        return _ok("token", "DigitalOcean credentials present")
+    """A doctl config where SkyPilot reads it — the only DO credential SkyPilot uses.
+
+    This used to accept ``$DIGITALOCEAN_TOKEN`` or ``~/.config/doctl/config.yaml``: SkyPilot
+    ignores the first, and does not read the second once ``$XDG_CONFIG_HOME`` is set, so the check
+    passed launches that then died with "No credentials found" after the submit.
+    """
+    paths = _do_credential_paths()
+    found = next((p for p in paths if p.exists()), None)
+    if found is not None:
+        return _ok("token", f"doctl config at {found}")
+    unread = []
+    if os.environ.get("DIGITALOCEAN_TOKEN") or os.environ.get("DIGITALOCEAN_ACCESS_TOKEN"):
+        unread.append("DIGITALOCEAN_TOKEN is set, but SkyPilot never reads it")
+    snap = Path.home() / "snap" / "doctl" / "current" / ".config" / "doctl" / "config.yaml"
+    if snap.exists():
+        unread.append(f"the snap doctl config at {snap} exists, but SkyPilot does not read snap")
+    stray = Path.home() / ".config" / "doctl" / "config.yaml"
+    if stray.exists() and stray not in paths:
+        unread.append(f"{stray} exists, but XDG_CONFIG_HOME points SkyPilot elsewhere")
+    detail = "no doctl config where SkyPilot reads it (" + ", ".join(map(str, paths)) + ")"
+    if unread:
+        detail += "; " + "; ".join(unread)
     return _fail(
         "token",
-        "no DigitalOcean token found",
-        "doctl auth init (writes ~/.config/doctl/config.yaml), or set DIGITALOCEAN_TOKEN",
+        detail,
+        f"doctl auth init (writes {paths[1]}), or copy/symlink an existing doctl config there",
     )
 
 
@@ -610,8 +747,28 @@ _REGISTRY: dict[str, tuple[tuple[str, Any], ...]] = {
     ),
     "vast": (("balance", check_vast_balance), ("catalog", check_catalog)),
     "do": (("token", check_do_token), ("catalog", check_catalog)),
-    "local": (),
+    "local": (("local", lambda _res, _ctx: check_local()),),
 }
+
+
+def check_local() -> CheckResult:
+    """The whole report for the local backend: there is nothing that could fail."""
+    return _ok(
+        "local",
+        "the local backend runs jobs as subprocesses on this machine: no credentials, "
+        "quota or billing to check",
+    )
+
+
+def validate_doctor_cloud(cloud: str | None) -> str | None:
+    """The clouds `doctor` answers for: every launchable cloud (``validate_cloud``) plus
+    ``local``, the default backend — refusing it as "unknown" sent an agent asking a sensible
+    question off to work around an error. Raises ``LabError`` for anything else."""
+    if cloud == "local":
+        return cloud
+    from lab.core import validate_cloud  # lab.core imports this module
+
+    return validate_cloud(cloud)
 
 def run_checks(
     cloud: str | None,
@@ -624,15 +781,16 @@ def run_checks(
     """Run a cloud's preflight checks in order.
 
     ``quick`` restricts to :data:`QUICK_CHECKS` — the subset cheap and decisive enough to run on
-    the submit path. Results are cached per (cloud, project, check) with per-check TTLs so the
-    automatic preflight usually costs no API calls at all.
+    the submit path. Passing results are cached per (cloud, project, check) with per-check TTLs so
+    the automatic preflight usually costs no API calls at all. ``use_cache=False`` re-asks every
+    check but still writes its fresh answers back, so the next cached run reads them.
     """
     key = cloud or "vast"
     checks = _REGISTRY.get(key)
     if checks is None:
         return [_skip("cloud", f"no checks defined for {key!r}")]
     res = resources or ResourceRequest(cloud=cloud)
-    cache = CheckCache.for_home(home) if (home is not None and use_cache) else None
+    cache = CheckCache.for_home(home) if home is not None else None
 
     ctx: dict[str, Any] = {}
     out: list[CheckResult] = []
@@ -642,7 +800,7 @@ def run_checks(
         cacheable = cache if name not in _NEVER_CACHE else None
         shape = _shape_key(res) if name in _SHAPE_DEPENDENT else "-"
         cache_key = f"{key}|{ctx.get('project', '-')}|{name}|{shape}"
-        cached = cacheable.get(cache_key) if cacheable is not None else None
+        cached = cacheable.get(cache_key) if (cacheable is not None and use_cache) else None
         if cached is not None:
             out.append(cached)
             events.note("doctor.check", name=name, status=cached.status, detail=cached.detail)
@@ -654,8 +812,7 @@ def run_checks(
             result = _skip(name, f"check errored: {str(e)[:160]}")
         out.append(result)
         events.note("doctor.check", name=name, status=result.status, detail=result.detail)
-        # A `skip` means "could not answer", which is not a finding worth remembering.
-        if cacheable is not None and result.status != "skip":
+        if cacheable is not None and result.status in _CACHEABLE:
             cacheable.put(cache_key, result)
     return out
 

@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
+import math
 import os
 import re
 import shlex
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -92,7 +97,7 @@ def _parse_compound(s: str) -> float | None:
     return sum(float(number) * _UNITS[unit] for number, unit in parts)
 
 
-def parse_duration(value: str | float | None) -> float | None:
+def parse_duration(value: str | float | None, *, allow_zero: bool = False) -> float | None:
     """Parse a wall-clock limit (FR-I1). ``'2h'``/``'30m'``/``'45s'``/``'1d'``, a compound
     (``'3h30m'``, ``'1d2h'``, ``'1h30m15s'``), or plain seconds (string or number).
 
@@ -103,33 +108,88 @@ def parse_duration(value: str | float | None) -> float | None:
     ever sees input the old parse already rejected, and cannot change an existing answer.
     ``3h30m`` (twice in the ledger, on two jobs, as ``could not convert string to float: '3h30'``)
     is what it exists for.
+
+    The result must be a positive, finite length of time. ``float()`` happily reads ``inf``,
+    ``nan``, ``1e400`` and ``-5``: a cap that never fires, one that compares false everywhere, and
+    one that pays for a provision and kills it at once. ``0`` is refused too, because every
+    ``parse_duration(...) or default`` caller reads it as "no limit". ``allow_zero=True`` admits
+    ``0`` for the one kind of caller where it is meaningful and not a limit: a wait whose zero
+    means "check once, don't wait" (``lab queue wait-drain --timeout 0s``, which the scheduler
+    redeploy runs as its race check).
     """
     if value is None:
         return None
     s = str(value).strip().lower()
     if not s:
         return None
+    seconds: float | None
     try:
-        if s[-1] in _UNITS:
-            return float(s[:-1]) * _UNITS[s[-1]]
-        return float(s)
+        seconds = float(s[:-1]) * _UNITS[s[-1]] if s[-1] in _UNITS else float(s)
     except ValueError:
+        seconds = _parse_compound(s)
+    if seconds is None:
+        raise ValueError(
+            f"invalid duration {value!r}: expected <n>s / <n>m / <n>h / <n>d, a compound like "
+            "3h30m (largest unit first, each unit at most once), or a plain number of seconds"
+        )
+    if not math.isfinite(seconds) or seconds < 0 or (seconds == 0 and not allow_zero):
+        raise ValueError(f"invalid duration {value!r}: must be a positive, finite length of time")
+    return seconds
+
+
+def _umask() -> int:
+    """The process umask, read without changing it (``os.umask`` can only be read by setting it,
+    which would race any thread creating a file meanwhile). Linux exposes it in /proc."""
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("Umask:"):
+                return int(line.split()[1], 8)
+    except (OSError, ValueError, IndexError):
         pass
-    compound = _parse_compound(s)
-    if compound is not None:
-        return compound
-    raise ValueError(
-        f"invalid duration {value!r}: expected <n>s / <n>m / <n>h / <n>d, a compound like "
-        "3h30m (largest unit first, each unit at most once), or a plain number of seconds"
-    )
+    return 0o022
 
 
 def atomic_write_text(path: Path, text: str) -> None:
-    """Write via a same-directory temp file + ``os.replace`` so readers never see a torn file."""
+    """Write via a same-directory temp file + ``os.replace`` so readers never see a torn file.
+
+    The temp file is unique per call (``mkstemp``). It used to be a fixed ``<file>.tmp``, so two
+    concurrent writers truncated and interleaved into the same temp file and one renamed the
+    other's half-written bytes into place — a 4-process stress read 4,269 torn files, and the
+    loser of the rename race raised FileNotFoundError. The result gets the permissions a plain
+    ``write_text`` would have given it, not mkstemp's owner-only 0600.
+
+    This makes each *write* atomic; it does not make a read-modify-write safe. Callers that load,
+    change and save a shared file hold :func:`file_lock` around all three.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, 0o666 & ~_umask())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+@contextmanager
+def file_lock(path: Path) -> Iterator[None]:
+    """Hold an exclusive ``flock`` on ``<path>.lock`` — for a read-modify-write of ``path``.
+
+    A sibling lock file rather than ``path`` itself, because ``atomic_write_text`` replaces
+    ``path``'s inode on every write and a lock on a replaced inode excludes nobody.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_name(path.name + ".lock"), "a") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def tail_last_line(path: Path, max_bytes: int = 1024) -> tuple[str | None, datetime | None]:
@@ -243,3 +303,32 @@ def pid_alive(pid: int | None, *, start_time: int | None = None) -> bool:
     if current is None:
         return True  # cannot tell -> assume alive, never destroy on a guess
     return current == start_time
+
+
+def unwritable_dest_message(dest: Path | str, err: OSError) -> str | None:
+    """What to tell a caller whose ``--to``/``to`` directory could not be written, or ``None``
+    when ``err`` is about some other path (a source file) and should propagate unchanged.
+
+    ``export`` to a path it cannot create used to surface as a bare ``[Errno 2] No such file or
+    directory: '/proc/nope'`` over MCP — no hint that the *destination* was the problem, nor
+    that a relative path resolves against the server's working directory, not the caller's.
+    """
+    target = Path(dest).expanduser()
+    resolved = target if target.is_absolute() else Path.cwd() / target
+    failed = Path(str(err.filename)) if err.filename else None
+    if failed is not None and failed != resolved and resolved not in failed.parents and (
+        failed not in resolved.parents
+    ):
+        return None
+    reason = err.strerror or type(err).__name__
+    at = f" (at {failed})" if failed is not None and failed != resolved else ""
+    relative = (
+        f"; {str(dest)!r} is relative, so it resolved against {Path.cwd()}"
+        if not target.is_absolute()
+        else ""
+    )
+    return (
+        f"cannot write the bundle to {resolved}: {reason}{at}{relative}. Pass a directory "
+        "you can write (it is created if missing, so its nearest existing parent must be a "
+        "writable directory), e.g. an absolute path inside this project."
+    )

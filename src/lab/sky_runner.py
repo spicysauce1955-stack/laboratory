@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import contextvars
+import math
 import os
 import re
 import signal
@@ -23,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import FrameType
-from typing import Any
+from typing import Any, TypeVar
 
 from lab import events
 from lab._util import actual_cost, duration_seconds, now, parse_duration, timeout_reason
@@ -32,7 +33,9 @@ from lab.backends.skypilot import (
     REMOTE_RUN_DIR,
     TIMEOUT_SENTINEL,
     ProvisionTimeout,
+    boot_allowance_s,
     build_task,
+    cluster_do_volume_ids,
     cluster_name_for,
     confirm_success,
     map_job_status,
@@ -42,6 +45,7 @@ from lab.backends.skypilot import (
     wasteful_provision_timeout_warning,
     provision_with_watchdog,
     tear_down_and_record,
+    teardown_found_resources,
     vast_balance,
     vast_hourly_for_cluster,
 )
@@ -75,8 +79,50 @@ def _rec_field(rec: Any, key: str) -> Any:
     return rec.get(key) if isinstance(rec, dict) else getattr(rec, key, None)
 
 
+SKY_CALL_TIMEOUT_S = 120.0
+"""Bound on one SkyPilot request the supervisor waits on (a queue poll, a status probe).
+
+``sky.get`` has no timeout of its own, so a wedged request — an API server whose connection went
+half-open — blocked the supervisor forever, and the local wall-clock backstop, which is only
+checked *between* calls, never fired. Generous against a healthy answer (well under a second) and
+small against every deadline it guards."""
+
+_T = TypeVar("_T")
+
+
+def _bounded_call(fn: Callable[[], _T], *, what: str, timeout_s: float | None = None) -> _T:
+    """``fn()`` on a daemon thread, joined for at most :data:`SKY_CALL_TIMEOUT_S`.
+
+    Raises :class:`TimeoutError` when it does not answer in time — which every caller already
+    treats as "no answer yet", never as a verdict — and re-raises whatever ``fn`` raised. A call
+    that never returns is abandoned to its daemon thread rather than taking the supervisor (and
+    the teardown that follows it) down with it.
+    """
+    limit = SKY_CALL_TIMEOUT_S if timeout_s is None else timeout_s
+    holder: dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            holder["value"] = fn()
+        except BaseException as e:  # noqa: BLE001 — surfaced to the caller below
+            holder["error"] = e
+
+    thread = threading.Thread(target=_run, name=f"lab-sky-{what}", daemon=True)
+    thread.start()
+    thread.join(limit)
+    if thread.is_alive():
+        raise TimeoutError(f"sky {what} did not answer within {limit:.0f}s")
+    if "error" in holder:
+        raise holder["error"]
+    value: _T = holder["value"]
+    return value
+
+
 def _job_status_name(sky_mod: Any, cluster: str, sky_job_id: int | None) -> str | None:
-    recs = sky_mod.get(sky_mod.queue(cluster, skip_finished=False))  # 0.12: RequestId
+    recs = _bounded_call(
+        lambda: sky_mod.get(sky_mod.queue(cluster, skip_finished=False)),  # 0.12: RequestId
+        what="queue",
+    )
     for rec in recs:
         if sky_job_id is None or _rec_field(rec, "job_id") == sky_job_id:
             status = _rec_field(rec, "status")
@@ -123,11 +169,17 @@ supervisor dying. This grace covers the gap between the remote kill and the supe
 it — it is not a second budget.
 """
 
+POLL_S = 10.0
+"""How often :func:`_wait_terminal` asks the cluster's job queue. Module-level so tests can
+shorten it without re-plumbing every caller."""
 
-def remaining_wall_budget(timeout: str | None, started: datetime | None) -> float:
-    """Local wall-clock budget still owed to a job that started at ``started``.
 
-    Anchored to the job's *start*, never to "now", which is the whole point. The previous code
+def remaining_wall_budget(
+    timeout: str | None, started: datetime | None, *, boot_s: float = 0.0
+) -> float:
+    """Local wall-clock budget still owed to a job whose run phase was anchored at ``started``.
+
+    Anchored to a fixed moment, never to "now", which is the whole point. The previous code
     computed ``max_wait = timeout + 300`` immediately before the poll loop — but the unbounded
     ``sky.tail_logs(..., follow=True)`` sits in front of that line and blocks for essentially the
     entire run. The budget therefore did not begin until streaming returned, making the effective
@@ -135,11 +187,24 @@ def remaining_wall_budget(timeout: str | None, started: datetime | None) -> floa
     hung. On 2026-08-20 four jobs with a 7h timeout ran 703 minutes on that arithmetic and were
     stopped by an external watchdog rather than by the lab.
 
+    ``boot_s`` is the boot allowance the on-box watchdog grants before the entrypoint starts
+    (:func:`~lab.backends.skypilot.boot_allowance_s`). The box's own cap wraps only the
+    entrypoint, so a backstop that does not grant the same allowance fires on a healthy run whose
+    ``uv sync`` was slow — and records it ``failed``.
+
+    **No timeout means no local budget** (``math.inf``): a job submitted without ``--timeout``
+    asked for no wall-clock bound, and the 3600s this used to invent killed every uncapped job
+    older than 65 minutes the moment its log stream dropped. It is bounded by the remote job
+    ending, autostop and ``lab reconcile``, exactly as :func:`lifetime_bound_s` documents.
+
     Returns ``0.0`` once the cap is spent — a blown cap must never hand out more time — and the
     full budget when ``started`` is unknown, which is the only safe reading of a malformed
     manifest (refusing to wait at all would abandon a live machine).
     """
-    total = (parse_duration(timeout) or 3600.0) + WALL_CLOCK_GRACE_S
+    wall = parse_duration(timeout)
+    if not wall:
+        return math.inf
+    total = wall + WALL_CLOCK_GRACE_S + boot_s
     if started is None:
         return total
     spent = duration_seconds(started, now()) or 0.0
@@ -152,12 +217,17 @@ def _wait_terminal(
     sky_job_id: int | None,
     max_wait: float,
     *,
-    poll_s: float = 10.0,
+    poll_s: float | None = None,
     heartbeat_s: float | None = None,
     on_heartbeat: Callable[[], None] | None = None,
 ) -> tuple[JobState, bool, str | None]:
     """Poll the remote job until terminal — sky.launch (0.12) returns at submit time, not
     completion, so we must wait before fetching artifacts and tearing down.
+
+    ``max_wait`` may be ``math.inf`` (an uncapped job): the loop then ends only on a terminal
+    status or a definitively lost cluster. A non-terminal status at a finite deadline comes back
+    as itself (``running``/``queued``, ``reached_terminal=False``) — the caller decides what an
+    exhausted backstop means, and it is never "the job failed".
 
     If ``heartbeat_s``/``on_heartbeat`` are given, ``on_heartbeat`` is called roughly every
     ``heartbeat_s`` of polling so the supervisor can fetch partial results mid-run; a callback
@@ -174,6 +244,7 @@ def _wait_terminal(
     longer exists, in which case it carries sky's message and the state is ``failed``. Only that
     one answer ends the wait early — see :func:`_cluster_lost_reason`.
     """
+    poll_s = POLL_S if poll_s is None else poll_s
     deadline = time.time() + max_wait
     name: str | None = None
     # Real elapsed time, not accumulated nominal sleep. `since_beat += poll_s` made the heartbeat
@@ -209,7 +280,12 @@ def _wait_terminal(
         if name in _TERMINAL_NAMES:
             reached = True
             break
-        time.sleep(poll_s)
+        # Never sleep past the deadline: with the budget spent this is the one look, and a full
+        # poll interval of napping after it only delays the backstop it exists to enforce.
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_s, remaining))
         if heartbeat_s and on_heartbeat is not None:
             if time.time() - last_beat >= heartbeat_s:
                 last_beat = time.time()
@@ -230,7 +306,10 @@ def cluster_up_or_raise(sky_mod: Any, cluster: str) -> bool:
     away a healthy run. Callers that genuinely want the conservative reading use
     :func:`_cluster_up`.
     """
-    recs = sky_mod.get(sky_mod.status(cluster_names=[cluster]))  # 0.12: RequestId -> list
+    recs = _bounded_call(
+        lambda: sky_mod.get(sky_mod.status(cluster_names=[cluster])),  # 0.12: RequestId -> list
+        what="status",
+    )
     return _any_up(recs)
 
 
@@ -259,6 +338,92 @@ def _any_up(recs: Any) -> bool:
         if name == "UP":
             return True
     return False
+
+
+STREAM_PROBE_S = 120.0
+"""While the log stream is open, how often the queue is asked whether the run is already over.
+
+A half-open stream never returns, and an uncapped job has no budget to run out — so without this
+it would wait forever on a run that ended hours ago. One ``sky.queue`` per job per this interval,
+the same order as the partial-results heartbeat."""
+
+STREAM_REATTACH_S = 300.0
+"""Minimum gap between re-attaching a log stream that ended while the job is still running."""
+
+STREAM_REATTACH_TAIL = 50
+"""Lines of backlog a re-attached stream replays, so the log shows where it picked up again."""
+
+
+class _LogStream:
+    """``sky.tail_logs(follow=True)`` on a daemon thread: log output only, never the source of
+    truth about how the run ended — that is the job queue (:func:`_wait_terminal`).
+
+    It used to be a bare blocking call on the supervisor's main thread with no timeout. A
+    half-open stream therefore blocked the supervisor forever, and the local wall-clock backstop
+    — only ever checked after it returned — never fired.
+    """
+
+    def __init__(self, sky_mod: Any, cluster: str, sky_job_id: int | None) -> None:
+        self._sky = sky_mod
+        self._cluster = cluster
+        self._job = sky_job_id
+        self._thread: threading.Thread | None = None
+        self._attached_at = 0.0
+
+    def start(self, *, tail: int | None = None) -> None:
+        def _run() -> None:
+            try:
+                if tail is None:
+                    self._sky.tail_logs(self._cluster, self._job, follow=True)
+                else:
+                    self._sky.tail_logs(self._cluster, self._job, follow=True, tail=tail)
+            except Exception as e:  # noqa: BLE001 — a stream error says nothing about the run
+                print(f"[lab] tail_logs issue: {e}")
+
+        self._attached_at = time.monotonic()
+        self._thread = threading.Thread(target=_run, name="lab-tail-logs", daemon=True)
+        self._thread.start()
+
+    @property
+    def alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def wait(self, budget_s: float, *, run_is_over: Callable[[], bool]) -> None:
+        """Return when the stream ends, the budget is spent, or ``run_is_over()`` says the run
+        finished under a stream that did not. ``budget_s`` may be ``math.inf`` (uncapped)."""
+        deadline = time.monotonic() + budget_s
+        while self.alive and self._thread is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print(
+                    "[lab] wall-clock budget spent with the log stream still open — no longer "
+                    "waiting on it"
+                )
+                return
+            self._thread.join(min(remaining, STREAM_PROBE_S))
+            if self.alive and run_is_over():
+                print("[lab] the run has ended but its log stream is still open — detaching")
+                return
+
+    def reattach_if_dropped(self) -> None:
+        """Re-open a stream that ended while the job is still running (an API-server restart
+        does that), at most every :data:`STREAM_REATTACH_S`. Logs only: never a verdict."""
+        if self.alive or time.monotonic() - self._attached_at < STREAM_REATTACH_S:
+            return
+        print(
+            "[lab] log stream ended while the job is still running — re-attaching (up to "
+            f"{STREAM_REATTACH_TAIL} earlier lines may repeat)"
+        )
+        self.start(tail=STREAM_REATTACH_TAIL)
+
+
+def _run_is_over(sky_mod: Any, cluster: str, sky_job_id: int | None) -> bool:
+    """One bounded look at the queue: has the run ended (or its cluster definitively gone)?
+    Any doubt reads as "not yet" — this only decides whether to keep waiting on a stream."""
+    try:
+        return _job_status_name(sky_mod, cluster, sky_job_id) in _TERMINAL_NAMES
+    except Exception as e:  # noqa: BLE001
+        return _cluster_lost_reason(e) is not None
 
 
 @dataclass(frozen=True)
@@ -291,6 +456,20 @@ def parse_rsync_stats(stdout: str) -> RsyncStats:
     )
 
 
+RSYNC_PULL_FLAGS: tuple[str, ...] = (
+    "-az",
+    # A rented box is not trusted. `-a` implies `--links`, so a symlink on the box arrived as a
+    # symlink here — and the R2 upload, the partial mirror and `lab export` then *follow* it. A
+    # hostile host planting `results.csv -> ~/.ssh/sky-key` would get the supervisor's private
+    # key uploaded and bundled. Links (and device/special files) are refused outright.
+    "--no-links",
+    "--no-devices",
+    "--no-specials",
+    "--stats",
+)
+"""Options for every rsync that pulls from a rented box (operands go after these)."""
+
+
 def _rsync_down(cluster: str, remote_dir: str, local_dir: Path) -> RsyncStats:
     """Pull the remote run dir down, returning what was transferred.
 
@@ -302,7 +481,7 @@ def _rsync_down(cluster: str, remote_dir: str, local_dir: Path) -> RsyncStats:
     """
     local_dir.mkdir(parents=True, exist_ok=True)
     proc = subprocess.run(
-        ["rsync", "-az", "--stats", f"{cluster}:{remote_dir}/", f"{local_dir}/"],
+        ["rsync", *RSYNC_PULL_FLAGS, f"{cluster}:{remote_dir}/", f"{local_dir}/"],
         check=True,
         timeout=RSYNC_TIMEOUT_S,
         capture_output=True,
@@ -575,6 +754,42 @@ class PartialsFetcher:
         events.note("partials.empty", phase=phase, attempts=st["attempts"])
 
 
+# One DO volume listing while the job runs. Short: it sits on the supervisor's own thread (at UP,
+# then on heartbeats until it has seen the volume), and a slow DO API must not stall supervision.
+DO_VOLUME_MEMO_TIMEOUT_S = 30.0
+
+
+def remember_do_volumes(store: JobStore, job_id: str, cluster: str) -> list[str]:
+    """Record the ids of the DO volumes named after ``cluster`` in ``_runtime.json``.
+
+    Called while the job runs, when the volume is attached to a live droplet and has been for
+    minutes — the one time a listing describes it reliably. At teardown those ids are verified gone
+    by a direct ``volumes.get`` (``robust_teardown``), so the verdict no longer rests on a listing
+    taken while DO is in the middle of deleting the volume, which is how job E (2026-11-19)
+    recorded ``succeeded`` over a volume that was still billing two hours later.
+
+    Merges with what is already recorded, so a restarted supervisor (``--adopt``) keeps an earlier
+    one's memory. Returns the ids found this time. Best-effort and bounded: it never raises, since
+    losing this memory costs only the strongest form of the check, never the teardown.
+    """
+    try:
+        found = _bounded_call(
+            lambda: cluster_do_volume_ids(cluster),
+            what="do-volumes",
+            timeout_s=DO_VOLUME_MEMO_TIMEOUT_S,
+        )
+    except Exception as e:  # noqa: BLE001 — a memo, not a gate
+        print(f"[lab] could not record this job's DO volume ids (teardown still lists): {e}")
+        events.note("do_volumes.remember_failed", cluster=cluster, error=str(e)[:200])
+        return []
+    if found:
+        recorded = [str(v) for v in store.read_runtime(job_id).get("do_volume_ids") or []]
+        store.write_runtime(
+            job_id, do_volume_ids=recorded + [v for v in found if v not in recorded]
+        )
+    return found
+
+
 def _hourly_cost(handle: Any) -> float | None:
     """USD/hour for the launched cluster, or None if unavailable (best-effort, FR-I2)."""
     try:
@@ -616,7 +831,7 @@ def resolve_cost(
     folding the disk in there fixes ``estimated_usd``, the dashboard, and the scheduler's spend
     accounting at once.
     """
-    from lab.placement import storage_hourly_usd
+    from lab.placement import effective_disk_gb, storage_hourly_usd
 
     compute = _resolve_hourly(cluster, handle, cloud)
     # The comparison the launch path never made. SkyPilot applied the cap to its own catalog,
@@ -643,10 +858,15 @@ def resolve_cost(
                 open_call.result(
                     over_cap=True, actual_hourly_usd=compute, cap_hourly_usd=cap
                 )
-    storage = storage_hourly_usd(cloud, manifest.resources.disk_size, instance_type)
+    # The disk the job actually launched with, not the raw request: `build_task` applies the same
+    # `effective_disk_gb` default, and a scheduler-registered GCP/DO job (which never passes
+    # through `resolve_backend_profile`) arrives here with `disk_size=None` while billing for
+    # 50/100 GB — left out, its hourly_usd/actual_usd/spend under-reported (~16% on a GCP n4).
+    disk_gb = effective_disk_gb(manifest.resources)
+    storage = storage_hourly_usd(cloud, disk_gb, instance_type)
     total = None if compute is None else compute + storage
     estimated = actual_cost(total, parse_duration(manifest.resources.timeout))
-    disk = manifest.resources.disk_size or 0
+    disk = disk_gb or 0
     shape = f"{cloud} {instance_type or 'unknown instance type'}"
     priced = "compute unknown" if compute is None else f"compute ${compute:.4f}/hr"
     return CostInfo(
@@ -1379,6 +1599,88 @@ def install_signal_handlers() -> list[str]:
     return installed
 
 
+def _catalog_cost(manifest: JobManifest) -> CostInfo | None:
+    """A rate for a job stopped before its box reported UP, from the catalog for its spec.
+
+    The normal path prices the *launched* handle at UP; an abort before then has no handle. The
+    top of the catalog band is used — exact on DO, whose prices do not vary by region, and an
+    upper bound elsewhere, the safe direction for a spend total. ``None`` when the catalog cannot
+    price the spec; never raises.
+    """
+    from lab import placement
+
+    try:
+        est = placement.estimate(manifest.resources)
+    except Exception as e:  # noqa: BLE001 — pricing must never get in the teardown's way
+        print(f"[lab] could not price the aborted job from the catalog: {e}")
+        return None
+    if est is None:
+        return None
+    return CostInfo(
+        hourly_usd=est.worst_hourly_usd,
+        compute_hourly_usd=est.high_usd,
+        storage_hourly_usd=est.storage_usd,
+        hourly_basis=(
+            f"catalog estimate, top of band — stopped before the box reported UP, so there was "
+            f"no launched handle to price: {est.basis}"
+        ),
+        estimated_usd=actual_cost(est.worst_hourly_usd, parse_duration(manifest.resources.timeout)),
+        cap_hourly_usd=manifest.resources.max_hourly_usd,
+    )
+
+
+def record_cost_after_abort(store: JobStore, job_id: str) -> None:
+    """Price an aborted job the way the normal path does: ``hourly x supervisor wall``.
+
+    Job F (2026-11-19) was cancelled four minutes into a DO run, before its box reported UP —
+    the moment the normal path writes ``CostInfo`` — so it recorded none, and ``lab list``'s spend
+    left a real rental out under ``unknown_cost_jobs``.
+
+    * A rate recorded at UP is **finalized** (duration and ``actual_usd``), never re-priced.
+    * With no rate, the job is priced from the catalog (:func:`_catalog_cost`) — but only when
+      the teardown is evidence that a machine existed (:func:`teardown_found_resources`, or a
+      volume the supervisor remembered). A launch that never created anything stays without a
+      ``CostInfo``: putting money nobody spent in the total is the opposite error.
+    * A ``CostInfo`` whose rate was unreadable stays as it is — an honest unknown.
+
+    Wall is ``started_at`` to ``ended_at``, the same span the normal path bills. Never raises.
+    """
+    try:
+        m = store.read_manifest(job_id)
+        if m.started_at is None:
+            return
+        cost = m.cost
+        if cost is None:
+            remembered = store.read_runtime(job_id).get("do_volume_ids")
+            if not (teardown_found_resources(m.teardown_detail) or remembered):
+                return
+            cost = _catalog_cost(m)
+            if cost is None:
+                return
+        elif cost.actual_usd is not None or cost.hourly_usd is None:
+            return
+        wall = duration_seconds(m.started_at, m.ended_at or now())
+        store.update_manifest(
+            job_id,
+            cost=cost.model_copy(
+                update={"duration_seconds": wall, "actual_usd": actual_cost(cost.hourly_usd, wall)}
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 — accounting, after the teardown; never mask the unwind
+        _emit(f"[lab] recording the aborted job's cost failed: {type(e).__name__}: {e}\n")
+
+
+def _user_cancel_in_flight(store: JobStore, job_id: str) -> bool:
+    """Has ``lab cancel`` recorded its intent? It writes ``cancelling`` to ``_runtime.json``
+    *before* it SIGTERMs the supervisor (R9), so this is what tells a cancel from any other
+    signal. An unreadable runtime file is "no": a real interruption must never be misfiled as a
+    deliberate one."""
+    try:
+        return bool(store.read_runtime(job_id).get("cancelling"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # The default ladder is 5+15+30+60+120 = 230s of `sky.down` retries before the provider-direct
 # fallback even starts. A process that has been signalled cannot count on that much time — a
 # system shutdown SIGKILLs 90s later by default — and the fallback is the half that actually asks
@@ -1395,8 +1697,13 @@ def _teardown_on_abort(
     why: str,
     launched: bool,
     torn_down: bool,
+    request_id: Any = None,
 ) -> None:
     """Stop the machine for a supervisor unwinding out of ``_impl`` on an unplanned exception.
+
+    ``request_id`` is a launch request that may still be in flight on the API server. It is
+    ``api_cancel``ed *before* the teardown: a launch still queued server-side would otherwise
+    provision after we tore down, onto a cluster name nobody supervises any more.
 
     Every *expected* exit from ``_impl`` tears down on its own way out. This covers the ones that
     are not expected — a signal, a Ctrl-C, a bug — which previously recorded nothing and left the
@@ -1421,6 +1728,11 @@ def _teardown_on_abort(
     sky_mod = sys.modules.get("sky")
     if sky_mod is None:  # pragma: no cover — implied by `launched`; kept as a hard guard
         return
+    if request_id is not None:
+        try:
+            sky_mod.api_cancel(request_id)
+        except Exception as e:  # noqa: BLE001 — best-effort; the teardown below is the real net
+            _emit(f"[lab] api_cancel of the in-flight launch failed: {type(e).__name__}: {e}\n")
     try:
         if not torn_down:
             tear_down_and_record(
@@ -1429,12 +1741,43 @@ def _teardown_on_abort(
         if store.read_manifest(job_id).status in (JobState.queued, JobState.running):
             # Nothing supervises this job any more, so `running` can only go stale — that is what
             # made `lab wait` hang for its full timeout and drove the operator's 5-minute status
-            # poller. A concurrent `lab cancel` sets `cancelled` first; any terminal state stands.
-            store.update_manifest(
-                job_id, status=JobState.failed, ended_at=now(), end_reason=why[:300]
-            )
+            # poller. Any terminal state already written stands.
+            #
+            # `lab cancel` records its intent (`cancelling` in `_runtime.json`) and SIGTERMs us
+            # *before* it marks the job terminal (R9). That SIGTERM is a cancel, not a crash: once
+            # this writes `failed`, recovery can never repair it, so a cancel whose caller is then
+            # killed would read as a supervisor failure forever.
+            if store.read_runtime(job_id).get("cancelling"):
+                store.update_manifest(
+                    job_id, status=JobState.cancelled, ended_at=now(), end_reason="cancelled by user"
+                )
+            else:
+                store.update_manifest(
+                    job_id, status=JobState.failed, ended_at=now(), end_reason=why[:300]
+                )
     except Exception as e:  # noqa: BLE001 — never mask the exception we are unwinding on
         _emit(f"[lab] teardown after abort ({why}) failed: {type(e).__name__}: {e}\n")
+    # After the teardown, never before it: the destroy is the cost-critical half, and this is only
+    # the bill for what ran. Needs `ended_at`, which the block above has just written.
+    record_cost_after_abort(store, job_id)
+
+
+def _provision_budget_s(res: ResourceRequest, cloud: str) -> float:
+    """Seconds one launch attempt gets to come up — ``--provision-timeout``, else the calibrated
+    per-cloud budget (larger when pinned). One definition for the launch path and the adopt path's
+    wall-clock fallback, so the two cannot disagree about how long provisioning may take."""
+    pinned = bool(res.region or res.zone)
+    return parse_duration(res.provision_timeout) or provision_timeout_min(cloud, pinned=pinned) * 60
+
+
+def _parse_anchor(value: Any) -> datetime | None:
+    """The ``run_anchor_at`` a supervisor recorded in ``_runtime.json``, or ``None``."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def run_job(job_dir: Path, adopt: bool = False) -> int:
@@ -1472,8 +1815,13 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
     # earlier one recorded is not evidence about the cluster it was just told to attach to.
     attempt_torn_down = False
 
+    # The launch request that may still be running on the API server, for the abort path to
+    # `api_cancel` (see `_teardown_on_abort`). Set at each launch; cleared once provisioning has
+    # returned, after which the request is finished and there is nothing left to cancel.
+    inflight_request: Any = None
+
     def _impl() -> int:
-        nonlocal machine_requested, attempt_torn_down, manifest
+        nonlocal machine_requested, attempt_torn_down, manifest, inflight_request
         if not adopt:
             started = now()
             store.update_manifest(job_id, status=JobState.running, started_at=started)
@@ -1495,6 +1843,13 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         # except-branch returns, so the post-try read is always bound. Declared here so that
         # stays true no matter how the try grows.
         lost_reason: str | None = None
+        # True when the local backstop's deadline passed with the remote job still RUNNING. That
+        # is a cap the supervisor enforced (`timed_out`), never evidence the job failed.
+        still_running_at_deadline = False
+        # When the run phase began: provisioning complete, the box UP. The local deadline is
+        # anchored here rather than at `started` (the launch request) — see
+        # `remaining_wall_budget`. Recorded in `_runtime.json` so an adopting supervisor keeps it.
+        run_anchor: datetime | None = None
 
         # The partial-results net (§6c). Constructed before the try so that every exit path —
         # including the provision-failure branches, which return straight to teardown — can stop
@@ -1550,7 +1905,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                 # know which case it is in or it kills healthy pinned hosts.
                 pinned = bool(manifest.resources.region or manifest.resources.zone)
                 explicit_s = parse_duration(manifest.resources.provision_timeout)
-                provision_s = explicit_s or provision_timeout_min(cloud, pinned=pinned) * 60
+                provision_s = _provision_budget_s(manifest.resources, cloud)
                 if warning := wasteful_provision_timeout_warning(
                     explicit_s, cloud, pinned=pinned
                 ):
@@ -1593,7 +1948,17 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                     # teardown recorded is about a box that no longer exists, so it cannot stand
                     # in for the one this request is about to create.
                     attempt_torn_down = False
+                    # The same is true of the manifest, which is what `lab wait` reads: left
+                    # standing, the abandoned attempt's `succeeded` reads as a confirmed
+                    # all-clear for this machine from the terminal-status write until the final
+                    # teardown — and a supervisor killed in that window leaves it there for good.
+                    # Rotation only continues after a *confirmed* teardown, so no alarm is lost.
+                    if store.read_manifest(job_id).teardown_status is not None:
+                        # The detail goes with it: evidence about a box that no longer exists
+                        # beside a status that has been cleared would read as this one's.
+                        store.update_manifest(job_id, teardown_status=None, teardown_detail=None)
                     request_id = _launch_with_retry(sky, task, cluster)
+                    inflight_request = request_id
 
                     # Did we just draw a machine we have already watched fail? Only asked when
                     # there is an attempt left to spend on the answer, and only when the memo
@@ -1669,6 +2034,12 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                             attempt=rotation.attempt,
                         )
                         _rotate_to(nxt)
+                # The box is UP and the job submitted: the run phase starts here, and so does the
+                # local wall-clock deadline. Durable, so a supervisor restart (`--adopt`) budgets
+                # from the same moment instead of from the launch request.
+                inflight_request = None  # the launch request has completed
+                run_anchor = now()
+                store.write_runtime(job_id, run_anchor_at=run_anchor.isoformat())
                 # Record cost up-front so a running job already shows it (FR-I2). The host is UP now,
                 # so the Vast rental exists — bill at its real dph_total, not SkyPilot's low catalog
                 # estimate.
@@ -1718,10 +2089,21 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                         update={"estimated_usd": manifest.cost.estimated_usd}
                     )
                 sky_job_id = None  # match any job in the cluster queue
+                run_anchor = _parse_anchor(store.read_runtime(job_id).get("run_anchor_at"))
+
+            boot_s = float(boot_allowance_s(manifest))
+            if run_anchor is None:
+                # Adopted from a supervisor that never recorded when the box came up: budget from
+                # the launch request, and charge it every provisioning attempt the job may have
+                # spent. Generous on purpose — the box bounds its own lifetime, so a late
+                # backstop costs a little rental, while an early one ends a healthy run.
+                attempts = LaunchRotation.for_manifest(manifest).max_attempts
+                boot_s += _provision_budget_s(manifest.resources, cloud) * attempts
+            anchor = run_anchor or started
 
             # Wait for the run to actually finish before fetching artifacts / tearing down.
-            # `tail_logs` blocks for the whole run and has no timeout of its own. That single
-            # fact caused both defects fixed here, so both comments belong together:
+            # `tail_logs` streams for the whole run and has no timeout of its own. That fact
+            # caused every defect fixed here, so the comments belong together:
             #
             #   * the wall-clock budget must charge the time it spends, or the cap is anchored to
             #     whenever streaming happens to return — which let four jobs run 703 minutes
@@ -1729,14 +2111,31 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             #   * the partial-results fetch must start BEFORE it, because until now nothing
             #     fetched until it returned — by which time the box is either finished (the fetch
             #     is redundant) or unreachable (the fetch is impossible). Those same four jobs
-            #     each lost ~6h of fsynced result rows to that ordering (see `PartialsFetcher`).
+            #     each lost ~6h of fsynced result rows to that ordering (see `PartialsFetcher`);
+            #   * it must not run on this thread unbounded: a half-open stream never returns, and
+            #     the backstop below never got its turn. It streams on a daemon thread joined
+            #     against the remaining budget, and the queue is probed meanwhile so an uncapped
+            #     job notices a run that ended under a stream that did not (see `_LogStream`).
+            # The box is UP on both paths: remember its DO volume while a listing still describes
+            # it truthfully, so teardown can verify it gone by id (job E). Retried on heartbeats
+            # until seen — one cheap listing per minute at most, and none once it has the id.
+            do_volumes_known = cloud == "do" and bool(remember_do_volumes(store, job_id, cluster))
             partials.start()
-            try:
-                sky.tail_logs(cluster, sky_job_id, follow=True)  # streams run logs; blocks till done
-            except Exception as e:  # noqa: BLE001
-                print(f"[lab] tail_logs issue: {e}")
+            stream = _LogStream(sky, cluster, sky_job_id)
+            stream.start()
+            stream.wait(
+                remaining_wall_budget(manifest.resources.timeout, anchor, boot_s=boot_s),
+                run_is_over=lambda: _run_is_over(sky, cluster, sky_job_id),
+            )
 
-            max_wait = remaining_wall_budget(manifest.resources.timeout, started)
+            def _beat() -> None:
+                nonlocal do_volumes_known
+                partials.beat()
+                stream.reattach_if_dropped()
+                if cloud == "do" and not do_volumes_known:
+                    do_volumes_known = bool(remember_do_volumes(store, job_id, cluster))
+
+            max_wait = remaining_wall_budget(manifest.resources.timeout, anchor, boot_s=boot_s)
             if max_wait <= 0:
                 print(
                     "[lab] wall-clock cap already spent when streaming returned — not waiting "
@@ -1754,9 +2153,17 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                 sky_job_id,
                 max_wait,
                 heartbeat_s=HEARTBEAT_S,
-                on_heartbeat=partials.beat,
+                on_heartbeat=_beat,
             )
             final = raw_final
+            # Only a finite deadline can end the wait on a live job; an uncapped one keeps
+            # polling until the remote job ends or its cluster is definitively gone.
+            still_running_at_deadline = (
+                lost_reason is None
+                and not reached_terminal
+                and math.isfinite(max_wait)
+                and raw_final in (JobState.running, JobState.queued)
+            )
         except ProvisionTimeout:
             _remember_capacity(store, job_id, manifest, cloud, error_text="")
             store.update_manifest(
@@ -1830,7 +2237,10 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         # the classifier only ever *trusts* a succeeded/failed terminal, never invents one.
         timed_out = (store.output_dir(job_id) / TIMEOUT_SENTINEL).exists()
         fresh = store.read_manifest(job_id)
-        cancel_requested = fresh.status == JobState.cancelled
+        # `lab cancel` writes its intent to `_runtime.json` before anything terminal (R9).
+        cancel_requested = fresh.status == JobState.cancelled or bool(
+            store.read_runtime(job_id).get("cancelling")
+        )
         use_spot = (
             fresh.backend.launched_spot
             if fresh.backend.launched_spot is not None
@@ -1866,6 +2276,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             use_spot=use_spot,
             cluster_gone=cluster_gone,
             reached_terminal=reached_terminal,
+            wall_clock_exceeded=still_running_at_deadline,
         )
 
         # The other kind of dead host: one that boots, advertises a GPU, and has none. It fails
@@ -1899,6 +2310,11 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         if final is JobState.timed_out:
             wall = int(parse_duration(manifest.resources.timeout) or 0)
             end_reason = timeout_reason(wall)
+            if still_running_at_deadline:
+                # The box should have ended it itself; say that it did not, without changing the
+                # documented prefix callers match on.
+                end_reason += " (still running at the supervisor's deadline; it was stopped there)"
+                events.note("wall_clock.backstop", cluster=cluster, wall_s=wall)
         else:
             end_reason = final.value
 
@@ -1920,9 +2336,12 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             # The instance vanished (preemption inferred), but we can't confirm the Vast rental is
             # actually gone — flag it so `lab wait` exits 3 and the operator can run `lab reconcile`
             # before any auto-resubmitter builds on a potentially-still-billing orphan (FR-C2).
+            detail = dict(store.read_manifest(job_id).teardown_detail or {})
+            detail["overridden"] = "preempted but the provider teardown is unconfirmed"
             store.update_manifest(
                 job_id,
                 teardown_status="failed",
+                teardown_detail=detail,
                 end_reason="preempted but teardown unconfirmed — see `lab reconcile`",
             )
             teardown_ok = False
@@ -1937,7 +2356,18 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         outcome is durable in the other place that matters — `tear_down_and_record` writes
         `teardown_status` on the manifest, which is what `lab wait` (exit 3/6) and `lab reconcile`
         read.
+
+        A SIGTERM sent by ``lab cancel`` is the supervisor doing what it was asked, not failing:
+        it closes ``ok`` with ``cancelled_by_user`` in the call's result (job F, 2026-11-19, was
+        listed among ``lab history --failures`` as ``SupervisorTerminated``). The ``cancelling``
+        intent that ``lab cancel`` writes *before* signalling is the only evidence accepted — the
+        same signal from anything else stays ``interrupted``, a failure.
         """
+        if isinstance(exc, SupervisorTerminated) and _user_cancel_in_flight(store, job_id):
+            call.result(cancelled_by_user=True, signal=exc.signal_name)
+            outcome, error = "ok", None
+        else:
+            error = events.error_dict(exc)
         # `teardown` is what this abort is about to *do*, not merely whether a machine was ever
         # asked for: a rotated job reaches here with its abandoned attempt already destroyed, and
         # a ledger that claimed a teardown either way could not be used to audit this path.
@@ -1948,7 +2378,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             teardown=machine_requested and not attempt_torn_down,
         )
         exit_code = exc.code if isinstance(exc, SystemExit) and isinstance(exc.code, int) else None
-        events.finish(call, outcome=outcome, exit_code=exit_code, error=events.error_dict(exc))
+        events.finish(call, outcome=outcome, exit_code=exit_code, error=error)
         _teardown_on_abort(
             store,
             job_id,
@@ -1957,6 +2387,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             why=why,
             launched=machine_requested,
             torn_down=attempt_torn_down,
+            request_id=inflight_request,
         )
 
     try:

@@ -248,8 +248,8 @@ def test_gcp_destroy_matching_collects_failures(monkeypatch):
     monkeypatch.setattr(
         "lab.backends.skypilot.delete_gcp_instance", _raise(RuntimeError("403 Forbidden"))
     )
-    destroyed, failures = _gcp_destroy_matching("lab-x")
-    assert destroyed == []
+    destroyed, failures, pending = _gcp_destroy_matching("lab-x")
+    assert destroyed == [] and pending == []
     assert len(failures) == 1 and "403 Forbidden" in failures[0]
 
 
@@ -326,11 +326,16 @@ def test_delete_gcp_disk_raises_when_the_operation_fails():
 
 
 def test_robust_teardown_gcp_fallback_failure_is_failed(monkeypatch):
+    """sky definitively refused and GCP could not be asked: a real alarm. (An *uncertain* sky
+    error with the same fallback is `unknown` — test_teardown_unfinished_is_unknown.py.)"""
     from lab.backends.skypilot import robust_teardown
+
+    class ClusterDoesNotExist(Exception):
+        """Matched by type name, as lab._skycompat does: a definitive refusal."""
 
     class _SkyDownFails:
         def down(self, cluster):
-            raise RuntimeError("sky.down boom")
+            raise ClusterDoesNotExist("sky.down boom")
 
         def get(self, x):
             return x

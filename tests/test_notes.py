@@ -138,6 +138,46 @@ def test_matching_ignores_a_note_from_a_different_signature(tmp_path: Path) -> N
     assert notes.match(signature="LabError: no offer") == []
 
 
+def test_a_note_filed_under_a_job_specific_signature_fires_for_the_next_job(
+    tmp_path: Path,
+) -> None:
+    """Before signatures normalised real job ids, an "unknown job id" note was keyed on
+    `'<sha>-<n>-7486e1'` — the one job it was written about — and could never fire again. The
+    stored key is upgraded on read, so those notes start doing their job without a migration."""
+    from lab.events.stats import signature
+
+    legacy = "Exit: unknown job id '<sha>-<n>-7486e1' — not in local runs/"
+    notes.write(text="the job ran from the other checkout", signature=legacy)
+
+    later = signature(
+        {"type": "Exit", "message": "unknown job id '20261120-081512-a0b1c2' — not in local runs/"}
+    )
+    assert [n.text for n in notes.match(signature=later)] == ["the job ran from the other checkout"]
+    # ...and a note filed today under the new key is matched by the same lookup.
+    notes.write(text="filed today", signature=later)
+    assert [n.text for n in notes.match(signature=later)] == [
+        "filed today", "the job ran from the other checkout",
+    ]
+
+
+def test_a_legacy_signature_cut_at_the_length_cap_still_matches(tmp_path: Path) -> None:
+    """The old normaliser left ~13 more characters per id, so a long message hit the 120-char
+    cap earlier: the upgraded stored key is then a strict prefix of today's signature."""
+    from lab.events.stats import signature
+
+    tail = "x" * 200
+    job, other = "20261119-102456-7486e1", "20261120-081512-a0b1c2"
+    # What the old normaliser stored: the id rewritten as `<sha>-<n>-7486e1`, then cut at 120.
+    legacy_message = f"unknown job id '<sha>-<n>-7486e1' {tail}"[:120]
+    notes.write(text="long one", signature=f"Exit: {legacy_message}")
+
+    later = signature({"type": "Exit", "message": f"unknown job id '{other}' {tail}"})
+    assert [n.text for n in notes.match(signature=later)] == ["long one"]
+    # A *different* failure sharing only the generic head of the message must not match.
+    unrelated = signature({"type": "Exit", "message": f"unknown job id '{job}' " + "y" * 200})
+    assert notes.match(signature=unrelated) == []
+
+
 def test_matching_finds_a_note_by_entrypoint_and_cloud(tmp_path: Path) -> None:
     notes.write(text="DO caps out at 8 boxes", facets={"entrypoint": "census.py", "cloud": "do"})
 
@@ -187,6 +227,47 @@ def test_a_retired_note_is_still_history(tmp_path: Path) -> None:
     assert len(retired) == 1
     assert retired[0].retired is not None
     assert retired[0].retired["reason"] == "enforced on-box since v0.1.0"
+
+
+def test_a_retired_note_no_longer_counts_on_its_job(tmp_path: Path) -> None:
+    """`lab status` shows `notes: N` from `count_for_job`. The retirement is an append to the
+    *index*; the per-job file still holds the original, so reading that file alone kept counting
+    a retired note as live forever."""
+    runs = tmp_path / "runs"
+    (runs / "j-1").mkdir(parents=True)
+    n = notes.write(text="the cap is not enforced on the box", job_id="j-1", home=runs)
+    assert n is not None and notes.count_for_job("j-1", home=runs) == 1
+
+    notes.retire(n.id, reason="enforced since v0.1.0")
+
+    assert notes.count_for_job("j-1", home=runs) == 0
+    [only] = notes.for_job("j-1", home=runs)  # still history: listed once, marked retired
+    assert only.id == n.id and only.retired is not None
+    assert only.retired["reason"] == "enforced since v0.1.0"
+
+
+def test_a_retired_note_no_longer_counts_on_the_index_fallback_either(tmp_path: Path) -> None:
+    """No per-job file (written with no home): the index holds the original AND its retirement
+    line, which used to be counted as two live notes for the job."""
+    runs = tmp_path / "runs"
+    n = notes.write(text="x", job_id="j-2", home=None)
+    assert n is not None
+    notes.retire(n.id, reason="stale")
+
+    assert notes.count_for_job("j-2", home=runs) == 0
+    assert [x.id for x in notes.for_job("j-2", home=runs)] == [n.id]
+
+
+def test_retiring_one_note_leaves_the_jobs_other_notes_live(tmp_path: Path) -> None:
+    runs = tmp_path / "runs"
+    (runs / "j-3").mkdir(parents=True)
+    a = notes.write(text="a", job_id="j-3", home=runs)
+    notes.write(text="b", job_id="j-3", home=runs)
+    assert a is not None
+    notes.retire(a.id, reason="stale")
+
+    assert notes.count_for_job("j-3", home=runs) == 1
+    assert [x.text for x in notes.for_job("j-3", home=runs) if x.retired is None] == ["b"]
 
 
 def test_retiring_an_unknown_note_is_an_error_the_caller_can_report(tmp_path: Path) -> None:

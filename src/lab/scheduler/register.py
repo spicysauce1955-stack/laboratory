@@ -20,6 +20,7 @@ from lab.core import (
     check_sweep_admission,
     expand_grid,
     validate_cloud,
+    validate_durations,
 )
 from lab.models import CodeRef, JobSpec, ResourceRequest
 from lab.scheduler.bundle import create_bundle
@@ -112,6 +113,7 @@ def _check_cloud_triggers(resources: ResourceRequest, triggers: Triggers) -> Non
     """Fail-loud (FR-F3): price/offer triggers query the Vast offer feed only — gating a DO/GCP
     job on Vast prices would silently never (or always) fire."""
     validate_cloud(resources.cloud)
+    validate_durations(resources)
     cloud = resources.cloud or "vast"
     if cloud != "vast" and (triggers.max_hourly_usd is not None or triggers.offer_query):
         raise LabError(
@@ -126,7 +128,16 @@ def register(
     spec: JobSpec,
     triggers: Triggers,
     guardrails: Guardrails,
+    *,
+    hold: bool = False,
 ) -> Registration:
+    """Capture and commit one registration. ``hold=True`` registers it held.
+
+    The hold marker is written for the pre-generated reg_id *before* the entry: the entry is the
+    commit point, after which the scheduler may launch it, so a hold written afterwards left a
+    window -- and an R2 blip there left an unheld, eligible registration the operator had asked
+    to hold. If the hold write fails, nothing is committed.
+    """
     _check_cloud_triggers(spec.resources, triggers)
     reg_id = _new_reg_id()
     with tempfile.TemporaryDirectory() as td:
@@ -140,6 +151,8 @@ def register(
         bundle_key=bundle_key,
         code=code,
     )
+    if hold:
+        queue.hold(reg_id)  # before the commit point, never after it
     queue.put_entry(reg)  # last write = commit point
     return reg
 

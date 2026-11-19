@@ -94,6 +94,160 @@ def test_zero_preemptible_cpu_quota_is_not_a_failure(monkeypatch, ctx):
 
 
 # --------------------------------------------------------------------------------------------
+# Regional quota: `fail` only when every region the launch could use was checked
+# --------------------------------------------------------------------------------------------
+
+
+def _cands(*regions):
+    from lab.placement import Candidate
+
+    return [Candidate(region=r, zones=(), hourly_usd=0.35) for r in regions]
+
+
+FIVE = ("us-central1", "us-east1", "us-west1", "europe-west4", "asia-east1")
+
+
+def test_gpu_quota_outside_the_checked_regions_does_not_block(monkeypatch, ctx):
+    """Only the 3 cheapest candidates are asked about. A project holding T4 quota only in the 4th
+    is a launch SkyPilot fails over to — refusing it on a partial look is a confident false
+    negative, and only definitive negatives may block."""
+    compute = fake_compute(
+        region_quotas={r: {"NVIDIA_T4_GPUS": (0, 0)} for r in FIVE[:3]}
+        | {"europe-west4": {"NVIDIA_T4_GPUS": (4, 0)}},
+        project_quotas={"GPUS_ALL_REGIONS": 4},
+    )
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    ctx["candidates"] = _cands(*FIVE)
+    result = D.check_quota_gpu(ResourceRequest(cloud="gcp", accelerators="T4:1"), ctx)
+    assert result.status == "warn"
+    assert not result.blocking
+
+
+def test_gpu_quota_fails_when_every_usable_region_was_checked(monkeypatch, ctx):
+    compute = fake_compute(
+        region_quotas={r: {"NVIDIA_T4_GPUS": (0, 0)} for r in FIVE[:2]},
+        project_quotas={"GPUS_ALL_REGIONS": 4},
+    )
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    ctx["candidates"] = _cands(*FIVE[:2])
+    result = D.check_quota_gpu(ResourceRequest(cloud="gcp", accelerators="T4:1"), ctx)
+    assert result.status == "fail"
+
+
+def test_gpu_quota_in_a_pinned_region_is_definitive(monkeypatch, ctx):
+    compute = fake_compute(
+        region_quotas={"us-east1": {"NVIDIA_T4_GPUS": (0, 0)}},
+        project_quotas={"GPUS_ALL_REGIONS": 4},
+    )
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    ctx["candidates"] = _cands(*FIVE)
+    res = ResourceRequest(cloud="gcp", accelerators="T4:1", region="us-east1")
+    assert D.check_quota_gpu(res, ctx).status == "fail"
+
+
+def test_a_quota_metric_that_is_not_reported_is_a_skip(monkeypatch, ctx):
+    """Absent is "cannot tell" (a metric named differently, a family GCP meters elsewhere), never
+    "zero"."""
+    compute = fake_compute(
+        region_quotas={"us-central1": {"CPUS": (24, 0)}},
+        project_quotas={"GPUS_ALL_REGIONS": 4},
+    )
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    res = ResourceRequest(cloud="gcp", accelerators="A100-80GB:1", region="us-central1")
+    result = D.check_quota_gpu(res, ctx)
+    assert result.status == "skip"
+
+
+def test_a_tpu_request_is_not_judged_by_gpu_quota(monkeypatch, ctx):
+    """TPUs are metered as TPU_* quotas, never NVIDIA_*_GPUS, and do not draw on
+    GPUS_ALL_REGIONS — so every TPU request used to fail this check."""
+    compute = fake_compute(
+        region_quotas={"us-central2": {"TPU_V4_PODSLICE": (32, 0)}},
+        project_quotas={"GPUS_ALL_REGIONS": 0},
+    )
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    ctx["candidates"] = _cands("us-central2")
+    result = D.check_quota_gpu(ResourceRequest(cloud="gcp", accelerators="tpu-v4-8"), ctx)
+    assert result.status == "skip"
+
+
+def test_cpu_quota_outside_the_checked_regions_does_not_block(monkeypatch, ctx):
+    compute = fake_compute(
+        region_quotas={r: {"CPUS": (8, 8)} for r in FIVE[:3]}
+        | {"europe-west4": {"CPUS": (24, 0)}}
+    )
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    ctx["candidates"] = _cands(*FIVE)
+    result = D.check_quota_cpu(ResourceRequest(cloud="gcp", cpus=4), ctx)
+    assert result.status == "warn"
+
+
+def test_cpu_quota_fails_when_every_usable_region_was_checked(monkeypatch, ctx):
+    compute = fake_compute(region_quotas={"us-east1": {"CPUS": (8, 8)}})
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    ctx["candidates"] = _cands("us-east1")
+    assert D.check_quota_cpu(ResourceRequest(cloud="gcp", cpus=4), ctx).status == "fail"
+
+
+def test_no_candidates_means_an_unrepresentative_look(monkeypatch, ctx):
+    """With no priced candidates the check falls back to us-central1 — one region of ~40, which
+    proves nothing about the others."""
+    compute = fake_compute(region_quotas={"us-central1": {"CPUS": (0, 0)}})
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    result = D.check_quota_cpu(ResourceRequest(cloud="gcp", cpus=4), ctx)
+    assert result.status != "fail"
+
+
+# --------------------------------------------------------------------------------------------
+# Disk quota: the metric of the disk type SkyPilot actually provisions
+# --------------------------------------------------------------------------------------------
+
+
+def _with_instance(ctx, instance_type):
+    ctx["estimate"] = types.SimpleNamespace(instance_type=instance_type)
+    return ctx
+
+
+def test_disk_quota_reads_the_ssd_metric_pd_balanced_draws_on(monkeypatch, ctx):
+    """The lab never sets a disk_tier, so SkyPilot's GCP default (MEDIUM) provisions pd-balanced,
+    which GCP meters as SSD_TOTAL_GB. DISKS_TOTAL_GB is pd-standard's quota: reading it blocked
+    launches on a quota they never draw on, and passed ones whose real quota was exhausted."""
+    compute = fake_compute(
+        region_quotas={"us-east1": {"DISKS_TOTAL_GB": (100, 100), "SSD_TOTAL_GB": (500, 0)}}
+    )
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    res = ResourceRequest(cloud="gcp", accelerators="T4:1", disk_size=100, region="us-east1")
+    result = D.check_quota_disk(res, _with_instance(ctx, "n1-highmem-4"))
+    assert result.status == "ok"
+    assert "SSD_TOTAL_GB" in result.detail
+
+
+def test_exhausted_ssd_quota_is_the_definitive_negative(monkeypatch, ctx):
+    compute = fake_compute(
+        region_quotas={"us-east1": {"DISKS_TOTAL_GB": (4096, 0), "SSD_TOTAL_GB": (500, 480)}}
+    )
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    res = ResourceRequest(cloud="gcp", cpus=4, disk_size=50, region="us-east1")
+    assert D.check_quota_disk(res, _with_instance(ctx, "n2-standard-4")).status == "fail"
+
+
+def test_a_hyperdisk_only_series_is_not_judged_by_persistent_disk_quota(monkeypatch, ctx):
+    compute = fake_compute(
+        region_quotas={"us-east1": {"DISKS_TOTAL_GB": (0, 0), "SSD_TOTAL_GB": (0, 0)}}
+    )
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    res = ResourceRequest(cloud="gcp", cpus=4, disk_size=50, region="us-east1")
+    assert D.check_quota_disk(res, _with_instance(ctx, "n4-standard-4")).status == "skip"
+
+
+def test_disk_quota_without_a_resolved_instance_type_cannot_tell(monkeypatch, ctx):
+    compute = fake_compute(region_quotas={"us-east1": {"SSD_TOTAL_GB": (0, 0)}})
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    res = ResourceRequest(cloud="gcp", cpus=4, disk_size=50, region="us-east1")
+    assert D.check_quota_disk(res, ctx).status == "skip"
+
+
+# --------------------------------------------------------------------------------------------
 # Fail-open on error, fail-closed on a definitive negative
 # --------------------------------------------------------------------------------------------
 
@@ -220,6 +374,10 @@ def test_shape_key_separates_specs_that_would_get_different_verdicts():
         base.model_copy(update={"region": "europe-west1"}),
         base.model_copy(update={"zone": "europe-west1-b"}),
         base.model_copy(update={"use_spot": False}),
+        # `--memory` changes the instance type the catalog resolves, hence its vCPU count, hence
+        # the quota_cpu verdict — it was missing, so a `--memory 8` verdict served `--memory 64`.
+        base.model_copy(update={"memory": "64GB"}),
+        base.model_copy(update={"gpus": 2}),
     ]
     keys = [D._shape_key(base)] + [D._shape_key(v) for v in variants]
     assert len(set(keys)) == len(keys), "two distinguishable specs share a cache key"
@@ -249,8 +407,57 @@ def test_skips_are_not_cached(tmp_path):
     """"Could not answer" is not a finding worth remembering — the next run should retry."""
     cache = D.CheckCache.for_home(tmp_path)
     cache.put("k", D._skip("apis", "timeout"))
-    # put() itself stores whatever it is given; run_checks is what declines to cache a skip.
-    assert cache.get("k") is not None
+    # put() stores whatever it is given; run_checks declines to cache a skip, and get() never
+    # serves one either way.
+    assert cache.get("k") is None
+
+
+def _api_toggle_registry(monkeypatch, state):
+    def _adc(res, ctx):
+        ctx["creds"], ctx["project"] = object(), "proj-x"
+        return D._ok("adc", "x")
+
+    def _apis(res, ctx):
+        if state["api_on"]:
+            return D._ok("apis", "on")
+        return D._fail("apis", "disabled: compute", "gcloud services enable compute")
+
+    monkeypatch.setitem(
+        D._REGISTRY, "gcp", (("adc", _adc), ("project", D.check_project), ("apis", _apis))
+    )
+
+
+def test_a_fixed_failure_stops_blocking_at_once(monkeypatch, tmp_path):
+    """A `fail` was cached for 24h (apis/iam) or 1h (quota), so after the user ran the very fix
+    the check printed, preflight kept refusing every submit from cache — and `--no-cache` could
+    not clear it, because it bypassed the cache in both directions. A definitive negative is
+    exactly the verdict the user is about to act on; it must be re-asked every time."""
+    state = {"api_on": False}
+    _api_toggle_registry(monkeypatch, state)
+    res = ResourceRequest(cloud="gcp", cpus=4)
+
+    assert [r.name for r in D.preflight("gcp", res, home=tmp_path)] == ["apis"]
+    state["api_on"] = True  # the user runs the suggested `gcloud services enable`
+
+    assert D.preflight("gcp", res, home=tmp_path) == []
+
+
+def test_a_fail_written_by_an_older_version_is_not_served(tmp_path):
+    cache = D.CheckCache.for_home(tmp_path)
+    cache.put("gcp|p|apis|-", D._fail("apis", "disabled", "enable it"))
+    assert cache.get("gcp|p|apis|-") is None
+
+
+def test_no_cache_still_refreshes_the_cache(monkeypatch, tmp_path):
+    """`lab doctor --no-cache` asks every question fresh; its answers should then be what the
+    next cached preflight reads, not be thrown away."""
+    state = {"api_on": True}
+    _api_toggle_registry(monkeypatch, state)
+    res = ResourceRequest(cloud="gcp")
+
+    D.run_checks("gcp", res, home=tmp_path, use_cache=False)
+
+    assert D.CheckCache.for_home(tmp_path).get("gcp|proj-x|apis|-") is not None
 
 
 def test_corrupt_cache_reads_as_empty(tmp_path):
@@ -264,6 +471,72 @@ def test_expired_cache_entry_is_ignored(tmp_path):
     cache.put("gcp|p|iam|-", D._ok("iam", "fine"), now_s=1000.0)
     assert cache.get("gcp|p|iam|-", now_s=1000.0 + D._TTL_S["iam"] - 1) is not None
     assert cache.get("gcp|p|iam|-", now_s=1000.0 + D._TTL_S["iam"] + 1) is None
+
+
+# --------------------------------------------------------------------------------------------
+# DigitalOcean token: exactly where SkyPilot looks (sky/provision/do/utils.py)
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("DIGITALOCEAN_TOKEN", raising=False)
+    monkeypatch.delenv("DIGITALOCEAN_ACCESS_TOKEN", raising=False)
+    return tmp_path
+
+
+def _doctl_config(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("access-token: x\n")
+
+
+def test_do_token_in_the_env_alone_is_not_enough(home, monkeypatch):
+    """SkyPilot never reads DIGITALOCEAN_TOKEN — it builds its client from doctl's config file —
+    so an env-only token passed this check and the launch then died with "No credentials found"."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", "dop_v1_fake")
+    result = D.check_do_token(ResourceRequest(cloud="do"), {})
+    assert result.status == "fail"
+    assert "DIGITALOCEAN_TOKEN" in result.detail
+
+
+def test_do_token_under_xdg_config_home_is_found(home, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "xdg"))
+    _doctl_config(home / "xdg" / "doctl" / "config.yaml")
+    assert D.check_do_token(ResourceRequest(cloud="do"), {}).status == "ok"
+
+
+def test_with_xdg_config_home_set_the_dot_config_copy_is_not_read(home, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "xdg"))
+    _doctl_config(home / ".config" / "doctl" / "config.yaml")
+    assert D.check_do_token(ResourceRequest(cloud="do"), {}).status == "fail"
+
+
+def test_do_token_at_the_macos_path_is_found(home):
+    _doctl_config(home / "Library" / "Application Support" / "doctl" / "config.yaml")
+    assert D.check_do_token(ResourceRequest(cloud="do"), {}).status == "ok"
+
+
+def test_the_snap_doctl_config_is_named_as_unread(home):
+    """The snap package keeps its config under ~/snap; SkyPilot does not look there."""
+    _doctl_config(home / "snap" / "doctl" / "current" / ".config" / "doctl" / "config.yaml")
+    result = D.check_do_token(ResourceRequest(cloud="do"), {})
+    assert result.status == "fail"
+    assert "snap" in result.detail
+
+
+def test_do_token_paths_match_skypilots_own_list(home):
+    """A drift guard: the paths checked are the paths the installed SkyPilot reads."""
+    import importlib.util
+
+    # Its list is computed at import time from HOME/XDG_CONFIG_HOME, so execute a private copy of
+    # the module under this test's environment rather than reloading the shared one.
+    spec = importlib.util.find_spec("sky.provision.do.utils")
+    assert spec is not None and spec.loader is not None
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    assert [str(p) for p in D._do_credential_paths()] == list(fresh.POSSIBLE_CREDENTIALS_PATHS)
 
 
 # --------------------------------------------------------------------------------------------

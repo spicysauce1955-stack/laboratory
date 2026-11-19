@@ -443,3 +443,15 @@ class TestRotationNeverRaisesAPriceCap:
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(P, "_catalog", lambda: cat)
             assert P.affordable_under_cap(_vast(max_hourly_usd=0.5), "A:1") is True
+
+    def test_affordability_compares_compute_like_the_cap_skypilot_applies(self, monkeypatch):
+        """`--price-cap` becomes `sky.Resources(max_hourly_cost=)`, which SkyPilot's optimizer
+        compares against the *compute* price. Adding the disk's storage rate here refused an
+        accelerator whose compute fits the cap — the rotation skipping a launch the cap allows."""
+        est = P.Estimate(
+            instance_type="x", low_usd=0.45, high_usd=0.60, storage_usd=0.10,
+            regions=1, excluded_zones=0, basis="test",
+        )
+        monkeypatch.setattr(P, "estimate", lambda res, **kw: est)
+        assert P.affordable_under_cap(_vast(max_hourly_usd=0.50), "A:1") is True
+        assert P.affordable_under_cap(_vast(max_hourly_usd=0.40), "A:1") is False

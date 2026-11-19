@@ -99,6 +99,60 @@ def test_check_fails_on_a_missing_file_and_writes_nothing(tmp_path: Path) -> Non
     assert not (tmp_path / ".env.example").exists()
 
 
+def test_check_is_not_ok_while_a_file_conflicts(tmp_path: Path) -> None:
+    """A user-edited scaffold file is drift `lab init` cannot resolve on its own — exactly what a
+    CI `lab init --check` exists to surface. It reported ok and exited 0."""
+    scaffold(tmp_path)
+    (tmp_path / "experiments" / "example.py").write_text("# my own experiment\n")
+
+    report = scaffold(tmp_path, check=True)
+
+    assert "experiments/example.py" in report["conflicts"]
+    assert report["ok"] is False
+    assert not (tmp_path / "experiments" / "example.py.new").exists()
+
+
+def _cli_init(tmp_path: Path, monkeypatch, *args: str):  # type: ignore[no-untyped-def]
+    from typer.testing import CliRunner
+
+    from lab.cli import app
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LAB_EVENTS_DIR", str(tmp_path / "ev"))
+    return CliRunner().invoke(app, ["init", *args])
+
+
+def test_cli_check_exits_non_zero_on_a_conflict_and_claims_no_new_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    scaffold(tmp_path)
+    (tmp_path / "experiments" / "example.py").write_text("# my own experiment\n")
+
+    result = _cli_init(tmp_path, monkeypatch, "--check")
+
+    assert result.exit_code != 0
+    assert "is beside it" not in result.output  # check mode wrote nothing
+    assert "would" in result.output
+    assert not (tmp_path / "experiments" / "example.py.new").exists()
+
+
+def test_cli_names_a_new_file_only_when_one_was_written(tmp_path: Path, monkeypatch) -> None:
+    """A conflicting `.mcp.json` lab entry is left alone with no `.new` beside it."""
+    scaffold(tmp_path)
+    path = tmp_path / ".mcp.json"
+    cfg = json.loads(path.read_text())
+    cfg["mcpServers"]["lab"]["args"] = ["run", "lab", "mcp", "--my-flag"]
+    path.write_text(json.dumps(cfg))
+    (tmp_path / "experiments" / "example.py").write_text("# my own experiment\n")
+
+    result = _cli_init(tmp_path, monkeypatch)
+
+    assert ".mcp.json.new" not in result.output
+    assert not (tmp_path / ".mcp.json.new").exists()
+    assert "experiments/example.py.new" in result.output
+    assert (tmp_path / "experiments" / "example.py.new").exists()
+
+
 def test_skill_lands_under_dot_claude(tmp_path: Path) -> None:
     scaffold(tmp_path)
     assert (tmp_path / ".claude" / "skills" / "laboratory" / "SKILL.md").is_file()

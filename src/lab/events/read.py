@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Protocol
 
 from lab._util import now as _now
 from lab._util import parse_duration
 from lab.events import store
 from lab.events.models import Event, Note
+from lab.events.stats import action_key
+
+_DAY = timedelta(days=1)
 
 
 class _ManifestStore(Protocol):
@@ -95,6 +99,50 @@ def _as_trace(value: object, *, id_: str) -> list[Note]:
     return notes
 
 
+def _open_event(id_: str, record: dict[str, Any]) -> Event | None:
+    """An ``open`` record as an :class:`Event` with no outcome yet, or ``None`` without a ts."""
+    ts = _dt(record.get("ts"))
+    if ts is None:
+        return None
+    return Event(
+        id=id_, ts=ts, session=str(record.get("session", "")),
+        seq=_as_int(record.get("seq"), default=0, field="seq", id_=id_),
+        surface=str(record.get("surface", "")),
+        action=str(record.get("action", "")),
+        params=_as_dict(record.get("params"), field="params", id_=id_),
+        project=_as_dict(record.get("project"), field="project", id_=id_),
+        lab_version=str(record.get("lab_version", "")),
+    )
+
+
+def _apply_close(event: Event, close: dict[str, Any]) -> None:
+    id_ = event.id
+    event.outcome = close.get("outcome")
+    event.exit_code = close.get("exit_code")
+    event.duration_ms = close.get("duration_ms")
+    event.refs = _as_dict(close.get("refs"), field="refs", id_=id_)
+    event.result = _as_dict(close.get("result"), field="result", id_=id_)
+    event.error = _as_error(close.get("error"), id_=id_)
+    event.trace = _as_trace(close.get("trace"), id_=id_)
+
+
+def _split(records: Iterable[dict[str, Any]]) -> tuple[dict[str, Event], dict[str, dict[str, Any]]]:
+    """Opens (as events) and closes, by id; a later line for the same id wins."""
+    events: dict[str, Event] = {}
+    closes: dict[str, dict[str, Any]] = {}
+    for record in records:
+        id_ = record.get("id")
+        if not isinstance(id_, str):
+            continue
+        if record.get("phase") == "open":
+            event = _open_event(id_, record)
+            if event is not None:
+                events[id_] = event
+        elif record.get("phase") == "close":
+            closes[id_] = record
+    return events, closes
+
+
 def fold(records: Iterable[dict[str, Any]]) -> list[Event]:
     """Pair opens with closes. A close with no open is dropped (its open aged out); an open with
     no close becomes a ``running-or-died`` row, which is itself the finding.
@@ -104,39 +152,50 @@ def fold(records: Iterable[dict[str, Any]]) -> list[Event]:
     Every field read here is coerced per-field rather than trusted, so one malformed record
     degrades instead of raising and taking the rest of the batch down with it.
     """
-    events: dict[str, Event] = {}
-    closes: dict[str, dict[str, Any]] = {}
-    for record in records:
-        id_ = record.get("id")
-        if not isinstance(id_, str):
-            continue
-        if record.get("phase") == "open":
-            ts = _dt(record.get("ts"))
-            if ts is None:
-                continue
-            events[id_] = Event(
-                id=id_, ts=ts, session=str(record.get("session", "")),
-                seq=_as_int(record.get("seq"), default=0, field="seq", id_=id_),
-                surface=str(record.get("surface", "")),
-                action=str(record.get("action", "")),
-                params=_as_dict(record.get("params"), field="params", id_=id_),
-                project=_as_dict(record.get("project"), field="project", id_=id_),
-                lab_version=str(record.get("lab_version", "")),
-            )
-        elif record.get("phase") == "close":
-            closes[id_] = record
+    events, closes = _split(records)
     for id_, close in closes.items():
         event = events.get(id_)
-        if event is None:
-            continue
-        event.outcome = close.get("outcome")
-        event.exit_code = close.get("exit_code")
-        event.duration_ms = close.get("duration_ms")
-        event.refs = _as_dict(close.get("refs"), field="refs", id_=id_)
-        event.result = _as_dict(close.get("result"), field="result", id_=id_)
-        event.error = _as_error(close.get("error"), id_=id_)
-        event.trace = _as_trace(close.get("trace"), id_=id_)
+        if event is not None:
+            _apply_close(event, close)
     return sorted(events.values(), key=lambda e: e.ts, reverse=True)
+
+
+def _day_start(path: Path) -> datetime | None:
+    try:
+        return datetime.strptime(path.stem, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _days_newest_first(paths: list[Path]) -> Iterator[tuple[datetime, list[Event]]]:
+    """Fold the ledger one day file at a time, newest day first, yielding each day's calls
+    newest first — so a caller can stop as soon as it has what it needs.
+
+    Sound because of how ``record`` writes (UTC throughout, ``_util.now``): a call's ``open`` is
+    appended to the file of the UTC day its ``ts`` falls on (``when=call.started``), and its
+    ``close`` to the file of the day it *ended* — the same file or a later one. So by the time
+    day D is folded, every close of a call opened on D has already been read, and every call in
+    an older file opened strictly before D began. The only memory carried between files is the
+    closes still waiting for an open — calls straddling midnight — instead of the whole ledger.
+    """
+    pending: dict[str, dict[str, Any]] = {}
+    seen: set[str] = set()
+    for path in reversed(paths):
+        start = _day_start(path)
+        assert start is not None  # the caller only takes this path when every name is a date
+        opens, closes = _split(store.iter_records([path]))
+        for id_, close in closes.items():
+            pending.setdefault(id_, close)  # a newer file's close outranks an older one's
+        day: list[Event] = []
+        for id_, event in opens.items():
+            if id_ in seen:  # a newer file already had this open (only a damaged ledger does)
+                continue
+            seen.add(id_)
+            if id_ in pending:
+                _apply_close(event, pending.pop(id_))
+            day.append(event)
+        day.sort(key=lambda e: e.ts, reverse=True)
+        yield start, day
 
 
 def _absolute(text: str) -> datetime | None:
@@ -206,24 +265,47 @@ def read(
     now_: datetime | None = None,
 ) -> list[Event]:
     """Folded rows, newest first. ``since`` takes a duration string (``2d``, ``30m``, ``3h30m``)
-    or an absolute UTC date/time (``2026-09-06``) — see :func:`since_cutoff`."""
-    events = fold(store.iter_records(store.day_files()))
-    if since:
-        cutoff = since_cutoff(since, now_=now_)
-        if cutoff is not None:
-            events = [e for e in events if e.ts >= cutoff]
-    if project:
-        events = [e for e in events if e.project.get("name") == project]
-    if action:
-        events = [e for e in events if e.action == action]
-    if session:
-        events = [e for e in events if e.session == session]
-    if job:
-        events = [e for e in events
-                  if job == e.refs.get("job_id") or job in (e.refs.get("job_ids") or [])]
-    if failures_only:
-        events = [e for e in events if e.failed]
-    return events[:limit] if limit else events
+    or an absolute UTC date/time (``2026-09-06``) — see :func:`since_cutoff`.
+
+    Reads only what the query can need, newest day first (:func:`_days_newest_first`): a day
+    file wholly before the ``since`` cutoff is never opened, and once ``limit`` rows are in hand
+    and the last of them is no older than the day file just read, nothing older can displace
+    them, so reading stops. The rows are exactly what folding the whole ledger and filtering it
+    would give — that was ~1.0 s and 251 MB RSS per call on a 33 MB ledger, whatever was asked.
+    """
+    cutoff = since_cutoff(since, now_=now_) if since else None
+    # One command, either surface's spelling (`sweep-aggregate` / `sweep_aggregate`) — the same
+    # key `lab history --stats` groups by, so a row there drills down to all of its calls.
+    wanted_action = action_key(action) if action else None
+
+    def keep(e: Event) -> bool:
+        if cutoff is not None and e.ts < cutoff:
+            return False
+        if project and e.project.get("name") != project:
+            return False
+        if wanted_action is not None and action_key(e.action) != wanted_action:
+            return False
+        if session and e.session != session:
+            return False
+        if job and not (job == e.refs.get("job_id") or job in (e.refs.get("job_ids") or [])):
+            return False
+        return not failures_only or e.failed
+
+    paths = store.day_files()
+    starts = [_day_start(p) for p in paths]
+    if any(s is None for s in starts):
+        # A name that is not a date says nothing about what it holds: no shortcut is safe.
+        events = [e for e in fold(store.iter_records(paths)) if keep(e)]
+        return events[:limit] if limit else events
+    if cutoff is not None:
+        bound = cutoff if cutoff.tzinfo is not None else cutoff.replace(tzinfo=timezone.utc)
+        paths = [p for p, s in zip(paths, starts) if s is not None and s + _DAY > bound]
+    found: list[Event] = []
+    for start, day in _days_newest_first(paths):
+        found.extend(e for e in day if keep(e))
+        if limit and len(found) >= limit and found[limit - 1].ts >= start:
+            break
+    return found[:limit] if limit else found
 
 
 def crossref(event: Event, job_store: _ManifestStore) -> dict[str, Any]:

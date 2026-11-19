@@ -6,8 +6,9 @@ Wired to the local backend by default; structured JSON output mirrors the MCP §
 from __future__ import annotations
 
 import atexit
-import json
 import errno
+import json
+import math
 import os
 import shutil
 import sys
@@ -15,7 +16,7 @@ import tempfile
 import traceback
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -23,7 +24,12 @@ import typer
 
 from lab import __version__, events
 from lab import notes as lab_notes
-from lab._util import atomic_write_text, now, parse_duration, wrap_with_extras
+from lab._util import (
+    atomic_write_text,
+    parse_duration,
+    unwritable_dest_message,
+    wrap_with_extras,
+)
 from lab.core import (
     Lab,
     LabError,
@@ -32,19 +38,26 @@ from lab.core import (
     job_status_view,
     orphan_key,
     resolve_backend_profile,
-    validate_cloud,
 )
 from lab.env import load_lab_env
 from lab.events import store as events_store
 from lab.events.annotate import digest_of, refs_from
 from lab.events.sanitize import sanitize_argv
+from lab.dashboard import DEFAULT_DASHBOARD_ROWS
+from lab.list_view import DEFAULT_LIST_LIMIT, list_view
 from lab.manifest import git_work_tree, repo_root
+from lab.metrics import DEFAULT_MAX_POINTS
 from lab.models import JobManifest, JobSpec, ResourceRequest
-from lab.scheduler.models import Guardrails, RegState, Triggers
+from lab.queue_view import queue_list_view
+from lab.scheduler.models import Guardrails, Triggers
 from lab.scheduler.price import PriceFeed
-from lab.scheduler.queue import QueueStore, default_queue, wait_for_queue_drain
+from lab.scheduler.queue import (
+    QueueStore,
+    UnreadableEntriesError,
+    default_queue,
+    wait_for_queue_drain,
+)
 from lab.scheduler.register import parse_expires, parse_window
-from lab.scheduler.skew import skew_from_heartbeat
 from lab.scheduler.register import register as sched_register
 from lab.scheduler.register import register_sweep as sched_register_sweep
 from lab.scheduler.register import worst_case_cost
@@ -326,11 +339,46 @@ def _lab_for_mirrored_or_fail(job_id: str) -> Lab:
         _fail(2, msg)
 
 
+def _json_default(o: Any) -> Any:
+    """``json.dumps`` hook for what it cannot encode: dates as ISO-8601 (``T`` separator, the
+    form the MCP tools return), anything else as ``str`` — which is what this used to do for
+    datetimes too, printing ``2026-11-19 10:24:56+00:00`` on the CLI and ``…T10:24:56…`` over
+    MCP for the same field."""
+    if isinstance(o, date):  # datetime is a date subclass
+        return o.isoformat()
+    return str(o)
+
+
+def _finite(obj: Any) -> Any:
+    """``obj`` with every non-finite float (NaN, ±Infinity) replaced by ``None``, recursively.
+
+    Python's ``json`` writes those as bare ``NaN``/``Infinity`` tokens, which are not JSON: a
+    strict parser (``jq``, ``JSON.parse``) rejects the whole payload, so one diverged loss made
+    ``lab metrics`` unreadable. ``null`` is what the MCP tools return for the same value.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_finite(v) for v in obj]
+    return obj
+
+
+def _dumps(obj: Any) -> str:
+    """Strict JSON for anything the CLI prints or writes for a caller to parse."""
+    try:
+        return json.dumps(obj, indent=2, default=_json_default, allow_nan=False)
+    except ValueError:  # a non-finite float somewhere: the rare case pays for the walk
+        return json.dumps(_finite(obj), indent=2, default=_json_default, allow_nan=False)
+
+
 def _emit(obj: Any) -> None:
     """Print a command's JSON payload, and annotate the open ledger call with its ids/digest.
 
     Nearly every command funnels its result through here, which makes it the one place to learn
-    what a call produced without touching each command.
+    what a call produced without touching each command. Output is strict JSON (``null`` for a
+    non-finite float) with ISO-8601 timestamps — see :func:`_dumps`.
     """
     call = events.current()
     if call is not None:
@@ -339,7 +387,7 @@ def _emit(obj: Any) -> None:
             call.result(**digest_of(obj))
         except Exception as e:  # noqa: BLE001 — annotating the ledger must never fail a command
             events_store.debug(f"annotate failed: {e}")
-    typer.echo(json.dumps(obj, indent=2, default=str))
+    typer.echo(_dumps(obj))
 
 
 def _fail(code: int, cause: BaseException | str | None = None) -> NoReturn:
@@ -576,7 +624,8 @@ def sweep(
             allow_unknown_config=allow_unknown_config,
         )
     except LabError as e:
-        _emit({"error": str(e)})
+        # A sweep refused partway also names the sweep_id + ids it already launched.
+        _emit({"error": str(e), **getattr(e, "details", {})})
         _fail(1, e)
     if lab.store.has_sweep_plan(sweep_id):
         plan = lab.sweep_plan(sweep_id)
@@ -602,6 +651,11 @@ def export(
     except LabError as e:
         _emit({"error": str(e)})
         _fail(1, e)
+    except OSError as e:
+        if (msg := unwritable_dest_message(to, e)) is None:
+            raise
+        _emit({"error": f"export: {msg}"})
+        _fail(1, e)
 
 
 @app.command()
@@ -609,13 +663,20 @@ def lint(
     command: str = typer.Option(..., "--command", "-c", help="entrypoint, e.g. 'python experiments/x.py'"),
     grid: list[str] = typer.Option([], "--grid", "-g", help="key=v1,v2,... (repeatable)"),
     key: list[str] = typer.Option([], "--key", help="extra override key(s) to check (repeatable)"),
+    seeds: str | None = typer.Option(
+        None, "--seeds",
+        help="the --seeds a sharded sweep will use; checks the seeds= key it appends to each shard",
+    ),
 ) -> None:
-    """Pre-submit check: warn about override keys the entrypoint source never references.
+    """Pre-submit check: will the entrypoint accept the override keys a sweep passes?
 
-    A heuristic grep for legacy entrypoints that don't write effective_config.json — catches the
-    silent-dropped-override trap (field-report #1) before money is spent. Exits 1 on findings.
+    When the script declares its keys with `get_overrides(known={...})`, lint checks against that
+    declaration — the keys it will refuse at runtime (`check: "declared"`). Otherwise it falls
+    back to a grep for keys the source never mentions (`check: "heuristic"`), the
+    silent-dropped-override trap (field-report #1). Exits 1 on findings.
     """
-    from lab.experiment import unreferenced_keys
+    from lab.lint import lint_keys
+    from lab.sharding import parse_seeds
 
     script = next((tok for tok in command.split() if tok.endswith(".py")), None)
     if script is None or not Path(script).exists():
@@ -623,18 +684,25 @@ def lint(
         _emit({"error": msg})
         _fail(2, msg)
     keys = list(_parse_grid(grid)) + list(key)
-    missing = unreferenced_keys(Path(script).read_text(), keys)
-    _emit({"script": script, "checked_keys": sorted(keys), "missing_keys": missing})
-    if missing:
-        _fail(1, f"lint: {len(missing)} unreferenced config key(s): {missing}")
+    if seeds is not None:
+        try:
+            parse_seeds(seeds)
+        except ValueError as e:
+            raise typer.BadParameter(f"bad --seeds {seeds!r}: {e}") from e
+        keys.append("seeds")  # what `lab sweep --seeds` appends to every shard (seed axis key)
+    result = lint_keys(Path(script).read_text(), keys)
+    _emit({"script": script, "checked_keys": sorted(set(keys)), **result})
+    if missing := result["missing_keys"]:
+        what = "undeclared" if result["check"] == "declared" else "unreferenced"
+        _fail(1, f"lint: {len(missing)} {what} config key(s): {missing}")
 
 
 @app.command()
 def mcp() -> None:
     """Run the MCP server on stdio (the command scaffolded into ``.mcp.json``)."""
-    from lab.mcp_server import build_server
+    from lab.mcp_server import build_server, run_stdio
 
-    build_server(default_lab()).run()
+    run_stdio(build_server(default_lab()))  # stdout is the JSON-RPC stream; diagnostics -> stderr
 
 
 @app.command()
@@ -647,12 +715,17 @@ def init(
     from lab.init import scaffold
 
     report = scaffold(Path.cwd(), check=check)
+    for warning in report.get("warnings", []):
+        print(f"warning: {warning}", file=sys.stderr)
     for dest in report["conflicts"]:
-        print(
-            f"warning: {dest} differs from the version lab ships and was left as-is; "
-            f"the current version is beside it as {dest}.new",
-            file=sys.stderr,
-        )
+        copy = f"{dest}.new" if f"{dest}.new" in report.get("new_copies", []) else None
+        if check:
+            beside = f"; `lab init` would write the current version beside it as {copy}"
+            msg = f"{dest} differs from the version lab ships and would be left as-is"
+        else:
+            beside = f"; the current version is beside it as {copy}"
+            msg = f"{dest} differs from the version lab ships and was left as-is"
+        print(f"warning: {msg}{beside if copy else ''}", file=sys.stderr)
     if report.get("skill_changed"):
         # The one file whose content is *instructions*. A silent refresh is how a capability can
         # ship and still be recorded as impossible eight days later, so say it out loud — on
@@ -668,7 +741,12 @@ def init(
     _emit(report)
     if check and not report["ok"]:
         stale = len(report["created"]) + len(report["refreshed"]) + len(report["merged"])
-        _fail(1, f"init --check: scaffold is stale ({stale} file(s) would change)")
+        conflicts = len(report["conflicts"])
+        _fail(
+            1,
+            f"init --check: scaffold is stale ({stale} file(s) would change, "
+            f"{conflicts} conflict(s) need a hand merge)",
+        )
 
 
 @app.command()
@@ -691,7 +769,7 @@ def status(job_id: str) -> None:
 
 
 @app.command()
-def logs(job_id: str, tail: int = typer.Option(100)) -> None:
+def logs(job_id: str, tail: int = typer.Option(100, help="last N lines (0 = none)")) -> None:
     """Tail a job's logs (FR-D1); scheduler-launched jobs fall back to the mirrored manifest
     (spec §4.3), same as `lab status`."""
     for line in _lab_for_mirrored_or_fail(job_id).logs(job_id, tail=tail):
@@ -848,7 +926,9 @@ def history(
     project = None if all_projects else repo_root().name
     found = events.read(
         since=since, project=project, action=action, session=session, job=job,
-        failures_only=failures, limit=None,
+        # +1: room for this call's own open row, which `_exclude_self` drops. A bound lets the
+        # reader stop at the newest day file that satisfies it instead of parsing the ledger.
+        failures_only=failures, limit=limit + 1 if limit > 0 and not stats else None,
     )
     found = _exclude_self(found)
     if not stats:
@@ -928,11 +1008,29 @@ def metrics(
     job_id: str,
     name: list[str] = typer.Option(None, "--name", "-n", help="filter to these metric names"),
     since_step: int | None = typer.Option(None, help="only points with step > since_step"),
+    max_points: int = typer.Option(
+        DEFAULT_MAX_POINTS, "--max-points", min=0,
+        help="points per series: the newest N (0 = every point). What was cut is reported "
+        "under `truncated`",
+    ),
+    downsample: bool = typer.Option(
+        False, "--downsample",
+        help="spread --max-points evenly over the whole series (always keeping the newest point) "
+        "instead of returning only the newest",
+    ),
 ) -> None:
     """Query a job's incremental metric series (FR-D2 — the early-kill loop); scheduler-launched
-    jobs fall back to the mirrored manifest (spec §4.3), same as `lab status`."""
+    jobs fall back to the mirrored manifest (spec §4.3), same as `lab status`.
+
+    Bounded by default: each series returns its newest --max-points (200) points, and
+    `truncated` names every series that had more ({returned, omitted}). Poll with --since-step
+    for what's new; --downsample for the shape of a whole run; --max-points 0 for everything.
+    """
     _emit(
-        {"series": _lab_for_mirrored_or_fail(job_id).metrics(job_id, names=name or None, since_step=since_step)}
+        _lab_for_mirrored_or_fail(job_id).metrics_view(
+            job_id, names=name or None, since_step=since_step,
+            max_points=max_points, downsample=downsample,
+        )
     )
 
 
@@ -1074,7 +1172,7 @@ def sweep_retry(sweep_id: str) -> None:
     try:
         plan = _lab().retry_sweep(sweep_id)
     except LabError as e:
-        _emit({"error": str(e)})
+        _emit({"error": str(e), **getattr(e, "details", {})})
         _fail(1, e)
     _emit(plan.view())
 
@@ -1090,29 +1188,23 @@ def list_jobs(
         "named in spend.unsupervised_suspect_jobs. Jobs whose rate was never readable are named "
         "in spend.unknown_cost_jobs, never counted as $0.",
     ),
+    limit: int = typer.Option(
+        DEFAULT_LIST_LIMIT, "--limit", "-n", min=0,
+        help="the newest N jobs (0 = every job); jobs_omitted says how many were left out. "
+        "spend always covers every job",
+    ),
 ) -> None:
-    """List jobs, with this project's realized spend so far (FR-H1, FR-I2)."""
-    the_lab = _lab()
-    jobs = the_lab.list_jobs()
-    spend = the_lab.spend(jobs, alert_usd=spend_alert)
-    if spend["alert"] is not None:
+    """List jobs, with this project's realized spend so far (FR-H1, FR-I2).
+
+    Bounded by default to the newest --limit (100) jobs, in the listing's usual oldest-to-newest
+    order; `jobs_total`/`jobs_omitted` say what the page left out. `spend` covers every job.
+    """
+    view = list_view(_lab(), limit=limit, spend_alert=spend_alert)
+    if view["spend"]["alert"] is not None:
         # A $45 crossing was found ~2 landings late in a retrospective audit. Say it the moment
         # it is read — on stderr, so stdout stays the JSON a caller parses.
-        print(spend["alert"]["message"], file=sys.stderr)
-    _emit(
-        {
-            "jobs": [
-                {
-                    "job_id": j.job_id,
-                    "sweep_id": j.sweep_id,
-                    "status": j.status.value,
-                    "created_at": j.created_at,
-                }
-                for j in jobs
-            ],
-            "spend": spend,
-        }
-    )
+        print(view["spend"]["alert"]["message"], file=sys.stderr)
+    _emit(view)
 
 
 @app.command()
@@ -1141,15 +1233,18 @@ def wait(
     ),
     fail_fast: bool = typer.Option(
         False, "--fail-fast",
-        help="exit 4 as soon as any job is failed/timed_out (preempted/cancelled don't trip it); "
-        "surviving jobs are NOT cancelled — `pending` in the summary names them",
+        help="exit 4 as soon as any job is failed/timed_out (preempted/cancelled don't trip it), "
+        "also when every job has already finished; surviving jobs are NOT cancelled — `pending` "
+        "in the summary names them",
     ),
 ) -> None:
     """Block until the job(s) reach a terminal state, then exit (FR-G1).
 
     Run as a Claude Code background task — its completion is the push signal the session acts on,
     so the agent need not poll. Exit codes: 0 clean; 1 gave up on --timeout; 2 bad args;
-    3 teardown leaked (a paid machine may still bill); 4 --fail-fast tripped.
+    3 teardown leaked (a paid machine may still bill); 4 --fail-fast tripped; 6 teardown outcome
+    unknown (verify with the provider). When several apply, 3 > 6 > 4 > 1: a leak on a job that
+    already finished is reported even if another job is still running at --timeout.
 
     Scheduler-launched (deferred) job ids work too: they have no local runs/ record, so they are
     read from the scheduler queue's mirrored manifest — the same fallback `lab status` uses — and
@@ -1177,7 +1272,7 @@ def wait(
         _fail(2, msg)
     the_lab = _lab_for_wait(ids[0])
     on_update = (
-        (lambda s: atomic_write_text(done_file, json.dumps(s, indent=2, default=str)))
+        (lambda s: atomic_write_text(done_file, _dumps(s)))
         if done_file is not None
         else None
     )
@@ -1205,37 +1300,41 @@ def wait(
             "block volume is still billing.",
             err=True,
         )
+    # Precedence 3 > 6 > 4 > 1 (docs/COMPATIBILITY.md). Money outranks everything: exit 3 is the
+    # documented URGENT "a paid machine may still be billing — run `lab reconcile` now" alarm
+    # (FR-C2), and exit 6 is the same concern without the certainty — an unverified machine costs
+    # the same as a verified one (R10). Both are checked before the fail-fast *and* the timeout
+    # exits: a job that already finished with a leaked teardown is billing now, whether or not
+    # some other job in the same wait is still running. Checking the timeout first used to report
+    # that as exit 1 ("gave up"), while `lab wait <that job>` alone exited 3.
+    if teardown_leaks:
+        _fail(3, "teardown leaked on at least one job")
+    if teardown_unknown:
+        _fail(6, "teardown outcome unknown on at least one job — verify with the provider")
     if summary["failed_fast"]:
-        # Money outranks the fail-fast signal. Exit 3 is the documented URGENT "a paid machine
-        # may still be billing — run `lab reconcile` now" alarm (FR-C2); exit 6 is the same
-        # concern without the certainty, and it still outranks 4 because an unverified machine
-        # costs the same as a verified one (R10).
-        if teardown_leaks:
-            _fail(3, "fail-fast: teardown leaked")
-        if teardown_unknown:
-            _fail(6, "fail-fast: teardown outcome unknown")
         _fail(4, "fail-fast: a job failed/timed out")
     if not all_terminal:
         _fail(1, "gave up: --timeout elapsed before all jobs reached a terminal state")
-    if teardown_leaks:
-        # all terminal but at least one cluster may still be billing
-        _fail(3, "teardown leaked on at least one job")
-    if teardown_unknown:
-        # all terminal, nothing confirmed leaked, but at least one outcome is unreadable
-        _fail(6, "teardown outcome unknown on at least one job — verify with the provider")
 
 
 @app.command()
 def dashboard(
     sweep: str | None = typer.Option(None, "--sweep", help="only jobs in this sweep_id"),
     interval: float = typer.Option(2.0, help="refresh seconds"),
+    limit: int = typer.Option(
+        DEFAULT_DASHBOARD_ROWS, "--limit", "-n", min=0,
+        help="show the most recent N jobs (0 = every job)",
+    ),
 ) -> None:
-    """Live terminal dashboard of job status + cost + latest metrics (FR-D3). Ctrl-C to exit."""
+    """Live terminal dashboard of job status + cost + latest metrics (FR-D3). Ctrl-C to exit.
+
+    Shows the most recent --limit (40) jobs; a caption says how many more there are.
+    """
     from lab.dashboard import run_dashboard
 
     lab = _lab()
     ids = lab.jobs_in_sweep(sweep) if sweep else None
-    run_dashboard(lab, ids, interval=interval)
+    run_dashboard(lab, ids, interval=interval, limit=limit)
 
 
 # Every orphan list `reconcile` can report. The dry-run leak alarm reads the UNION: each pass
@@ -1416,7 +1515,9 @@ def reconcile(
 
 @app.command()
 def doctor(
-    cloud: str | None = typer.Option(None, "--cloud", help="vast | do | gcp (default vast)"),
+    cloud: str | None = typer.Option(
+        None, "--cloud", help="vast | do | gcp | local (default vast; local has nothing to check)"
+    ),
     accelerators: str | None = typer.Option(
         None, "--gpu", "--accelerators", help="check quota for this accelerator, e.g. T4:1"
     ),
@@ -1437,14 +1538,14 @@ def doctor(
     Quota is checked at both levels GCP enforces: a fresh project can hold regional GPU quota and
     still be blocked by a global ``GPUS_ALL_REGIONS`` of 0.
     """
-    from lab.doctor import doctor_view, format_report, run_checks
+    from lab.doctor import doctor_view, format_report, run_checks, validate_doctor_cloud
 
     resources = ResourceRequest(
         cpus=cpus, disk_size=disk_size, accelerators=accelerators,
         cloud=cloud, region=region, zone=zone, use_spot=spot,
     )
     try:
-        validate_cloud(cloud)
+        validate_doctor_cloud(cloud)
     except LabError as e:
         _emit({"error": str(e)})
         _fail(2, e)
@@ -1559,12 +1660,11 @@ def register(
         submitted_by="human",
     )
     try:
-        reg = sched_register(repo_root(), queue, spec, triggers, guardrails)
+        # The hold is written before the entry (the commit point), inside `register`.
+        reg = sched_register(repo_root(), queue, spec, triggers, guardrails, hold=hold)
     except LabError as e:  # fail-loud, actionable (FR-F3)
         _emit({"error": str(e)})
         _fail(1, e)
-    if hold:
-        queue.hold(reg.reg_id)
     _emit(
         {
             "reg_id": reg.reg_id,
@@ -1687,13 +1787,6 @@ queue_app = typer.Typer(help="Manage deferred registrations (spec §6).", no_arg
 app.add_typer(queue_app, name="queue")
 
 
-def _heartbeat_age_s(hb: dict[str, Any] | None) -> float | None:
-    if not hb or "at" not in hb:
-        return None
-    at = datetime.fromisoformat(str(hb["at"]))
-    return max(0.0, (now() - at).total_seconds())
-
-
 def _require_entry(queue: QueueStore, reg_id: str) -> None:
     try:
         queue.get_entry(reg_id)
@@ -1709,55 +1802,10 @@ def queue_list() -> None:
     wrote it. `heartbeat_paused` is what the *last completed tick* actually observed and acted
     on -- unlike `control.paused` below (which flips the instant a write lands), it's the signal
     a redeploy cutover needs to confirm the running scheduler has genuinely stopped launching."""
-    queue = default_queue()
-    entries = queue.list_entries()
-    hb = queue.read_heartbeat()
-    # Two listings, not two round trips per entry: asking `held()`/`cancel_requested()` per row
-    # cost 163-326 sequential HEADs on the campaign that motivated this (2026-09, ~65s of a ~70s
-    # `queue list`). One snapshot each also means the rows can no longer self-contradict, which
-    # per-entry reads taken 30s apart could.
-    held_ids = queue.held_ids()
-    cancelled_ids = queue.cancel_requested_ids()
-    # Version skew is silent and expensive: the always-on host deserialises registrations with
-    # ITS pydantic models, so an older host drops fields it doesn't know — that is how
-    # `--price-cap` was quietly lost on the deferred path, and it was then misdiagnosed as
-    # `lab register` not having the flag. Diagnostic only: never a gate, never a refusal.
-    #
-    # `may_drop_fields` is False when there is no heartbeat at all: warning about an old host on a
-    # queue no scheduler has ever ticked against asserts a fact nobody has evidence for, and a
-    # diagnostic that is usually wrong is ignored when it is finally right (R10). The verdict and
-    # its `detail` still ride in the payload, next to `heartbeat_age_s: null`.
-    skew = skew_from_heartbeat(hb)
-    if skew.may_drop_fields:
-        typer.echo(f"[lab] warning: {skew.detail}", err=True)
-    _emit(
-        {
-            "scheduler_skew": {
-                "verdict": skew.verdict,
-                "host_version": skew.host_version,
-                "client_version": skew.client_version,
-                "detail": skew.detail,
-            },
-            "heartbeat_age_s": _heartbeat_age_s(hb),
-            "host": (hb or {}).get("host"),
-            "heartbeat_paused": (hb or {}).get("paused"),
-            "tick_count": (hb or {}).get("tick_count"),
-            "control": queue.read_control().model_dump(),
-            "entries": [
-                {
-                    "reg_id": r.reg_id,
-                    "state": "held"
-                    if (r.state is RegState.pending and r.reg_id in held_ids)
-                    else r.state.value,
-                    "cancel_requested": r.reg_id in cancelled_ids,
-                    "job_id": r.job_id,
-                    "last_skip_reason": r.last_skip_reason,
-                    "expires_at": r.guardrails.expires_at,
-                }
-                for r in entries
-            ],
-        }
-    )
+    view = queue_list_view(default_queue())  # shared with the MCP tool (lab.queue_view)
+    if view.warning is not None:
+        typer.echo(view.warning, err=True)
+    _emit(view.payload)
 
 
 @queue_app.command(name="show")
@@ -1834,11 +1882,17 @@ def queue_wait_drain(
     to run before pausing the queue for a scheduler redeploy (never pause first: pausing stops
     the sync that would let this ever observe a real drain)."""
     try:
-        timeout_s = parse_duration(timeout)
+        # 0 is "check once, don't wait" — the redeploy's race check runs exactly that.
+        timeout_s = parse_duration(timeout, allow_zero=True)
     except ValueError as e:
         raise typer.BadParameter(f"bad --timeout {timeout!r}: {e}") from e
     queue = default_queue()
-    blocking = wait_for_queue_drain(queue, interval=interval, timeout=timeout_s)
+    try:
+        blocking = wait_for_queue_drain(queue, interval=interval, timeout=timeout_s)
+    except UnreadableEntriesError as e:
+        # Fail closed, but as data: an entry that can't be read may be in flight.
+        _emit({"drained": False, "blocking": [], "unreadable": sorted(e.reg_ids)})
+        _fail(1, str(e))
     if blocking:
         _emit({"drained": False, "blocking": [r.reg_id for r in blocking]})
         _fail(1, f"{len(blocking)} registration(s) still in flight after timeout")

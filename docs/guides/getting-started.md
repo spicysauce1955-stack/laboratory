@@ -37,6 +37,12 @@ No extras at all still gives you the full local backend, which needs no credenti
 `pyproject.toml`. Commit `.lab-scaffold.json` along with the rest — it is how `lab init` tells a
 file it wrote from one you edited.
 
+`.skyignore` decides what is **not** uploaded to a remote box, and SkyPilot reads it *instead of*
+`.gitignore` once it exists. So when `lab init` creates one it copies your git-ignore into it
+(and says so on stderr), keeping every git-ignored secret off the box as before. It never rewrites
+a `.skyignore` you already have; it warns about git-ignored paths that file will upload. Whatever
+you git-ignore later, add to `.skyignore` too.
+
 **Both files matter to the lab:** `uv.lock` is hashed into every manifest so the remote
 environment provably matches yours, and the git history supplies the commit each run pins.
 `lab submit` refuses to run without them.

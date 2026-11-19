@@ -63,11 +63,46 @@ def git_work_tree(start: Path) -> Path | None:
     return Path(out) if out else None
 
 
+class GitCommandError(subprocess.CalledProcessError):
+    """A ``CalledProcessError`` whose message carries git's own stderr. Raised where git's
+    reason is captured rather than printed, so it travels with the exception instead."""
+
+    def __str__(self) -> str:
+        reason = (self.stderr or "").strip().splitlines()
+        return super().__str__() + (f": {reason[0]}" if reason else "")
+
+
 def current_commit(repo: Path) -> str:
-    """Resolve HEAD to a full commit SHA (FR-B1)."""
-    return subprocess.check_output(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
-    ).strip()
+    """Resolve HEAD to a full commit SHA (FR-B1).
+
+    git's stderr is captured, not inherited: every CLI call probes HEAD for the event ledger,
+    and in a repo with no commits yet — where ``lab init`` is typically run first — git's
+    ``fatal: ambiguous argument 'HEAD'`` went straight to the user's terminal. A caller that
+    fails on it still says why: the reason is in the raised :class:`GitCommandError`.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True
+    )
+    if proc.returncode != 0:
+        raise GitCommandError(proc.returncode, proc.args, proc.stdout, proc.stderr)
+    return proc.stdout.strip()
+
+
+def resolve_commit(repo: Path, ref: str) -> str | None:
+    """The full SHA of the commit ``ref`` names in ``repo`` (a SHA, branch, tag, ``HEAD~1``…),
+    or ``None`` when it names no commit there. Never treats ``ref`` as an option."""
+    if not ref or ref.startswith("-"):
+        return None
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", "--end-of-options",
+             f"{ref}^{{commit}}"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, NotADirectoryError):
+        return None
+    return out or None
 
 
 def commit_exists(repo: Path, commit: str) -> bool:

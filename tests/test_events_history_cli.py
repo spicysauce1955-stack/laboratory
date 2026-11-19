@@ -249,3 +249,39 @@ def test_history_through_main_excludes_its_own_call(tmp_path: Path) -> None:
         e["action"] == "history" and e["status"] == "running-or-died"
         for e in payload["events"]
     )
+
+
+def test_history_with_a_limit_reads_only_the_day_files_it_needs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`lab history` used to ask the reader for everything (`limit=None`) and slice afterwards,
+    so the reader could never stop early: every call parsed the whole ledger (~1.0 s, 251 MB on
+    a 33 MB one). It now asks for `--limit` + 1 (one spare for its own still-open call, which
+    `_exclude_self` drops) and the reader stops at the newest day file that satisfies it."""
+    from datetime import timedelta
+
+    def _list_call(id_: str, when: datetime) -> None:
+        store.append({"id": id_, "ts": when.isoformat(), "phase": "open", "session": "s",
+                      "seq": 0, "surface": "cli", "action": "list", "params": {},
+                      "project": {"name": "capacity"}, "lab_version": "0.5.1"}, when=when)
+
+    for d in range(1, 11):  # ten older days of calls, below the fixture's own (NOW)
+        _list_call(f"old{d}", NOW - timedelta(days=d))
+    today = datetime.now(timezone.utc)
+    for i in range(3):  # enough calls today that `--limit 2` is satisfied by today alone
+        _list_call(f"new{i}", today + timedelta(microseconds=i))
+    # Retention is not under test, and its compaction pass would read every file itself.
+    (tmp_path / "events" / ".pruned").write_text(today.strftime("%Y-%m-%d"))
+
+    opened: list[str] = []
+    real = store.iter_records
+
+    def spy(paths):  # type: ignore[no-untyped-def]
+        for path in paths:
+            opened.append(Path(path).name)
+            yield from real([path])
+
+    monkeypatch.setattr(store, "iter_records", spy)
+    out = json.loads(_invoke("history", "--all-projects", "--limit", "2").stdout)
+    assert [e["id"] for e in out["events"]] == ["new2", "new1"]
+    assert opened == [today.strftime("%Y-%m-%d") + ".jsonl"]

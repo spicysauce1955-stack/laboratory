@@ -248,6 +248,32 @@ def default_queue() -> QueueStore:
     return LocalQueueStore(repo_root() / "queue")
 
 
+def unreadable_entry_ids(queue: QueueStore) -> frozenset[str]:
+    """reg_ids the store's most recent ``list_entries()`` skipped because it could not read them.
+
+    ``R2QueueStore.list_entries`` skips an entry it cannot validate (a version-skewed host's
+    enum, a read racing a write, corrupt bytes) so one bad blob cannot hide the whole queue. That
+    is right for a listing and wrong for a *decision*: a dependent would read the entry as
+    "missing" and be cancelled, GC would delete its code, a drain gate would call it drained.
+    Those callers ask here. A store that never skips (``LocalQueueStore`` raises instead) has no
+    attribute and reads as "none skipped".
+    """
+    ids = getattr(queue, "last_unreadable", None)
+    return frozenset(ids) if isinstance(ids, (set, frozenset)) else frozenset()
+
+
+class UnreadableEntriesError(RuntimeError):
+    """The queue could not be shown drained because some entries could not be read."""
+
+    def __init__(self, reg_ids: frozenset[str]) -> None:
+        self.reg_ids = reg_ids
+        super().__init__(
+            f"{len(reg_ids)} queue entr{'y' if len(reg_ids) == 1 else 'ies'} could not be read, "
+            f"so the queue cannot be shown drained (any of them may be in flight): "
+            f"{', '.join(sorted(reg_ids))}"
+        )
+
+
 _BLOCKING_STATES = frozenset({RegState.launching, RegState.launched})
 
 
@@ -273,9 +299,15 @@ def wait_for_queue_drain(
     this feature adds; a `list_entries()` that never once succeeds re-raises its last error at
     the deadline instead of silently reporting a clean drain with zero evidence, right before the
     caller pauses production.
+
+    An entry the listing had to skip as unreadable (:func:`unreadable_entry_ids`) is never
+    drained: it may well be ``launched``. It keeps the wait going, and if it is still unreadable
+    at the deadline with nothing else blocking, :class:`UnreadableEntriesError` is raised rather
+    than a clean ``[]``.
     """
     deadline = time.monotonic() + timeout if timeout is not None else None
     blocking: list[Registration] = []
+    unreadable: frozenset[str] = frozenset()
     ever_read = False
     last_error: Exception | None = None
     while True:
@@ -286,13 +318,16 @@ def wait_for_queue_drain(
         else:
             ever_read = True
             blocking = [r for r in entries if r.state in _BLOCKING_STATES]
-            if not blocking:
+            unreadable = unreadable_entry_ids(queue)
+            if not blocking and not unreadable:
                 return []
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 if not ever_read and last_error is not None:
                     raise last_error
+                if not blocking and unreadable:
+                    raise UnreadableEntriesError(unreadable)
                 return blocking
             time.sleep(max(0.05, min(interval, remaining)))  # never overrun the deadline
         else:

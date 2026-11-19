@@ -76,7 +76,10 @@ mcp__lab__fetch_artifacts(job_id="20260528-141233-a1b2c3")
 # → {"local_paths": ["runs/20260528-.../output/result.json", ...], "artifacts": [...]}
 
 mcp__lab__metrics(job_id="20260528-141233-a1b2c3")
-# → {"series": {"demo_metric": [{"step": 0, "value": 0.31, "wall_time": ...}, ...]}}
+# → {"series": {"demo_metric": [{"step": 0, "value": 0.31, "wall_time": ...}, ...]},
+#    "max_points": 200, "truncated": {}}
+# Newest 200 points per series by default; `truncated` names any series that had more.
+# downsample=True for the shape of a whole long run, max_points=0 for every point.
 ```
 
 If `state != "succeeded"`:

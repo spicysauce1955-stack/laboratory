@@ -8,6 +8,8 @@ from lab.core import Lab
 from lab.manifest import repo_root
 from lab.models import JobState
 
+from helpers import pin_in_flight, wait_terminal
+
 
 def _lab(tmp_path: Path) -> Lab:
     repo = repo_root(Path.cwd())
@@ -122,7 +124,8 @@ def test_aggregate_excludes_running_shard(tmp_path: Path):
     out = lab.store.output_dir(cell.shard_job_ids[1])
     out.mkdir(parents=True, exist_ok=True)
     (out / "results.csv").write_text("seed,acc\n1,0.1\n")
-    lab.store.update_manifest(cell.shard_job_ids[1], status=JobState.running)
+    wait_terminal(lab.backend, cell.shard_job_ids[1])
+    pin_in_flight(lab.store, cell.shard_job_ids[1])
 
     c = lab.aggregate_sweep(sweep_id).cells[0]
     assert c.seeds_present == [0] and c.missing_seeds == [1]
@@ -135,10 +138,13 @@ def test_aggregate_excludes_unconsumed_config_shard(tmp_path: Path):
     import json as _json
 
     lab = _lab(tmp_path)
-    sweep_id, _ = lab.sweep("true N=1000", {}, seeds="0-1", shard_size=1)
+    # `N` is a grid key, i.e. an override the lab injects — the only kind the audit judges (a
+    # `k=v` typed into the base command is indistinguishable from an env prefix or a
+    # `--with pkg==x` spec, which is how real successes used to be flipped to failed).
+    sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0-1", shard_size=1)
     cell = lab.sweep_plan(sweep_id).cells[0]
     _write_shard_result(lab, cell.shard_job_ids[0], [0])
-    # shard 2 wrote rows + an effective config that consumed only `seeds` — the argv-passed
+    # shard 2 wrote rows + an effective config that consumed only `seeds` — the injected
     # `N` went unconsumed. It then timed out; the terminal audit records unconsumed_config.
     out = lab.store.output_dir(cell.shard_job_ids[1])
     out.mkdir(parents=True, exist_ok=True)
@@ -272,7 +278,8 @@ def test_aggregate_hits_follow_the_csv_inclusion_rules(tmp_path: Path):
     import json as _json
 
     lab = _lab(tmp_path)
-    sweep_id, _ = lab.sweep("true N=1000", {}, seeds="0-3", shard_size=1)
+    # `N` is a grid key, i.e. an override the lab injects: the only kind the config audit judges.
+    sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0-3", shard_size=1)
     ok, partial, running, wrong_config = lab.sweep_plan(sweep_id).cells[0].shard_job_ids
     for jid, seed in zip((ok, partial, running, wrong_config), range(4)):
         _write_hits(lab, jid, f'{{"seed": {seed}}}\n')
@@ -329,7 +336,8 @@ def test_aggregate_empty_hits_file_means_searched_and_nothing_passed(tmp_path: P
 
 def test_aggregate_hits_never_count_a_seed_as_present(tmp_path: Path):
     """Seed presence is judged by results.csv alone: a shard that left hits but no result rows
-    still has its seeds missing, so sweep-retry buys them back."""
+    still has its seeds missing, so sweep-retry buys them back — and the missing seed's hits are
+    left out of the cell file, which only covers the seeds results.csv lists as present."""
     lab = _lab(tmp_path)
     sweep_id, _ = lab.sweep("true", {"N": [1000]}, seeds="0-1", shard_size=1)
     cell = lab.sweep_plan(sweep_id).cells[0]
@@ -339,7 +347,7 @@ def test_aggregate_hits_never_count_a_seed_as_present(tmp_path: Path):
 
     c = lab.aggregate_sweep(sweep_id).cells[0]
     assert c.seeds_present == [0] and c.missing_seeds == [1] and c.status == "incomplete"
-    assert c.hits == 1
+    assert c.hits == 0  # searched (the file exists), but seed 1's search never finished
 
 
 def test_aggregate_succeeded_shard_with_torn_hits_fails_loud(tmp_path: Path):

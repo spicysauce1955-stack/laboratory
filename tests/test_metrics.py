@@ -37,3 +37,132 @@ def test_group_series(tmp_path: Path):
     s = group_series(read_points(tmp_path / METRICS_FILE))
     assert list(s.keys()) == ["loss"]
     assert [p["step"] for p in s["loss"]] == [0, 1]
+
+
+# --- final_values: a non-finite point must never reach the manifest (review 2026-11) ----------
+
+
+def test_final_values_skips_non_finite_points(tmp_path: Path):
+    """`log_metric` writes NaN/Infinity (Python's json allows them); `float()` accepts them; and
+    pydantic serialises a NaN in `final_metrics` as `null`, which its own float field then refuses
+    to read back — one diverged loss bricked the whole manifest. The baseline is the last *finite*
+    value per series: a re-run that diverges the same way reads the same baseline."""
+    import math
+
+    from lab.metrics import final_values, snapshot_final_metrics
+
+    log_metric("loss", 1.0, 0, run_dir=tmp_path)
+    log_metric("loss", float("nan"), 1, run_dir=tmp_path)
+    log_metric("acc", float("inf"), 1, run_dir=tmp_path)
+    log_metric("acc", float("-inf"), 2, run_dir=tmp_path)
+
+    fm = snapshot_final_metrics(tmp_path)
+
+    assert fm == {"loss": 1.0}
+    assert all(math.isfinite(v) for v in fm.values())
+    assert final_values([{"name": "x", "step": 0, "value": "nan"}]) == {}
+
+
+def test_final_values_round_trips_through_the_manifest_model(tmp_path: Path):
+    from pydantic import BaseModel, Field
+
+    from lab.metrics import snapshot_final_metrics
+
+    class M(BaseModel):
+        final_metrics: dict[str, float] = Field(default_factory=dict)
+
+    log_metric("loss", 0.5, 0, run_dir=tmp_path)
+    log_metric("loss", float("nan"), 1, run_dir=tmp_path)
+    dumped = M(final_metrics=snapshot_final_metrics(tmp_path)).model_dump_json()
+    assert M.model_validate_json(dumped).final_metrics == {"loss": 0.5}
+
+
+# --- read_points: the file is written by user code, so every line is untrusted ---------------
+
+
+def test_valid_json_that_is_not_an_object_is_skipped(tmp_path: Path):
+    """`7`, `[1]`, `"x"`, `null` all parse — and then `.get` crashed every read of the series."""
+    f = tmp_path / METRICS_FILE
+    good = json.dumps({"name": "loss", "value": 1.0, "step": 0})
+    f.write_text("\n".join([good, "7", "[1, 2]", '"x"', "null", good.replace("0}", "1}")]) + "\n")
+
+    pts = read_points(f)
+
+    assert [p["step"] for p in pts] == [0, 1]
+
+
+def test_a_string_step_is_coerced_or_skipped_never_a_crash(tmp_path: Path):
+    from lab.metrics import final_values
+
+    f = tmp_path / METRICS_FILE
+    lines = [
+        {"name": "loss", "value": 1, "step": 0},
+        {"name": "loss", "value": 2, "step": "3"},  # coercible
+        {"name": "loss", "value": 9, "step": "late"},  # not
+        {"name": "loss", "value": 9, "step": {"x": 1}},
+        {"name": "loss", "value": 9, "step": True},
+        {"name": {"un": "hashable"}, "value": 9, "step": 5},
+    ]
+    f.write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+
+    assert [p["step"] for p in read_points(f)] == [0, 3]
+    assert [p["step"] for p in read_points(f, since_step=1)] == [3]
+    assert [p["step"] for p in read_points(f, names=["loss"])] == [0, 3]
+    assert final_values(read_points(f)) == {"loss": 2.0}
+
+
+def _big_metrics_file(path: Path, n: int) -> Path:
+    f = path / METRICS_FILE
+    with f.open("w") as out:
+        for i in range(n):
+            out.write(json.dumps({"name": "loss", "value": 1.0 / (i + 1), "step": i}) + "\n")
+    return f
+
+
+def _peak_bytes(fn) -> int:  # type: ignore[no-untyped-def]
+    import tracemalloc
+
+    tracemalloc.start()
+    try:
+        fn()
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_a_since_step_poll_streams_instead_of_loading_the_file(tmp_path: Path):
+    """A `lab metrics --since-step` poll returns a handful of points but used to `read_text()`
+    and `splitlines()` the whole file first — 425 MB RSS for 9 points on a 147 MB file. Memory
+    must scale with what is returned, not with the file."""
+    n = 200_000  # ~11 MB on disk
+    f = _big_metrics_file(tmp_path, n)
+    size = f.stat().st_size
+
+    out: list[list[dict]] = []
+    peak = _peak_bytes(lambda: out.append(read_points(f, since_step=n - 10)))
+
+    assert [p["step"] for p in out[0]] == list(range(n - 9, n))
+    assert peak < size / 4, f"peak {peak} bytes for a {size}-byte file"
+
+
+def test_snapshot_final_metrics_streams_too(tmp_path: Path):
+    from lab.metrics import snapshot_final_metrics
+
+    n = 200_000
+    f = _big_metrics_file(tmp_path, n)
+    size = f.stat().st_size
+
+    out: list[dict] = []
+    peak = _peak_bytes(lambda: out.append(snapshot_final_metrics(tmp_path)))
+
+    assert out[0] == {"loss": 1.0 / n}
+    assert peak < size / 4, f"peak {peak} bytes for a {size}-byte file"
+
+
+def test_a_non_finite_step_is_skipped(tmp_path: Path):
+    f = tmp_path / METRICS_FILE
+    f.write_text(
+        '{"name": "x", "value": 1, "step": NaN}\n{"name": "x", "value": 2, "step": Infinity}\n'
+        '{"name": "x", "value": 3, "step": 4}\n'
+    )
+    assert [p["step"] for p in read_points(f, since_step=0)] == [4]

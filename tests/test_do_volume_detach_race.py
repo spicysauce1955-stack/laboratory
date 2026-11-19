@@ -68,11 +68,21 @@ class _Volumes:
         self.list_calls = 0
         self.delete_calls = 0
 
+    def _vanished(self) -> bool:
+        return self._vanish_after is not None and self.list_calls > self._vanish_after
+
     def list(self, **kw):
         self.list_calls += 1
-        if self._vanish_after is not None and self.list_calls > self._vanish_after:
+        if self._vanished():
             return {"volumes": []}
         return {"volumes": self._volumes}
+
+    def get(self, volume_id, **kw):
+        """pydo's shape: a missing volume is DO's 404 body, not an exception."""
+        for v in [] if self._vanished() else self._volumes:
+            if str(v["id"]) == str(volume_id):
+                return {"volume": v}
+        return {"id": "not_found", "message": "The resource you were accessing could not be found."}
 
     def delete(self, volume_id, **kw):
         self.delete_calls += 1
@@ -93,6 +103,14 @@ def _patch(monkeypatch, volumes):
     return client
 
 
+def _sweep(cluster=CLUSTER):
+    """The cluster-scoped check robust_teardown runs after a clean sky.down, as the
+    ``(deleted, failures)`` pair these tests were written against (formerly
+    ``_do_sweep_leftover_volumes``, now one view of ``settle_do_volumes``)."""
+    settled = m.settle_do_volumes(cluster=cluster)
+    return settled.deleted, settled.failures
+
+
 @pytest.fixture
 def no_sleep(monkeypatch):
     slept: list[float] = []
@@ -109,7 +127,7 @@ class TestTheDetachRaceIsNotALeak:
         """The regression: one "not yet" must not become a permanent teardown alarm."""
         client = _patch(monkeypatch, _Volumes(_one_volume(), refuse_times=1))
 
-        deleted, failures = m._do_sweep_leftover_volumes(CLUSTER)
+        deleted, failures = _sweep()
 
         assert failures == [], f"a settling detach was reported as a leak: {failures}"
         assert client.volumes.deleted == ["vol-1"]
@@ -121,7 +139,7 @@ class TestTheDetachRaceIsNotALeak:
             monkeypatch, _Volumes(_one_volume(), refuse_times=99, vanish_after=1)
         )
 
-        deleted, failures = m._do_sweep_leftover_volumes(CLUSTER)
+        deleted, failures = _sweep()
 
         assert failures == [], f"an already-gone volume was reported as a leak: {failures}"
         assert client.volumes.list_calls >= 2, "must re-list, not just re-issue DELETE"
@@ -130,7 +148,7 @@ class TestTheDetachRaceIsNotALeak:
         """The alarm must survive for the case it exists for -- a volume that really is stuck."""
         _patch(monkeypatch, _Volumes(_one_volume(), refuse_times=99))
 
-        deleted, failures = m._do_sweep_leftover_volumes(CLUSTER)
+        deleted, failures = _sweep()
 
         assert failures, "a volume that never became deletable must still alarm (FR-C2)"
         assert "attached volume cannot be deleted" in failures[0]
@@ -139,18 +157,20 @@ class TestTheDetachRaceIsNotALeak:
         """A volume already detached costs no extra time -- the common case must stay fast."""
         client = _patch(monkeypatch, _Volumes(_one_volume()))
 
-        deleted, failures = m._do_sweep_leftover_volumes(CLUSTER)
+        deleted, failures = _sweep()
 
         assert failures == []
         assert deleted == ["vol-1"]
-        assert no_sleep == [], f"slept {no_sleep} on a volume that deleted first try"
+        # Only the one confirmation re-read (`_GONE_CONFIRM_S`): DO's read-by-id can flap right
+        # after a delete, so "gone" is read twice. Never the detach ladder.
+        assert no_sleep == [m._GONE_CONFIRM_S], f"slept {no_sleep} on a volume that deleted first try"
         assert client.volumes.delete_calls == 1
 
     def test_nothing_matching_is_success_without_waiting(self, monkeypatch, no_sleep):
         """Finding nothing means nothing is billing; it must not spend the retry ladder."""
         _patch(monkeypatch, _Volumes([{"id": "x", "name": "someone-elses-volume"}]))
 
-        deleted, failures = m._do_sweep_leftover_volumes(CLUSTER)
+        deleted, failures = _sweep()
 
         assert (deleted, failures) == ([], [])
         assert no_sleep == []
@@ -162,7 +182,7 @@ class TestOnlyTheDetachMessageIsRetryable:
         boom = RuntimeError("403 forbidden: insufficient permissions")
         client = _patch(monkeypatch, _Volumes(_one_volume(), refuse_times=99, error=boom))
 
-        deleted, failures = m._do_sweep_leftover_volumes(CLUSTER)
+        deleted, failures = _sweep()
 
         assert failures, "a permission error is a real failure"
         assert no_sleep == [], "a permission error will not fix itself in 60 seconds"
@@ -170,9 +190,10 @@ class TestOnlyTheDetachMessageIsRetryable:
 
 
 class TestTheListingContractIsUnchanged:
-    def test_a_listing_failure_still_raises(self, monkeypatch, no_sleep):
-        """"We could not ask" must stay distinct from "we asked and there is nothing" -- the
-        caller turns the first into `unknown` and the second into `succeeded`."""
+    def test_a_listing_failure_is_unknown_not_nothing(self, monkeypatch, no_sleep):
+        """"We could not ask" must stay distinct from "we asked and there is nothing": the first
+        is `unknown`, the second `succeeded`. (It used to raise for the caller to translate; the
+        settlement now says so itself.)"""
 
         class _Boom:
             list_calls = 0
@@ -183,8 +204,10 @@ class TestTheListingContractIsUnchanged:
 
         _patch(monkeypatch, _Boom())
 
-        with pytest.raises(RuntimeError, match="unreachable"):
-            m._do_sweep_leftover_volumes(CLUSTER)
+        settled = m.settle_do_volumes(cluster=CLUSTER)
+
+        assert settled.status == "unknown"
+        assert "unreachable" in (settled.listing_error or "")
 
 
 class TestAMixedBatchStillGivesTheDetachItsChance:
@@ -216,6 +239,12 @@ class TestAMixedBatchStillGivesTheDetachItsChance:
                 self.list_calls += 1
                 return {"volumes": self.vols}
 
+            def get(self, volume_id, **kw):
+                for v in self.vols:
+                    if v["id"] == volume_id:
+                        return {"volume": v}
+                return {"id": "not_found"}
+
             def delete(self, volume_id, **kw):
                 n = self.attempts.get(volume_id, 0) + 1
                 self.attempts[volume_id] = n
@@ -228,7 +257,7 @@ class TestAMixedBatchStillGivesTheDetachItsChance:
 
         _patch(monkeypatch, _Mixed())
 
-        deleted, failures = m._do_sweep_leftover_volumes(CLUSTER)
+        deleted, failures = _sweep()
 
         assert "vol-1" in deleted, "the detaching volume must still get its retry"
         assert not any(DETACH_MSG in f for f in failures), (

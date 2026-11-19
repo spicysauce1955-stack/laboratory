@@ -28,6 +28,11 @@ writing nothing in this repo has confirmed it actually carries that tag — the 
 simply refuse until you've checked (`doctl compute droplet list --tag-name lab-scheduler`) and,
 if needed, tagged it (`doctl compute droplet tag <id> --tag-name lab-scheduler`).
 
+**A paused queue is refused, and left paused.** If `control.paused` is already true at preflight
+(or becomes true while step 1 drains), someone paused it on purpose: the script never resumes a
+pause it did not make, and it could not drain or smoke-test a paused queue anyway (a paused
+scheduler syncs nothing). Resume it yourself first if that pause is no longer wanted.
+
 **The smoke test spends real money** — step 7 is a real registration that launches a real cloud
 rental via SkyPilot (`--cloud do` by default), not a simulation. Budget for it like any other
 job. If step 1's drain-wait times out, the message names the blocking `reg_id`s; there is no
@@ -35,8 +40,29 @@ job. If step 1's drain-wait times out, the message names the blocking `reg_id`s;
 past it is to cancel or wait out those registrations by hand (`lab queue cancel <reg_id>` or let
 them finish).
 
-Four env vars tune timeouts and one failure-mode default:
+**A failed smoke test rolls back only what is safe to roll back.** By then step 6 has resumed the
+queue with the new droplet as its only ticker, so it may have launched real jobs whose supervisors
+run *on it*. Rollback first waits (unpaused, `LAB_DEPLOY_ROLLBACK_DRAIN_TIMEOUT`) for those to
+finish, pauses, waits for the pause ack and re-checks; it then powers the old droplet on and
+confirms it by its real status *before* powering the new one off, resumes, and confirms the old
+host is really ticking — and only then deletes the new droplet. If anything is still in flight,
+or a power action cannot be confirmed, it stops in a **safe hold** instead: queue paused, new
+droplet left running (it owns its jobs), the old one untouched, and a `MANUAL ACTION REQUIRED`
+block naming the in-flight registrations and the exact commands for either way forward.
+
+**Every failure path reads the droplets' real power state.** `doctl ... --wait` can exit non-zero
+after the action took effect, so the script decides which droplet keeps ticking from
+`doctl compute droplet get <id> --format Status`, never from the exit code alone, and after any
+failure-path resume it waits for proof that a scheduler ticked unpaused — or prints
+`ZERO TICKERS?` with both droplet ids.
+
+Env vars tune timeouts and one failure-mode default:
 - `LAB_DEPLOY_DRAIN_TIMEOUT` (default `30m`) — step 1, waiting for in-flight jobs to clear.
+- `LAB_DEPLOY_ROLLBACK_DRAIN_TIMEOUT` (default `10m`) — rollback, waiting for the new droplet's
+  own jobs before retiring it (shorter: the host being drained just failed its smoke test and
+  keeps launching while unpaused; the hold that follows a timeout is safe).
+- `LAB_DEPLOY_TICKER_CONFIRM_TIMEOUT_S` (default `180`) — after a failure-path resume, how long to
+  wait for proof that a scheduler is ticking unpaused again.
 - `LAB_DEPLOY_VERIFY_TIMEOUT_S` (default `1200`) — step 4, waiting for the new droplet's first
   heartbeat (boot + package installs on a 1 vCPU/1GB droplet is realistically 10+ minutes).
 - `LAB_DEPLOY_SMOKE_TIMEOUT_S` (default `1800`) — step 7, waiting for the smoke job to finish.
@@ -53,6 +79,17 @@ always needed: `~/.config/vastai/vast_api_key`, `~/.cloudflare/r2.credentials`,
 `$LAB_R2_ENDPOINT` exported (or set in this repo's git-ignored `.env` — `deploy.sh` fills in
 whichever of `LAB_R2_ENDPOINT`/`LAB_R2_BUCKET` aren't already exported from there, same rule as
 the rest of the lab: real env always wins over the file).
+
+**The new droplet also gets this machine's DigitalOcean token**, written as the `lab` user's
+`~/.config/doctl/config.yaml` — the only place SkyPilot's DO provisioner reads a credential from.
+Without it the `--cloud do` smoke job could never launch (every deploy would roll back), no DO
+registration could launch on the host, and `robust_teardown`'s DO-direct fallback would be dead
+there. `deploy/scheduler/do_token.py` finds the token doctl itself uses — `$DIGITALOCEAN_ACCESS_TOKEN`,
+else the current context of `$XDG_CONFIG_HOME/doctl/config.yaml`, `~/.config/doctl/config.yaml` or
+a snap install's `~/snap/doctl/current/.config/doctl/config.yaml` (two files that disagree are
+refused; export the variable to choose) — and preflight proves it authenticates (`doctl account
+get`) before anything is touched. It is never printed; like the Vast key it travels only base64-
+encoded inside the rendered cloud-init.
 
 Full design + the two real bugs an adversarial review caught before this shipped:
 `docs/superpowers/specs/2026-08-27-scheduler-deploy-cutover-design.md`.

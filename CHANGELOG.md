@@ -4,6 +4,180 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning is 
 breaks the surface in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md); MINOR may, and says so
 with a **BREAKING** entry and an upgrade note.
 
+## v0.13.0 — 2026-11-19
+
+`lab.search` ships, and the whole lab went through a review, a fix round, a local stress run and a
+capped cloud smoke run (DigitalOcean, GCP, Vast; $0.3 total) before this tag. Most of what follows
+was found that way rather than reported from the field, and every fix carries a regression test.
+
+### BREAKING — read before upgrading
+
+- **`lab wait --fail-fast` exits 4 whenever any job failed or timed out**, including when every job
+  had already finished by the time it looked. It used to exit 0 in that case, so a single failing
+  job always read as success and multi-job exit codes depended on poll timing.
+- **`lab wait` exit precedence is 3 > 6 > 4 > 1.** A confirmed leak (3) or unknown teardown (6) on a
+  job that already finished now outranks giving up on `--timeout` (1); it used to be masked by it.
+- **The config audit judges only the overrides the lab injects** (submit config, grid keys, sweep
+  points). A `k=v` typed straight into the command is no longer audited: it cannot be told apart
+  from `uv run --with scipy==1.11` or an `OMP_NUM_THREADS=1` prefix, which used to flip real
+  successes to `failed` (and make `sweep-retry` re-buy them).
+- **Durations must be positive and finite.** `inf`, `nan`, negatives and `0` are refused for
+  `--timeout` and `--provision-timeout` on every surface, at submit, sweep and register time.
+  `lab queue wait-drain --timeout 0s` still means "check once".
+- **`lab logs --tail 0` prints no lines**, like `tail -n 0` (it used to print the whole log).
+- **`.jsonl` artifacts are typed `table`** (was `other`), so `hits.jsonl` and `metrics.jsonl` now
+  reach `lab export` bundles; the size cap still applies.
+- **`lab queue list`'s `expires_at` uses ISO `T`**, as MCP always did.
+- **`lab list` returns the newest 100 jobs by default** (`--limit`/`limit`, `0` for all), with
+  `jobs_total`/`jobs_omitted`; `spend` still covers every job. **`lab metrics` returns the newest
+  200 points per series** (`--max-points`/`max_points`, `0` for all; `--downsample` spreads them
+  over the run) and names what it cut in `truncated`. At 10k jobs MCP `list` was 1.24 MB per call.
+- **CLI JSON is strict and ISO-timestamped**: NaN/Infinity print as `null` (as MCP always did) and
+  every timestamp uses `T`.
+- **A cell's hits aggregate drops hits for seeds the cell does not count as present**, so the hits
+  and the presence view agree.
+- **`lab.search` refuses values JSON cannot hold** (a `Path`, an `Enum`) instead of logging their
+  `str()`.
+
+### Added
+
+- **`lab.search`** — experiment-side `grid_search`, `find_boundary` and `crosses_threshold`: the
+  experiment supplies `evaluate(**params) -> bool`, the lab walks the grid and writes passes to
+  `$LAB_RUN_DIR/hits.jsonl` as they are found. `summary_axis="seed"` writes the per-seed
+  `results.csv` rows `sweep-aggregate` counts as present (zero-hit seeds included), `append=True`
+  keeps earlier hits, and `search/tested` / `search/hits` progress goes to `metrics.jsonl`.
+  `experiments/example_search.py` is the contract fixture.
+- **Per-cell hits aggregate.** `sweep-aggregate` concatenates shard `hits.jsonl` into the cell's
+  `hits.jsonl` (stamped with `_shard_status`), reported as `hits` / `hits_ref`; exported with the
+  sweep.
+- **`--code-ref` works.** It was accepted and silently ignored; a commit other than HEAD now runs
+  from that commit's tree (the mechanism `confirm` uses) and the manifest records it.
+- **MCP reached CLI parity on the deferred path**: `register`/`register_sweep` gained `price_cap`,
+  `price_cap_strict`, region/zone, spot, accelerator rotation and `hold`; `queue_list` returns
+  `scheduler_skew` and `cancel_requested` from one shared view. `tests/test_cli_mcp_parity.py`
+  fails CI on future drift.
+- **Bounded, faster read paths** for agents and dashboards: `lab dashboard --limit` (40 rows),
+  `lab lint` checks the keys the entrypoint actually declares (`--seeds` too), MCP `doctor`
+  answers `cloud="local"`, MCP reports the lab's own version and starts with no banner and no
+  network call.
+- **Reconcile reports more**: `pass_errors` (a provider listing that failed under `--apply`; exit 5),
+  `other_projects[].runs_dir`, and `unreadable_manifests` (their machines stay protected).
+
+### Fixed — money and ownership
+
+- **Reconcile took a matching project slug as proof of ownership.** Two job stores sharing a project
+  name — two clones, or the scheduler host and a laptop checkout of the same project — could
+  destroy each other's running clusters. A resource whose job is not in this `runs/` is now
+  destroyable only when the job index names this `runs_dir`.
+- **GCP fallbacks could delete a sibling job's VM** (a 2-hex name-fragment collision, p≈1/256 per
+  pair in a month). Instances are matched by their `lab-job-id` label.
+- **An uncapped job was killed after 65 minutes** whenever the API server restarted; capped jobs
+  could be killed early as `failed` when provisioning ran long. A RUNNING remote job is never
+  classified terminal, and the deadline is anchored at run start plus the boot allowance.
+- **Reconcile built its protected set before listing the clouds**, so a shard submitted mid-reconcile
+  could be destroyed. Listings now come first.
+- **A DigitalOcean teardown could report `succeeded` while its 50 GB volume kept billing.**
+  `sky.down` hands the volume to a background deletion it never checks, and the lab trusted one
+  listing taken the instant it returned — a listing that lags. Found on the smoke run: a job read
+  clean while its volume survived until `lab reconcile` caught it. Volumes are now remembered
+  while the box runs and verified gone by id (a direct read must 404); anything unverifiable is
+  `failed` or `unknown`, never `succeeded`. Every teardown records a `teardown_detail` on the
+  manifest, so the next incident is explainable.
+- **A `lab cancel`led DigitalOcean job leaked its volume.** DO now words its detach-race rejection
+  "cannot delete attached volume" and answers it with more than one status, so the retry ladder
+  never engaged; and `cancel` tore down from the CLI while the SIGTERMed supervisor tore down too,
+  racing it. DO's wording now decides the race at any status, `cancel` lets a live supervisor
+  finish its own teardown, and a volume counts as gone only after two `not_found` reads (DO's
+  read-by-id flapped once, live). Verified on real DigitalOcean: cancel → volume deleted and
+  verified gone, `lab wait` exit 0.
+- **A cancelled remote job recorded no cost**, so spend missed real rentals, and a user cancel
+  counted as a failure in the ledger.
+- **False `teardown failed` / exit 3 from DigitalOcean's volume-detach race** on the fallback and
+  reconcile paths, and from a GCE delete that was still running; those are retried or `unknown`.
+- **`lab wait` printed "teardown not confirmed" on clean DigitalOcean runs**: teardown can take tens
+  of seconds after terminal. The settle continues while the job's supervisor is still alive.
+- **`sweep-retry` relaunched remote shards on the local backend**, and two concurrent retries could
+  double-buy shards. **A sweep that failed partway** left its launched jobs with no plan and no
+  ids; the error now carries `sweep_id` and `job_ids` and the partial plan is written.
+- **Concurrent `sweep-retry` calls bought duplicate shards** and lost all but one from the plan (8
+  concurrent retries bought 5, recorded 1); plan read-submit-write now holds a per-sweep lock.
+- **A local job whose runner died kept its experiment running**, unbounded and uncancellable; it is
+  now stopped (identity-checked) and `lab ps` reports it `unsupervised`.
+- **A misspelled `--backend` silently ran the job on this machine**; unknown names are refused on
+  every surface before anything runs.
+- **Vast GPU jobs never got a price band** (SkyPilot's Vast catalog lacks the accelerator region
+  lookup); placement now prices them through the instance type.
+- **Spend under-reported scheduler-registered GCP/DO jobs** by pricing their disk at 0 GB.
+- **An aborted supervisor left its queued launch request alive**, and recorded a user cancel as
+  `failed`; teardown status is also reset between accelerator-rotation attempts.
+
+### Fixed — the scheduler and its redeploy
+
+- **A redeployed scheduler had no DigitalOcean credential**, so every `deploy.sh` would have rolled
+  back at the smoke test, and DO registrations could not launch or tear down on that host.
+- **Redeploy could orphan a billing job** (a launch between drain and pause; a rollback that deleted
+  the droplet supervising new jobs), **could leave zero tickers**, and **un-paused a queue an
+  operator had paused**. Each path now checks real droplet state, drains before pausing, holds
+  instead of deleting when jobs are in flight, and refuses to touch a pre-paused queue.
+  `tests/test_deploy_script.py` runs the real script against a simulated world (21 scenarios) and
+  `tests/test_deploy_cli_contract.py` parses every `lab` command line it runs against the real CLI.
+- **A killed reconcile tick repeated forever** without writing a heartbeat; the heartbeat is written
+  first and reconcile runs on its own budget.
+- **Cancel/hold re-checks failed open** on an R2 error; launch repair could bind a registration to a
+  stale attempt; an unreadable entry irreversibly cancelled its dependents and let `queue gc` delete
+  bundles; a preempt resubmit bypassed concurrency and budget caps; `register --hold` could launch
+  before the hold landed; each waiting entry cost two R2 writes per tick.
+
+### Fixed — secrets (FR-J1)
+
+- **`lab init` made SkyPilot ignore `.gitignore`.** Creating a `.skyignore` switched SkyPilot to that
+  file alone, so git-ignored secrets were rsynced to rented hosts. A created `.skyignore` now
+  carries the project's git-ignore rules; `init --check` reports anything it would upload.
+- **Symlinks from a rented box were followed** on the supervisor host (a hostile host could exfiltrate
+  its keys into R2 and export bundles). Pulls use `--no-links`; uploads skip symlinks.
+- **Sanitizing missed snake_case secrets** (`--wandb_key`, `DB_PASSWORD=`), `lab export --logs` was
+  not actually redacted, and the exported manifest kept inline secrets.
+- **Log redaction only knew cloud-provider shapes**: GitHub, OpenAI/Anthropic, Hugging Face, Stripe,
+  Slack and DigitalOcean tokens, JWTs and PEM private-key blocks now mask in exported logs, and one
+  credential-name test is shared by logs, the ledger and notes. The ledger stopped over-masking run
+  paths, object URLs, digests and lab cluster names that forensics need.
+- **Export bundles embedded absolute local paths** (home directory) and ignored the size cap for
+  sweep aggregates; exported copies use bundle-relative paths and the same 32 MB cap.
+- **Diagnostics leaked onto stdout**, corrupting CLI JSON and, under MCP, the JSON-RPC stream.
+
+### Fixed — correctness and performance
+
+- **A NaN/Inf final metric made the manifest unreadable**, breaking `list`, `status`, `wait` and
+  reconcile for the whole project.
+- **Manifest writes raced** (a fetch could erase `teardown_status="failed"`); writes are locked and a
+  terminal job can no longer go back to running. Concurrent writers no longer tear memo files.
+- **Truncated CSV rows from a timed-out shard were aggregated** with wrong values.
+- **Local jobs ignoring SIGTERM survived** timeout and cancel, and cancel could kill a recycled PID.
+- **doctor kept refusing after a fix** (cached `fail`), and blocked GPU/TPU launches on incomplete
+  quota answers.
+- **Concurrent read polls each claimed the ledger's rate-limit window**, writing duplicate pairs.
+- **Error signatures kept job ids**, so every "unknown job id" failure was its own row in `lab
+  report` and notes keyed on a signature never fired for the next job; ids, sweep/reg ids and
+  cluster names now normalize (old notes still match).
+- **Job ids could collide silently** (24-bit suffix, `mkdir(exist_ok=True)`); ids are claimed
+  exclusively. `sweep-status` counts now cover every state.
+- **Read paths scaled with history, not with the question.** Measured on a 10k-job project, a 33 MB
+  ledger and a 2M-line metrics file: `lab metrics` 7.9 s / 2.0 GB to 0.68 s / 49 MB; `lab history`
+  1.0 s to 0.19 s; a repeat `sweep-aggregate` of 866k hits 7.8 s to 0.27 s; `sweep-status` 0.58 s
+  to 0.19 s; a dashboard frame 4.2 s to 0.07 s. `lab confirm` of a local job no longer idles 10 s.
+- **`release.sh` did not stage the skill version it bumps.**
+
+### Tests and CI
+
+- **The suite no longer touches the developer's cloud.** In-process CLI tests loaded the checkout's
+  `.env` and later tests uploaded to the real R2 bucket (1,028 objects on 2026-11-19, since
+  removed); three tests listed the live Vast account. The suite now scrubs cloud settings, sets
+  `LAB_DOTENV=0` (a new off switch for the `.env` loader) and refuses real R2/Vast/DO clients; the
+  live R2 test needs `LAB_TEST_LIVE=1`.
+- A test pinned to 2026-08-18 started failing when ledger retention deleted its fixture; two real
+  sleeps (60 s, and 10 s per `confirm` test) are gone.
+- CI actions moved to their Node 24 majors (`checkout@v5`, `setup-uv@v7`).
+
 ## v0.12.0 — 2026-09-08
 
 A campaign retrospective (`2026-09-planted-teacher`: $136.70, five days) was checked against the

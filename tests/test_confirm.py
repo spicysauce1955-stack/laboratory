@@ -175,8 +175,9 @@ def test_build_backend_maps_names(tmp_path: Path):
     repo = repo_root(Path.cwd())
     assert type(build_backend("local", home=tmp_path, repo=repo)).__name__ == "LocalBackend"
     assert type(build_backend("skypilot", home=tmp_path, repo=repo)).__name__ == "SkyPilotBackend"
-    # unknown name falls back to local (preserves prior default_lab behavior)
-    assert type(build_backend("bogus", home=tmp_path, repo=repo)).__name__ == "LocalBackend"
+    # An unknown name is refused: it used to fall back to local and run the job on this machine.
+    with pytest.raises(LabError, match="unknown backend"):
+        build_backend("bogus", home=tmp_path, repo=repo)
 
 
 def test_update_manifest_snapshots_final_metrics_centrally(tmp_path: Path):

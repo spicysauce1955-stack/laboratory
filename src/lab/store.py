@@ -9,8 +9,15 @@ Layout (per job, under the lab ``home`` dir, default ``runs/``):
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
+import shlex
+import shutil
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +33,31 @@ _TERMINAL_STATES = frozenset(
         JobState.timed_out, JobState.preempted,
     }
 )
+
+
+def argv_override_keys(command: str) -> set[str]:
+    """Keys of the loose ``key=value`` tokens in a shell command (the lab's override convention).
+
+    A superset of the real overrides — it also sees env prefixes and ``--with pkg==x`` specs —
+    so callers intersect it with the config keys they know were injected. Never raises: an
+    unbalanced quote falls back to a whitespace split rather than failing a terminal write.
+    """
+    from lab.experiment import parse_overrides
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    return set(parse_overrides(tokens))
+
+
+def injected_override_keys(command: str, config: dict[str, Any] | None) -> list[str]:
+    """The config keys that actually ride ``command`` as ``key=value`` — what the lab injected.
+
+    A config key that is not on the argv (plain ``submit`` records ``config`` as metadata) is not
+    something the entrypoint could have consumed, so it is not audited either.
+    """
+    return sorted(argv_override_keys(command) & set(config or {}))
 
 
 def cell_id_for(coords: dict[str, Any]) -> str:
@@ -53,6 +85,24 @@ class JobStore:
     def runtime_path(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "_runtime.json"
 
+    def claim_dir(self, name: str) -> bool:
+        """Create ``<home>/<name>`` exclusively: ``True`` if this call made it, ``False`` if it
+        already existed (another job or sweep holds that id — draw another)."""
+        self.home.mkdir(parents=True, exist_ok=True)
+        try:
+            (self.home / name).mkdir()
+        except FileExistsError:
+            return False
+        return True
+
+    def release_dir(self, name: str) -> None:
+        """Undo :meth:`claim_dir` for a submit/sweep refused before it recorded anything. Never
+        touches a dir holding a manifest or a plan — that is a real job's or sweep's record."""
+        d = self.home / name
+        if (d / "manifest.json").exists() or (d / "plan.json").exists():
+            return
+        shutil.rmtree(d, ignore_errors=True)
+
     def create(self, manifest: JobManifest) -> Path:
         """Create the run dir (incl. output/) and persist the initial manifest.
 
@@ -60,13 +110,21 @@ class JobStore:
         not in ``write_manifest``: ``code`` is immutable after create, so validating once at
         creation prevents any new Gap-B manifest, while later status ``update_manifest`` writes
         (including on legacy Gap-B manifests already on disk) never re-validate and so never
-        crash (FR-B1)."""
+        crash (FR-B1).
+
+        The manifest is published exclusively: ``FileExistsError`` if the job id already has
+        one, which is left untouched. ``Lab.submit`` claims a fresh id first
+        (:meth:`claim_dir`), so this is the backstop that makes a collision loud instead of one
+        job silently replacing another's record."""
         manifest.code.assert_fail_closed()
         if manifest.lab_version is None:
             manifest.lab_version = __version__
+        self.job_dir(manifest.job_id).mkdir(parents=True, exist_ok=True)
+        self._create_exclusive(
+            self.manifest_path(manifest.job_id), manifest.model_dump_json(indent=2)
+        )
         self.output_dir(manifest.job_id).mkdir(parents=True, exist_ok=True)
         self.logs_path(manifest.job_id).touch()
-        self.write_manifest(manifest)
         # Claim this job in the machine-wide index, so a `reconcile` run from *any* project can
         # tell whose `lab-*` cloud resources it is looking at. Deliberately after the fail-closed
         # guard and the manifest write: a rejected job must not appear in the index. Never raises,
@@ -80,8 +138,47 @@ class JobStore:
     def read_manifest(self, job_id: str) -> JobManifest:
         return JobManifest.model_validate_json(self.manifest_path(job_id).read_text())
 
-    def update_manifest(self, job_id: str, **fields: Any) -> JobManifest:
-        """Read-modify-write the manifest's mutable fields (used by runner/backend).
+    def manifest_lock_path(self, job_id: str) -> Path:
+        # A dot-file in the job dir, beside manifest.json and outside output/ (which is what gets
+        # collected, mirrored and exported).
+        return self.job_dir(job_id) / ".manifest.lock"
+
+    @contextmanager
+    def _manifest_lock(self, job_id: str) -> Iterator[None]:
+        """Exclusive per-job ``flock`` around a manifest read-modify-write.
+
+        Several processes write one manifest — the runner/supervisor, ``status`` finalizing a dead
+        runner, ``cancel``, ``collect_artifacts`` — and each used to read, modify and write with
+        nothing in between. A writer that read before another's write landed then wrote its stale
+        copy back over it: a fetch could erase ``teardown_status="failed"`` (the FR-C2 money
+        alarm) and put a terminal job back to ``running``. One open+flock+close per *write*;
+        plain reads take no lock (writes are atomic renames, so a reader never sees a torn file),
+        so status polls stay a free filesystem read. Raises ``FileNotFoundError`` for a job dir
+        that does not exist, exactly as the read it guards would.
+        """
+        fd = os.open(self.manifest_lock_path(job_id), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)  # closing the descriptor releases the lock
+
+    def update_manifest(
+        self, job_id: str, *, only_if_active: bool = False, **fields: Any
+    ) -> JobManifest:
+        """Read-modify-write the manifest's mutable fields (used by runner/backend), under the
+        job's manifest lock (see ``_manifest_lock``).
+
+        Two invariants hold under that lock, whoever the caller is:
+
+        * **A terminal job never moves back to non-terminal.** A ``status`` that would do so is
+          dropped (the rest of the write still lands) — e.g. a runner recording ``running`` after
+          a cancel already landed.
+        * ``only_if_active=True`` makes the whole write conditional on the job still being
+          non-terminal *as read under the lock*, and otherwise returns the current manifest
+          unchanged. The dead-runner finalizers use it: "the pid is gone" is only evidence of a
+          crash if the runner did not record its own verdict first, and a check made before the
+          lock cannot know that.
 
         On any transition to ``succeeded``, snapshot the run's final metric values into the manifest
         (FR-B4 durable baseline) unless the caller supplied them — so every backend's finalize path
@@ -93,35 +190,51 @@ class JobStore:
         than requested is the worst kind of wrong answer (field-report #1). Legacy entrypoints
         (no file) are unaffected. Runs once (guarded on ``config_effective is None``).
         """
-        updated = self.read_manifest(job_id).model_copy(update=fields)
-        if updated.status is JobState.succeeded and not updated.final_metrics:
-            fm = snapshot_final_metrics(self.output_dir(job_id))
-            if fm:
-                updated = updated.model_copy(update={"final_metrics": fm})
-        if updated.status in _TERMINAL_STATES and updated.config_effective is None:
-            updated = self._audit_effective_config(
-                job_id, updated, flip=updated.status is JobState.succeeded
-            )
-        self.write_manifest(updated)
-        return updated
+        with self._manifest_lock(job_id):
+            current = self.read_manifest(job_id)
+            if current.status in _TERMINAL_STATES:
+                if only_if_active:
+                    return current
+                status = fields.get("status")
+                if status is not None and JobState(status) not in _TERMINAL_STATES:
+                    from lab import events
+
+                    events.note(
+                        "store.terminal_regression_refused",
+                        job_id=job_id, current=current.status.value, requested=str(status),
+                    )
+                    fields = {k: v for k, v in fields.items() if k != "status"}
+            updated = current.model_copy(update=fields)
+            if updated.status is JobState.succeeded and not updated.final_metrics:
+                fm = snapshot_final_metrics(self.output_dir(job_id))
+                if fm:
+                    updated = updated.model_copy(update={"final_metrics": fm})
+            if updated.status in _TERMINAL_STATES and updated.config_effective is None:
+                updated = self._audit_effective_config(
+                    job_id, updated, flip=updated.status is JobState.succeeded
+                )
+            self.write_manifest(updated)
+            return updated
 
     def _audit_effective_config(
         self, job_id: str, updated: JobManifest, *, flip: bool
     ) -> JobManifest:
         """The unconsumed-config check (see ``update_manifest``); pure function of output/.
 
-        Audits the ``key=value`` overrides actually passed on the command line (parsed from
-        ``entrypoint_command``) — NOT ``resolved_config``, which plain ``submit`` records as
-        metadata without ever putting it on the argv.
+        Audits only the overrides the lab itself injected — ``run.config_overrides``, recorded at
+        submit as the config keys that ride the argv. Not every ``k=v`` token of the shell
+        command: ``uv run --with scipy==1.11`` and an ``OMP_NUM_THREADS=1 …`` env prefix used to
+        be read as unconsumed config, flipping real successes to failed (and then aggregate
+        dropped their rows and sweep-retry re-bought them). Nor ``resolved_config`` as such,
+        which plain ``submit`` records as metadata without ever putting it on the argv. A legacy
+        manifest (no ``config_overrides``) gets the same intersection computed here.
 
         Runs on EVERY terminal transition so ``unconsumed_config`` is populated for timed-out/
         failed shards too (the aggregator's wrong-config guard depends on it); only a succeeded
         verdict is flipped to ``failed`` (``flip=True``) — the others already aren't successes.
         """
-        import shlex
-
         from lab import events
-        from lab.experiment import parse_overrides, read_effective_config
+        from lab.experiment import read_effective_config
 
         try:
             eff = read_effective_config(self.output_dir(job_id))
@@ -133,7 +246,12 @@ class JobStore:
             return updated  # already non-succeeded; corrupt evidence can't be recorded
         if eff is None:
             return updated  # legacy entrypoint — nothing reported, nothing to audit
-        passed = set(parse_overrides(shlex.split(updated.run.entrypoint_command)))
+        run = updated.run
+        passed = set(
+            run.config_overrides
+            if run.config_overrides is not None
+            else injected_override_keys(run.entrypoint_command, run.resolved_config)
+        )
         passed.discard("seed")  # a grid 'seed' key is consumed by the lab itself (sets LAB_SEED)
         unconsumed = sorted(passed - set(eff))
         updated = updated.model_copy(
@@ -172,6 +290,34 @@ class JobStore:
     def read_sweep_plan(self, sweep_id: str) -> SweepPlan:
         return SweepPlan.model_validate_json(self.sweep_plan_path(sweep_id).read_text())
 
+    def sweep_lock_path(self, sweep_id: str) -> Path:
+        # Beside plan.json, as a dot-file: `atomic_write_text` replaces plan.json's inode on every
+        # write, and a lock held on a replaced inode excludes nobody.
+        return self.home / sweep_id / ".plan.lock"
+
+    @contextmanager
+    def sweep_lock(self, sweep_id: str) -> Iterator[None]:
+        """Exclusive per-sweep ``flock`` around a plan read-modify-write (incl. what happens
+        between the read and the write — for ``sweep-retry``, the shard submits).
+
+        Without it, N concurrent ``sweep-retry`` calls each read the plan, each saw no in-flight
+        retry, each bought a shard and each wrote its own copy back: 8 retries launched 8 shards
+        and recorded 1, and the other 7 — paid for, on a remote backend — were invisible to
+        ``sweep-aggregate`` and to the next retry's in-flight check (stress run 2026-11-19). An
+        aggregate whose read predated a retry's write lost that shard the same way.
+
+        Same shape as :meth:`_manifest_lock`: one open+flock per critical section, released by
+        closing the descriptor, so it also excludes other threads of one process (an MCP server).
+        Raises ``FileNotFoundError`` when the sweep has no directory, rather than creating one
+        for an id that names nothing; callers check :meth:`has_sweep_plan` first.
+        """
+        fd = os.open(self.sweep_lock_path(sweep_id), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)  # closing the descriptor releases the lock
+
     def list_job_ids(self) -> list[str]:
         if not self.home.exists():
             return []
@@ -189,3 +335,22 @@ class JobStore:
     @staticmethod
     def _atomic_write(path: Path, text: str) -> None:
         atomic_write_text(path, text)
+
+    @staticmethod
+    def _create_exclusive(path: Path, text: str) -> None:
+        """Write ``path`` whole, but only if it does not exist yet (``FileExistsError`` if it
+        does). The content goes to a temp name first and is published with ``link``, which —
+        unlike ``replace`` — refuses an existing target; a reader never sees a partial file."""
+        tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.new")
+        atomic_write_text(tmp, text)
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            raise
+        except OSError:
+            # No hard links on this filesystem: claim the name with O_EXCL, then fill it. A
+            # reader can see it empty for that moment, which `list_jobs` already tolerates.
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644))
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)

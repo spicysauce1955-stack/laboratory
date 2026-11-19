@@ -57,10 +57,13 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   **Ownership is proved, never assumed (incident 2026-08-20).** "Not in this repo's `runs/`" is
   *not* evidence of a leak: the cloud account is machine-global while the job store is
   per-project, and that asymmetry let a `reconcile --apply --yes` run from this repo destroy
-  seven *running* `tempotron-capacity` jobs. A `lab-*` resource is destroyable only when
-  `lab.attribution` can attribute it to **this** project — via the project slug stamped into the
-  cluster name (`lab-<slug>-<job_id>`, `parse_cluster_name`) or the user-global job index
-  `~/.lab/jobs/index.jsonl` (written by `JobStore.create`, ledger fallback for older jobs).
+  seven *running* `tempotron-capacity` jobs. A `lab-*` resource is destroyable only when it is
+  provably **this job store's**: its job is in this `runs/`, or the user-global job index
+  `~/.lab/jobs/index.jsonl` (written by `JobStore.create`) names *this* runs_dir. The slug stamped
+  into the cluster name (`lab-<slug>-<job_id>`, `parse_cluster_name`) proves only the project
+  *name* — two clones, or the scheduler host and the laptop, share it — so a slug match alone
+  lands in `unattributed`, and a mismatch in `other_projects` (ledger fallback only for legacy
+  unstamped names).
   Anything owned elsewhere lands in `other_projects`, anything unprovable in `unattributed`;
   both are reported and **never destroyed** (the treatment `gcp_unmatched` already had). Clean up
   another project's leak by running reconcile *from that project*. Every destroy now records its
@@ -226,6 +229,15 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   absolute **UTC** date. `sanitize.ObjectKey` lets an internal note carry a vetted object key
   without opening the deny-list: it is a Python type, so nothing crossing a trust boundary
   (argv, JSON, YAML) can *be* one, and the value must still pass path-shape + secret checks.
+- **Parameter search (`lab.search`, v0.13.0):** an experiment-side helper (like `lab.experiment`,
+  nothing from `lab.store`/`lab.core`): the entrypoint supplies `evaluate(**params) -> bool`, the
+  lab walks the grid and appends passes to `$LAB_RUN_DIR/hits.jsonl` as found. Hits are deliberately
+  **not** `results.csv` rows — `sweep-aggregate` reads any row there as "this seed is present". In a
+  sharded sweep pass `summary_axis="seed"` (seed as a grid key), which writes one `seed,tested,hits`
+  row per seed, zero-hit seeds included; without it every seed reads missing and `sweep-retry`
+  re-buys them all. `sweep-aggregate` also concatenates shard hits into a per-cell `hits.jsonl`
+  (`lab.aggregate.merge_hits`, pure; presence is still judged by the CSV only). Fixture:
+  `experiments/example_search.py`.
 - **User notes (`lab.notes`):** the channel back from whoever ran the job. `lab note [<job>]
   -m "..."` writes to `runs/<job_id>/notes.jsonl` (beside `logs.txt`, copied into `lab export`
   bundles) **and** a user-global `~/.lab/notes/index.jsonl` (`LAB_NOTES_DIR`, `LAB_NOTES=0`);
@@ -289,7 +301,21 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   **`ruff format` is deliberately NOT used** — it would reformat 73 of 129 existing files and CI has
   never run it. Do not run it, and do not treat a `ruff format --check` failure as a real one.
 - CLI and MCP server are thin shells over the `lab.core.Lab` library — never duplicate logic
-  between them.
+  between them. `tests/test_cli_mcp_parity.py` fails on any flag/parameter drift; an intentional
+  difference goes on its commented allow-list.
+- **The test suite never touches real infrastructure (incident 2026-11-19).** `lab.cli`'s callback
+  loads `<repo>/.env`, so in-process CLI tests used to pull the developer's real R2 settings into the
+  pytest process and later tests uploaded 1,028 objects (job bundles carrying the checkout's
+  untracked files) to the real bucket; three tests listed the live Vast account. CI never saw it —
+  it has no `.env`. `tests/conftest.py` now scrubs `LAB_R2_*`/DO/`GOOGLE_*` settings, sets
+  `LAB_DOTENV=0` (the loader's off switch, inherited by subprocess CLI tests) and refuses to build
+  real R2, DigitalOcean or Vast clients. A test that must talk to a real service is marked
+  `live_cloud` and skipped unless `LAB_TEST_LIVE=1`. Use real-shaped job ids
+  (`YYYYMMDD-HHMMSS-xxxxxx`) in tests: a fake id can't be parsed out of a cluster name, which made
+  results depend on the checkout directory's name.
+- **`deploy/scheduler/deploy.sh`'s `lab` calls are pinned** by `tests/test_deploy_cli_contract.py`:
+  the deploy harness simulates `uv run lab`, so it cannot notice a lab change that breaks a command
+  line the deploy runs (a zero-duration refusal would have aborted every real deploy).
 - **Secrets** never in repo/manifest/logs (FR-J1); manifests record URIs, not keys. Machine-local
   settings (GCP project + service-account key **path**, R2 endpoint/bucket) go in a git-ignored
   `.env` at the repo root, loaded by `lab.env.load_lab_env` at CLI/MCP startup; the committed

@@ -80,7 +80,7 @@ class TestTeardownRecordsUnknown:
     def test_an_undecodable_reply_the_provider_can_settle_is_succeeded(self, tmp_path, monkeypatch):
         """DO answered: nothing matching is running. That is knowledge, not doubt."""
         store = _store_with_job(tmp_path, "t1b")
-        monkeypatch.setattr(m, "_do_destroy_matching", lambda c: ([], []))
+        monkeypatch.setattr(m, "_do_destroy_matching", lambda c, **_: ([], []))
 
         m.tear_down_and_record(_Sky(UNDECODABLE), "lab-t1b", store, "t1b", "do", backoffs=())
 
@@ -90,7 +90,7 @@ class TestTeardownRecordsUnknown:
         """sky could not tell us and the provider could not either -- genuinely unknown."""
         store = _store_with_job(tmp_path, "t1c")
 
-        def _unreachable(cluster):
+        def _unreachable(cluster, **_):
             raise RuntimeError("401 Unauthorized")
 
         monkeypatch.setattr(m, "_do_destroy_matching", _unreachable)
@@ -103,7 +103,7 @@ class TestTeardownRecordsUnknown:
         """We know sky did not do it, and we know we could not either. That is a real alarm."""
         store = _store_with_job(tmp_path, "t1d")
 
-        def _unreachable(cluster):
+        def _unreachable(cluster, **_):
             raise RuntimeError("401 Unauthorized")
 
         monkeypatch.setattr(m, "_do_destroy_matching", _unreachable)
@@ -117,7 +117,9 @@ class TestTeardownRecordsUnknown:
     def test_a_definitive_refusal_still_records_failed(self, tmp_path, monkeypatch):
         """`failed` must stay meaningful -- it is the thing exit 3 is for."""
         store = _store_with_job(tmp_path, "t2")
-        monkeypatch.setattr(m, "_do_destroy_matching", lambda c: ([], ["droplet lab-t2: 422"]))
+        monkeypatch.setattr(
+            m, "_do_destroy_matching", lambda c, **_: ([], ["droplet lab-t2: 422"])
+        )
 
         m.tear_down_and_record(_Sky(_ClusterGone("gone")), "lab-t2", store, "t2", "do", backoffs=())
 
@@ -127,11 +129,13 @@ class TestTeardownRecordsUnknown:
         """A clean `sky.down` whose storage is *verified* gone still records `succeeded`.
 
         The verification is not optional on DO: since P4-a a clean `sky.down` alone is not proof,
-        so this test has to say what the volume sweep found. Stubbing it to "nothing left" is the
-        success case; leaving it unstubbed would (correctly) yield `unknown`.
+        so this test has to say what the volume check found. Stubbing it to "listed, nothing
+        left" is the success case; leaving it unstubbed would (correctly) yield `unknown`.
         """
         store = _store_with_job(tmp_path, "t3")
-        monkeypatch.setattr(m, "_do_sweep_leftover_volumes", lambda cluster: ([], []))
+        monkeypatch.setattr(
+            m, "settle_do_volumes", lambda *a, **k: m.VolumeSettlement(discovery=True, covered=True)
+        )
 
         class _OkSky:
             def get(self, x):
@@ -236,6 +240,36 @@ class TestWaitExitCodes:
         _patch_wait(monkeypatch, tmp_path)
 
         assert runner.invoke(app, ["wait", "j1"]).exit_code == 0
+
+    # A `--timeout` that elapses with one job still running must not hide a money signal already
+    # recorded on a job that *did* finish: exit 1 ("gave up") reads as "nothing known yet", while
+    # the finished job's machine is billing now. Same precedence the fail-fast branch applies.
+    def test_a_confirmed_leak_outranks_a_timeout(self, monkeypatch, tmp_path):
+        _patch_wait(
+            monkeypatch, tmp_path,
+            all_terminal=False, pending=["j2"], teardown_leaks=["j1"],
+        )
+
+        result = runner.invoke(app, ["wait", "j1", "j2", "--timeout", "3"])
+
+        assert result.exit_code == 3, result.output
+
+    def test_an_unknown_teardown_outranks_a_timeout(self, monkeypatch, tmp_path):
+        _patch_wait(
+            monkeypatch, tmp_path,
+            all_terminal=False, pending=["j2"], teardown_unknown=["j1"],
+        )
+
+        result = runner.invoke(app, ["wait", "j1", "j2", "--timeout", "3"])
+
+        assert result.exit_code == 6, result.output
+
+    def test_a_timeout_with_no_money_signal_still_exits_1(self, monkeypatch, tmp_path):
+        _patch_wait(monkeypatch, tmp_path, all_terminal=False, pending=["j2"])
+
+        result = runner.invoke(app, ["wait", "j1", "j2", "--timeout", "3"])
+
+        assert result.exit_code == 1, result.output
 
     def test_a_null_teardown_still_only_warns(self, monkeypatch, tmp_path):
         """`None` means nothing was ever recorded -- weaker than `unknown`, unchanged behaviour."""

@@ -43,6 +43,9 @@ class R2QueueStore:
     def __init__(self, store: R2Store, prefix: str = "queue") -> None:
         self.store = store
         self.prefix = prefix.rstrip("/")
+        self.last_unreadable: frozenset[str] = frozenset()
+        """reg_ids the most recent :meth:`list_entries` skipped as unreadable (read it through
+        :func:`lab.scheduler.queue.unreadable_entry_ids`). Reset on every listing."""
 
     @classmethod
     def from_env(cls) -> R2QueueStore | None:
@@ -95,7 +98,9 @@ class R2QueueStore:
         from lab.events.sanitize import ObjectKey
 
         out: list[Registration] = []
-        for key, text, error in self._read_prefix(self._k("entries") + "/"):
+        skipped: set[str] = set()
+        prefix = self._k("entries") + "/"
+        for key, text, error in self._read_prefix(prefix):
             try:
                 if error is not None:
                     raise error
@@ -116,8 +121,14 @@ class R2QueueStore:
                 # `ObjectKey` for the same reason as `list_mirrored`'s note below: without it the
                 # ledger records that *a* queue entry was corrupt but not which one.
                 events.note("queue.entry_corrupt", key=ObjectKey(key), error=str(e))
+                # ...and named to the caller: skipping is right for a *listing*, but a caller that
+                # decides from it (a dependency check, bundle GC, the deploy drain gate) must tell
+                # "does not exist" from "exists, could not be read" (`unreadable_entry_ids`).
+                name = key[len(prefix) :] if key.startswith(prefix) else key.rsplit("/", 1)[-1]
+                skipped.add(name.removesuffix(".json"))
                 continue
             out.append(reg)
+        self.last_unreadable = frozenset(skipped)
         return out
 
     # -- control / heartbeat ---------------------------------------------------

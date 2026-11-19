@@ -10,7 +10,7 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from lab.redact import redact
+from lab.redact import mask_named_values, redact, sensitive_name
 
 MASK = "…REDACTED…"
 MAX_STR = 512
@@ -22,7 +22,23 @@ _SECRET_VALUE = (
     re.compile(r"^ya29\."),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     _BASE64_BLOB,
+    # Provider key shapes too short (or too low-entropy) for the generic bar below. Anchored at
+    # the start and closed with a no-more-key-characters guard, so they fire on one *word*
+    # (`_mask_word`) and never mask a whole sentence that merely contains one.
+    re.compile(r"^(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Za-z])"),  # AWS access key id
+    re.compile(r"^AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"),  # Google API key
+    re.compile(r"^dop_v1_[0-9a-f]{64}(?![0-9a-f])"),  # DigitalOcean personal access token
 )
+# Does a flag / env-var / field / query-param *name* say its value is a credential? The one name
+# test, shared with the log redaction in `lab.redact` (where it lives, since this module imports
+# that one): a log line and a ledger record must never disagree about a credential's name.
+_sensitive_name = sensitive_name
+
+
+def _sensitive_key(key: str) -> bool:
+    """The dict-key / argv-flag test: the historical broad substring match, plus the bounded name
+    test (which adds what the substring missed — `DB_PASS`, `passwd`, `signature`)."""
+    return bool(_SECRET_KEY.search(key)) or _sensitive_name(key)
 _HEXISH = re.compile(r"^[0-9a-f-]+$", re.IGNORECASE)  # commits, cell ids, job ids — not secrets
 # A `--flag=value` or `--flag value` pair anywhere inside a larger string. Matched directly
 # against the raw text (see `_mask_command_line`) rather than by tokenizing it — free text is not
@@ -61,15 +77,14 @@ _INLINE_FLAG = re.compile(
     """,
     re.VERBOSE,
 )
-# Flag names treated as "this looks like it holds a secret" by `_mask_flag` below — deliberately
-# narrower than `_SECRET_KEY` (which stays as-is for dict keys in `_walk` and real argv tokens in
-# `_mask_tokens`, both different, less ambiguous contexts). `_SECRET_KEY` includes "auth", which
-# also matches plenty of ordinary, non-secret-bearing flag names that just *mention* auth
-# (`--basic-auth`, `--no-auth`) with nothing secret-shaped following — "auth" alone is too weak a
-# signal once it's being matched against arbitrary prose rather than a known argv key. Word-
-# boundary anchored so "keyword" (one glued-together word, no separator) does not match "key" the
-# way "--api-key" (a real hyphen-separated segment) does.
-_SENSITIVE_FLAG_NAME = re.compile(r"\b(?:key|token|secret|password|credential)\b", re.IGNORECASE)
+# Flag names treated as "this looks like it holds a secret" by `_mask_flag` below are judged by
+# `_sensitive_name` — deliberately narrower than `_SECRET_KEY` (which stays as-is for dict keys in
+# `_walk` and real argv tokens in `_mask_tokens`, both different, less ambiguous contexts).
+# `_SECRET_KEY` includes "auth", which also matches plenty of ordinary, non-secret-bearing flag
+# names that just *mention* auth (`--basic-auth`, `--no-auth`) with nothing secret-shaped
+# following — "auth" alone is too weak a signal once it's being matched against arbitrary prose
+# rather than a known argv key. Segment-bounded so "keyword" (one glued-together word, no
+# separator) does not match "key" the way "--api-key" and "--api_key" do.
 # A free-standing word, for the pass that catches a secret with no flag in front of it at all
 # (e.g. "failed with key AKIA... during connect"). Applied only to text `_INLINE_FLAG` did not
 # already consume/mask, via a second, independent sweep — see `_mask_command_line`.
@@ -131,7 +146,10 @@ class ObjectKey(str):
        ``_SECRET_KEY``, ``_INLINE_FLAG`` and every default-pass path behave exactly as before for
        every plain ``str``, and the two paths that handle user input — :func:`sanitize_argv` and
        :func:`mask_text` — are given no bypass at all: they take ``str``, and a ``str`` is
-       masked. ``redact()`` still runs on what is let through.
+       masked. ``redact()`` still runs on what is let through. (``_looks_secret`` has since
+       learned to spare *anchored* structured words — a lab id, a ``lab-`` resource name, a
+       digest, a rooted path or a scheme URL; see :func:`_structured`. A relative key like the
+       one above carries none of those anchors and is still masked as a plain ``str``.)
 
     The residual risk is "a lab author wraps a secret in source", which is a code-review-visible
     act that (2) then has to be talked past as well. That is a much smaller hole than the
@@ -147,15 +165,84 @@ def _entropy(s: str) -> float:
     return -sum((n / len(s)) * math.log2(n / len(s)) for n in counts.values())
 
 
+# --- structured words the entropy bar must not take ---------------------------------------------
+#
+# The entropy bar is right for an *unknown* credential — one long run from a token alphabet — and
+# wrong for anything structured: a run path, an object URL, a digest, a cluster name, the lab's
+# own hint text all measure > 3.5 bits at ≥ 32 chars, and were masked on sight. That cost the
+# ledger exactly the identifiers forensics needs: which output file, which bucket object, which
+# cluster a teardown note is about (stress run 2026-11-19). `_structured` exempts such a word, and
+# only one that (a) carries its own provenance and (b) has no credential-shaped run inside it.
+
+#: A lab job id (``lab.core._new_job_id``), alone or inside a sweep/reg id, a run path, an object
+#: key or a cluster name. Nothing a vendor issues is shaped like a UTC timestamp plus 6 hex.
+_LAB_ID = re.compile(r"(?<![0-9])[0-9]{8}-[0-9]{6}-[0-9a-f]{6}(?![0-9a-f])")
+#: A name lab gives its own cloud resources (``lab-<slug>-<job_id>``, and the SkyPilot nodes built
+#: from one — GCP truncates those until no job id is left): lowercase kebab-case.
+_LAB_NAME = re.compile(r"lab(?:-[a-z0-9]+)+")
+#: A content digest says what it is: ``sha256:<hex>``, optionally behind an image reference.
+_DIGEST = re.compile(
+    r"(?P<ref>[\w./:-]*@)?(?:sha1|sha224|sha256|sha384|sha512|md5|blake2[bs]):[0-9a-f]{32,128}"
+)
+_URL_SCHEME = re.compile(r"[a-z][a-z0-9+.-]*://")
+_URL_USERINFO = re.compile(r"://[^/\s]*:[^/\s]*@")
+_ROOTED = re.compile(r"(?:~|\.{1,2})?/")
+#: A character no standard-base64 credential contains. A word with ``/`` that also has one of
+#: these cannot be standard base64 (and base64url and hex have no ``/``), which is what separates
+#: a path from an AWS-style secret access key that merely contains slashes.
+_NOT_BASE64 = re.compile(r"[^A-Za-z0-9+/=]")
+_ALNUM_RUN = re.compile(r"[A-Za-z0-9]{16,}")
+#: Quoting and punctuation a word picks up from the sentence around it.
+_EDGES = "\"'`()[]{}<>,;:."
+
+
+def _credential_run(text: str) -> bool:
+    """Does ``text`` contain a run that could be a credential on its own? 32+ alphanumerics, or
+    16+ that mix letters and digits — the shape of every random token, and of nothing lab names:
+    its ids, slugs, uuid8s and file names are punctuated into short runs."""
+    for m in _ALNUM_RUN.finditer(text):
+        run = m.group(0)
+        if len(run) >= 32 or (any(c.isdigit() for c in run) and any(c.isalpha() for c in run)):
+            return True
+    return False
+
+
+def _structured(word: str) -> bool:
+    """Is ``word`` recognisably *not* a credential, for all its length and entropy?
+
+    Needs provenance in the word itself — a digest prefix, a lab id or ``lab-`` resource name, a
+    backtick (markdown, and the lab's own hint text), or a path/URL anchored at a filesystem root
+    or a scheme — and nothing credential-shaped inside it. A relative object key with none of
+    these (``queue/jobs/….json``) is *not* exempt: that is :class:`ObjectKey`'s job, vetted at the
+    call site, by design.
+    """
+    core = word.strip(_EDGES)
+    digest = _DIGEST.fullmatch(core)
+    if digest is not None:  # the hex is the digest; only the image reference in front is judged
+        return not _credential_run(digest.group("ref") or "")
+    if _credential_run(core) or _URL_USERINFO.search(core):
+        return False
+    if _LAB_ID.search(core) or _LAB_NAME.fullmatch(core) or "`" in word:
+        return True
+    return (
+        "/" in core
+        and _NOT_BASE64.search(core) is not None
+        and (_URL_SCHEME.match(core) is not None or _ROOTED.match(core) is not None)
+    )
+
+
 def _looks_secret(value: str) -> bool:
     # Hex-only strings ≤40 chars (commit SHAs, cell ids, job IDs) are never secrets, so check
     # first to prevent the base64 pattern from matching 40-char hex strings. Longer hex strings
-    # (e.g. 64-char hex API tokens) fall through to entropy check and are masked.
+    # (e.g. 64-char hex API tokens) fall through to entropy check and are masked — a bare 64-hex
+    # value is the Vast API key / R2 secret shape; only a digest *prefix* (`_structured`) exempts.
     if _HEXISH.match(value) and len(value) <= 40:
         return False
     if any(p.search(value) for p in _SECRET_VALUE):
         return True
     if " " in value or len(value) < 32:
+        return False
+    if _structured(value):
         return False
     return _entropy(value) > 3.5
 
@@ -193,9 +280,9 @@ def _mask_tokens(tokens: Sequence[str]) -> list[str]:
             continue
         if token.startswith("-") and "=" in token:
             flag, _, value = token.partition("=")
-            out.append(f"{flag}={MASK}" if _SECRET_KEY.search(flag) else f"{flag}={_scalar(value)}")
+            out.append(f"{flag}={MASK}" if _sensitive_key(flag) else f"{flag}={_scalar(value)}")
             continue
-        if token.startswith("-") and _SECRET_KEY.search(token):
+        if token.startswith("-") and _sensitive_key(token):
             mask_next = True
         out.append(str(_scalar(token)))
     return out
@@ -248,7 +335,7 @@ def _mask_command_line(text: str) -> str:
         # (`--basic-auth flag`, `--keyword search`).
         quoted = len(value) >= 2 and value[0] == '"' and value[-1] == '"'
         stripped = value[1:-1] if quoted else value
-        if _looks_secret(stripped) or _SENSITIVE_FLAG_NAME.search(flag):
+        if _looks_secret(stripped) or _sensitive_name(flag):
             return f"{flag}{sep}{MASK}"
         return m.group(0)
 
@@ -263,9 +350,15 @@ def _mask_command_line(text: str) -> str:
 def _mask_secrets(value: str) -> str:
     """Secret-masking only, no length cap: the piece of ``_scalar`` a caller whose whole point
     is holding free text in full (``lab.notes``) needs on its own — the 512-char cap right after
-    this belongs to the ledger's argv/param records, not to a note body."""
+    this belongs to the ledger's argv/param records, not to a note body.
+
+    Named values first (``lab.redact.mask_named_values``: ``NAME=value``, ``name: value``, JSON
+    fields, URL userinfo, bearer tokens — ``bare=True``, so a ledger ``key=…`` still masks), so
+    the word pass below never sees ``WANDB_API_KEY=<40 hex>`` whole and masks the name with it.
+    """
     if _looks_secret(value):
         return MASK
+    value = mask_named_values(value, bare=True)
     if re.search(r"\s", value):
         value = _mask_command_line(value)
     return redact(value)
@@ -303,7 +396,7 @@ def _walk(value: Any, *, key: str | None = None) -> Any:
     # object key — a diagnostic that has to misname its subject to keep it is no better off.
     if isinstance(value, ObjectKey):
         return _vetted_object_key(value)
-    if key is not None and _SECRET_KEY.search(key):
+    if key is not None and _sensitive_key(key):
         return MASK
     if isinstance(value, Mapping):
         return {str(k): _walk(v, key=str(k)) for k, v in value.items()}

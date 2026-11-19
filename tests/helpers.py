@@ -52,6 +52,25 @@ def make_manifest(
     )
 
 
+def pin_in_flight(store, job_id: str, status: JobState = JobState.running) -> None:
+    """Make a (settled) local job read as genuinely in flight: a non-terminal manifest AND a live
+    runner. Status reads refresh through the backend, which finalizes a non-terminal job whose
+    runner is gone — so a bare status rewrite now reads as a dead supervisor, not in-flight.
+    Our own pid, with its real start time, is a runner that is provably alive."""
+    import os
+
+    from lab._util import process_start_time
+
+    store.write_manifest(
+        store.read_manifest(job_id).model_copy(
+            update={"status": status, "ended_at": None, "end_reason": None}
+        )
+    )
+    store.write_runtime(
+        job_id, runner_pid=os.getpid(), runner_start_time=process_start_time(os.getpid())
+    )
+
+
 def wait_terminal(backend, job_id: str, timeout: float = 30.0) -> JobState:
     """Poll status until the job reaches a terminal state (or fail)."""
     deadline = time.time() + timeout

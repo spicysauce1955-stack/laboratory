@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from lab.events.models import Event
 from lab.events.stats import signature, stats, stats_dict
 
@@ -51,6 +53,168 @@ def test_signature_collapses_a_path_even_when_a_segment_looks_like_a_sha() -> No
     assert signature(a) == signature(b)
     assert "<path>" in signature(a)
     assert "config.yaml" not in signature(a)
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "placeholder"),
+    [
+        # A real job id is `YYYYMMDD-HHMMSS-<6 hex>`. Only the legacy `j-…` shape used to be
+        # recognised, so the date became `<sha>`, the time `<n>`, and the hex suffix survived —
+        # every "unknown job id" was its own signature.
+        ("20261119-102456-7486e1", "20261120-081512-a0b1c2", "<job>"),
+        ("20261119-102456-748612", "20261120-081512-abcdef", "<job>"),  # all-digit / all-alpha
+        ("sweep-20261119-102809-b2ca49", "sweep-20261121-000000-ffee00", "<sweep>"),
+        ("reg-20261119-102809-b2ca49", "reg-20261121-000000-ffee00", "<reg>"),
+        (
+            "lab-proj-20261119-102456-7486e1",
+            "lab-proj-20261120-081512-a0b1c2",
+            "<cluster>",
+        ),
+        ("lab-20261119-102456-7486e1", "lab-20261120-081512-a0b1c2", "<cluster>"),  # legacy
+        (
+            "lab-tempotron-capacity-20261119-102456-7486e1-head-1a2b3c4d-compute",
+            "lab-tempotron-capacity-20261120-081512-a0b1c2-head-c0h9pkx0-compute",
+            "<cluster>",
+        ),
+        (  # GCP truncates past 35 chars: no job id survives, only the node suffix
+            "lab-laboratory-20260820-ef-3dd12990-head-c0h9pkx0-compute",
+            "lab-laboratory-20260821-a1-77aa0011-worker-zz00yy11-tpu",
+            "<cluster>",
+        ),
+    ],
+)
+def test_signature_normalizes_lab_ids_and_cluster_names(
+    first: str, second: str, placeholder: str
+) -> None:
+    """The next run has a different id. A signature that keeps any of it can never recur, so
+    `lab report` gets one triage row per failure and a note filed on it never fires again."""
+    for template in (
+        "unknown job id '{}' — not in local runs/",
+        "teardown of {} did not confirm",
+        "{}: sky.down raised ClusterNotUpError",
+    ):
+        a = signature({"type": "Exit", "message": template.format(first)})
+        b = signature({"type": "Exit", "message": template.format(second)})
+        assert a == b, (a, b)
+        assert placeholder in a, a
+
+
+def test_signature_still_tells_a_job_id_from_ordinary_numbers() -> None:
+    """Normalising ids must not collapse the message around them: two different failures about
+    the same job stay two signatures."""
+    job = "20261119-102456-7486e1"
+    a = signature({"type": "Exit", "message": f"unknown job id '{job}'"})
+    b = signature({"type": "Exit", "message": f"job '{job}' is still running"})
+    assert a != b
+    assert signature({"type": "Exit", "message": f"unknown job id '{job}'"}) == (
+        "Exit: unknown job id '<job>'"
+    )
+
+
+@pytest.mark.parametrize(
+    ("legacy", "message"),
+    [
+        # Signatures the pre-fix normaliser produced (and notes were filed under), each next to
+        # a message the same failure produces for a *different* job today.
+        (
+            "Exit: unknown job id '<sha>-<n>-7486e1' — not in local runs/",
+            "unknown job id '20261120-081512-a0b1c2' — not in local runs/",
+        ),
+        (
+            "Exit: unknown job id '<sha>-<n>-<n>' — not in local runs/",
+            "unknown job id '20261120-081512-a0b1c2' — not in local runs/",
+        ),
+        (
+            "Exit: teardown of lab-proj-<sha>-<n>-7486e1 did not confirm",
+            "teardown of lab-proj-20261120-081512-a0b1c2 did not confirm",
+        ),
+        (
+            "Exit: sweep sweep-<sha>-<n>-b2ca49 has no plan",
+            "sweep sweep-20261121-000000-ffee00 has no plan",
+        ),
+        (
+            "Exit: lab-proj-<sha>-<n>-7486e1-head-<sha>-compute is gone",
+            "lab-proj-20261120-081512-a0b1c2-head-c0h9pkx0-compute is gone",
+        ),
+        (
+            "Exit: lab-laboratory-<sha>-ef-<sha>-head-c0h9pkx0-compute is gone",
+            "lab-laboratory-20260821-a1-77aa0011-head-zz00yy11-compute is gone",
+        ),
+        (
+            "Exit: registration reg-<sha>-<n>-<n> not found",
+            "registration reg-20261121-000000-ffee00 not found",
+        ),
+    ],
+)
+def test_a_legacy_signature_upgrades_onto_todays(legacy: str, message: str) -> None:
+    """Notes store the signature they were filed under. Upgrading the stored key — rather than
+    leaving it — is what lets a note written against the old normaliser fire for the next job."""
+    from lab.events.stats import upgrade_signature
+
+    current = signature({"type": "Exit", "message": message})
+    assert upgrade_signature(legacy) == current
+    assert upgrade_signature(current) == current  # idempotent on today's form
+
+
+def test_a_word_the_old_sanitizer_masked_matches_whatever_signs_there_now() -> None:
+    """The ledger signs the *sanitized* message. Before the sanitizer learned to spare cluster
+    names and run paths, they were masked to `…REDACTED…` and the signature kept the mask; now
+    they reach the normaliser and sign as `<cluster>` / `<path>`. A note keyed on the old form
+    must still find the failure — and only that failure."""
+    from lab.events.stats import same_signature
+
+    stored = "Exit: teardown of …REDACTED… did not confirm"
+    now = signature({"type": "Exit", "message":
+                     "teardown of lab-proj-20261120-081512-a0b1c2 did not confirm"})
+    assert now == "Exit: teardown of <cluster> did not confirm"
+    assert same_signature(stored, now)
+    assert not same_signature(stored, "Exit: teardown of <cluster> confirmed late")
+    assert not same_signature(stored, "Exit: teardown of two words did not confirm")
+    # A mask in today's signature is literal text too (a real secret is still masked).
+    assert same_signature(stored, stored)
+
+
+def test_upgrading_leaves_a_signature_with_no_ids_alone() -> None:
+    from lab.events.stats import upgrade_signature
+
+    sig = signature({"type": "ProvisionTimeout", "message": "host never reached UP in 20m"})
+    assert upgrade_signature(sig) == sig
+    assert upgrade_signature("unknown") == "unknown"
+
+
+def test_one_command_reached_from_both_surfaces_is_one_action_row() -> None:
+    """The CLI records `sweep-aggregate` (and a group leaf as `queue list`); the MCP tool of the
+    same name records `sweep_aggregate` / `queue_list`. Same command, same row — split, each
+    half under-reports the failure rate and the failure looks half as common as it is."""
+    err = {"type": "LabError", "message": "no shard plan"}
+    events = [
+        Event(id="1", ts=NOW, session="s", seq=0, surface="cli", action="sweep-aggregate",
+              outcome="error", duration_ms=10, error=err),
+        Event(id="2", ts=NOW, session="s", seq=1, surface="mcp", action="sweep_aggregate",
+              outcome="ok", duration_ms=30),
+        Event(id="3", ts=NOW, session="s", seq=2, surface="cli", action="queue list",
+              outcome="ok", duration_ms=5),
+        Event(id="4", ts=NOW, session="s", seq=3, surface="mcp", action="queue_list",
+              outcome="ok", duration_ms=5),
+        Event(id="5", ts=NOW, session="s", seq=4, surface="mcp", action="sweep_aggregate",
+              outcome="error", duration_ms=20, error=err),
+    ]
+    view = stats(events)
+    rows = {a.action: a for a in view.actions}
+    # The CLI's spelling labels the row: it is what a person types to repeat the command.
+    assert set(rows) == {"sweep-aggregate", "queue list"}
+    assert rows["sweep-aggregate"].calls == 3 and rows["sweep-aggregate"].failures == 2
+    assert rows["queue list"].calls == 2
+    assert view.signatures[0].actions == ["sweep-aggregate"]
+    # The raw records are untouched: grouping is a read-side concern.
+    assert [e.action for e in events][:2] == ["sweep-aggregate", "sweep_aggregate"]
+    assert [e.surface for e in events][:2] == ["cli", "mcp"]
+
+
+def test_an_action_seen_only_over_mcp_keeps_its_mcp_spelling() -> None:
+    view = stats([Event(id="1", ts=NOW, session="s", seq=0, surface="mcp",
+                        action="fetch_artifacts", outcome="ok", duration_ms=1)])
+    assert [a.action for a in view.actions] == ["fetch_artifacts"]
 
 
 def test_stats_counts_calls_failures_and_failure_rate() -> None:

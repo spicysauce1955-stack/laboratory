@@ -7,7 +7,7 @@ from lab.core import Lab
 from lab.manifest import repo_root
 from lab.models import JobState
 
-from helpers import wait_terminal
+from helpers import pin_in_flight, wait_terminal
 
 
 def _lab(tmp_path: Path) -> Lab:
@@ -76,7 +76,7 @@ def test_retry_sweep_no_duplicate_when_prior_retry_in_flight(tmp_path: Path):
 
     # Simulate the retry job still being in-flight (non-terminal: running)
     _settle(lab, new_id)
-    lab.store.update_manifest(new_id, status=JobState.running)
+    pin_in_flight(lab.store, new_id)
 
     # Second retry — the in-flight job covers seeds [2,3], so NO additional job should be added
     updated2 = lab.retry_sweep(sweep_id)
@@ -118,7 +118,7 @@ def test_retry_skips_when_inflight_superset_covers_missing(tmp_path):
     retry_jid = first.cells[0].shard_job_ids[-1]
     assert "seeds=2,3" in lab.manifest(retry_jid).run.entrypoint_command
     _settle(lab, retry_jid)
-    lab.store.update_manifest(retry_jid, status=JobState.running)  # pin the retry in flight
+    pin_in_flight(lab.store, retry_jid)  # pin the retry in flight
     # seed 2 now surfaces from the timed-out shard's late-rsynced partial output
     out = lab.store.output_dir(cell.shard_job_ids[1])
     out.mkdir(parents=True, exist_ok=True)

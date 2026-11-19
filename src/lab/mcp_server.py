@@ -1,6 +1,6 @@
 """MCP server exposing the lab as structured tools (FR-F1, spec §9).
 
-Run (stdio):  uv run python -m lab.mcp_server
+Run (stdio):  uv run python -m lab.mcp_server   (or ``lab mcp``; both go through ``run_stdio``)
 
 Tools return JSON-serializable dicts so FastMCP emits ``structuredContent``. Unknown jobs and
 submission errors raise ``ToolError`` (fail-loud, FR-F3). ``submit`` chooses the backend
@@ -11,31 +11,87 @@ manifest), mirroring the CLI. ``build_server(lab)`` lets tests inject a Lab at a
 
 from __future__ import annotations
 
+import io
+import os
 import shutil
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
+import fastmcp
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
 from mcp.types import CallToolRequestParams
 
-from lab import events
-from lab._util import parse_duration, wrap_with_extras
+from lab import __version__, events
+from lab._util import parse_duration, unwritable_dest_message, wrap_with_extras
 from lab.core import Lab, LabError, default_lab, job_status_view, resolve_backend_profile
 from lab.env import load_lab_env
 from lab.events import store as events_store
 from lab.events.annotate import digest_of, refs_from
+from lab.list_view import DEFAULT_LIST_LIMIT, list_view
 from lab.manifest import repo_root
+from lab.metrics import DEFAULT_MAX_POINTS
 from lab.models import JobManifest, JobSpec, ResourceRequest
+from lab.queue_view import queue_list_view
 from lab.store import JobStore
 
 
 def _iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt else None
+
+
+class _StdoutForDiagnostics(io.TextIOBase):
+    """``sys.stdout`` while the stdio server runs: text goes to stderr, ``.buffer`` is the
+    transport's private copy of the real stdout (the stdio transport wraps ``sys.stdout.buffer``
+    when it starts, and nothing else should ever reach that stream)."""
+
+    def __init__(self, transport: IO[bytes]) -> None:
+        super().__init__()
+        self._transport = transport
+
+    @property
+    def buffer(self) -> IO[bytes]:
+        return self._transport
+
+    def write(self, s: str) -> int:
+        return sys.stderr.write(s)
+
+    def flush(self) -> None:
+        sys.stderr.flush()
+
+    def fileno(self) -> int:
+        return sys.stderr.fileno()
+
+    def isatty(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+
+def run_stdio(server: FastMCP) -> None:
+    """Serve ``server`` over stdio with stdout reserved for JSON-RPC.
+
+    Over stdio the server's stdout *is* the protocol stream, and plenty of code a tool reaches
+    prints to it: diagnostics written for the CLI's terminal (an export whose artifact fetch
+    failed, a teardown falling back to a provider API), libraries, and child processes that
+    inherit fd 1. Each such line used to land in the JSON-RPC stream as a non-JSON message. So the
+    transport gets a duplicate of the real stdout to itself, and fd 1 — plus any ``print()`` or
+    ``sys.stdout`` write, including through a stream object captured before this ran — is pointed
+    at stderr, where a stdio client already expects diagnostics.
+    """
+    sys.stdout.flush()
+    transport = os.fdopen(os.dup(sys.stdout.fileno()), "wb")
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    sys.stdout = _StdoutForDiagnostics(transport)
+    # No banner: FastMCP's start-up banner is decoration for a human terminal, and rendering it
+    # is what asks PyPI for a newer FastMCP — a network call on every agent session's start.
+    server.run(show_banner=False)
 
 
 def _since_cutoff(since: str | None) -> datetime | None:
@@ -98,7 +154,12 @@ class EventMiddleware(Middleware):
 
 
 def build_server(lab: Lab) -> FastMCP:
-    mcp: FastMCP = FastMCP("laboratory")
+    # Belt and braces with `run_stdio`'s show_banner=False: the update check is the banner's
+    # only network call, and a stdio server for an agent must make none on start.
+    fastmcp.settings.check_for_updates = "off"
+    # serverInfo.version is how a client tells which lab it is talking to; FastMCP otherwise
+    # reports its own version there.
+    mcp: FastMCP = FastMCP("laboratory", version=__version__)
     mcp.add_middleware(EventMiddleware())
     home = lab.home
     store = JobStore(home)
@@ -359,7 +420,7 @@ def build_server(lab: Lab) -> FastMCP:
         interval: float = 10,
         fail_fast: bool = False,
     ) -> dict[str, Any]:
-        """Block until the job(s) (or every job in a sweep) reach a terminal state, up to timeout (seconds or '10m'/'2h'), then return the FR-C2 verdict: {all_terminal, failed_fast, pending, mirrored, teardown_leaks, teardown_unconfirmed, jobs}. fail_fast=True returns as soon as any job is failed/timed_out (failed_fast=true, offender listed first; pending names still-running — and still-billing — jobs; nothing is cancelled). Non-empty teardown_leaks = a paid machine may still be billing — call reconcile. teardown_unconfirmed = teardown never recorded either way; treat as suspect, not clean. Scheduler-launched (deferred) job ids work here: they are read from the mirrored manifest and listed in `mirrored` (state may be a scheduler tick stale, and such a wait polls no faster than every 30s)."""
+        """Block until the job(s) (or every job in a sweep) reach a terminal state, up to timeout (seconds or '10m'/'2h'), then return the FR-C2 verdict: {all_terminal, failed_fast, pending, mirrored, teardown_leaks, teardown_unknown, teardown_unconfirmed, jobs}. fail_fast=True returns as soon as any job is failed/timed_out; failed_fast=true whenever fail_fast was set and any job failed/timed_out, even if every job had already finished (offender listed first; pending names still-running — and still-billing — jobs; nothing is cancelled). Non-empty teardown_leaks = a paid machine may still be billing — call reconcile. teardown_unknown = the destroy's outcome could not be read; verify against the provider. teardown_unconfirmed = teardown never recorded either way; treat as suspect, not clean. Scheduler-launched (deferred) job ids work here: they are read from the mirrored manifest and listed in `mirrored` (state may be a scheduler tick stale, and such a wait polls no faster than every 30s)."""
         try:
             timeout_s = parse_duration(timeout)
         except ValueError as e:
@@ -385,6 +446,10 @@ def build_server(lab: Lab) -> FastMCP:
             return lab.export(job_or_sweep_id, Path(to), include_logs=include_logs)
         except LabError as e:
             raise ToolError(str(e)) from e
+        except OSError as e:
+            if (msg := unwritable_dest_message(to, e)) is None:
+                raise
+            raise ToolError(f"export: {msg}") from e
 
     @mcp.tool
     def reconcile() -> dict[str, Any]:
@@ -403,13 +468,14 @@ def build_server(lab: Lab) -> FastMCP:
         region: str | None = None,
         zone: str | None = None,
         use_spot: bool = False,
+        use_cache: bool = True,
     ) -> dict[str, Any]:
-        """Check whether a launch on this cloud would work, BEFORE it costs a provision — run this when a submit fails to provision, or before the first job on a new cloud/shape. Returns {cloud, ok, checks:[{name,status,detail,fix}], blocking:[...]} where status is ok|warn|fail|skip. Verifies credentials (including SkyPilot's API-server daemon, which does not inherit .env), project, billing, enabled APIs, IAM permissions, and quota for the requested shape, then reports the catalog's instance type and price band. GCP GPU quota is checked at both levels Google enforces: a project can hold regional NVIDIA_*_GPUS quota and still be blocked by a global GPUS_ALL_REGIONS of 0. status="skip" means the check could not answer and is never a blocker; only "fail" is a definitive negative."""
-        from lab.core import default_disk_gb, validate_cloud
-        from lab.doctor import doctor_view, run_checks
+        """Check whether a launch on this cloud would work, BEFORE it costs a provision — run this when a submit fails to provision, or before the first job on a new cloud/shape. Returns {cloud, ok, checks:[{name,status,detail,fix}], blocking:[...]} where status is ok|warn|fail|skip. cloud="local" (the default backend) returns a trivial ok report: nothing there can fail. Verifies credentials (including SkyPilot's API-server daemon, which does not inherit .env), project, billing, enabled APIs, IAM permissions, and quota for the requested shape, then reports the catalog's instance type and price band. GCP GPU quota is checked at both levels Google enforces: a project can hold regional NVIDIA_*_GPUS quota and still be blocked by a global GPUS_ALL_REGIONS of 0. status="skip" means the check could not answer and is never a blocker; only "fail" is a definitive negative. use_cache=False re-runs every check instead of reusing cached results (e.g. right after fixing credentials or quota)."""
+        from lab.core import default_disk_gb
+        from lab.doctor import doctor_view, run_checks, validate_doctor_cloud
 
         try:
-            validate_cloud(cloud)
+            validate_doctor_cloud(cloud)
         except LabError as e:
             raise ToolError(str(e)) from e
         resources = ResourceRequest(
@@ -417,19 +483,25 @@ def build_server(lab: Lab) -> FastMCP:
             cloud=cloud, region=region, zone=zone, use_spot=use_spot,
         )
         resources = resources.model_copy(update={"disk_size": default_disk_gb(resources)})
-        return doctor_view(cloud, run_checks(cloud, resources, home=home))
+        return doctor_view(cloud, run_checks(cloud, resources, home=home, use_cache=use_cache))
 
     @mcp.tool
     def metrics(
-        job_id: str, names: list[str] | None = None, since_step: int | None = None
+        job_id: str,
+        names: list[str] | None = None,
+        since_step: int | None = None,
+        max_points: int = DEFAULT_MAX_POINTS,
+        downsample: bool = False,
     ) -> dict[str, Any]:
-        """Query incremental metric series; returns {series:{name:[{step,value,wall_time}]}}
-        (FR-D2). Scheduler-launched (deferred) jobs fall back to the mirrored manifest (spec
-        §4.3), matching `status`; since their logs/metrics only live durably on the scheduler
-        host, this may legitimately return an empty series rather than an error."""
+        """Query incremental metric series; returns {series:{name:[{step,value,wall_time}]}, max_points, truncated} (FR-D2). BOUNDED by default: each series returns its newest max_points (200) points, and `truncated` names every series that had more as {name: {returned, omitted}} — read it before concluding a run is short. Poll with since_step=<last step seen> for only what is new (cheap: the file is read from the end); downsample=True spreads max_points evenly over the whole series (always keeping the newest point) to see a run's shape; max_points=0 returns every point (can be tens of MB on a long run). Non-finite values (a diverged loss) come back as null. Scheduler-launched (deferred) jobs fall back to the mirrored manifest (spec §4.3), matching `status`; since their logs/metrics only live durably on the scheduler host, this may legitimately return an empty series rather than an error."""
+        if max_points < 0:
+            raise ToolError(f"max_points must be >= 0 (0 = every point), got {max_points}")
         the_lab, tmp_home = _lab_for_any(job_id)
         try:
-            return {"series": the_lab.metrics(job_id, names=names, since_step=since_step)}
+            return the_lab.metrics_view(
+                job_id, names=names, since_step=since_step,
+                max_points=max_points, downsample=downsample,
+            )
         finally:
             # The server is long-lived (unlike the CLI's atexit sweep) — a mirrored job's
             # throwaway JobStore dir must be removed right after this call, not left to leak.
@@ -438,7 +510,8 @@ def build_server(lab: Lab) -> FastMCP:
 
     @mcp.tool
     def logs(job_id: str, tail: int | None = 100) -> dict[str, Any]:
-        """Tail a job's logs; returns {lines: [...]} (FR-D1). Scheduler-launched (deferred) jobs
+        """Tail a job's logs; returns {lines: [...]} (FR-D1). tail=N gives the last N lines,
+        tail=0 none, tail=None the whole log. Scheduler-launched (deferred) jobs
         fall back to the mirrored manifest (spec §4.3), matching `status`; since their logs only
         live durably on the scheduler host, this may legitimately return an empty list rather
         than an error."""
@@ -520,22 +593,14 @@ def build_server(lab: Lab) -> FastMCP:
             raise ToolError(str(e)) from e
 
     @mcp.tool(name="list")
-    def list_jobs(spend_alert: float | None = None) -> dict[str, Any]:
-        """List jobs; returns {jobs: [...], spend: {...}} (FR-H1, FR-I2). `spend` is this project's realized USD so far, derived from the job manifests on every read (there is no meter): landed jobs at their recorded actual cost, still-running jobs at rate x elapsed-so-far (that part is `running_usd`, and it is included in `realized_usd`) BOUNDED by each job's own --timeout (24h when it declares none), because a manifest left at `running` by a dead supervisor would otherwise add money nobody spent on every read; jobs that hit that bound are named in `unsupervised_suspect_jobs` (probably orphaned — confirm with `reconcile`) and the total is a lower bound for them. Jobs whose rate was never readable are named in `unknown_cost_jobs` and left OUT of the total — never counted as $0. `scope` states exactly what is and is not included; read it before quoting the number. spend_alert=<usd> sets a threshold: `spend.alert` stays null until the total reaches it, then carries {threshold_usd, realized_usd, over_by_usd, message}."""
-        the_lab = _lab()
-        jobs = the_lab.list_jobs()
-        return {
-            "jobs": [
-                {
-                    "job_id": j.job_id,
-                    "sweep_id": j.sweep_id,
-                    "status": j.status.value,
-                    "created_at": _iso(j.created_at),
-                }
-                for j in jobs
-            ],
-            "spend": the_lab.spend(jobs, alert_usd=spend_alert),
-        }
+    def list_jobs(
+        spend_alert: float | None = None, limit: int = DEFAULT_LIST_LIMIT
+    ) -> dict[str, Any]:
+        """List jobs; returns {jobs: [...], jobs_total, jobs_omitted, limit, spend: {...}} (FR-H1, FR-I2). BOUNDED: `jobs` is the newest `limit` (default 100) jobs, oldest-to-newest; `jobs_omitted` says how many older ones were left out, and limit=0 returns every job. `spend` always covers every job, not just the page. `spend` is this project's realized USD so far, derived from the job manifests on every read (there is no meter): landed jobs at their recorded actual cost, still-running jobs at rate x elapsed-so-far (that part is `running_usd`, and it is included in `realized_usd`) BOUNDED by each job's own --timeout (24h when it declares none), because a manifest left at `running` by a dead supervisor would otherwise add money nobody spent on every read; jobs that hit that bound are named in `unsupervised_suspect_jobs` (probably orphaned — confirm with `reconcile`) and the total is a lower bound for them. Jobs whose rate was never readable are named in `unknown_cost_jobs` and left OUT of the total — never counted as $0. `scope` states exactly what is and is not included; read it before quoting the number. spend_alert=<usd> sets a threshold: `spend.alert` stays null until the total reaches it, then carries {threshold_usd, realized_usd, over_by_usd, message}."""
+        try:
+            return list_view(_lab(), limit=limit, spend_alert=spend_alert)
+        except ValueError as e:
+            raise ToolError(str(e)) from e
 
     @mcp.tool(name="ps")
     def ps() -> dict[str, Any]:
@@ -545,7 +610,7 @@ def build_server(lab: Lab) -> FastMCP:
         wherever it was submitted from."""
         return _lab().ps()
 
-    from lab.scheduler.models import Guardrails, RegState, Triggers
+    from lab.scheduler.models import Guardrails, Triggers
     from lab.scheduler.queue import default_queue
     from lab.scheduler.register import parse_expires, parse_window
     from lab.scheduler.register import register as sched_register
@@ -569,8 +634,18 @@ def build_server(lab: Lab) -> FastMCP:
         offer_query: str | None = None,
         max_cost: float | None = None,
         after: list[str] | None = None,
+        gpus: int | None = None,
+        accelerator_pool: str | None = None,
+        max_launch_attempts: int | None = None,
+        region: str | None = None,
+        zone: str | None = None,
+        price_cap: float | None = None,
+        price_cap_strict: bool = False,
+        use_spot: bool = False,
+        spot_fallback: bool = True,
+        hold: bool = False,
     ) -> dict[str, Any]:
-        """Register a deferred job: launched by the scheduler when all triggers hold (time window HH:MM-HH:MM, Vast price <= max_hourly $/h, after=reg_ids succeeded). expires (+3d / ISO) is the required run-by guardrail; worst-case cost = max_hourly x timeout. cloud picks the skypilot cloud: vast (default) | do | gcp — max_hourly/offer_query gate on Vast offers and are rejected for other clouds."""
+        """Register a deferred job: launched by the scheduler when all triggers hold (time window HH:MM-HH:MM, Vast price <= max_hourly $/h, after=reg_ids succeeded). expires (+3d / ISO) is the required run-by guardrail; worst-case cost = max_hourly x timeout. cloud picks the skypilot cloud: vast (default) | do | gcp — max_hourly/offer_query gate on Vast offers and are rejected for other clouds. max_hourly is a wait-until trigger; price_cap is the ceiling on the launched machine's compute $/hr (same semantics as submit: not a hard ceiling on Vast, whose rentals can bill above SkyPilot's catalog), and price_cap_strict=True destroys a machine that bills above it — this matters most here, since a deferred job launches unattended and an unnoticed overrun bills longest. region/zone pin placement; use_spot uses spot instances and spot_fallback=False makes it spot-only; accelerator_pool/max_launch_attempts rotate accelerators on a launch that dies in provisioning (off by default, never raises price_cap). hold=True registers it held (state "held"; released with `lab queue release`)."""
         from datetime import datetime
 
         if accelerators and timeout is None:
@@ -594,20 +669,28 @@ def build_server(lab: Lab) -> FastMCP:
             command=command,
             seed=seed,
             resources=ResourceRequest(
-                cpus=cpus, memory=memory, accelerators=accelerators, cloud=cloud, timeout=timeout
+                cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, cloud=cloud,
+                region=region, zone=zone, max_hourly_usd=price_cap,
+                price_cap_strict=price_cap_strict,
+                accelerator_pool=accelerator_pool, max_launch_attempts=max_launch_attempts,
+                timeout=timeout, use_spot=use_spot, spot_fallback=spot_fallback,
             ),
             submitted_by="agent",
         )
+        queue = default_queue()
         try:
+            # The hold is written before the entry (the commit point), inside `register`, exactly
+            # as `lab register --hold` does: a hold written afterwards left an R2 blip's worth of
+            # window in which an unheld, eligible registration could launch.
             reg = sched_register(
-                lab.repo, default_queue(), spec, triggers,
-                Guardrails(expires_at=expires_at, max_cost_usd=max_cost),
+                lab.repo, queue, spec, triggers,
+                Guardrails(expires_at=expires_at, max_cost_usd=max_cost), hold=hold,
             )
         except Exception as e:  # noqa: BLE001
             raise ToolError(str(e)) from e
         return {
             "reg_id": reg.reg_id,
-            "state": reg.state.value,
+            "state": "held" if hold else reg.state.value,
             "expires_at": _iso(reg.guardrails.expires_at),
             "worst_case_cost_usd": worst_case_cost(triggers, spec.resources),
         }
@@ -630,12 +713,25 @@ def build_server(lab: Lab) -> FastMCP:
         offer_query: str | None = None,
         max_cost: float | None = None,
         sweep_max_cost: float | None = None,
+        gpus: int | None = None,
+        accelerator_pool: str | None = None,
+        max_launch_attempts: int | None = None,
+        region: str | None = None,
+        zone: str | None = None,
+        price_cap: float | None = None,
+        price_cap_strict: bool = False,
+        use_spot: bool = False,
+        spot_fallback: bool = True,
+        with_pkg: list[str] | None = None,
     ) -> dict[str, Any]:
         """Register a parameter grid as N deferred points sharing one sweep_id + ceiling + bundle;
         the always-on scheduler paces them (subject to triggers and the queue-wide max_concurrent
         control) and stops launching once finished-spend hits sweep_max_cost (it never kills a
         running point). grid is {key: [values]}. expires (+3d / ISO) is the required run-by
         guardrail. cloud: vast (default) | do | gcp — max_hourly/offer_query are Vast-only.
+        price_cap/price_cap_strict, region/zone, use_spot/spot_fallback,
+        accelerator_pool/max_launch_attempts and gpus apply to every point, with the same
+        semantics as on register; with_pkg layers extra runtime packages via uv run --with.
         Returns {sweep_id, count, reg_ids}."""
         from datetime import datetime
 
@@ -658,10 +754,13 @@ def build_server(lab: Lab) -> FastMCP:
         queue = default_queue()
         try:
             sweep_id, regs = sched_register_sweep(
-                lab.repo, queue, command, grid,
+                lab.repo, queue, wrap_with_extras(command, with_pkg), grid,
                 resources=ResourceRequest(
-                    cpus=cpus, memory=memory, accelerators=accelerators, cloud=cloud,
-                    timeout=timeout
+                    cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, cloud=cloud,
+                    region=region, zone=zone, max_hourly_usd=price_cap,
+                    price_cap_strict=price_cap_strict,
+                    accelerator_pool=accelerator_pool, max_launch_attempts=max_launch_attempts,
+                    timeout=timeout, use_spot=use_spot, spot_fallback=spot_fallback,
                 ),
                 triggers=triggers,
                 guardrails=Guardrails(expires_at=expires_at, max_cost_usd=max_cost),
@@ -676,37 +775,8 @@ def build_server(lab: Lab) -> FastMCP:
 
     @mcp.tool
     def queue_list() -> dict[str, Any]:
-        """List deferred registrations: state, job_id, last skip reason, scheduler heartbeat
-        age/host, and heartbeat_paused -- the pause state the *last completed tick* actually
-        observed and acted on (unlike control.paused below, which flips the instant a write
-        lands)."""
-        queue = default_queue()
-        hb = queue.read_heartbeat()
-        age = None
-        if hb and "at" in hb:
-            from lab._util import now
-
-            age = max(0.0, (now() - datetime.fromisoformat(str(hb["at"]))).total_seconds())
-        entries = queue.list_entries()
-        held_ids = queue.held_ids()  # one listing, not a round trip per row (see cli.queue_list)
-        return {
-            "heartbeat_age_s": age,
-            "host": (hb or {}).get("host"),
-            "heartbeat_paused": (hb or {}).get("paused"),
-            "tick_count": (hb or {}).get("tick_count"),
-            "control": queue.read_control().model_dump(),
-            "entries": [
-                {
-                    "reg_id": r.reg_id,
-                    "state": "held" if (r.state is RegState.pending and r.reg_id in held_ids)
-                    else r.state.value,
-                    "job_id": r.job_id,
-                    "last_skip_reason": r.last_skip_reason,
-                    "expires_at": _iso(r.guardrails.expires_at),
-                }
-                for r in entries
-            ],
-        }
+        """List deferred registrations: state, cancel_requested, job_id, last skip reason, expiry; scheduler heartbeat age/host/tick_count; heartbeat_paused -- the pause state the *last completed tick* actually observed and acted on (unlike control.paused, which flips the instant a write lands); and scheduler_skew {verdict, host_version, client_version, detail}. verdict host_older or unknown means the always-on scheduler may be silently dropping registration fields it does not know (that is how price_cap was once lost on the deferred path) -- redeploy it before trusting a newer field; treat an unrecognised verdict as unknown. Diagnostic only, never a gate."""
+        return queue_list_view(default_queue()).payload  # the same view `lab queue list` emits
 
     @mcp.tool
     def queue_show(reg_id: str) -> dict[str, Any]:
@@ -761,7 +831,8 @@ def build_server(lab: Lab) -> FastMCP:
         found = _exclude_self(
             events.read(
                 since=since, project=project, action=action, job=job, session=session,
-                failures_only=failures, limit=None,
+                # +1 for this call's own open row (`_exclude_self`); a bound lets the reader stop.
+                failures_only=failures, limit=limit + 1 if limit > 0 and not stats else None,
             )
         )
         if stats:
@@ -787,4 +858,4 @@ def build_server(lab: Lab) -> FastMCP:
 if __name__ == "__main__":
     # Before default_lab(): the .env carries the cloud project/credentials the backends read.
     load_lab_env(repo_root())
-    build_server(default_lab()).run()
+    run_stdio(build_server(default_lab()))

@@ -170,7 +170,9 @@ def claim_read_slot(action: str, project: str, *, now: datetime, min_interval_s:
     is exactly the case to skip, and a poll must never wait on the ledger.
 
     Every failure mode resolves to ``True`` (record it): a missing, corrupt, or unreadable stamp
-    means "no recent success", and a clock that moved backwards records rather than suppresses.
+    means "no recent success", and a clock that moved backwards by more than a whole window
+    records rather than suppresses. A stamp less than a window in the *future* is in-window: that
+    is two concurrent polls reaching the lock out of the order their end times were read in.
     An unrecorded call is invisible forever, so the fallback direction is to keep it.
     """
     if not enabled() or min_interval_s <= 0:
@@ -193,7 +195,12 @@ def claim_read_slot(action: str, project: str, *, now: datetime, min_interval_s:
                 except (ValueError, OSError) as e:
                     debug(f"unreadable read-rate stamp {path} (recording): {e}")
                 current = now.timestamp()
-                if last is not None and 0.0 <= current - last < min_interval_s:
+                # Inside the window in EITHER direction. `now` is the call's end time, read before
+                # this lock, so two pollers ending ms apart can take the lock in the other order
+                # and the later locker sees the stamp slightly in its future. Reading that as "the
+                # clock moved backwards" recorded a second pair ~15% of the time under 16
+                # concurrent polls. A real backwards jump bigger than a window still records.
+                if last is not None and abs(current - last) < min_interval_s:
                     return False
                 f.seek(0)
                 f.truncate()
