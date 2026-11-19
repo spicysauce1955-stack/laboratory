@@ -27,7 +27,7 @@ from fastmcp.tools import ToolResult
 from mcp.types import CallToolRequestParams
 
 from lab import events
-from lab._util import parse_duration, wrap_with_extras
+from lab._util import parse_duration, unwritable_dest_message, wrap_with_extras
 from lab.core import Lab, LabError, default_lab, job_status_view, resolve_backend_profile
 from lab.env import load_lab_env
 from lab.events import store as events_store
@@ -438,6 +438,10 @@ def build_server(lab: Lab) -> FastMCP:
             return lab.export(job_or_sweep_id, Path(to), include_logs=include_logs)
         except LabError as e:
             raise ToolError(str(e)) from e
+        except OSError as e:
+            if (msg := unwritable_dest_message(to, e)) is None:
+                raise
+            raise ToolError(f"export: {msg}") from e
 
     @mcp.tool
     def reconcile() -> dict[str, Any]:

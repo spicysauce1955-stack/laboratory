@@ -24,7 +24,12 @@ import typer
 
 from lab import __version__, events
 from lab import notes as lab_notes
-from lab._util import atomic_write_text, parse_duration, wrap_with_extras
+from lab._util import (
+    atomic_write_text,
+    parse_duration,
+    unwritable_dest_message,
+    wrap_with_extras,
+)
 from lab.core import (
     Lab,
     LabError,
@@ -645,6 +650,11 @@ def export(
         _emit(_lab().export(target_id, to, include_logs=logs))
     except LabError as e:
         _emit({"error": str(e)})
+        _fail(1, e)
+    except OSError as e:
+        if (msg := unwritable_dest_message(to, e)) is None:
+            raise
+        _emit({"error": f"export: {msg}"})
         _fail(1, e)
 
 
