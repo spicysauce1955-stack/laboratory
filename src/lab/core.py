@@ -1749,7 +1749,34 @@ class Lab:
         return {"jobs": jobs, "count": len(jobs)}
 
     def jobs_in_sweep(self, sweep_id: str) -> list[str]:
+        """The job ids of a sweep, sorted.
+
+        A sharded sweep's plan.json records every shard id — retries included, since they hold
+        the plan lock and record each launch — so those are read off the plan (dropping any whose
+        run dir is gone, as the scan never saw them). Only a sweep without a plan (unsharded, or
+        one still submitting its first shards) falls back to parsing every manifest in the
+        project, which is what `sweep-status`, `wait --sweep` and `export <sweep>` all used to
+        do: 0.56 s at 10k jobs, and 1.77 s p50 under 20x concurrency (stress run 2026-11-19).
+        """
+        if self.store.has_sweep_plan(sweep_id):
+            plan = self.store.read_sweep_plan(sweep_id)
+            ids = {j for cell in plan.cells for j in cell.shard_job_ids}
+            return sorted(j for j in ids if self.store.manifest_path(j).exists())
         return [j.job_id for j in self.list_jobs() if j.sweep_id == sweep_id]
+
+    def _sweep_manifests(self, sweep_id: str) -> list[JobManifest]:
+        """Every readable manifest of a sweep (:meth:`jobs_in_sweep`'s ids), in id order. One
+        that cannot be read is skipped with a stderr line, as :meth:`list_jobs` skips it."""
+        if not self.store.has_sweep_plan(sweep_id):
+            return [m for m in self.list_jobs() if m.sweep_id == sweep_id]
+        manifests: list[JobManifest] = []
+        for job_id in self.jobs_in_sweep(sweep_id):
+            try:
+                manifests.append(self.store.read_manifest(job_id))
+            except (OSError, ValueError) as e:  # ValueError covers pydantic's ValidationError
+                print(f"[lab] skipping unreadable manifest {job_id} ({e})", file=sys.stderr)
+                events.note("core.manifest_unreadable", job_id=job_id, error=str(e)[:300])
+        return manifests
 
     def export(
         self,
@@ -1897,8 +1924,7 @@ class Lab:
         """Aggregate a sweep's outcomes for trustworthy reporting (preemptions, fallback, spend)."""
         ms = [
             m if m.status in _TERMINAL_STATES else self._fresh_manifest(m.job_id)
-            for m in self.list_jobs()
-            if m.sweep_id == sweep_id
+            for m in self._sweep_manifests(sweep_id)
         ]
 
         def spend(m: JobManifest) -> float:
