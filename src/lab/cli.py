@@ -576,7 +576,8 @@ def sweep(
             allow_unknown_config=allow_unknown_config,
         )
     except LabError as e:
-        _emit({"error": str(e)})
+        # A sweep refused partway also names the sweep_id + ids it already launched.
+        _emit({"error": str(e), **getattr(e, "details", {})})
         _fail(1, e)
     if lab.store.has_sweep_plan(sweep_id):
         plan = lab.sweep_plan(sweep_id)
@@ -1073,7 +1074,7 @@ def sweep_retry(sweep_id: str) -> None:
     try:
         plan = _lab().retry_sweep(sweep_id)
     except LabError as e:
-        _emit({"error": str(e)})
+        _emit({"error": str(e), **getattr(e, "details", {})})
         _fail(1, e)
     _emit(plan.view())
 

@@ -101,6 +101,25 @@ class LabError(RuntimeError):
     """Fail-loud lab error (FR-F3)."""
 
 
+class SweepSubmitError(LabError):
+    """A sweep (or sweep-retry) refused partway, after some of its jobs had already launched.
+
+    Those jobs are running — and, on a remote backend, billing — so the caller must learn which
+    they are and which sweep they belong to; a bare error used to leave them orphaned from any
+    record the caller held. ``details`` is the structured form a shell emits next to ``error``;
+    the message names the same ids for surfaces that only carry text (MCP's ``ToolError``).
+    """
+
+    def __init__(self, message: str, *, sweep_id: str, job_ids: list[str]) -> None:
+        super().__init__(message)
+        self.sweep_id = sweep_id
+        self.job_ids = list(job_ids)
+
+    @property
+    def details(self) -> dict[str, Any]:
+        return {"sweep_id": self.sweep_id, "job_ids": self.job_ids}
+
+
 class MirrorReadError(LabError):
     """The scheduler queue's mirror could not be read for a job.
 
@@ -316,6 +335,25 @@ def _submit_stagger_s() -> float:
         return max(0.0, float(os.environ.get("LAB_SUBMIT_STAGGER_S", "1.5")))
     except ValueError:
         return 1.5
+
+
+def _partial_sweep_error(
+    sweep_id: str,
+    job_ids: list[str],
+    planned: int | None,
+    cause: BaseException,
+    *,
+    next_step: str,
+) -> SweepSubmitError:
+    """The error for a sweep that stopped after launching ``job_ids`` (see SweepSubmitError)."""
+    of = f" of {planned}" if planned is not None else ""
+    return SweepSubmitError(
+        f"sweep {sweep_id} stopped after launching {len(job_ids)}{of} jobs: {cause}. "
+        f"Already launched (running, and billing if remote — `lab cancel <id>` to stop): "
+        f"{', '.join(job_ids)}. {next_step}.",
+        sweep_id=sweep_id,
+        job_ids=job_ids,
+    )
 
 
 def build_sweep_point_spec(
@@ -735,45 +773,57 @@ class Lab:
         sweep_id = f"sweep-{_new_job_id()}"
         all_job_ids: list[str] = []
         plan_cells: list[SweepCell] = []
-        stagger = _submit_stagger_s() if self.backend.name != "local" else 0.0
         for cell in cells:
             coords = {k: str(v) for k, v in cell.items()}
             cid = cell_id_for(coords)
-            shard_job_ids: list[str] = []
-            for shard in shards:
-                if all_job_ids and stagger:
-                    time.sleep(stagger)  # don't stampede the local SkyPilot API server
-                    events.note("core.submit_stagger", seconds=stagger, shard=shard[0])
-                point = {**cell, seed_axis_key: seeds_to_arg(shard)}
-                spec = build_sweep_point_spec(
-                    command, point, seed=shard[0], resources=resources,
-                    code_ref=code_ref, submitted_by=submitted_by,
-                    allow_unknown_config=allow_unknown_config,
-                )
-                jid = self.submit(
-                    spec, allow_dirty=allow_dirty, sweep_id=sweep_id, cell_id=cid
-                )
-                shard_job_ids.append(jid)
-                all_job_ids.append(jid)
             plan_cells.append(
                 SweepCell(
                     coords=coords,
                     cell_id=cid,
                     seeds_expected=seed_set,
                     shard_seeds=shards,
-                    shard_job_ids=shard_job_ids,
+                    shard_job_ids=[],  # filled as each shard launches
                     results_file=results_file,
                     seed_column=seed_column,
                     row_key=row_key_cols,
                     aggregate_ref=str(self.home / sweep_id / "cells" / cid / results_file),
                 )
             )
-        self.store.write_sweep_plan(
-            SweepPlan(
-                sweep_id=sweep_id, created_at=now(), command=command,
-                seed_axis_key=seed_axis_key, cells=plan_cells,
-            )
+        plan = SweepPlan(
+            sweep_id=sweep_id, created_at=now(), command=command,
+            seed_axis_key=seed_axis_key, cells=plan_cells,
         )
+        stagger = _submit_stagger_s() if self.backend.name != "local" else 0.0
+        try:
+            for cell, plan_cell in zip(cells, plan_cells):
+                for shard in shards:
+                    if all_job_ids and stagger:
+                        time.sleep(stagger)  # don't stampede the local SkyPilot API server
+                        events.note("core.submit_stagger", seconds=stagger, shard=shard[0])
+                    point = {**cell, seed_axis_key: seeds_to_arg(shard)}
+                    spec = build_sweep_point_spec(
+                        command, point, seed=shard[0], resources=resources,
+                        code_ref=code_ref, submitted_by=submitted_by,
+                        allow_unknown_config=allow_unknown_config,
+                    )
+                    jid = self.submit(
+                        spec, allow_dirty=allow_dirty, sweep_id=sweep_id, cell_id=plan_cell.cell_id
+                    )
+                    plan_cell.shard_job_ids.append(jid)
+                    all_job_ids.append(jid)
+        except BaseException as e:
+            if not all_job_ids:
+                raise  # nothing launched: there is no sweep to report, just the refusal
+            # Persist what launched, so aggregate/retry/export see these jobs and `sweep-retry`
+            # can submit the rest once the cause is fixed.
+            self.store.write_sweep_plan(plan)
+            if not isinstance(e, Exception):
+                raise  # Ctrl-C/SystemExit: the plan is saved; don't dress the signal up
+            raise _partial_sweep_error(
+                sweep_id, all_job_ids, n_jobs, e,
+                next_step=f"`lab sweep-retry {sweep_id}` submits the rest once that is fixed",
+            ) from e
+        self.store.write_sweep_plan(plan)
         return sweep_id, all_job_ids
 
     def _sweep_unsharded(
@@ -808,16 +858,24 @@ class Lab:
         sweep_id = f"sweep-{_new_job_id()}"
         job_ids: list[str] = []
         stagger = _submit_stagger_s() if self.backend.name != "local" else 0.0
-        for point in points:
-            if job_ids and stagger:
-                time.sleep(stagger)  # don't stampede the local SkyPilot API server
-                events.note("core.submit_stagger", seconds=stagger, shard=None)
-            spec = build_sweep_point_spec(
-                command, point, seed=seed, resources=resources,
-                code_ref=code_ref, submitted_by=submitted_by,
-                allow_unknown_config=allow_unknown_config,
-            )
-            job_ids.append(self.submit(spec, allow_dirty=allow_dirty, sweep_id=sweep_id))
+        try:
+            for point in points:
+                if job_ids and stagger:
+                    time.sleep(stagger)  # don't stampede the local SkyPilot API server
+                    events.note("core.submit_stagger", seconds=stagger, shard=None)
+                spec = build_sweep_point_spec(
+                    command, point, seed=seed, resources=resources,
+                    code_ref=code_ref, submitted_by=submitted_by,
+                    allow_unknown_config=allow_unknown_config,
+                )
+                job_ids.append(self.submit(spec, allow_dirty=allow_dirty, sweep_id=sweep_id))
+        except Exception as e:
+            if not job_ids:
+                raise
+            raise _partial_sweep_error(
+                sweep_id, job_ids, len(points), e,
+                next_step="the launched points carry this sweep_id (`lab export`, `lab list`)",
+            ) from e
         return sweep_id, job_ids
 
     def sweep_plan(self, sweep_id: str) -> SweepPlan:
@@ -903,7 +961,29 @@ class Lab:
         non-terminal state (queued/running), that shard is skipped — no duplicate in-flight jobs.
         """
         plan = self.aggregate_sweep(sweep_id)  # refresh present/missing from current shard states
-        submitted = 0
+        launched: list[str] = []
+        try:
+            self._retry_cells(plan, launched, allow_dirty=allow_dirty)
+        except BaseException as e:
+            if not launched:
+                raise
+            # Same rule as `sweep`: what launched is persisted, so a re-run of retry sees it as
+            # in flight instead of buying it a second time, and the caller learns the ids.
+            self.store.write_sweep_plan(plan)
+            if not isinstance(e, Exception):
+                raise
+            raise _partial_sweep_error(
+                sweep_id, launched, None, e,
+                next_step=f"`lab sweep-retry {sweep_id}` resumes once that is fixed",
+            ) from e
+        self.store.write_sweep_plan(plan)
+        return self.aggregate_sweep(sweep_id)
+
+    def _retry_cells(self, plan: SweepPlan, launched: list[str], *, allow_dirty: bool) -> None:
+        """:meth:`retry_sweep`'s submit loop. Appends each launched id to its cell *and* to
+        ``launched`` as it goes, so a refusal partway leaves both accurate."""
+        sweep_id = plan.sweep_id
+        any_shard = next((j for c in plan.cells for j in c.shard_job_ids), None)
         for cell in plan.cells:
             if cell.status != "incomplete":
                 continue
@@ -921,9 +1001,13 @@ class Lab:
                             in_flight_seed_sets.append(set(parse_seeds(str(sub))))
                         except ValueError:
                             pass  # unparseable subset — can't prove coverage, don't suppress
-            # inherit the original shard resources (timeout/backend/etc.) from an existing shard
-            # [0] is safe: an incomplete cell always has >=1 shard (seeds_expected is non-empty)
-            base_manifest = self.manifest(cell.shard_job_ids[0])
+            # Inherit the original shard resources (timeout/backend/etc.) from an existing shard:
+            # this cell's own, or — for a cell a refused sweep never reached — any of the sweep's
+            # (every shard of a sweep is submitted with the same resources).
+            base_id = cell.shard_job_ids[0] if cell.shard_job_ids else any_shard
+            if base_id is None:
+                raise LabError(f"sweep {sweep_id} has no launched shard to inherit resources from")
+            base_manifest = self.manifest(base_id)
             base_resources = base_manifest.resources
             # Launch where the sweep ran. Both shells build a local-backend Lab for sweep-retry
             # whatever the sweep used, so `self.submit` turned a retried cpu/skypilot shard into a
@@ -945,15 +1029,13 @@ class Lab:
                     plan.command, point, seed=shard_missing[0], resources=base_resources,
                     allow_unknown_config=base_manifest.run.allow_unknown_config,
                 )
-                if submitted and stagger:
+                if launched and stagger:
                     time.sleep(stagger)  # same API-server cold-start guard as `sweep`
                 jid = launcher.submit(
                     spec, allow_dirty=allow_dirty, sweep_id=sweep_id, cell_id=cell.cell_id
                 )
-                submitted += 1
                 cell.shard_job_ids.append(jid)
-        self.store.write_sweep_plan(plan)
-        return self.aggregate_sweep(sweep_id)
+                launched.append(jid)
 
     def _lab_on(self, provisioner: str) -> Lab:
         """This Lab, or one sharing its repo/home/store that launches through ``provisioner``.
