@@ -63,8 +63,38 @@ def crosses_threshold(trace: Any, threshold: float) -> bool:
 
 
 def _plain(value: Any) -> Any:
-    """A NumPy or tensor scalar as the Python value it holds; anything else unchanged."""
-    return value.item() if hasattr(value, "item") else value
+    """A NumPy or tensor value as plain Python: one element as a scalar, more as a (nested) list.
+
+    Anything without ``.item`` is returned unchanged. ``.item()`` is tried first because it is the
+    one call NumPy, PyTorch and JAX share; each raises its own error type for a larger array.
+    """
+    if not hasattr(value, "item"):
+        return value
+    try:
+        return value.item()
+    except (ValueError, RuntimeError, TypeError):
+        if not hasattr(value, "tolist"):
+            raise
+        return value.tolist()
+
+
+def _jsonable(value: Any) -> Any:
+    """``json.dumps`` hook for what it cannot encode itself, at any depth: NumPy or tensor values
+    become plain Python; anything else is refused rather than logged as an unreadable string."""
+    plain = _plain(value)
+    if plain is value:
+        raise TypeError(f"{type(value).__name__} is not JSON-serializable")
+    return plain
+
+
+def _check_loggable(name: str, value: Any, what: str) -> None:
+    try:
+        json.dumps(value, default=_jsonable)
+    except (TypeError, ValueError) as e:
+        raise TypeError(
+            f"{what} {name!r} cannot be written to {HITS_FILE} ({e}): use numbers, strings, "
+            "booleans, or lists or arrays of them (look anything else up inside evaluate)"
+        ) from e
 
 
 def _as_bool(value: Any) -> bool:
@@ -84,34 +114,79 @@ def _split(answer: Any) -> tuple[Any, dict[str, Any]]:
     return answer[HIT_KEY], {name: value for name, value in answer.items() if name != HIT_KEY}
 
 
+_ONE_AT_A_TIME = "no batch_size in grid_search, batched=False in find_boundary"
+
+
+def _single_answer(answer: Any, params: Mapping[str, Any]) -> bool:
+    """The answer of an evaluator called with one combination, refusing a batch's worth."""
+    plain = _plain(answer)
+    if isinstance(plain, list | tuple):
+        raise TypeError(
+            f"evaluate returned {len(plain)} answers for one combination ({dict(params)}). If it "
+            "evaluates many combinations per call, pass batch_size to grid_search (batched=True "
+            "to find_boundary); otherwise return a single True or False"
+        )
+    return _as_bool(plain)
+
+
+def _per_combination(column: Any, name: str, count: int) -> list[Any]:
+    """A batched evaluator's column as a list, refusing a single value where ``count`` belong."""
+    if isinstance(column, str | bytes | Mapping) or not hasattr(column, "__iter__"):
+        single = True
+    else:
+        try:
+            values = list(column)
+        except TypeError:  # a 0-d array or tensor is iterable in type only
+            single = True
+        else:
+            single = False
+    if single:
+        what = "its answer" if name == HIT_KEY else f"extra column {name!r}"
+        noun = "answer" if name == HIT_KEY else "value"
+        raise TypeError(
+            f"evaluate is called in batch mode with {count} combination(s) per call, so {what} "
+            f"must hold one {noun} per combination (a list or array), but it returned the single "
+            f"value {column!r}. Return one {noun} per combination, or evaluate one combination "
+            f"at a time ({_ONE_AT_A_TIME})"
+        )
+    if len(values) != count:
+        raise ValueError(
+            f"evaluate returned {len(values)} values for {count} combinations in column {name!r}"
+        )
+    return values
+
+
 def _outcomes(
     evaluate: Callable[..., Any], params: Sequence[Mapping[str, Any]], *, batched: bool
 ) -> list[Outcome]:
     if not batched:
         hit, extras = _split(evaluate(**params[0]))
-        return [(_as_bool(hit), extras)]
+        return [(_single_answer(hit, params[0]), extras)]
 
     columns = {name: [p[name] for p in params] for name in params[0]}
     hit_column, extra_columns = _split(evaluate(**columns))
-    hits = list(hit_column)
-    extras_by_column = {name: list(column) for name, column in extra_columns.items()}
-    for name, values in [(HIT_KEY, hits), *extras_by_column.items()]:
-        if len(values) != len(params):
-            raise ValueError(
-                f"evaluate returned {len(values)} values for {len(params)} combinations "
-                f"in column {name!r}"
-            )
+    hits = _per_combination(hit_column, HIT_KEY, len(params))
+    extras_by_column = {
+        name: _per_combination(column, name, len(params)) for name, column in extra_columns.items()
+    }
     return [
         (_as_bool(hit), {name: values[i] for name, values in extras_by_column.items()})
         for i, hit in enumerate(hits)
     ]
 
 
-def _row(params: Mapping[str, Any], extras: Mapping[str, Any]) -> dict[str, Any]:
+def _encode_row(params: Mapping[str, Any], extras: Mapping[str, Any]) -> str:
+    """One ``hits.jsonl`` line, naming the column at fault if it cannot be written."""
     clash = sorted(set(params) & set(extras))
     if clash:
         raise ValueError(f"extra column(s) would overwrite parameter(s): {clash}")
-    return {name: _plain(value) for name, value in {**params, **extras}.items()}
+    row = {**params, **extras}
+    try:
+        return json.dumps(row, default=_jsonable) + "\n"
+    except (TypeError, ValueError):
+        for name, value in row.items():  # the slow path only runs to name the culprit
+            _check_loggable(name, value, "extra column" if name in extras else "grid parameter")
+        raise
 
 
 def grid_search(
@@ -132,6 +207,9 @@ def grid_search(
     axes = {name: list(values) for name, values in grid.items()}
     if not axes or not all(axes.values()):
         raise ValueError("grid has nothing to test: every parameter needs at least one value")
+    for name, values in axes.items():
+        for value in values:
+            _check_loggable(name, value, "grid parameter")
 
     path = _resolve_run_dir(run_dir) / HITS_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -143,14 +221,20 @@ def grid_search(
     while chunk := list(itertools.islice(combinations, batch_size or 1)):
         params = [dict(zip(names, combination, strict=True)) for combination in chunk]
         outcomes = _outcomes(evaluate, params, batched=batch_size is not None)
-        rows = [
-            _row(p, extras) for p, (hit, extras) in zip(params, outcomes, strict=True) if hit
+        if not tested:
+            # A bad extra column is refused at the first answer rather than the first pass,
+            # which in a search with few hits can be hours in. Checked once, not per row.
+            _encode_row(params[0], outcomes[0][1])
+        lines = [
+            _encode_row(p, extras)
+            for p, (hit, extras) in zip(params, outcomes, strict=True)
+            if hit
         ]
-        if rows:
+        if lines:
             with path.open("a") as f:
-                f.writelines(json.dumps(row, default=str) + "\n" for row in rows)
+                f.writelines(lines)
         tested += len(params)
-        hits += len(rows)
+        hits += len(lines)
     return SearchResult(tested=tested, hits=hits, hits_path=path)
 
 

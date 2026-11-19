@@ -211,6 +211,107 @@ def test_an_extra_column_cannot_overwrite_a_parameter(tmp_path):
         grid_search(lambda a: {"hit": True, "a": 99}, {"a": [1]}, run_dir=tmp_path)
 
 
+def test_an_array_extra_is_logged_as_a_list(tmp_path):
+    grid_search(
+        lambda a: {"hit": True, "trace": np.array([1.0, 2.0])}, {"a": [1]}, run_dir=tmp_path
+    )
+    assert read_hits(tmp_path) == [{"a": 1, "trace": [1.0, 2.0]}]
+
+
+@pytest.mark.parametrize("scalar", [np.array(0.5), np.array([0.5])])
+def test_a_one_element_array_extra_is_logged_as_a_number(tmp_path, scalar):
+    grid_search(lambda a: {"hit": True, "score": scalar}, {"a": [1]}, run_dir=tmp_path)
+    assert read_hits(tmp_path) == [{"a": 1, "score": 0.5}]
+
+
+def test_numpy_values_inside_a_list_extra_are_logged_as_plain_numbers(tmp_path):
+    grid_search(
+        lambda a: {"hit": True, "xs": [np.float32(1.5), np.int64(2)]}, {"a": [1]}, run_dir=tmp_path
+    )
+    assert read_hits(tmp_path) == [{"a": 1, "xs": [1.5, 2]}]
+
+
+def test_a_batched_evaluator_can_return_an_array_per_combination(tmp_path):
+    def evaluate(a: list[int]) -> dict[str, Any]:
+        return {"hit": [True, True], "trace": np.array([[1.0, 2.0], [3.0, 4.0]])}
+
+    grid_search(evaluate, {"a": [1, 2]}, batch_size=2, run_dir=tmp_path)
+    assert read_hits(tmp_path) == [{"a": 1, "trace": [1.0, 2.0]}, {"a": 2, "trace": [3.0, 4.0]}]
+
+
+def test_an_extra_that_cannot_be_logged_is_refused_naming_its_column(tmp_path):
+    with pytest.raises(TypeError, match="'blob'"):
+        grid_search(lambda a: {"hit": True, "blob": object()}, {"a": [1]}, run_dir=tmp_path)
+
+
+def test_a_bad_extra_fails_at_the_first_answer_not_the_first_pass(tmp_path):
+    calls: list[int] = []
+
+    def evaluate(a: int) -> dict[str, Any]:
+        calls.append(a)
+        return {"hit": a == 3, "blob": object()}
+
+    with pytest.raises(TypeError, match="'blob'"):
+        grid_search(evaluate, {"a": [1, 2, 3]}, run_dir=tmp_path)
+    assert calls == [1]
+
+
+def test_an_extra_overwriting_a_parameter_fails_at_the_first_answer(tmp_path):
+    calls: list[int] = []
+
+    def evaluate(a: int) -> dict[str, Any]:
+        calls.append(a)
+        return {"hit": a == 3, "a": 99}
+
+    with pytest.raises(ValueError, match="'a'"):
+        grid_search(evaluate, {"a": [1, 2, 3]}, run_dir=tmp_path)
+    assert calls == [1]
+
+
+def test_a_grid_value_that_cannot_be_logged_is_refused_before_anything_runs(tmp_path):
+    calls: list[Any] = []
+
+    def evaluate(a: int, rule: Any) -> bool:
+        calls.append(rule)
+        return True
+
+    with pytest.raises(TypeError, match="'rule'"):
+        grid_search(evaluate, {"a": [1], "rule": ["stdp", object()]}, run_dir=tmp_path)
+    assert calls == []
+    assert not (tmp_path / HITS_FILE).exists()
+
+
+# --- a batched and an unbatched evaluator mixed up -----------------------------------------------
+
+
+@pytest.mark.parametrize("answers", [np.array([True, False]), [True, False]])
+def test_many_answers_without_batch_size_says_to_pass_it(tmp_path, answers):
+    with pytest.raises(TypeError, match="2 answers for one combination.*batch_size"):
+        grid_search(lambda a: answers, {"a": [1, 2]}, run_dir=tmp_path)
+
+
+@pytest.mark.parametrize("answer", [True, np.bool_(True), np.array(True)])
+def test_one_answer_with_batch_size_says_to_return_one_per_combination(tmp_path, answer):
+    with pytest.raises(TypeError, match="one answer per combination"):
+        grid_search(lambda a: answer, {"a": [1, 2]}, batch_size=2, run_dir=tmp_path)
+
+
+@pytest.mark.parametrize("column", [5, "abc"])
+def test_one_extra_value_with_batch_size_is_refused_naming_its_column(tmp_path, column):
+    with pytest.raises(TypeError, match="'label'.*one value per combination"):
+        grid_search(
+            lambda a: {"hit": [True] * 3, "label": column},
+            {"a": [1, 2, 3]},
+            batch_size=3,
+            run_dir=tmp_path,
+        )
+
+
+def test_a_scalar_answer_to_a_batched_boundary_search_is_explained():
+    with pytest.raises(TypeError, match="one answer per combination"):
+        find_boundary(lambda x: True, "x", lo=0.0, hi=1.0, batched=True)
+
+
 @pytest.mark.parametrize("grid", [{}, {"a": []}, {"a": [1], "b": []}])
 def test_a_grid_with_nothing_to_test_is_refused(tmp_path, grid):
     with pytest.raises(ValueError, match="grid"):
