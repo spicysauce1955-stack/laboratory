@@ -16,7 +16,6 @@ from typing import Any
 
 import pytest
 from helpers import PYTHON, make_manifest
-from typer.testing import CliRunner
 
 from lab.backends.local import LocalBackend
 from lab.cli import app
@@ -159,9 +158,14 @@ def test_dashboard_rows_show_the_latest_values_from_the_cache(tmp_path: Path):
 
 
 def test_cli_dashboard_has_a_limit_flag() -> None:
-    result = CliRunner().invoke(app, ["dashboard", "--help"])
-    assert result.exit_code == 0
-    assert "--limit" in result.output
+    """Asserted on the command's parameters, not on `--help` text: under GitHub Actions rich
+    renders help with ANSI styling that splits `--limit`, so a text search passed locally and
+    failed in CI."""
+    import typer
+
+    dashboard = typer.main.get_command(app).commands["dashboard"]  # type: ignore[attr-defined]
+    flags = {opt for p in dashboard.params for opt in getattr(p, "opts", [])}
+    assert {"--limit", "-n"} <= flags
 
 
 @pytest.mark.parametrize("limit", [-1])
