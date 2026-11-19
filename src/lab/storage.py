@@ -12,6 +12,7 @@ back to local-only artifacts. Config (env):
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -67,14 +68,34 @@ class R2Store:
         return f"r2://{self.bucket}/{prefix}"
 
     def upload_dir(self, local_dir: Path, prefix: str) -> int:
-        """Upload every file under ``local_dir`` to ``<bucket>/<prefix>/...``; returns the count."""
+        """Upload every regular file under ``local_dir`` to ``<bucket>/<prefix>/...``; returns
+        the count.
+
+        Symlinks are never followed — neither a linked file nor a linked directory. The dir this
+        uploads is a job's output, rsynced down from a rented box we do not control, and
+        ``rsync -a`` reproduces links verbatim: a hostile host that plants
+        ``results.csv -> ~/.ssh/sky-key`` would otherwise get the *supervisor's* private key
+        uploaded to R2 and from there into ``lab export`` bundles. The type check is ``lstat``,
+        so a FIFO or device node is skipped too. (Checked by path, then uploaded by path: this
+        runs after the final rsync, when nothing else writes the dir, so there is no window.)
+        """
         local_dir = Path(local_dir)
+        files: list[Path] = []
+        for root, dirs, names in os.walk(local_dir, followlinks=False):
+            # os.walk lists a linked dir under `dirs` but, with followlinks=False, never enters it.
+            dirs.sort()
+            for name in names:
+                f = Path(root) / name
+                try:
+                    if stat.S_ISREG(f.lstat().st_mode):
+                        files.append(f)
+                except OSError:
+                    continue
         count = 0
-        for f in sorted(local_dir.rglob("*")):
-            if f.is_file():
-                key = f"{prefix}/{f.relative_to(local_dir).as_posix()}"
-                self._s3.upload_file(str(f), self.bucket, key)
-                count += 1
+        for f in sorted(files):
+            key = f"{prefix}/{f.relative_to(local_dir).as_posix()}"
+            self._s3.upload_file(str(f), self.bucket, key)
+            count += 1
         return count
 
     def download_dir(self, prefix: str, local_dir: Path) -> int:
