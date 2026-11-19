@@ -12,6 +12,11 @@ from lab.core import Lab
 from lab.models import BackendInfo, JobState
 
 
+# Real-shaped job ids: a cluster name built from a fake id ("jdead") cannot be parsed back, so
+# these tests used to pass or fail with the checkout's directory name (the project slug).
+DEAD = "20260101-000000-dead01"
+FRESH = "20260101-000000-f4e510"
+
 def _dead_running_manifest(job_id: str, *, started_ago_s: float = 3600.0):
     """A skypilot job stuck `running` whose supervisor is gone."""
     return make_manifest(job_id, "python x.py", timeout="1h").model_copy(
@@ -41,11 +46,11 @@ def _patch_empty_sky(monkeypatch):
 
 def test_reconcile_flags_unsupervised_job_and_frees_its_rental(tmp_path, monkeypatch):
     lab = Lab(backend=LocalBackend(home=tmp_path, repo=tmp_path), repo=tmp_path, home=tmp_path)
-    m = _dead_running_manifest("jdead")
+    m = _dead_running_manifest(DEAD)
     lab.store.create(m)
-    lab.store.write_runtime("jdead", runner_pid=999999999, cluster=cluster_name_for("jdead"))
+    lab.store.write_runtime(DEAD, runner_pid=999999999, cluster=cluster_name_for(DEAD))
 
-    label = f"{cluster_name_for('jdead')}-1a2b-head"
+    label = f"{cluster_name_for(DEAD)}-1a2b-head"
     monkeypatch.setattr(
         "lab.backends.skypilot.list_vast_instances", lambda *a, **k: [{"id": 7, "label": label}]
     )
@@ -55,7 +60,7 @@ def test_reconcile_flags_unsupervised_job_and_frees_its_rental(tmp_path, monkeyp
     report = lab.reconcile()
 
     assert report["unsupervised"] == [
-        {"job_id": "jdead", "cluster": cluster_name_for("jdead")}
+        {"job_id": DEAD, "cluster": cluster_name_for(DEAD)}
     ]
     # The still-billing rental is now visible as an orphan instead of counted healthy.
     assert [o["id"] for o in report["orphans"]] == [7]
@@ -64,11 +69,11 @@ def test_reconcile_flags_unsupervised_job_and_frees_its_rental(tmp_path, monkeyp
 def test_reconcile_grace_period_protects_fresh_jobs(tmp_path, monkeypatch):
     """A just-started job whose runtime/pid isn't settled yet must NOT be torn down."""
     lab = Lab(backend=LocalBackend(home=tmp_path, repo=tmp_path), repo=tmp_path, home=tmp_path)
-    m = _dead_running_manifest("jfresh", started_ago_s=30)
+    m = _dead_running_manifest(FRESH, started_ago_s=30)
     lab.store.create(m)
-    lab.store.write_runtime("jfresh", runner_pid=999999999, cluster=cluster_name_for("jfresh"))
+    lab.store.write_runtime(FRESH, runner_pid=999999999, cluster=cluster_name_for(FRESH))
 
-    label = f"{cluster_name_for('jfresh')}-1a2b-head"
+    label = f"{cluster_name_for(FRESH)}-1a2b-head"
     monkeypatch.setattr(
         "lab.backends.skypilot.list_vast_instances", lambda *a, **k: [{"id": 9, "label": label}]
     )
