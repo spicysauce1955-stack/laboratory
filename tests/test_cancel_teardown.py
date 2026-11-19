@@ -179,3 +179,57 @@ class TestInterruptedCancelIsRecoverable:
         assert state is JobState.cancelled
         m = backend.store.read_manifest("jc7")
         assert m.end_reason is not None and "cancel" in m.end_reason.lower()
+
+
+class TestCancelLetsALiveSupervisorFinishItsOwnTeardown:
+    """Smoke run on real DigitalOcean, 2026-11-19: `lab cancel` SIGTERMed the supervisor (whose
+    abort path tears down) and then ran a second teardown itself, concurrently. Two teardowns
+    raced the same droplet and volume, and whichever wrote last decided the recorded outcome."""
+
+    def _live_then_exits(self, monkeypatch, backend, job_id, *, polls_alive):
+        state = {"n": 0}
+
+        def pid_alive(pid, *, start_time=None):
+            state["n"] += 1
+            if state["n"] <= polls_alive:
+                return True
+            if state["n"] == polls_alive + 1:  # the supervisor's abort path finished
+                backend.store.update_manifest(
+                    job_id, status=JobState.cancelled, teardown_status="succeeded",
+                    end_reason="cancelled by user",
+                )
+            return False
+
+        monkeypatch.setattr("lab.backends.skypilot.pid_alive", pid_alive)
+        monkeypatch.setattr("lab.backends.skypilot.os.kill", lambda pid, sig: None)
+        monkeypatch.setattr("lab.backends.skypilot.time.sleep", lambda s: None)
+
+    def test_a_supervisor_that_tears_down_is_not_raced(self, tmp_path, monkeypatch):
+        backend = _backend_with_running_job(tmp_path, "jc7")
+        _fake_sky(monkeypatch)
+        self._live_then_exits(monkeypatch, backend, "jc7", polls_alive=3)
+        monkeypatch.setattr(
+            "lab.backends.skypilot.tear_down_and_record",
+            lambda *a, **k: pytest.fail("the supervisor already tore down; don't race it"),
+        )
+
+        assert backend.cancel("jc7") is JobState.cancelled
+        m = backend.store.read_manifest("jc7")
+        assert m.teardown_status == "succeeded"
+
+    def test_a_supervisor_that_never_exits_is_not_waited_on_forever(self, tmp_path, monkeypatch):
+        backend = _backend_with_running_job(tmp_path, "jc8")
+        _fake_sky(monkeypatch)
+        self._live_then_exits(monkeypatch, backend, "jc8", polls_alive=10**9)
+        monkeypatch.setattr("lab.backends.skypilot._CANCEL_SUPERVISOR_WAIT_S", 0.01)
+        torn: list[str] = []
+
+        def _teardown(sky_mod, cluster, store, job_id, cloud, **kw):
+            torn.append(job_id)
+            store.update_manifest(job_id, teardown_status="succeeded")
+            return True
+
+        monkeypatch.setattr("lab.backends.skypilot.tear_down_and_record", _teardown)
+
+        assert backend.cancel("jc8") is JobState.cancelled
+        assert torn == ["jc8"]

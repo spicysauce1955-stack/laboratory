@@ -689,10 +689,6 @@ _VOLUME_DETACH_RE = re.compile(
     r"|(?:cannot|can\s*not|can't|unable\s+to)\s+delete\s+(?:an?\s+|the\s+)?attached\s+volume"
     r"|volume\s+is\s+(?:still\s+)?attached"
 )
-# Statuses that mean something other than "not yet", whatever the body happens to say: no
-# credentials, no permission, nothing there, throttled, or DO itself failing. Waiting a minute
-# fixes none of them, and the ladder must never delay that alarm.
-_NOT_A_DETACH_STATUS = frozenset({401, 403, 404, 429})
 # Measured live that day, not guessed: job 20260823-093644-873c9d ended at 12:07:24Z, its volume
 # still listed `attached` at 12:07:37 and was gone by 12:07:58. ~60s of ladder covers that with
 # room to spare, and costs nothing on the common path where the first delete is accepted.
@@ -729,18 +725,21 @@ def _http_status(exc: BaseException) -> int | None:
 def is_volume_detach_race(exc: BaseException) -> bool:
     """Is this DO refusal to delete a volume the asynchronous-detach race ("not yet")?
 
-    Reads the structure pydo raises, not just ``str(exc)``: azure-core's ``HttpResponseError``
-    carries DO's JSON message on ``.error.message`` and the HTTP status on ``.status_code``, and
-    SkyPilot's DO helpers re-raise it as ``DigitalOceanError(...) from err``, so the whole chain is
-    read. The status can only *disqualify* — DO has answered this race with a 409 and with a
-    non-409, so no status identifies it — while an auth/permission/not-found/throttle/5xx status
-    rules it out whatever the text says.
+    Decided by DO's own words, read from the structure pydo raises (azure-core's
+    ``HttpResponseError`` carries DO's JSON message on ``.error.message``; SkyPilot re-raises it
+    as ``DigitalOceanError(...) from err``, so the explicit cause chain is read too).
+
+    **The status never vetoes it.** DO answers this race with a 409 ``ResourceExistsError`` right
+    after a destroy (probed live 2026-11-19: "attached volume cannot be deleted", gone 9 s later)
+    and with a plain ``HttpResponseError`` worded "cannot delete attached volume" while its own
+    destroy-with-associated-resources job holds the volume. An earlier rule let a 401/403/404
+    status overrule the text; a `lab cancel`led smoke job then recorded `failed` after one pass,
+    twice, with its volume detaching normally behind it. A genuine permission refusal does not say
+    "attached volume", and every volume is read back by id afterwards, so a misread here costs at
+    most one ladder of waiting — never a false all-clear.
     """
     texts: list[str] = []
     for link in _exception_chain(exc):
-        status = getattr(link, "status_code", None)
-        if isinstance(status, int) and (status in _NOT_A_DETACH_STATUS or status >= 500):
-            return False
         texts.append(str(link))
         for holder in (getattr(link, "error", None), link):
             message = getattr(holder, "message", None)
@@ -920,10 +919,10 @@ def _settle_one_do_volume(
     try:
         reply = client.volumes.delete(volume_id=vid)
     except Exception as e:  # noqa: BLE001 — classified: retry "not yet", report "never"
-        text = _one_line(f"{type(e).__name__}: {e}")
+        status = _http_status(e)
+        text = _one_line(f"{type(e).__name__}: {e}") + (f" [HTTP {status}]" if status else "")
         if is_volume_detach_race(e):
             return "detaching", text, e  # the reply itself proves the volume is still there
-        status = _http_status(e)
         if status is not None and (status == 429 or status >= 500):
             # Throttled or a server-side failure says nothing about the volume: retry along the
             # ladder, and if it never clears it is "cannot tell" (`unknown`), never `failed`.
@@ -2536,6 +2535,12 @@ def dead_supervisor_reason(exit_record: dict[str, Any] | None) -> str:
     return f"{base} ({detail})" if detail else base
 
 
+# How long `lab cancel` lets a SIGTERMed supervisor finish its own abort teardown before tearing
+# down from the cancelling process instead: the abort ladder (5+15+30 s) plus sky.down and DO's
+# volume-detach ladder (5+10+15+30 s), with room.
+_CANCEL_SUPERVISOR_WAIT_S = 300.0
+
+
 class SkyPilotBackend:
     name = "skypilot"
 
@@ -2667,11 +2672,30 @@ class SkyPilotBackend:
         # inventing a crash that never happened.
         self.store.write_runtime(job_id, cancelling=True)
         rt = self.store.read_runtime(job_id)
-        if rt.get("runner_pid"):
+        pid, start_time = rt.get("runner_pid"), rt.get("runner_start_time")
+        # Only a pid that is still the supervisor we launched: a recycled pid is someone else.
+        if pid and pid_alive(pid, start_time=start_time):
             try:
-                os.kill(rt["runner_pid"], signal.SIGTERM)
+                os.kill(pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 pass
+            # The SIGTERMed supervisor's abort path tears its own machine down and records the
+            # outcome (and `cancelled`). Let it: a second teardown from here used to race it on
+            # the same droplet and volume, and whichever wrote last decided the recorded verdict
+            # (two `lab cancel`led DO smoke jobs, 2026-11-19). Bounded — a supervisor that never
+            # finishes is torn down from here as before.
+            deadline = time.monotonic() + _CANCEL_SUPERVISOR_WAIT_S
+            while pid_alive(pid, start_time=start_time) and time.monotonic() < deadline:
+                time.sleep(1.0)
+            if not pid_alive(pid, start_time=start_time):
+                done = self.store.read_manifest(job_id)
+                if done.teardown_status is not None:
+                    if done.status in _TERMINAL:
+                        return done.status
+                    return self.store.update_manifest(
+                        job_id, status=JobState.cancelled, ended_at=now(),
+                        end_reason="cancelled by user",
+                    ).status
         # The name recorded at launch, not one recomputed today: `cluster_name_for` gained a
         # project slug, so recomputing can address a different machine than the one we started.
         cluster = rt.get("cluster") or cluster_name_for(job_id)

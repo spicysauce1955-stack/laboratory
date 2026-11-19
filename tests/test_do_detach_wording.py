@@ -99,9 +99,18 @@ class TestTheRejectionIsRecognised:
         """"Never" must not be waited on: only the detach race earns the ladder."""
         assert not m.is_volume_detach_race(exc)
 
-    def test_an_auth_failure_never_reads_as_detaching_whatever_it_says(self) -> None:
-        """The status is part of the structure: a 401/403 cannot be a detach in progress."""
-        assert not m.is_volume_detach_race(http_error(403, NEW_DETACH, error_id="forbidden"))
+    def test_the_wording_decides_whatever_the_status(self) -> None:
+        """DO answers the race with more than one status. A 403 worded "cannot delete attached
+        volume" was read as a permission refusal, and two `lab cancel`led smoke jobs recorded
+        `failed` after one pass while their volumes detached normally behind them (2026-11-19).
+        Every volume is read back by id afterwards, so waiting on one costs at most a ladder."""
+        for status in (401, 403, 404, 409, 422, 500):
+            assert m.is_volume_detach_race(http_error(status, NEW_DETACH))
+
+    def test_a_real_permission_refusal_is_still_refused(self) -> None:
+        assert not m.is_volume_detach_race(
+            http_error(403, "You do not have access for the attempted action.", error_id="forbidden")
+        )
 
 
 class TestTheSuccessPathSweep:
@@ -193,12 +202,12 @@ class TestAnAbortPathContextDoesNotVeto:
     def test_an_unrelated_handled_exception_does_not_decide_the_verdict(self, status: int):
         assert m.is_volume_detach_race(self._with_context(http_error(status, "upstream")))
 
-    def test_an_explicit_cause_still_counts(self):
-        """SkyPilot's rewrap is `raise DigitalOceanError(...) from err` — a real cause."""
+    def test_an_explicit_cause_is_still_read(self):
+        """SkyPilot's rewrap is `raise DigitalOceanError(...) from err` — a real cause, read."""
         try:
             raise RuntimeError("Error: 403 Forbidden") from http_error(403, NEW_DETACH)
         except RuntimeError as e:
-            assert not m.is_volume_detach_race(e)
+            assert m.is_volume_detach_race(e)
 
 
 def test_a_throttled_or_5xx_delete_is_retried_and_never_reads_as_refused(monkeypatch):
