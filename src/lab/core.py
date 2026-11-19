@@ -1192,17 +1192,20 @@ class Lab:
         traceback and empty stdout. A failure is a stderr line plus a ledger note, and the
         caller carries on with local state (an absent results file reads as missing seeds).
 
-        Skipped outright for a local-backend job: nothing on that path uploads to R2, so there
-        is nothing to recover, and asking would only spend a network round trip (or fail).
+        Skipped for a local-backend job: nothing on that path uploads to R2 or mirrors partials,
+        so there is nothing to recover, and asking would only spend a network round trip (or
+        fail). The one exception is a manifest that itself records a durable ``artifacts_uri`` —
+        then there *is* something to fetch, whoever launched it.
         """
         manifest = self.store.read_manifest(job_id)
-        if manifest.backend.provisioner == "local":
+        local = manifest.backend.provisioner == "local"
+        if local and not manifest.artifacts_uri:
             return
         try:
             r2 = R2Store.from_env()
             if manifest.artifacts_uri and r2 is not None:
                 r2.download_dir(job_id, out)
-            if r2 is not None and not (out.exists() and any(out.iterdir())):
+            if r2 is not None and not local and not (out.exists() and any(out.iterdir())):
                 # Nothing durable from the end-of-run upload — which is the *normal* state of
                 # a job whose supervisor died, since `artifacts_uri` is written on the same
                 # line as that upload. The mid-run mirror (`lab.partials`) is then the only
