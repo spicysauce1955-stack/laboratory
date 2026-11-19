@@ -57,10 +57,13 @@ agent-usable **MCP** interface + a CLI, live observability, and cost-bounded aut
   **Ownership is proved, never assumed (incident 2026-08-20).** "Not in this repo's `runs/`" is
   *not* evidence of a leak: the cloud account is machine-global while the job store is
   per-project, and that asymmetry let a `reconcile --apply --yes` run from this repo destroy
-  seven *running* `tempotron-capacity` jobs. A `lab-*` resource is destroyable only when
-  `lab.attribution` can attribute it to **this** project — via the project slug stamped into the
-  cluster name (`lab-<slug>-<job_id>`, `parse_cluster_name`) or the user-global job index
-  `~/.lab/jobs/index.jsonl` (written by `JobStore.create`, ledger fallback for older jobs).
+  seven *running* `tempotron-capacity` jobs. A `lab-*` resource is destroyable only when it is
+  provably **this job store's**: its job is in this `runs/`, or the user-global job index
+  `~/.lab/jobs/index.jsonl` (written by `JobStore.create`) names *this* runs_dir. The slug stamped
+  into the cluster name (`lab-<slug>-<job_id>`, `parse_cluster_name`) proves only the project
+  *name* — two clones, or the scheduler host and the laptop, share it — so a slug match alone
+  lands in `unattributed`, and a mismatch in `other_projects` (ledger fallback only for legacy
+  unstamped names).
   Anything owned elsewhere lands in `other_projects`, anything unprovable in `unattributed`;
   both are reported and **never destroyed** (the treatment `gcp_unmatched` already had). Clean up
   another project's leak by running reconcile *from that project*. Every destroy now records its
