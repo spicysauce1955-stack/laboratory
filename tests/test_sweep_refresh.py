@@ -41,7 +41,8 @@ def test_aggregate_finalizes_a_dead_shard(tmp_path: Path, monkeypatch):
     lab.aggregate_sweep(sweep_id)
     m = lab.manifest(b)
     assert m.status is JobState.failed
-    assert m.end_reason == "runner exited without recording status"
+    # The shard's command really ran (and exited): the reason also says its exit code is unknown.
+    assert (m.end_reason or "").startswith("runner exited without recording status")
 
 
 def test_retry_resubmits_a_shard_whose_supervisor_died(tmp_path: Path, monkeypatch):
