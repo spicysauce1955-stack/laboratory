@@ -64,7 +64,7 @@ from lab.models import (
 from lab.aggregate import merge_seed_rows
 from lab.partials import PARTIAL_DIR
 from lab.sharding import parse_seeds, partition_seeds, seeds_to_arg
-from lab.store import JobStore, cell_id_for
+from lab.store import JobStore, cell_id_for, injected_override_keys
 
 if TYPE_CHECKING:  # import-time only: `lab.scheduler.queue` is reached lazily (module cycle)
     from lab.scheduler.queue import QueueStore
@@ -667,6 +667,8 @@ class Lab:
                 resolved_config=spec.config or {},
                 seed=seed,
                 allow_unknown_config=spec.allow_unknown_config,
+                # What the unconsumed-config audit may judge: config keys that ride the argv.
+                config_overrides=injected_override_keys(spec.command, spec.config),
             ),
             resources=spec.resources,
             backend=BackendInfo(provisioner=self.backend.name),

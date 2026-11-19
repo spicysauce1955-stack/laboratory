@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shlex
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -30,6 +31,31 @@ _TERMINAL_STATES = frozenset(
         JobState.timed_out, JobState.preempted,
     }
 )
+
+
+def argv_override_keys(command: str) -> set[str]:
+    """Keys of the loose ``key=value`` tokens in a shell command (the lab's override convention).
+
+    A superset of the real overrides — it also sees env prefixes and ``--with pkg==x`` specs —
+    so callers intersect it with the config keys they know were injected. Never raises: an
+    unbalanced quote falls back to a whitespace split rather than failing a terminal write.
+    """
+    from lab.experiment import parse_overrides
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    return set(parse_overrides(tokens))
+
+
+def injected_override_keys(command: str, config: dict[str, Any] | None) -> list[str]:
+    """The config keys that actually ride ``command`` as ``key=value`` — what the lab injected.
+
+    A config key that is not on the argv (plain ``submit`` records ``config`` as metadata) is not
+    something the entrypoint could have consumed, so it is not audited either.
+    """
+    return sorted(argv_override_keys(command) & set(config or {}))
 
 
 def cell_id_for(coords: dict[str, Any]) -> str:
@@ -167,18 +193,20 @@ class JobStore:
     ) -> JobManifest:
         """The unconsumed-config check (see ``update_manifest``); pure function of output/.
 
-        Audits the ``key=value`` overrides actually passed on the command line (parsed from
-        ``entrypoint_command``) — NOT ``resolved_config``, which plain ``submit`` records as
-        metadata without ever putting it on the argv.
+        Audits only the overrides the lab itself injected — ``run.config_overrides``, recorded at
+        submit as the config keys that ride the argv. Not every ``k=v`` token of the shell
+        command: ``uv run --with scipy==1.11`` and an ``OMP_NUM_THREADS=1 …`` env prefix used to
+        be read as unconsumed config, flipping real successes to failed (and then aggregate
+        dropped their rows and sweep-retry re-bought them). Nor ``resolved_config`` as such,
+        which plain ``submit`` records as metadata without ever putting it on the argv. A legacy
+        manifest (no ``config_overrides``) gets the same intersection computed here.
 
         Runs on EVERY terminal transition so ``unconsumed_config`` is populated for timed-out/
         failed shards too (the aggregator's wrong-config guard depends on it); only a succeeded
         verdict is flipped to ``failed`` (``flip=True``) — the others already aren't successes.
         """
-        import shlex
-
         from lab import events
-        from lab.experiment import parse_overrides, read_effective_config
+        from lab.experiment import read_effective_config
 
         try:
             eff = read_effective_config(self.output_dir(job_id))
@@ -190,7 +218,12 @@ class JobStore:
             return updated  # already non-succeeded; corrupt evidence can't be recorded
         if eff is None:
             return updated  # legacy entrypoint — nothing reported, nothing to audit
-        passed = set(parse_overrides(shlex.split(updated.run.entrypoint_command)))
+        run = updated.run
+        passed = set(
+            run.config_overrides
+            if run.config_overrides is not None
+            else injected_override_keys(run.entrypoint_command, run.resolved_config)
+        )
         passed.discard("seed")  # a grid 'seed' key is consumed by the lab itself (sets LAB_SEED)
         unconsumed = sorted(passed - set(eff))
         updated = updated.model_copy(

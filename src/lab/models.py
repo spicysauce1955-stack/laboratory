@@ -88,6 +88,12 @@ class RunSpec(BaseModel):
     # Persisted on the manifest so the store's succeeded-transition audit can read it (the
     # unconsumed-config fail-closed check; see JobStore.update_manifest).
     allow_unknown_config: bool = False
+    # The `key=value` overrides the lab itself put on the argv (config keys that ride the
+    # command), i.e. exactly what the unconsumed-config audit may judge. Not every `k=v` token in
+    # the command is one: `uv run --with scipy==1.11` and an `OMP_NUM_THREADS=1 python …` env
+    # prefix are shell, not config. None = written before this existed (the audit then falls
+    # back to argv tokens that are also resolved_config keys).
+    config_overrides: list[str] | None = None
 
 
 class BackendInfo(BaseModel):
