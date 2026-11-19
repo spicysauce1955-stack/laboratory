@@ -88,3 +88,23 @@ def test_sweep_summary_spend_aggregation(tmp_path: Path) -> None:
     assert s["per_point"]["e"]["usd"] == round(0.123456, 6)
     assert s["per_point"]["f"]["usd"] == 0.0
     assert s["failed"] == 1
+
+
+def test_sweep_summary_counts_every_state_so_the_parts_sum_to_the_total(tmp_path: Path) -> None:
+    """Stress run 2026-11-19: `32 = 28 + 1 + 0` with three cancelled shards unaccounted for, and
+    timed_out never counted at all — a summary whose parts do not add up reads as lost jobs."""
+    repo = repo_root(Path.cwd())
+    lab = Lab(backend=LocalBackend(home=tmp_path, repo=repo), repo=repo, home=tmp_path)
+    states = [
+        JobState.succeeded, JobState.succeeded, JobState.failed, JobState.cancelled,
+        JobState.cancelled, JobState.timed_out, JobState.preempted,
+    ]
+    for i, st in enumerate(states):
+        _seed(lab, f"p{i}", status=st, use_spot=False, launched_spot=None, actual=0.0)
+    s = lab.sweep_summary("sw")
+    assert s["total"] == len(states)
+    assert {st.value: s[st.value] for st in JobState} == {
+        "queued": 0, "running": 0, "succeeded": 2, "failed": 1, "cancelled": 2,
+        "timed_out": 1, "preempted": 1,
+    }
+    assert sum(s[st.value] for st in JobState) == s["total"]

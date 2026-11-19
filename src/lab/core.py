@@ -1904,12 +1904,16 @@ class Lab:
         def spend(m: JobManifest) -> float:
             return m.cost.actual_usd if m.cost and m.cost.actual_usd else 0.0
 
+        # One count per state, every state, so the parts always sum to `total`: counting only
+        # succeeded/failed/preempted left cancelled and timed_out shards unaccounted for
+        # (`32 = 28 + 1 + 0`), which reads as jobs that went missing.
+        by_state = {st.value: 0 for st in JobState}
+        for m in ms:
+            by_state[m.status.value] += 1
         return {
             "sweep_id": sweep_id,
             "total": len(ms),
-            "succeeded": int(sum(int(m.status is JobState.succeeded) for m in ms)),
-            "preempted": int(sum(int(m.status is JobState.preempted) for m in ms)),
-            "failed": int(sum(int(m.status is JobState.failed) for m in ms)),
+            **by_state,
             "fell_back_to_on_demand": int(
                 sum(int(m.resources.use_spot and m.backend.launched_spot is False) for m in ms)
             ),
