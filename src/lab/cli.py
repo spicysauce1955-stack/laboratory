@@ -40,6 +40,7 @@ from lab.events import store as events_store
 from lab.events.annotate import digest_of, refs_from
 from lab.events.sanitize import sanitize_argv
 from lab.manifest import git_work_tree, repo_root
+from lab.metrics import DEFAULT_MAX_POINTS
 from lab.models import JobManifest, JobSpec, ResourceRequest
 from lab.queue_view import queue_list_view
 from lab.scheduler.models import Guardrails, Triggers
@@ -980,11 +981,29 @@ def metrics(
     job_id: str,
     name: list[str] = typer.Option(None, "--name", "-n", help="filter to these metric names"),
     since_step: int | None = typer.Option(None, help="only points with step > since_step"),
+    max_points: int = typer.Option(
+        DEFAULT_MAX_POINTS, "--max-points", min=0,
+        help="points per series: the newest N (0 = every point). What was cut is reported "
+        "under `truncated`",
+    ),
+    downsample: bool = typer.Option(
+        False, "--downsample",
+        help="spread --max-points evenly over the whole series (always keeping the newest point) "
+        "instead of returning only the newest",
+    ),
 ) -> None:
     """Query a job's incremental metric series (FR-D2 — the early-kill loop); scheduler-launched
-    jobs fall back to the mirrored manifest (spec §4.3), same as `lab status`."""
+    jobs fall back to the mirrored manifest (spec §4.3), same as `lab status`.
+
+    Bounded by default: each series returns its newest --max-points (200) points, and
+    `truncated` names every series that had more ({returned, omitted}). Poll with --since-step
+    for what's new; --downsample for the shape of a whole run; --max-points 0 for everything.
+    """
     _emit(
-        {"series": _lab_for_mirrored_or_fail(job_id).metrics(job_id, names=name or None, since_step=since_step)}
+        _lab_for_mirrored_or_fail(job_id).metrics_view(
+            job_id, names=name or None, since_step=since_step,
+            max_points=max_points, downsample=downsample,
+        )
     )
 
 

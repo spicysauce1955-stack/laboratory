@@ -33,6 +33,7 @@ from lab.env import load_lab_env
 from lab.events import store as events_store
 from lab.events.annotate import digest_of, refs_from
 from lab.manifest import repo_root
+from lab.metrics import DEFAULT_MAX_POINTS
 from lab.models import JobManifest, JobSpec, ResourceRequest
 from lab.queue_view import queue_list_view
 from lab.store import JobStore
@@ -473,15 +474,21 @@ def build_server(lab: Lab) -> FastMCP:
 
     @mcp.tool
     def metrics(
-        job_id: str, names: list[str] | None = None, since_step: int | None = None
+        job_id: str,
+        names: list[str] | None = None,
+        since_step: int | None = None,
+        max_points: int = DEFAULT_MAX_POINTS,
+        downsample: bool = False,
     ) -> dict[str, Any]:
-        """Query incremental metric series; returns {series:{name:[{step,value,wall_time}]}}
-        (FR-D2). Scheduler-launched (deferred) jobs fall back to the mirrored manifest (spec
-        §4.3), matching `status`; since their logs/metrics only live durably on the scheduler
-        host, this may legitimately return an empty series rather than an error."""
+        """Query incremental metric series; returns {series:{name:[{step,value,wall_time}]}, max_points, truncated} (FR-D2). BOUNDED by default: each series returns its newest max_points (200) points, and `truncated` names every series that had more as {name: {returned, omitted}} — read it before concluding a run is short. Poll with since_step=<last step seen> for only what is new (cheap: the file is read from the end); downsample=True spreads max_points evenly over the whole series (always keeping the newest point) to see a run's shape; max_points=0 returns every point (can be tens of MB on a long run). Non-finite values (a diverged loss) come back as null. Scheduler-launched (deferred) jobs fall back to the mirrored manifest (spec §4.3), matching `status`; since their logs/metrics only live durably on the scheduler host, this may legitimately return an empty series rather than an error."""
+        if max_points < 0:
+            raise ToolError(f"max_points must be >= 0 (0 = every point), got {max_points}")
         the_lab, tmp_home = _lab_for_any(job_id)
         try:
-            return {"series": the_lab.metrics(job_id, names=names, since_step=since_step)}
+            return the_lab.metrics_view(
+                job_id, names=names, since_step=since_step,
+                max_points=max_points, downsample=downsample,
+            )
         finally:
             # The server is long-lived (unlike the CLI's atexit sweep) — a mirrored job's
             # throwaway JobStore dir must be removed right after this call, not left to leak.

@@ -48,7 +48,7 @@ from lab.manifest import (
 )
 from lab import events, placement, pricing
 from lab import notes as lab_notes
-from lab.metrics import final_values, group_series
+from lab.metrics import DEFAULT_MAX_POINTS, METRICS_FILE, final_values, group_series, series_view
 from lab.storage import R2Store, r2_enabled
 from lab.attribution import attribute_jobs, local_project
 from lab.models import (
@@ -1337,6 +1337,27 @@ class Lab:
     ) -> dict[str, list[dict[str, Any]]]:
         """Grouped incremental metric series for a job, queryable live (FR-D2)."""
         return group_series(self.backend.read_metrics(job_id, names=names, since_step=since_step))
+
+    def metrics_view(
+        self,
+        job_id: str,
+        names: Iterable[str] | None = None,
+        since_step: int | None = None,
+        *,
+        max_points: int = DEFAULT_MAX_POINTS,
+        downsample: bool = False,
+    ) -> dict[str, Any]:
+        """The bounded payload `lab metrics` and the MCP `metrics` tool both return (FR-D2):
+        ``{series, max_points, truncated}`` — see :func:`lab.metrics.series_view`. Reads the
+        same ``output/metrics.jsonl`` every backend's ``read_metrics`` reads, but from the end,
+        so a capped read or a ``since_step`` poll does not parse the whole file."""
+        return series_view(
+            self.store.output_dir(job_id) / METRICS_FILE,
+            names=names,
+            since_step=since_step,
+            max_points=max_points,
+            downsample=downsample,
+        )
 
     def cancel(self, job_id: str) -> JobState:
         return self.backend.cancel(job_id)

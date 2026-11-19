@@ -287,9 +287,20 @@ or `n/a` for non-SkyPilot backends. Run this before anything that could
 disturb a live job, not just `reconcile`/`queue list` — see §6.H.
 
 ### `mcp__lab__metrics`
-`{job_id, names?, since_step?}` → `{"series": {name: [{step, value, wall_time}, ...]}}`.
+`{job_id, names?, since_step?, max_points=200, downsample=false}` →
+`{"series": {name: [{step, value, wall_time}, ...]}, "max_points": 200, "truncated": {...}}`.
 Incremental — pass `since_step=<last_step_seen>` to fetch only new points.
-Designed for live polling at ~5–15s cadence (the early-kill loop).
+Designed for live polling at ~5–15s cadence (the early-kill loop); the file is
+read from the end, so a poll stays cheap however long the run gets.
+
+**Bounded by default.** Each series returns its **newest 200 points**;
+`truncated` names every series that had more, as `{name: {returned, omitted}}`
+(`{}` when nothing was cut). Read it before concluding a run is short or a curve
+starts where the payload does. `downsample=true` spreads the cap evenly over the
+whole series (newest point always kept) — use it to see a run's shape;
+`max_points=0` returns every point, which can be tens of MB on a long run. A
+diverged value (NaN/±Infinity) comes back as `null`. CLI: `uv run lab metrics
+<job> --max-points N --downsample --since-step S -n loss`.
 
 ### `mcp__lab__logs`
 `{job_id, tail=100}` → `{"lines": [...]}`. The stdout/stderr of the job.
@@ -803,6 +814,7 @@ past its cause costs real time. Each row below is a rule that was once right.
 | "`lab <cmd> --help` exits non-deterministically, so `--help` rows in `lab history` are noise." | That was `rich` raising on a closed stdout pipe; `--help` exits 0. A `usage_error` row is now a real usage error. | v0.7.0 |
 | "`--price-cap` is a hard ceiling." | **Still not true, and worth knowing exactly how.** SkyPilot applies it to its own catalog, which under-reports Vast ~4x. Since v0.8.0 the cheapest *live* Vast offer is checked before renting (an impossible cap fails the submit for free) and the *billed* rate is compared after boot and recorded as `cost.over_cap`. The optimizer can still land above the cheapest offer, so pass `--price-cap-strict` if the ceiling must hold, and bound real exposure with `--timeout`. | v0.8.0 |
 | "`reconcile`'s `ghosts` list is Vast-only — a healthy DO/GCP job may show up there as a false positive, so don't trust it for those backends." | Ghost detection now cross-checks every cloud's own SkyPilot-tracked state, not just Vast rental labels; a healthy DO/GCP job is no longer misreported. Each entry's cause is named in the additive `ghost_reasons`. | v0.10.0 |
+| "`mcp__lab__metrics` / `lab metrics` return every point of every series." | They return the **newest 200 points per series** by default and name what they cut in `truncated` (`{name: {returned, omitted}}`). `max_points=0` (`--max-points 0`) returns everything; `downsample=true` (`--downsample`) spreads the cap over the whole run. One unbounded read measured 27.7 MB over MCP. | v0.13.0 |
 | "There's no way to see what's actually running right now except `lab list` (this project only) or eyeballing `reconcile`'s rental counts." | `lab ps` / `mcp__lab__ps` gives a project-agnostic, machine-wide "what's running" view — closes a real gap found live, when both of the above were checked during an incident and neither surfaced jobs running in a *different* project. | v0.10.0 |
 | "`lab fetch`/`lab metrics`/`lab logs` don't work from the laptop for scheduler-launched jobs — only `lab status` reads the mirror." | The three now fall back to the mirrored manifest too (built over an ephemeral job store, never the real local one, so `cancel`/`reconcile` still correctly treat the job as not locally supervised). | v0.11.0 |
 | "`lab wait` can't watch a scheduler-launched job, so polling `lab status` in a shell loop is the only way to know when a deferred job finishes." | `lab wait <deferred_job_id>` (and `mcp__lab__wait`) now resolve the mirrored manifest, exactly like `lab status`. Hand-rolled poll loops were costing ~1,050 `lab status` calls/hour — 98,654 in one five-day campaign, which also blew the event ledger past its size cap and destroyed a day of forensic records. An all-mirrored wait polls at most every 30s and lists those ids under `mirrored` in the summary/`--done-file`. `lab cancel` is still deliberately local-only (`lab queue cancel <reg_id>` is the way). | v0.12.0 |

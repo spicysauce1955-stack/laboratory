@@ -147,6 +147,22 @@ upgrade note.
   date means the start of that day in UTC, never local time. Durations are still tried first, so
   `--since 20260906` keeps its old meaning of 20,260,906 seconds.
 
+  **Agent-facing reads are bounded by default** (after v0.12.0). One unbounded read measured
+  27.7 MB over MCP and 199 MB on the CLI, which no agent context survives:
+
+  | Command / tool | New flag / argument | Default | Opt out | Payload |
+  |---|---|---|---|---|
+  | `lab metrics` / `metrics` | `--max-points N` / `max_points` | `200` per series, the **newest** | `0` = every point | `series` unchanged; gained `max_points` and `truncated: {name: {returned, omitted}}` (`{}` when nothing was cut) |
+  | `lab metrics` / `metrics` | `--downsample` / `downsample` | off | — | the cap spread evenly over the whole series, newest point always kept |
+
+  This **changes a default**: a caller that read every point from `series` now gets the newest
+  200 of each series, and `truncated` says so — check it, or pass `--max-points 0` /
+  `max_points=0` for the old behaviour. `since_step` keeps its meaning (points with a larger
+  step) and composes with the cap; it is now answered from the end of the file, stopping a
+  series at its first step at or below `since_step`. That is exact for a series whose steps
+  never go backwards; a series the reader sees go backwards is read in full, and a counter reset
+  far back in the file (a restarted run) yields the newest run's points past `since_step`.
+
   `lab submit` / `lab sweep` / `lab register` / `lab register-sweep` and the `submit`/`sweep` MCP
   tools (v0.12.0) gained additive `--accelerator-pool` / `--max-launch-attempts`. Both default to
   off, so launch behaviour is unchanged unless you pass them, and rotation never raises
