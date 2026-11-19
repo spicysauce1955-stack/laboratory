@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import FrameType
-from typing import Any
+from typing import Any, TypeVar
 
 from lab import events
 from lab._util import actual_cost, duration_seconds, now, parse_duration, timeout_reason
@@ -77,8 +77,50 @@ def _rec_field(rec: Any, key: str) -> Any:
     return rec.get(key) if isinstance(rec, dict) else getattr(rec, key, None)
 
 
+SKY_CALL_TIMEOUT_S = 120.0
+"""Bound on one SkyPilot request the supervisor waits on (a queue poll, a status probe).
+
+``sky.get`` has no timeout of its own, so a wedged request — an API server whose connection went
+half-open — blocked the supervisor forever, and the local wall-clock backstop, which is only
+checked *between* calls, never fired. Generous against a healthy answer (well under a second) and
+small against every deadline it guards."""
+
+_T = TypeVar("_T")
+
+
+def _bounded_call(fn: Callable[[], _T], *, what: str, timeout_s: float | None = None) -> _T:
+    """``fn()`` on a daemon thread, joined for at most :data:`SKY_CALL_TIMEOUT_S`.
+
+    Raises :class:`TimeoutError` when it does not answer in time — which every caller already
+    treats as "no answer yet", never as a verdict — and re-raises whatever ``fn`` raised. A call
+    that never returns is abandoned to its daemon thread rather than taking the supervisor (and
+    the teardown that follows it) down with it.
+    """
+    limit = SKY_CALL_TIMEOUT_S if timeout_s is None else timeout_s
+    holder: dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            holder["value"] = fn()
+        except BaseException as e:  # noqa: BLE001 — surfaced to the caller below
+            holder["error"] = e
+
+    thread = threading.Thread(target=_run, name=f"lab-sky-{what}", daemon=True)
+    thread.start()
+    thread.join(limit)
+    if thread.is_alive():
+        raise TimeoutError(f"sky {what} did not answer within {limit:.0f}s")
+    if "error" in holder:
+        raise holder["error"]
+    value: _T = holder["value"]
+    return value
+
+
 def _job_status_name(sky_mod: Any, cluster: str, sky_job_id: int | None) -> str | None:
-    recs = sky_mod.get(sky_mod.queue(cluster, skip_finished=False))  # 0.12: RequestId
+    recs = _bounded_call(
+        lambda: sky_mod.get(sky_mod.queue(cluster, skip_finished=False)),  # 0.12: RequestId
+        what="queue",
+    )
     for rec in recs:
         if sky_job_id is None or _rec_field(rec, "job_id") == sky_job_id:
             status = _rec_field(rec, "status")
@@ -257,7 +299,10 @@ def cluster_up_or_raise(sky_mod: Any, cluster: str) -> bool:
     away a healthy run. Callers that genuinely want the conservative reading use
     :func:`_cluster_up`.
     """
-    recs = sky_mod.get(sky_mod.status(cluster_names=[cluster]))  # 0.12: RequestId -> list
+    recs = _bounded_call(
+        lambda: sky_mod.get(sky_mod.status(cluster_names=[cluster])),  # 0.12: RequestId -> list
+        what="status",
+    )
     return _any_up(recs)
 
 
@@ -286,6 +331,92 @@ def _any_up(recs: Any) -> bool:
         if name == "UP":
             return True
     return False
+
+
+STREAM_PROBE_S = 120.0
+"""While the log stream is open, how often the queue is asked whether the run is already over.
+
+A half-open stream never returns, and an uncapped job has no budget to run out — so without this
+it would wait forever on a run that ended hours ago. One ``sky.queue`` per job per this interval,
+the same order as the partial-results heartbeat."""
+
+STREAM_REATTACH_S = 300.0
+"""Minimum gap between re-attaching a log stream that ended while the job is still running."""
+
+STREAM_REATTACH_TAIL = 50
+"""Lines of backlog a re-attached stream replays, so the log shows where it picked up again."""
+
+
+class _LogStream:
+    """``sky.tail_logs(follow=True)`` on a daemon thread: log output only, never the source of
+    truth about how the run ended — that is the job queue (:func:`_wait_terminal`).
+
+    It used to be a bare blocking call on the supervisor's main thread with no timeout. A
+    half-open stream therefore blocked the supervisor forever, and the local wall-clock backstop
+    — only ever checked after it returned — never fired.
+    """
+
+    def __init__(self, sky_mod: Any, cluster: str, sky_job_id: int | None) -> None:
+        self._sky = sky_mod
+        self._cluster = cluster
+        self._job = sky_job_id
+        self._thread: threading.Thread | None = None
+        self._attached_at = 0.0
+
+    def start(self, *, tail: int | None = None) -> None:
+        def _run() -> None:
+            try:
+                if tail is None:
+                    self._sky.tail_logs(self._cluster, self._job, follow=True)
+                else:
+                    self._sky.tail_logs(self._cluster, self._job, follow=True, tail=tail)
+            except Exception as e:  # noqa: BLE001 — a stream error says nothing about the run
+                print(f"[lab] tail_logs issue: {e}")
+
+        self._attached_at = time.monotonic()
+        self._thread = threading.Thread(target=_run, name="lab-tail-logs", daemon=True)
+        self._thread.start()
+
+    @property
+    def alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def wait(self, budget_s: float, *, run_is_over: Callable[[], bool]) -> None:
+        """Return when the stream ends, the budget is spent, or ``run_is_over()`` says the run
+        finished under a stream that did not. ``budget_s`` may be ``math.inf`` (uncapped)."""
+        deadline = time.monotonic() + budget_s
+        while self.alive and self._thread is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print(
+                    "[lab] wall-clock budget spent with the log stream still open — no longer "
+                    "waiting on it"
+                )
+                return
+            self._thread.join(min(remaining, STREAM_PROBE_S))
+            if self.alive and run_is_over():
+                print("[lab] the run has ended but its log stream is still open — detaching")
+                return
+
+    def reattach_if_dropped(self) -> None:
+        """Re-open a stream that ended while the job is still running (an API-server restart
+        does that), at most every :data:`STREAM_REATTACH_S`. Logs only: never a verdict."""
+        if self.alive or time.monotonic() - self._attached_at < STREAM_REATTACH_S:
+            return
+        print(
+            "[lab] log stream ended while the job is still running — re-attaching (up to "
+            f"{STREAM_REATTACH_TAIL} earlier lines may repeat)"
+        )
+        self.start(tail=STREAM_REATTACH_TAIL)
+
+
+def _run_is_over(sky_mod: Any, cluster: str, sky_job_id: int | None) -> bool:
+    """One bounded look at the queue: has the run ended (or its cluster definitively gone)?
+    Any doubt reads as "not yet" — this only decides whether to keep waiting on a stream."""
+    try:
+        return _job_status_name(sky_mod, cluster, sky_job_id) in _TERMINAL_NAMES
+    except Exception as e:  # noqa: BLE001
+        return _cluster_lost_reason(e) is not None
 
 
 @dataclass(frozen=True)
@@ -1795,8 +1926,8 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             anchor = run_anchor or started
 
             # Wait for the run to actually finish before fetching artifacts / tearing down.
-            # `tail_logs` blocks for the whole run and has no timeout of its own. That single
-            # fact caused both defects fixed here, so both comments belong together:
+            # `tail_logs` streams for the whole run and has no timeout of its own. That fact
+            # caused every defect fixed here, so the comments belong together:
             #
             #   * the wall-clock budget must charge the time it spends, or the cap is anchored to
             #     whenever streaming happens to return — which let four jobs run 703 minutes
@@ -1804,12 +1935,22 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             #   * the partial-results fetch must start BEFORE it, because until now nothing
             #     fetched until it returned — by which time the box is either finished (the fetch
             #     is redundant) or unreachable (the fetch is impossible). Those same four jobs
-            #     each lost ~6h of fsynced result rows to that ordering (see `PartialsFetcher`).
+            #     each lost ~6h of fsynced result rows to that ordering (see `PartialsFetcher`);
+            #   * it must not run on this thread unbounded: a half-open stream never returns, and
+            #     the backstop below never got its turn. It streams on a daemon thread joined
+            #     against the remaining budget, and the queue is probed meanwhile so an uncapped
+            #     job notices a run that ended under a stream that did not (see `_LogStream`).
             partials.start()
-            try:
-                sky.tail_logs(cluster, sky_job_id, follow=True)  # streams run logs; blocks till done
-            except Exception as e:  # noqa: BLE001
-                print(f"[lab] tail_logs issue: {e}")
+            stream = _LogStream(sky, cluster, sky_job_id)
+            stream.start()
+            stream.wait(
+                remaining_wall_budget(manifest.resources.timeout, anchor, boot_s=boot_s),
+                run_is_over=lambda: _run_is_over(sky, cluster, sky_job_id),
+            )
+
+            def _beat() -> None:
+                partials.beat()
+                stream.reattach_if_dropped()
 
             max_wait = remaining_wall_budget(manifest.resources.timeout, anchor, boot_s=boot_s)
             if max_wait <= 0:
@@ -1829,7 +1970,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                 sky_job_id,
                 max_wait,
                 heartbeat_s=HEARTBEAT_S,
-                on_heartbeat=partials.beat,
+                on_heartbeat=_beat,
             )
             final = raw_final
             # Only a finite deadline can end the wait on a live job; an uncapped one keeps
