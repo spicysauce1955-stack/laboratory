@@ -112,9 +112,10 @@ class TestTheSuccessPathSweep:
         do = _install(monkeypatch, _account(message, status))
         do.droplets.destroy(droplet_id=DROPLET_ID)  # what sky.down just did
 
-        deleted, failures = m._do_sweep_leftover_volumes(CLUSTER)
+        settled = m.settle_do_volumes(cluster=CLUSTER)
 
-        assert failures == [], f"a settling detach was reported as a leak: {failures}"
+        assert settled.failures == [], f"a settling detach was reported as a leak: {settled}"
+        assert settled.status == "succeeded"
         assert "vol-1" not in do.vols
         assert do.slept, "the ladder must have engaged"
 

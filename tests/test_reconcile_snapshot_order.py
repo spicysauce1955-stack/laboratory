@@ -70,8 +70,17 @@ def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(sp, "list_do_volumes", lambda *a, **k: [volume])
 
     class _DoVolumes:
+        """pydo's shape: a missing volume reads back as DO's 404 body, not an exception —
+        reconcile now verifies each delete by id."""
+
+        alive = {"v1"}
+
+        def get(self, volume_id: str) -> dict[str, Any]:
+            return {"volume": volume} if volume_id in self.alive else {"id": "not_found"}
+
         def delete(self, volume_id: str) -> None:
             destroyed.append(("do", volume_id))
+            self.alive = self.alive - {volume_id}
 
     monkeypatch.setattr(sp, "_get_do_client", lambda: types.SimpleNamespace(volumes=_DoVolumes()))
     node = {

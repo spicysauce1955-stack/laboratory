@@ -414,6 +414,12 @@ def test_reconcile_finds_and_destroys_do_volume_orphans(
     deleted: list[str] = []
 
     class _DOVolumes:
+        # pydo's shape: a missing volume reads back as DO's 404 body, not an exception —
+        # reconcile now verifies each delete by id.
+        def get(self, volume_id: str, **kw: object) -> dict[str, object]:
+            known = {v["id"] for v in volumes} - set(deleted)
+            return {"volume": {"id": volume_id}} if volume_id in known else {"id": "not_found"}
+
         def delete(self, volume_id: str, **kw: object) -> None:
             deleted.append(volume_id)
 

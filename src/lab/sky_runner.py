@@ -35,6 +35,7 @@ from lab.backends.skypilot import (
     ProvisionTimeout,
     boot_allowance_s,
     build_task,
+    cluster_do_volume_ids,
     cluster_name_for,
     confirm_success,
     map_job_status,
@@ -750,6 +751,42 @@ class PartialsFetcher:
             f"({st['attempts']} attempt(s) over {elapsed / 60:.0f} min) — {consequence}"
         )
         events.note("partials.empty", phase=phase, attempts=st["attempts"])
+
+
+# One DO volume listing while the job runs. Short: it sits on the supervisor's own thread (at UP,
+# then on heartbeats until it has seen the volume), and a slow DO API must not stall supervision.
+DO_VOLUME_MEMO_TIMEOUT_S = 30.0
+
+
+def remember_do_volumes(store: JobStore, job_id: str, cluster: str) -> list[str]:
+    """Record the ids of the DO volumes named after ``cluster`` in ``_runtime.json``.
+
+    Called while the job runs, when the volume is attached to a live droplet and has been for
+    minutes — the one time a listing describes it reliably. At teardown those ids are verified gone
+    by a direct ``volumes.get`` (``robust_teardown``), so the verdict no longer rests on a listing
+    taken while DO is in the middle of deleting the volume, which is how job E (2026-11-19)
+    recorded ``succeeded`` over a volume that was still billing two hours later.
+
+    Merges with what is already recorded, so a restarted supervisor (``--adopt``) keeps an earlier
+    one's memory. Returns the ids found this time. Best-effort and bounded: it never raises, since
+    losing this memory costs only the strongest form of the check, never the teardown.
+    """
+    try:
+        found = _bounded_call(
+            lambda: cluster_do_volume_ids(cluster),
+            what="do-volumes",
+            timeout_s=DO_VOLUME_MEMO_TIMEOUT_S,
+        )
+    except Exception as e:  # noqa: BLE001 — a memo, not a gate
+        print(f"[lab] could not record this job's DO volume ids (teardown still lists): {e}")
+        events.note("do_volumes.remember_failed", cluster=cluster, error=str(e)[:200])
+        return []
+    if found:
+        recorded = [str(v) for v in store.read_runtime(job_id).get("do_volume_ids") or []]
+        store.write_runtime(
+            job_id, do_volume_ids=recorded + [v for v in found if v not in recorded]
+        )
+    return found
 
 
 def _hourly_cost(handle: Any) -> float | None:
@@ -1991,6 +2028,10 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             #     the backstop below never got its turn. It streams on a daemon thread joined
             #     against the remaining budget, and the queue is probed meanwhile so an uncapped
             #     job notices a run that ended under a stream that did not (see `_LogStream`).
+            # The box is UP on both paths: remember its DO volume while a listing still describes
+            # it truthfully, so teardown can verify it gone by id (job E). Retried on heartbeats
+            # until seen — one cheap listing per minute at most, and none once it has the id.
+            do_volumes_known = cloud == "do" and bool(remember_do_volumes(store, job_id, cluster))
             partials.start()
             stream = _LogStream(sky, cluster, sky_job_id)
             stream.start()
@@ -2000,8 +2041,11 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             )
 
             def _beat() -> None:
+                nonlocal do_volumes_known
                 partials.beat()
                 stream.reattach_if_dropped()
+                if cloud == "do" and not do_volumes_known:
+                    do_volumes_known = bool(remember_do_volumes(store, job_id, cluster))
 
             max_wait = remaining_wall_budget(manifest.resources.timeout, anchor, boot_s=boot_s)
             if max_wait <= 0:

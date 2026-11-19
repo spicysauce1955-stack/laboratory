@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -735,76 +735,288 @@ def is_volume_detach_race(exc: BaseException) -> bool:
     return bool(_VOLUME_DETACH_RE.search(text))
 
 
-def _do_sweep_leftover_volumes(
-    cluster: str, *, backoffs: tuple[int, ...] = _VOLUME_DETACH_BACKOFFS
-) -> tuple[list[Any], list[str]]:
-    """Delete any block volume still named after ``cluster``. Raises if DO cannot be asked.
+_DO_NOT_FOUND = "not_found"
+# How long a pre-`sky.down` listing may hold up the destroy it precedes. The droplet is what
+# bills, so this is abandoned rather than awaited; a healthy DO API answers in well under a second.
+_DO_SNAPSHOT_TIMEOUT_S = 20.0
 
-    A clean ``sky.down`` is not proof the storage is gone (P4-a, found live 2026-08-20): a job
-    that failed partway through launch recorded ``teardown_status: "succeeded"`` and left a 50 GB
-    detached volume billing for as long as nobody looked. SkyPilot's DO provisioner creates the
-    volume *before* the droplet is fully up, so a launch that dies in between is exactly the case
-    that strands one, and the ``sky.down`` success path never ran the fallback that would remove
-    it.
 
-    Raising rather than returning a failure when the *listing* fails is deliberate: "we could not
-    ask" and "we asked and there is nothing" must not collapse into the same answer. The caller
-    turns the first into ``unknown`` and the second into ``succeeded``.
+class DoVolumeNotVerified(RuntimeError):
+    """A DO volume we were responsible for could not be shown gone, and DO raised nothing we could
+    report instead: our delete was accepted but the volume still reads as present, or DO would not
+    answer at all. Carries the reason; never means success."""
 
-    The delete is retried while DO says the volume is still attached (2026-08-23). Deleting once
-    and alarming turned that detach race into ``teardown_status: "failed"`` on a job that had
-    **succeeded**, sending ``lab wait`` to exit 3 over a volume DO removed moments later — the
-    false alarm this alarm cannot afford, since its whole value is being rare enough to believe
-    (R10). Only that message is waited on: a permission error or a bad request alarms on the first
-    attempt rather than after a minute of pointless sleeping.
 
-    Each pass **re-lists**. A volume that vanished counts as success just as much as one we
-    deleted ourselves — which is what actually settled the 2026-08-23 case, where something other
-    than this function removed the volume while we were reporting it as a leak.
+def _one_line(text: str, limit: int = 300) -> str:
+    """azure-core's ``str()`` spans lines (``(None) msg\\nCode: …\\nMessage: msg``); a manifest
+    ``end_reason`` and a ledger line read better flat."""
+    return " ".join(text.split())[:limit]
 
-    Waiting here is cheap by construction: this only runs after ``sky.down`` succeeded, so the
-    droplet — the expensive half — is already destroyed and the ladder delays nothing that bills.
-    That is also why the ladder is not shortened for the abort path (``_ABORT_TEARDOWN_BACKOFFS``,
-    50s, where a SIGKILL may follow the signal that got us here): if the sweep is killed mid-wait
-    the volume is left for ``lab reconcile``'s ``do_volume_orphans`` pass, which is a better
-    outcome than the false alarm that racing produced.
-    """
-    client = _get_do_client()
-    deleted: list[Any] = []
-    failures: list[str] = []
+
+def _is_do_not_found(reply: Any) -> bool:
+    """pydo's ``volumes.get``/``volumes.delete``/``droplets.get`` list 404 as an *expected* status:
+    they return DO's error body ``{"id": "not_found", ...}`` instead of raising. A check that
+    waited for an exception would never see a volume go."""
+    return isinstance(reply, dict) and reply.get("id") == _DO_NOT_FOUND
+
+
+def _read_do_volume(client: Any, volume_id: str) -> tuple[str, Any]:
+    """One authoritative read of a volume **by id**: ``("gone", None)``, ``("present", volume)``
+    or ``("unreadable", why)``. Never a listing: DO's listing is eventually consistent, and a
+    volume's absence from one is what let job E record ``succeeded`` over a live volume."""
+    try:
+        reply = client.volumes.get(volume_id=volume_id)
+    except Exception as e:  # noqa: BLE001 — classified here, never raised
+        if getattr(e, "status_code", None) == 404:
+            return "gone", None  # a pydo that one day raises ResourceNotFoundError instead
+        return "unreadable", _one_line(f"{type(e).__name__}: {e}")
+    if _is_do_not_found(reply):
+        return "gone", None
+    volume = reply.get("volume") if isinstance(reply, dict) else None
+    if isinstance(volume, dict):
+        return "present", volume
+    return "unreadable", _one_line(f"unrecognised volumes.get reply: {reply!r}", 160)
+
+
+def cluster_do_volume_ids(cluster: str, client: Any | None = None) -> list[str]:
+    """Ids of the DO volumes named after ``cluster`` (SkyPilot names each node's volume
+    ``<cluster>-<user hash>-<4 hex>-<head|worker>``). Raises if DO cannot be listed."""
+    if client is None:
+        client = _get_do_client()
     prefix = cluster.lower()
+    return [
+        str(v["id"])
+        for v in list_do_volumes(client)
+        if v.get("id") is not None and str(v.get("name", "")).lower().startswith(prefix)
+    ]
+
+
+@dataclass(frozen=True)
+class _DoSnapshot:
+    """The cluster's volumes as listed *before* ``sky.down`` touched anything."""
+
+    ids: tuple[str, ...] = ()
+    listed: bool = False
+    error: str | None = None
+
+
+def _snapshot_do_volumes(cluster: str, *, timeout_s: float = _DO_SNAPSHOT_TIMEOUT_S) -> _DoSnapshot:
+    """List the cluster's volumes before the destroy begins. Bounded, and never raises.
+
+    Before ``sky.down`` the volume is attached to a live droplet and has been for minutes, which
+    is the one moment a listing describes it reliably. After, it is mid-way through DO's own
+    asynchronous deletion — the state a listing is least likely to report truthfully. This is
+    what gives a teardown that never reached the run phase (a cancel or crash mid-provision, so
+    nothing was remembered while it ran) an id to verify.
+    """
+    holder: dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            holder["ids"] = cluster_do_volume_ids(cluster)
+        except BaseException as e:  # noqa: BLE001 — reported in the snapshot, never raised
+            holder["error"] = e
+
+    thread = threading.Thread(target=_run, name="lab-do-volume-snapshot", daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    if thread.is_alive():
+        return _DoSnapshot(error=f"volume listing did not answer within {timeout_s:.0f}s")
+    if "error" in holder:
+        err = holder["error"]
+        return _DoSnapshot(error=_one_line(f"{type(err).__name__}: {err}"))
+    return _DoSnapshot(ids=tuple(holder["ids"]), listed=True)
+
+
+@dataclass
+class VolumeSettlement:
+    """What :func:`settle_do_volumes` established, volume by volume.
+
+    ``gone`` is the only evidence of success: DO answered 404 for each of those ids *by id*.
+    ``refused`` holds volumes DO showed us still there and would not let us delete — a real,
+    billing leak (``failed``). ``unverified`` holds volumes we could not show gone and have no
+    refusal to stand on — our delete was accepted but the volume still reads as present, or DO
+    would not answer (``unknown``). A discovery listing that never answered is ``unknown`` too:
+    a volume never seen cannot be ruled out. None of those may read as ``succeeded``.
+    """
+
+    known: list[str] = field(default_factory=list)
+    gone: list[str] = field(default_factory=list)
+    deleted: list[str] = field(default_factory=list)  # our own delete was accepted
+    discovered: list[str] = field(default_factory=list)  # found by listing, not known up front
+    refused: dict[str, str] = field(default_factory=dict)
+    unverified: dict[str, str] = field(default_factory=dict)
+    errors: dict[str, BaseException] = field(default_factory=dict)
+    names: dict[str, str] = field(default_factory=dict)
+    discovery: bool = False  # was a listing asked to find volumes we never saw...
+    covered: bool = False  # ...and did one answer, here or before `sky.down`?
+    listing_error: str | None = None
+    passes: int = 0
+
+    @property
+    def uncovered(self) -> bool:
+        return self.discovery and not self.covered
+
+    @property
+    def status(self) -> str:
+        if self.refused:
+            return "failed"
+        if self.unverified or self.uncovered:
+            return "unknown"
+        return "succeeded"
+
+    @property
+    def failures(self) -> list[str]:
+        """Every reason this is not ``succeeded``, worst first."""
+        out = [*self.refused.values(), *self.unverified.values()]
+        if self.uncovered:
+            out.append(
+                f"DO volumes could not be listed ({self.listing_error}), so one never seen "
+                "cannot be ruled out"
+            )
+        return out
+
+    def summary(self) -> dict[str, Any]:
+        """Compact and JSON-safe, for the manifest's ``teardown_detail``."""
+        return {
+            "verification": "get-by-id",
+            "known": list(self.known),
+            "discovered": list(self.discovered),
+            "gone": list(self.gone),
+            "deleted": list(self.deleted),
+            "refused": dict(self.refused),
+            "unverified": dict(self.unverified),
+            "listed": self.covered,
+            "listing_error": self.listing_error,
+            "passes": self.passes,
+        }
+
+
+def _settle_one_do_volume(
+    client: Any, vid: str, s: VolumeSettlement
+) -> tuple[str, str, BaseException | None] | None:
+    """One pass over one volume: ``None`` once DO answers 404 for it, else ``(kind, why, exc)``
+    with ``kind`` in ``detaching`` (retry), ``refused`` (stop) or ``unverified`` (retry)."""
+    state, info = _read_do_volume(client, vid)
+    if state == "gone":
+        return None
+    if state == "present" and info.get("name"):
+        s.names.setdefault(vid, str(info["name"]))
+    try:
+        reply = client.volumes.delete(volume_id=vid)
+    except Exception as e:  # noqa: BLE001 — classified: retry "not yet", report "never"
+        text = _one_line(f"{type(e).__name__}: {e}")
+        if is_volume_detach_race(e):
+            return "detaching", text, e  # the reply itself proves the volume is still there
+        if state == "present":
+            return "refused", text, e
+        return "unverified", f"could not be read ({info}) and the delete failed: {text}", e
+    if _is_do_not_found(reply):
+        return None
+    if vid not in s.deleted:
+        s.deleted.append(vid)
+    # Read it straight back, so an accepted delete settles in this pass rather than costing a
+    # sleep — the healthy path stays free of the ladder.
+    state, info = _read_do_volume(client, vid)
+    if state == "gone":
+        return None
+    why = "still reads as present" if state == "present" else f"cannot be read back ({info})"
+    return "unverified", f"delete accepted, but the volume {why}", None
+
+
+def settle_do_volumes(
+    volume_ids: Iterable[Any] = (),
+    *,
+    cluster: str | None = None,
+    covered: bool = False,
+    client: Any | None = None,
+    backoffs: tuple[int, ...] = _VOLUME_DETACH_BACKOFFS,
+) -> VolumeSettlement:
+    """Delete DO volumes and verify each one gone **by id**. Raises only if no client can be built.
+
+    The single implementation behind every DO volume path — the check after a clean ``sky.down``,
+    the DO-direct fallback, and ``lab reconcile``'s volume delete — so they cannot drift apart
+    again (the 2026-08-23 detach fix reached one path first and the other two only after review).
+
+    **A listing is never evidence that a volume is gone** (job E, 2026-11-19). SkyPilot's
+    ``sky.down`` on DO deletes the volume via DO's *asynchronous* destroy-with-associated-
+    resources and returns once the droplet has left the droplet listing; nobody checks the
+    volume's half. The old check was one ``volumes.list`` taken the instant ``sky.down`` returned,
+    and a name missing from it read as "nothing is billing" — while DO's listing is eventually
+    consistent (a deleted volume was still listed ~20 s later the same day), and a volume in the
+    middle of DO's own deletion is exactly the one a listing is least likely to describe. When DO's
+    background delete then failed, the volume stayed, detached and billing, under a recorded
+    ``succeeded``. So:
+
+    * every id in ``volume_ids`` (remembered while the job ran, or listed before ``sky.down``) is
+      read back by ``volumes.get`` until DO answers 404, deleting it on the way;
+    * with ``cluster``, each pass also lists volumes named after it — but only to *discover* ones
+      we never saw, which then get the same by-id treatment. ``covered`` says a listing already
+      answered for this cluster (before ``sky.down``); with neither, an unseen volume cannot be
+      ruled out and the result is ``unknown``, never ``succeeded``;
+    * only DO's detach race is waited on (:func:`is_volume_detach_race`, 2026-08-23): a refusal
+      waiting cannot fix stops the ladder at once rather than after a minute of sleeping;
+    * a volume our delete was *accepted* for still has to read 404 — a 204 is a promise.
+
+    **Cost.** The healthy path is one listing, then per volume a GET, a DELETE (or DO's 404) and a
+    GET back — no sleeping. Only a volume DO keeps answering about without a 404 costs the ladder,
+    ``sum(backoffs)`` (60 s by default) plus a few calls per pass. Waiting is cheap by construction
+    on the teardown paths: it runs after the droplet — the expensive half — is gone.
+    """
+    if client is None:
+        client = _get_do_client()
+    known = list(dict.fromkeys(str(v) for v in volume_ids if v is not None))
+    s = VolumeSettlement(known=known, discovery=cluster is not None, covered=covered)
+    pending = list(known)
+    last: dict[str, tuple[str, str, BaseException | None]] = {}
+    prefix = cluster.lower() if cluster is not None else None
     for delay in (0, *backoffs):
         if delay:
             time.sleep(delay)
-        matching = [
-            v for v in list_do_volumes(client)
-            if str(v.get("name", "")).lower().startswith(prefix)
-        ]
-        if not matching:
-            return deleted, []  # nothing named like ours is left, so nothing is billing
-        detaching: list[str] = []
-        terminal: list[str] = []
-        for vol in matching:
+        s.passes += 1
+        if prefix is not None:
             try:
-                client.volumes.delete(volume_id=str(vol["id"]))
-                deleted.append(vol["id"])
-            except Exception as e:  # noqa: BLE001 — found and un-removable is a real alarm
-                entry = f"volume {vol.get('name')}: {type(e).__name__}: {e}"
-                (detaching if is_volume_detach_race(e) else terminal).append(entry)
-        failures = terminal + detaching
-        if not failures:
-            return deleted, []
-        if not detaching:
-            return deleted, terminal  # nothing here is waiting on a detach; waiting cannot help
-        # Partitioned rather than all-or-nothing: with two volumes under one cluster prefix, a
-        # sibling failing for an unrelated reason used to abandon the ladder and report the
-        # still-detaching volume as survived — re-creating the false alarm this exists to remove.
-        # A terminal failure means we will alarm regardless, but the detaching one still gets its
-        # chance, so only the volumes that genuinely did not go are named.
-    return deleted, failures
+                listed = list_do_volumes(client)
+            except Exception as e:  # noqa: BLE001 — discovery only; known ids are verified below
+                s.listing_error = _one_line(f"{type(e).__name__}: {e}")
+            else:
+                s.covered = True
+                for vol in listed:
+                    raw_id, name = vol.get("id"), str(vol.get("name", ""))
+                    if raw_id is None or not name.lower().startswith(prefix):
+                        continue
+                    vid = str(raw_id)
+                    s.names.setdefault(vid, name)
+                    if vid not in pending and vid not in s.gone:
+                        pending.append(vid)
+                        s.discovered.append(vid)
+        still: list[str] = []
+        for vid in pending:
+            verdict = _settle_one_do_volume(client, vid, s)
+            if verdict is None:
+                s.gone.append(vid)
+                last.pop(vid, None)
+            else:
+                last[vid] = verdict
+                still.append(vid)
+        pending = still
+        # Partitioned rather than all-or-nothing: a sibling refused for an unrelated reason must
+        # not abandon a volume that is only mid-detach (that re-created the false alarm once).
+        if not pending or all(last[v][0] == "refused" for v in pending):
+            break
+    for vid in pending:
+        kind, why, exc = last[vid]
+        entry = f"volume {s.names.get(vid) or '?'} ({vid}): {why}"
+        # Still attached after the whole ladder is a volume DO showed us, billing, that we could
+        # not remove: `failed`, as before. Only "cannot tell" is `unknown`.
+        (s.refused if kind in ("refused", "detaching") else s.unverified)[vid] = entry
+        s.errors[vid] = exc if exc is not None else DoVolumeNotVerified(entry)
+    return s
 
 
-def _do_destroy_matching(cluster: str) -> tuple[list[Any], list[str]]:
+def _do_destroy_matching(
+    cluster: str, *, known_ids: Iterable[Any] = (), covered: bool = False
+) -> tuple[list[Any], list[str], VolumeSettlement]:
     """Destroy the droplet(s) and block volume(s) belonging to ``cluster``, via the DO API.
 
     The provider-direct fallback DigitalOcean was missing while Vast and GCP both had one (F2).
@@ -812,13 +1024,16 @@ def _do_destroy_matching(cluster: str) -> tuple[list[Any], list[str]]:
     cluster (``ClusterDoesNotExist``) but the droplet is alive and billing.
 
     Two resources, not one. SkyPilot's DO provisioner attaches a block volume named after the
-    cluster, and destroying the droplet alone leaves it behind — detached, invisible to every
-    instance-level pass, and still charged for. That residue is what the 2026-08-20 sweep found.
+    cluster, and destroying the droplet alone (a plain destroy, unlike SkyPilot's dangerous one)
+    leaves it behind — detached, invisible to every instance-level pass, and still charged for.
+    That residue is what the 2026-08-20 sweep found. The volume half goes through
+    :func:`settle_do_volumes`, verified by id like every other DO volume path.
 
     Matching is ``name.startswith(cluster)``, which is exact enough to be safe here: DO does not
     truncate instance names (unlike GCP — see :func:`gcp_name_matches`), and the cluster name now
     carries the owning project, so another project's droplet cannot share this prefix. Returns
-    ``(destroyed_ids, failures)``; finding nothing is success, since nothing is billing.
+    ``(destroyed_ids, failures, volumes)``; ``failures`` holds the definitive ones (a droplet we
+    could not kill, a volume DO refused), while ``volumes.status`` can still be ``unknown``.
     """
     client = _get_do_client()
     destroyed: list[Any] = []
@@ -834,17 +1049,20 @@ def _do_destroy_matching(cluster: str) -> tuple[list[Any], list[str]]:
         except Exception as e:  # noqa: BLE001 — a box we found and could not kill must alarm
             failures.append(f"droplet {d.get('name')}: {type(e).__name__}: {e}")
 
-    # The volume goes through the same detach ladder as the success path. Deleting it in the
-    # same instant its droplet was destroyed is the 2026-08-23 race: DO detaches asynchronously,
-    # refuses the delete for a volume seconds from deletable, and a fallback that *worked* was
-    # recorded `failed` (exit 3). When a droplet would not die its volume stays attached however
-    # long we wait, so the ladder is skipped and the real alarm is not delayed by a minute.
-    swept, leftovers = _do_sweep_leftover_volumes(
-        cluster, backoffs=() if failures else _VOLUME_DETACH_BACKOFFS
+    # Deleting the volume in the same instant its droplet was destroyed is the 2026-08-23 race:
+    # DO detaches asynchronously and refuses the delete for a volume seconds from deletable, so it
+    # rides the detach ladder. When a droplet would not die its volume stays attached however long
+    # we wait, so the ladder is skipped and the real alarm is not delayed by a minute.
+    volumes = settle_do_volumes(
+        known_ids,
+        cluster=cluster,
+        covered=covered,
+        client=client,
+        backoffs=() if failures else _VOLUME_DETACH_BACKOFFS,
     )
-    destroyed.extend(swept)
-    failures.extend(leftovers)
-    return destroyed, failures
+    destroyed.extend(volumes.deleted)
+    failures.extend(volumes.refused.values())
+    return destroyed, failures, volumes
 
 
 def delete_do_volumes(
@@ -853,46 +1071,19 @@ def delete_do_volumes(
     client: Any | None = None,
     backoffs: tuple[int, ...] = _VOLUME_DETACH_BACKOFFS,
 ) -> tuple[list[Any], dict[Any, BaseException]]:
-    """Delete exactly these DO volumes, riding out the asynchronous detach. Returns
+    """Delete exactly these DO volumes and verify them gone by id. Returns
     ``(gone, failures_by_id)``; raises only if no client can be built.
 
-    The id-addressed sibling of :func:`_do_sweep_leftover_volumes`, for ``lab reconcile``, which
-    may only touch the volumes the operator approved rather than everything under a prefix. Same
-    rules, same reasons (2026-08-23): only the detach message is retried; every pass re-lists, and
-    a volume that vanished counts as gone — reconcile's sky pass has usually just destroyed the
-    droplet, and SkyPilot deletes the volume itself moments later. A volume still attached after
-    the whole ladder keeps its error: its droplet is alive, and that is a real alarm.
+    For ``lab reconcile``, which may only touch the volumes the operator approved rather than
+    everything under a prefix — so no discovery listing, just :func:`settle_do_volumes` over the
+    ids. A volume reconcile listed that DO has deleted since (the listing lags) answers 404 and
+    counts as gone; one whose delete DO accepted but which still reads as present is *not* gone,
+    and is reported with a :class:`DoVolumeNotVerified` rather than counted as destroyed.
     """
-    if client is None:
-        client = _get_do_client()
-    gone: list[Any] = []
-    failed: dict[Any, BaseException] = {}
-    pending = list(volume_ids)
-    for attempt, delay in enumerate((0, *backoffs)):
-        if not pending:
-            break
-        if delay:
-            time.sleep(delay)
-        if attempt:
-            try:
-                listed: set[str] | None = {str(v.get("id")) for v in list_do_volumes(client)}
-            except Exception:  # noqa: BLE001 — cannot tell; the delete below still answers
-                listed = None
-            if listed is not None:
-                vanished = [v for v in pending if str(v) not in listed]
-                gone.extend(vanished)
-                pending = [v for v in pending if v not in vanished]
-        detaching: list[Any] = []
-        for vol_id in pending:
-            try:
-                client.volumes.delete(volume_id=vol_id)
-                gone.append(vol_id)
-            except Exception as e:  # noqa: BLE001 — classified: retry "not yet", report "never"
-                failed[vol_id] = e
-                if is_volume_detach_race(e):
-                    detaching.append(vol_id)
-        pending = detaching
-    return gone, {k: e for k, e in failed.items() if k not in gone}
+    originals = {str(v): v for v in volume_ids}
+    settled = settle_do_volumes(volume_ids, client=client, backoffs=backoffs)
+    gone = [originals.get(v, v) for v in settled.gone]
+    return gone, {originals.get(v, v): e for v, e in settled.errors.items()}
 
 
 class GcpNotConfigured(RuntimeError):
@@ -1445,10 +1636,63 @@ def _vast_destroy_matching(
     return destroyed, failures
 
 
+def _verify_do_volumes_after_down(
+    outcome: dict[str, Any], cluster: str, remembered: list[str], snapshot: _DoSnapshot
+) -> None:
+    """After a clean ``sky.down`` on DO, verify the cluster's volumes gone, by id, into ``outcome``.
+
+    ``sky.down`` returning is proof about the droplet only (P4-a, job E): SkyPilot leaves the
+    volume to DO's asynchronous destroy and never checks it. Every volume remembered while the job
+    ran or listed before ``sky.down`` is read back until DO answers 404 (:func:`settle_do_volumes`).
+    """
+    ids = list(dict.fromkeys([*remembered, *snapshot.ids]))
+    try:
+        volumes = settle_do_volumes(
+            ids, cluster=cluster, covered=snapshot.listed or bool(remembered)
+        )
+    except (ImportError, GcpNotConfigured) as e:
+        if ids:
+            # We knew of volumes — remembered by a process that could reach DO — and cannot
+            # check them from here. That is not evidence they are gone.
+            outcome["status"] = "unknown"
+            outcome["error"] = (
+                f"{len(ids)} known DO volume(s) could not be verified gone: no DigitalOcean "
+                f"client here ({type(e).__name__}: {e})"
+            )
+        else:
+            # Not set up for DO on this machine at all, and nothing was ever seen. That is not
+            # the same fact as a listing that failed: there is no evidence of a leak, and
+            # downgrading a teardown SkyPilot completed would raise an alarm on the healthy path
+            # — the false-alarm erosion the three-state work exists to prevent. Said, not hidden.
+            outcome["do_volumes"] = {
+                "verification": f"skipped: no DigitalOcean client here ({type(e).__name__})"
+            }
+        return
+    except Exception as e:  # noqa: BLE001 — configured but unable to answer
+        outcome["status"] = "unknown"
+        outcome["error"] = _one_line(f"volume check after sky.down: {type(e).__name__}: {e}")
+        outcome["do_volumes"] = {"verification": "failed", "known": ids}
+        return
+    outcome["do_volumes"] = volumes.summary()
+    if volumes.deleted:
+        outcome["do_volumes_swept"] = list(volumes.deleted)
+    if volumes.status == "failed":
+        outcome["status"] = "failed"
+        outcome["error"] = f"volume(s) survived teardown: {'; '.join(volumes.failures)}"
+    elif volumes.status == "unknown":
+        outcome["status"] = "unknown"
+        outcome["error"] = f"volume(s) not verified gone: {'; '.join(volumes.failures)}"
+
+
 def robust_teardown(
-    sky_mod: Any, cluster: str, *, backoffs: tuple[int, ...] = TEARDOWN_BACKOFFS, cloud: str = "vast"
+    sky_mod: Any,
+    cluster: str,
+    *,
+    backoffs: tuple[int, ...] = TEARDOWN_BACKOFFS,
+    cloud: str = "vast",
+    known_volume_ids: Iterable[Any] = (),
 ) -> dict[str, Any]:
-    """Tear down a SkyPilot cluster with retry + a provider-direct fallback (Vast/GCP).
+    """Tear down a SkyPilot cluster with retry + a provider-direct fallback (Vast/GCP/DO).
 
     Why this exists: a single ``sky.down`` call that swallows transient errors (network hiccup,
     provider API timeout) used to leak rentals — the cluster kept billing while we marked the
@@ -1478,7 +1722,16 @@ def robust_teardown(
     registered. The provider-direct fallback still runs in that case: sky having nothing to
     destroy is not evidence that the provider has nothing to destroy. ``attempts`` therefore
     reports the attempts actually made, which is no longer always ``1 + len(backoffs)``.
+
+    On DO, ``succeeded`` additionally requires every block volume of the cluster to be verified
+    gone **by id** (:func:`settle_do_volumes`): those in ``known_volume_ids`` (remembered while the
+    job ran — see ``tear_down_and_record``) and those listed here *before* ``sky.down``. The
+    outcome then carries ``do_volumes``, the verification's compact record.
     """
+    remembered = [str(v) for v in known_volume_ids]
+    # Taken before anything is destroyed, while the volume is attached to a live droplet and a
+    # listing describes it reliably. Bounded, never raises; DO only.
+    snapshot = _snapshot_do_volumes(cluster) if cloud == "do" else _DoSnapshot()
     last_err: str | None = None
     # Was every sky.down attempt a *definitive* refusal (sky rejected the request rather than
     # performing it)? Only then may a fallback that cannot answer be read as a confirmed leak
@@ -1503,25 +1756,10 @@ def robust_teardown(
                 "error": None,
             }
             if cloud == "do":
-                # The droplet is gone; its block volume may not be (P4-a). Only DO needs this —
-                # Vast has no volume concept, and a leaked GCP disk has its own reconcile pass.
-                try:
-                    swept, leftovers = _do_sweep_leftover_volumes(cluster)
-                except (ImportError, GcpNotConfigured):
-                    # Not set up for DO on this machine at all. That is not the same fact as a
-                    # listing that failed: there is no evidence of a leak, and downgrading a
-                    # teardown SkyPilot actually completed would raise an alarm on the healthy
-                    # path — the false-alarm erosion the three-state work exists to prevent.
-                    pass
-                except Exception as e:  # noqa: BLE001 — configured but unable to answer
-                    outcome["status"] = "unknown"
-                    outcome["error"] = f"volume check after sky.down: {type(e).__name__}: {e}"
-                else:
-                    if swept:
-                        outcome["do_volumes_swept"] = swept
-                    if leftovers:
-                        outcome["status"] = "failed"
-                        outcome["error"] = f"volume(s) survived teardown: {'; '.join(leftovers)}"
+                # The droplet is gone; its block volume may not be (P4-a, job E). Only DO needs
+                # this — Vast has no volume concept, and a leaked GCP disk has its own reconcile
+                # pass.
+                _verify_do_volumes_after_down(outcome, cluster, remembered, snapshot)
             return outcome
         except Exception as e:  # noqa: BLE001
             last_err = f"{type(e).__name__}: {e}"
@@ -1597,22 +1835,36 @@ def robust_teardown(
         # alongside it, which outlives the droplet and keeps billing if left (F2).
         print(f"[lab] sky.down exhausted for {cluster}; falling back to do-direct destroy")
         try:
-            do_destroyed, do_failures = _do_destroy_matching(cluster)
-            events.note("teardown.fallback", cluster=cluster, via="do", ok=not do_failures)
-            return {
-                # Destroyed-or-none-found are both safe. Found-and-failed-to-destroy is not.
-                "status": "failed" if do_failures else "succeeded",
+            found = _do_destroy_matching(
+                cluster,
+                known_ids=[*remembered, *snapshot.ids],
+                covered=snapshot.listed or bool(remembered),
+            )
+            # Indexed, not unpacked: like the GCP pass, a shorter (droplets-only) answer is
+            # tolerated rather than crashing the fallback into a misleading `unknown`.
+            do_destroyed, do_failures = found[0], found[1]
+            volumes: VolumeSettlement | None = found[2] if len(found) > 2 else None
+            doubtful = volumes is not None and volumes.status == "unknown"
+            unsettled = do_failures + (volumes.failures if doubtful and volumes else [])
+            events.note("teardown.fallback", cluster=cluster, via="do", ok=not unsettled)
+            result: dict[str, Any] = {
+                # Destroyed-or-none-found are both safe. Found-and-failed-to-destroy is not, and
+                # a volume we could not verify gone is neither: `unknown`, never `succeeded`.
+                "status": "failed" if do_failures else "unknown" if doubtful else "succeeded",
                 "attempts": attempts_made,
                 "vast_fallback_used": False,
                 "vast_destroyed": [],
                 "do_fallback_used": True,
                 "do_destroyed": do_destroyed,  # report what DID die even when we alarm
                 "error": (
-                    f"sky.down: {last_err}; do-direct: {'; '.join(do_failures)}"
-                    if do_failures
+                    f"sky.down: {last_err}; do-direct: {'; '.join(unsettled)}"
+                    if unsettled
                     else last_err
                 ),
             }
+            if volumes is not None:
+                result["do_volumes"] = volumes.summary()
+            return result
         except Exception as e:  # noqa: BLE001 — an unreachable DO API is not "nothing is running"
             events.note("teardown.fallback", cluster=cluster, via="do", ok=False)
             return {
@@ -1693,11 +1945,27 @@ def tear_down_and_record(
     either way so the state is visible in ``lab status`` / ``lab dashboard`` / ``lab wait``.
     ``backoffs`` overrides the retry ladder for callers that must stay quick (e.g. a status
     poll); None keeps the default.
+
+    On DO the volume ids the supervisor remembered while the job ran (``do_volume_ids`` in
+    ``_runtime.json``, see ``lab.sky_runner.remember_do_volumes``) are handed to the teardown to be
+    verified gone by id. Read from the runtime file rather than passed in, so every caller —
+    the supervisor, ``lab cancel``, the dead-supervisor recovery in ``status``, the scheduler
+    tick — verifies the same volumes without having to know about them.
     """
+    known_volume_ids: list[Any] = []
+    if cloud == "do":
+        try:
+            known_volume_ids = list(store.read_runtime(job_id).get("do_volume_ids") or [])
+        except Exception as e:  # noqa: BLE001 — losing the memory must never cost the teardown
+            print(f"[lab] could not read remembered DO volume ids for {job_id}: {e}")
     if backoffs is None:
-        outcome = robust_teardown(sky_mod, cluster, cloud=cloud)
+        outcome = robust_teardown(
+            sky_mod, cluster, cloud=cloud, known_volume_ids=known_volume_ids
+        )
     else:
-        outcome = robust_teardown(sky_mod, cluster, cloud=cloud, backoffs=backoffs)
+        outcome = robust_teardown(
+            sky_mod, cluster, cloud=cloud, backoffs=backoffs, known_volume_ids=known_volume_ids
+        )
     succeeded: bool = outcome["status"] == "succeeded"
     unknown: bool = outcome["status"] == "unknown"
     fields: dict[str, Any] = {"teardown_status": outcome["status"]}

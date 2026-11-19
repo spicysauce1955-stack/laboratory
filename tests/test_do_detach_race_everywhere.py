@@ -50,7 +50,9 @@ class _Client:
         self.settle = settle
         self.deletes = 0
         self.droplets = types.SimpleNamespace(list=self._list_droplets, destroy=self._destroy)
-        self.volumes = types.SimpleNamespace(list=self._list_volumes, delete=self._delete)
+        self.volumes = types.SimpleNamespace(
+            list=self._list_volumes, get=self._get_volume, delete=self._delete
+        )
 
     def _list_droplets(self, per_page: int = 200) -> dict[str, Any]:
         return {"droplets": [{"id": 1, "name": VOLUME}] if self.droplet_alive else []}
@@ -59,10 +61,21 @@ class _Client:
         self.droplet_alive = False
         self.lists_since_destroy = 0
 
-    def _list_volumes(self, per_page: int = 200) -> dict[str, Any]:
+    def _tick(self) -> None:
+        """Every read of the volume is time passing for the detach (listings and gets alike —
+        verification now reads by id, and reconcile never lists mid-delete)."""
         if self.lists_since_destroy is not None:
             self.lists_since_destroy += 1
+
+    def _list_volumes(self, per_page: int = 200) -> dict[str, Any]:
+        self._tick()
         return {"volumes": [{"id": "v1", "name": VOLUME}] if self.volume_alive else []}
+
+    def _get_volume(self, volume_id: str) -> dict[str, Any]:
+        self._tick()
+        if self.volume_alive and volume_id == "v1":
+            return {"volume": {"id": "v1", "name": VOLUME}}
+        return {"id": "not_found", "message": "The resource you were accessing could not be found."}
 
     def _delete(self, volume_id: str) -> None:
         self.deletes += 1
