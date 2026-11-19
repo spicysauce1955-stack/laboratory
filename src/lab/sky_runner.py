@@ -449,6 +449,20 @@ def parse_rsync_stats(stdout: str) -> RsyncStats:
     )
 
 
+RSYNC_PULL_FLAGS: tuple[str, ...] = (
+    "-az",
+    # A rented box is not trusted. `-a` implies `--links`, so a symlink on the box arrived as a
+    # symlink here — and the R2 upload, the partial mirror and `lab export` then *follow* it. A
+    # hostile host planting `results.csv -> ~/.ssh/sky-key` would get the supervisor's private
+    # key uploaded and bundled. Links (and device/special files) are refused outright.
+    "--no-links",
+    "--no-devices",
+    "--no-specials",
+    "--stats",
+)
+"""Options for every rsync that pulls from a rented box (operands go after these)."""
+
+
 def _rsync_down(cluster: str, remote_dir: str, local_dir: Path) -> RsyncStats:
     """Pull the remote run dir down, returning what was transferred.
 
@@ -460,7 +474,7 @@ def _rsync_down(cluster: str, remote_dir: str, local_dir: Path) -> RsyncStats:
     """
     local_dir.mkdir(parents=True, exist_ok=True)
     proc = subprocess.run(
-        ["rsync", "-az", "--stats", f"{cluster}:{remote_dir}/", f"{local_dir}/"],
+        ["rsync", *RSYNC_PULL_FLAGS, f"{cluster}:{remote_dir}/", f"{local_dir}/"],
         check=True,
         timeout=RSYNC_TIMEOUT_S,
         capture_output=True,
