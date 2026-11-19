@@ -583,7 +583,10 @@ class Lab:
                             r2.upload_file(Path(blob), rel)
                             diff_ref = r2.uri(rel)
                         except Exception as e:  # noqa: BLE001 — local diff_ref stays fail-closed
-                            print(f"[lab] diff R2 upload failed, keeping local copy: {e}")
+                            print(
+                                f"[lab] diff R2 upload failed, keeping local copy: {e}",
+                                file=sys.stderr,
+                            )
                             events.note("storage.upload_failed", key=rel, error=str(e))
             code = CodeRef(
                 git_commit=current_commit(self.repo), git_dirty=dirty, diff_ref=diff_ref
@@ -882,7 +885,10 @@ class Lab:
                         try:
                             r2.upload_file(dest, rel)
                         except Exception as e:  # noqa: BLE001 — local aggregate stays authoritative
-                            print(f"[lab] aggregate R2 mirror failed, keeping local copy: {e}")
+                            print(
+                                f"[lab] aggregate R2 mirror failed, keeping local copy: {e}",
+                                file=sys.stderr,
+                            )
                             events.note("storage.upload_failed", key=rel, error=str(e))
         self.store.write_sweep_plan(plan)
         return plan
@@ -1073,7 +1079,7 @@ class Lab:
             except ImportError as e:
                 # R2 env configured but the `r2` extra isn't installed — the fallback is
                 # best-effort recovery, never a reason to fail a local operation.
-                print(f"[lab] R2 fallback unavailable ({e}); using local state only")
+                print(f"[lab] R2 fallback unavailable ({e}); using local state only", file=sys.stderr)
         return self.backend.collect_artifacts(job_id, dest or str(self.store.job_dir(job_id)))
 
     def manifest(self, job_id: str) -> JobManifest:
@@ -1322,7 +1328,10 @@ class Lab:
             try:
                 self.fetch_artifacts(jid)  # R2 fallback for outputs that only live durably
             except Exception as e:  # noqa: BLE001 — export what exists locally
-                print(f"[lab] export: fetch_artifacts({jid}) failed, exporting local state: {e}")
+                print(
+                    f"[lab] export: fetch_artifacts({jid}) failed, exporting local state: {e}",
+                    file=sys.stderr,
+                )
             jdir = dest / jid
             jdir.mkdir(parents=True, exist_ok=True)
             (jdir / "manifest.json").write_text(self.store.manifest_path(jid).read_text())
