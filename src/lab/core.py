@@ -391,6 +391,51 @@ def _mirror_sweep_aggregate(path: Path, key: str) -> None:
         events.note("storage.upload_failed", key=key, error=str(e))
 
 
+# Bump when a cell's aggregate outputs would change for the same inputs (a merge or format
+# change), so fingerprints recorded by an older lab stop matching and the cell is re-merged.
+_AGGREGATE_FORMAT = 1
+
+
+# (job_id, terminal state, results file, hits file) of one shard an aggregate includes.
+_IncludedShard = tuple[str, str, Path | None, Path | None]
+
+
+def _cell_fingerprint(cell: SweepCell, included: list[_IncludedShard]) -> str:
+    """What a cell's aggregate is a function of: the shards it includes (id, terminal state, and
+    each input file's size + mtime), plus every plan field that shapes the output.
+
+    Re-merging one cell of 866k hits cost 7.8 s and 1.4 GB on *every* ``sweep-aggregate`` — and
+    ``sweep-retry`` runs two (stress run 2026-11-19) — while a finished sweep's inputs never
+    change. A stat is cheap and a terminal shard's files only change if something rewrites them,
+    which changes their size or mtime. A file that cannot be stat'ed counts as absent.
+    """
+
+    def stat(p: Path | None) -> list[int] | None:
+        if p is None:
+            return None
+        try:
+            st = p.stat()
+        except OSError:
+            return None
+        return [st.st_size, st.st_mtime_ns]
+
+    payload = [
+        _AGGREGATE_FORMAT, cell.aggregate_ref, cell.results_file, cell.seed_column, cell.row_key,
+        [[jid, state, stat(rf), stat(hf)] for jid, state, rf, hf in included],
+    ]
+    return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
+
+
+def _cell_outputs_intact(cell: SweepCell, hits_dest: Path) -> bool:
+    """Do the cell files still match what the plan says the last aggregate wrote? A deleted
+    output (or a hits file reappearing where none should be) forces a re-merge."""
+    if cell.seeds_present and not Path(cell.aggregate_ref).exists():
+        return False
+    if cell.hits_ref is not None:
+        return Path(cell.hits_ref).exists()
+    return not hits_dest.exists()
+
+
 def _submit_stagger_s() -> float:
     """Delay between remote sweep submits (``LAB_SUBMIT_STAGGER_S``, default 1.5s; 0 disables).
 
@@ -1148,8 +1193,7 @@ class Lab:
                 # Aggregate-time declaration for plans that predate --row-key (persisted below
                 # via write_sweep_plan, so later aggregates/retries inherit it).
                 cell.row_key = _parse_row_key(row_key, cell.seed_column)
-            shard_texts: list[tuple[str, str]] = []
-            shard_hits: list[tuple[str, str]] = []
+            included: list[_IncludedShard] = []
             for jid in cell.shard_job_ids:
                 m = self._fresh_manifest(jid)  # a dead supervisor must not pin a shard `running`
                 if m.status not in _TERMINAL_STATES:
@@ -1160,18 +1204,25 @@ class Lab:
                     continue  # ran different config than requested — never aggregate its rows
                 self.fetch_artifacts(jid)  # ensure the local copy exists (R2 fallback inside)
                 out = self.store.output_dir(jid)
-                rf = out / cell.results_file
-                if rf.exists():
-                    shard_texts.append((rf.read_text(), m.status.value))
-                hf = out / HITS_FILE
-                if hf.exists():
-                    shard_hits.append((hf.read_text(), m.status.value))
+                rf, hf = out / cell.results_file, out / HITS_FILE
+                included.append(
+                    (jid, m.status.value, rf if rf.exists() else None, hf if hf.exists() else None)
+                )
+            hits_dest = Path(cell.aggregate_ref).with_name(HITS_FILE)
+            # Taken before anything is read: a file that changes after this is re-read next time.
+            fingerprint = _cell_fingerprint(cell, included)
+            if fingerprint == cell.inputs_fingerprint and _cell_outputs_intact(cell, hits_dest):
+                continue  # same inputs as the last aggregate: its outputs and counts still stand
+            shard_texts = [(rf.read_text(), st) for _, st, rf, _ in included if rf is not None]
+            hit_files = [(hf, st) for _, st, _, hf in included if hf is not None]
             merged, present, partial = merge_seed_rows(
                 shard_texts, cell.seed_column, row_key=cell.row_key
             )
             # Both merges run before anything is written: a fatal line in either leaves this
-            # cell's files exactly as they were.
-            merged_hits, n_hits = merge_hits(shard_hits, row_key=cell.row_key)
+            # cell's files exactly as they were. Hits files are read one at a time, as merged.
+            merged_hits, n_hits = merge_hits(
+                ((hf.read_text(), st) for hf, st in hit_files), row_key=cell.row_key
+            )
             cell.seeds_present = present
             cell.seeds_partial = partial
             present_set = set(present)
@@ -1180,14 +1231,11 @@ class Lab:
             csv_key = f"{sweep_id}/cells/{cell.cell_id}/{cell.results_file}"
             if merged:
                 dest = Path(cell.aggregate_ref)
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_text(merged)
+                atomic_write_text(dest, merged)  # an export reading it never sees it torn
                 _mirror_sweep_aggregate(dest, csv_key)
-            hits_dest = Path(cell.aggregate_ref).with_name(HITS_FILE)
-            if shard_hits:
+            if hit_files:
                 # Written even when empty: an empty file is "searched, nothing passed".
-                hits_dest.parent.mkdir(parents=True, exist_ok=True)
-                hits_dest.write_text(merged_hits)
+                atomic_write_text(hits_dest, merged_hits)
                 cell.hits_ref, cell.hits = str(hits_dest), n_hits
                 _mirror_sweep_aggregate(
                     hits_dest, posixpath.join(posixpath.dirname(csv_key), HITS_FILE)
@@ -1195,6 +1243,7 @@ class Lab:
             else:
                 hits_dest.unlink(missing_ok=True)
                 cell.hits_ref, cell.hits = None, None
+            cell.inputs_fingerprint = fingerprint
         self.store.write_sweep_plan(plan)
         return plan
 

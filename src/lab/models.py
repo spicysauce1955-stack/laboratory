@@ -250,6 +250,9 @@ class SweepCell(BaseModel):
     # "searched and nothing passed". Optional so plans written before them still read.
     hits_ref: str | None = None
     hits: int | None = None
+    # What the last aggregate of this cell was computed from (see `Lab.aggregate_sweep`): when
+    # it still matches, the cell is neither re-merged nor re-written. None = never fingerprinted.
+    inputs_fingerprint: str | None = None
 
 
 class SweepPlan(BaseModel):

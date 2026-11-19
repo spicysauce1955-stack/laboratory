@@ -22,9 +22,16 @@ from __future__ import annotations
 import csv
 import io
 import json
+from collections.abc import Iterable
 from typing import Any
 
 STATUS_COLUMN = "_shard_status"
+# Compact separators for every JSON line this module writes: the default ", "/": " added ~15%
+# to a cell hits.jsonl for nothing (91.5 MB written from 65 MB of input, stress run 2026-11-19).
+# Encoders are built once: `json.dumps` with any non-default argument builds a new one per call.
+_COMPACT = (",", ":")
+_LINE = json.JSONEncoder(separators=_COMPACT)
+_CANONICAL = json.JSONEncoder(sort_keys=True, separators=_COMPACT)
 
 
 def merge_seed_rows(
@@ -132,22 +139,22 @@ def merge_seed_rows(
     return out.getvalue(), sorted(present_set), sorted(partial_set)
 
 
-def _hit_identity(
-    hit: dict[str, Any], key_cols: list[str] | None, status_column: str
-) -> tuple[str, ...]:
-    """What makes two hits from different shards the same one (see :func:`merge_hits`).
+def _hit_identity(hit: dict[str, Any], key_cols: list[str] | None) -> str:
+    """What makes two hits from different shards the same one (see :func:`merge_hits`); ``hit``
+    is the object *without* its status column.
 
-    Tagged so a row-key identity can never equal a whole-object one. Values are compared as
-    canonical JSON, which makes any JSON value hashable and ignores an object's key order.
+    One string per hit (a tuple per hit cost another object on every one of them): tagged ``k``
+    for a row-key identity and ``h`` for a whole-object one, so the two can never be equal.
+    Values are compared as canonical JSON, which makes any JSON value hashable and ignores an
+    object's key order; ``json`` never emits a raw NUL, so it can separate key values.
     """
     if key_cols is not None and all(c in hit for c in key_cols):
-        return ("key", *(json.dumps(hit[c], sort_keys=True) for c in key_cols))
-    body = {k: v for k, v in hit.items() if k != status_column}
-    return ("hit", json.dumps(body, sort_keys=True))
+        return "k" + "\0".join(_CANONICAL.encode(hit[c]) for c in key_cols)
+    return "h" + _CANONICAL.encode(hit)
 
 
 def merge_hits(
-    shard_hits: list[tuple[str, str]],
+    shard_hits: Iterable[tuple[str, str]],
     *,
     row_key: list[str] | None = None,
     status_column: str = STATUS_COLUMN,
@@ -155,9 +162,10 @@ def merge_hits(
     """Concatenate shard ``hits.jsonl`` texts into one cell-level JSONL, every hit stamped.
 
     ``shard_hits`` is ``[(jsonl_text, shard_status), ...]`` in submission order, as for
-    :func:`merge_seed_rows`. Returns ``(merged_text, hit_count)``; ``("", 0)`` when no shard
-    holds a hit. Each hit is written back as it was read, with ``status_column`` set (last) to
-    the state of the shard it came from — overwriting any value the object already carried.
+    :func:`merge_seed_rows` — any iterable, so a caller can read each shard's file only as it is
+    consumed. Returns ``(merged_text, hit_count)``; ``("", 0)`` when no shard holds a hit. Each
+    hit is written back with the keys it was read with, as compact JSON, with ``status_column``
+    set (last) to the state of the shard it came from — overwriting any value it already carried.
 
     **Identity.** With ``row_key``, a hit belongs to the key formed by its values for those
     fields; without, its identity is the whole object minus ``status_column`` (key order
@@ -177,13 +185,22 @@ def merge_hits(
     A line that is not a JSON object is skipped for a non-succeeded shard (rsync can copy the
     file mid-append and tear its tail) and raises ``ValueError`` for a succeeded one, whose file
     should be whole. Output order is deterministic: owning shard's submission order, then line.
+
+    Memory: each hit is serialized (stamped, compact) as soon as it is parsed and only that line
+    and its identity are kept — never the parsed object, which for 866k hits was most of a
+    1.4 GB peak (stress run 2026-11-19).
     """
     key_cols = list(row_key) if row_key is not None else None
-    # identity -> (precedence, order, status, [(line_no, hit), ...]); precedence 1 = succeeded
-    owners: dict[tuple[str, ...], tuple[int, int, str, list[tuple[int, dict[str, Any]]]]] = {}
+    # Per shard, in submission order: its rank and two parallel lists, each hit's identity and
+    # its output line (parallel lists rather than a tuple per hit: one object fewer per hit).
+    shards: list[tuple[tuple[int, int], list[str], list[str]]] = []
+    # identity -> rank of the shard that owns it; rank = (precedence, order), 1 = succeeded
+    owners: dict[str, tuple[int, int]] = {}
     for order, (text, status) in enumerate(shard_hits):
         strict = status == "succeeded"
-        groups: dict[tuple[str, ...], list[tuple[int, dict[str, Any]]]] = {}
+        rank = (1 if strict else 0, order)
+        idents: list[str] = []
+        lines: list[str] = []
         for line_no, line in enumerate(text.split("\n"), start=1):
             if not line.strip():
                 continue
@@ -198,23 +215,19 @@ def merge_hits(
                         f"{line[:80]!r}"
                     )
                 continue  # torn/garbled line of a partial shard — skip, keep the rest
-            ident = _hit_identity(hit, key_cols, status_column)
-            groups.setdefault(ident, []).append((line_no, hit))
-        for ident, hits in groups.items():
-            candidate = (1 if strict else 0, order, status, hits)
+            hit.pop(status_column, None)  # never part of a hit's identity, and restamped below
+            idents.append(_hit_identity(hit, key_cols))
+            hit[status_column] = status
+            lines.append(_LINE.encode(hit))
+        for ident in idents:
             incumbent = owners.get(ident)
-            if incumbent is None or candidate[:2] >= incumbent[:2]:
-                owners[ident] = candidate
-    kept = sorted(
-        (
-            (order, line_no, status, hit)
-            for _precedence, order, status, hits in owners.values()
-            for line_no, hit in hits
-        ),
-        key=lambda t: (t[0], t[1]),  # unique per hit: one hit per (shard, line)
-    )
-    lines = [
-        json.dumps({**{k: v for k, v in hit.items() if k != status_column}, status_column: status})
-        for _order, _line_no, status, hit in kept
+            if incumbent is None or rank >= incumbent:
+                owners[ident] = rank
+        shards.append((rank, idents, lines))
+    out = [
+        line
+        for rank, idents, lines in shards
+        for ident, line in zip(idents, lines)
+        if owners[ident] == rank
     ]
-    return "".join(line + "\n" for line in lines), len(lines)
+    return ("\n".join(out) + "\n" if out else ""), len(out)
