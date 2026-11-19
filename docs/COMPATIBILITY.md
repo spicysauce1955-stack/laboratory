@@ -210,7 +210,11 @@ upgrade note.
   `--max-file-mb` cap as any table. A sweep plan's cells (and the `sweep-aggregate` /
   `sweep-retry` cell view) gained `hits_ref` and `hits`, the cell's concatenated `lab.search`
   `hits.jsonl` and its count; both are `null` on a plan written before them or when no shard
-  searched. `logs.txt` gained a leading UTC timestamp per line in v0.7.0
+  searched. v0.13.0 adds, all optional: a manifest's `teardown_detail` (how the teardown was
+  verified: attempts, destroyed ids, DigitalOcean volumes known / verified gone / refused /
+  unverified), `RunSpec.config_overrides` (the keys the config audit judges), a cell's
+  `inputs_fingerprint`, and `lab reconcile`'s `pass_errors`, `unreadable_manifests` and
+  `other_projects[].runs_dir`. `logs.txt` gained a leading UTC timestamp per line in v0.7.0
   (`LAB_LOG_TIMESTAMPS=0` restores the old format); its *content* has never been frozen, but
   anything parsing it should expect the prefix. A newer lab always reads
   manifests written by an older one; new fields are optional. Every manifest records
