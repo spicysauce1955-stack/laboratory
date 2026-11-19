@@ -8,6 +8,8 @@ from lab.core import Lab
 from lab.manifest import repo_root
 from lab.models import JobState
 
+from helpers import pin_in_flight, wait_terminal
+
 
 def _lab(tmp_path: Path) -> Lab:
     repo = repo_root(Path.cwd())
@@ -122,7 +124,8 @@ def test_aggregate_excludes_running_shard(tmp_path: Path):
     out = lab.store.output_dir(cell.shard_job_ids[1])
     out.mkdir(parents=True, exist_ok=True)
     (out / "results.csv").write_text("seed,acc\n1,0.1\n")
-    lab.store.update_manifest(cell.shard_job_ids[1], status=JobState.running)
+    wait_terminal(lab.backend, cell.shard_job_ids[1])
+    pin_in_flight(lab.store, cell.shard_job_ids[1])
 
     c = lab.aggregate_sweep(sweep_id).cells[0]
     assert c.seeds_present == [0] and c.missing_seeds == [1]

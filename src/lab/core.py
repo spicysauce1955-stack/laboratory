@@ -855,7 +855,7 @@ class Lab:
                 cell.row_key = _parse_row_key(row_key, cell.seed_column)
             shard_texts: list[tuple[str, str]] = []
             for jid in cell.shard_job_ids:
-                m = self.manifest(jid)
+                m = self._fresh_manifest(jid)  # a dead supervisor must not pin a shard `running`
                 if m.status not in _TERMINAL_STATES:
                     continue  # still moving under the heartbeat rsync — never read mid-flight
                 if not include_partial and m.status is not JobState.succeeded:
@@ -912,7 +912,7 @@ class Lab:
             # exact strings): a full-shard in-flight retry "2,3" must suppress a narrowed "3".
             in_flight_seed_sets: list[set[int]] = []
             for jid in cell.shard_job_ids:
-                m = self.manifest(jid)
+                m = self._fresh_manifest(jid)  # a dead supervisor is not an in-flight retry
                 if m.status not in _TERMINAL_STATES:
                     sub = m.run.resolved_config.get(plan.seed_axis_key)
                     if sub is not None:
@@ -1114,6 +1114,35 @@ class Lab:
 
     def manifest(self, job_id: str) -> JobManifest:
         return self.store.read_manifest(job_id)
+
+    def _fresh_manifest(self, job_id: str) -> JobManifest:
+        """A local job's manifest, refreshed through *its own* backend while it is non-terminal.
+
+        A raw read leaves a shard whose supervisor died frozen at ``running`` forever: the sweep
+        readers then never aggregate it, and ``sweep-retry`` treats it as in flight and never
+        resubmits it. ``backend.status`` is what notices the dead runner and writes the terminal
+        manifest (and, on skypilot, attempts the teardown that never ran) — the same refresh
+        :meth:`_resolve_manifest` does for ``wait``. Routed through :meth:`_backend_for` because
+        ``sweep-aggregate``/``sweep-retry`` build a local-backend Lab whatever ran the shards.
+
+        Terminal manifests are returned as read (nothing left to notice). A refresh that cannot
+        run — e.g. the skypilot extra is not installed here — falls back to the recorded state
+        with a stderr line: a stale ``running`` is the old behaviour, never a crash.
+        """
+        m = self.manifest(job_id)
+        if m.status in _TERMINAL_STATES:
+            return m
+        try:
+            self._backend_for(m.backend.provisioner).status(job_id)
+        except Exception as e:  # noqa: BLE001 — a refresh is best-effort; the read still answers
+            print(
+                f"[lab] could not refresh {job_id} through its {m.backend.provisioner} backend "
+                f"({type(e).__name__}: {e}); using its recorded state",
+                file=sys.stderr,
+            )
+            events.note("core.refresh_failed", job_id=job_id, error=str(e))
+            return m
+        return self.manifest(job_id)
 
     def _queue(self) -> QueueStore:
         """The scheduler's queue store, built once per :class:`Lab` and then reused.
@@ -1447,7 +1476,11 @@ class Lab:
 
     def sweep_summary(self, sweep_id: str) -> dict[str, Any]:
         """Aggregate a sweep's outcomes for trustworthy reporting (preemptions, fallback, spend)."""
-        ms = [m for m in self.list_jobs() if m.sweep_id == sweep_id]
+        ms = [
+            m if m.status in _TERMINAL_STATES else self._fresh_manifest(m.job_id)
+            for m in self.list_jobs()
+            if m.sweep_id == sweep_id
+        ]
 
         def spend(m: JobManifest) -> float:
             return m.cost.actual_usd if m.cost and m.cost.actual_usd else 0.0
