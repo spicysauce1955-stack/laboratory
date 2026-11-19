@@ -436,6 +436,24 @@ def _cell_outputs_intact(cell: SweepCell, hits_dest: Path) -> bool:
     return not hits_dest.exists()
 
 
+def _bundle_relative_plan(plan: SweepPlan) -> SweepPlan:
+    """A copy of ``plan`` whose cell outputs point where ``Lab.export`` puts them in the bundle
+    (``cells/<cell_id>/<file>``, relative to the bundle root, where plan.json sits)."""
+    cells = [
+        cell.model_copy(
+            update={
+                "aggregate_ref": f"cells/{cell.cell_id}/{Path(cell.aggregate_ref).name}",
+                "hits_ref": (
+                    None if cell.hits_ref is None
+                    else f"cells/{cell.cell_id}/{Path(cell.hits_ref).name}"
+                ),
+            }
+        )
+        for cell in plan.cells
+    ]
+    return plan.model_copy(update={"cells": cells})
+
+
 def _submit_stagger_s() -> float:
     """Delay between remote sweep submits (``LAB_SUBMIT_STAGGER_S``, default 1.5s; 0 disables).
 
@@ -1922,7 +1940,12 @@ class Lab:
                     "state": m.status.value,
                     "git_commit": m.code.git_commit,
                     "git_dirty": m.code.git_dirty,
-                    "diff_ref": m.code.diff_ref,
+                    # Bundle-relative when it is this job's own local diff (exported beside it).
+                    "diff_ref": (
+                        f"{jid}/{rel_diff}"
+                        if (rel_diff := self._job_relative(jid, m.code.diff_ref)) is not None
+                        else m.code.diff_ref
+                    ),
                     "seed": m.run.seed,
                     "sweep_id": m.sweep_id,
                     "cell_id": m.cell_id,
@@ -1936,19 +1959,38 @@ class Lab:
         sweep_block: dict[str, Any] | None = None
         if kind == "sweep" and self.store.has_sweep_plan(target_id):
             plan = self.sweep_plan(target_id)
-            (dest / "plan.json").write_text(self.store.sweep_plan_path(target_id).read_text())
+            cell_skipped: list[dict[str, str]] = []
             for cell in plan.cells:
                 # The result aggregate, plus the search-hits aggregate when the plan records one
-                # (keyed on the plan, not on the file, so a stale file is never bundled).
+                # (keyed on the plan, not on the file, so a stale file is never bundled). Under
+                # the same per-file cap as job outputs: a 91.5 MB cell hits.jsonl used to go in
+                # whole, into a 150 MB bundle meant to be committed (stress run 2026-11-19).
                 aggs = [Path(cell.aggregate_ref)]
                 if cell.hits_ref is not None:
                     aggs.append(Path(cell.hits_ref))
                 for agg in aggs:
-                    if agg.exists():
-                        target = dest / "cells" / cell.cell_id / agg.name
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        target.write_bytes(agg.read_bytes())
-            sweep_block = {"sweep_id": target_id, "plan_exported": True, **plan.view()}
+                    if not agg.exists():
+                        continue
+                    rel = f"cells/{cell.cell_id}/{agg.name}"
+                    target = dest / rel
+                    size = agg.stat().st_size
+                    if size > max_bytes:
+                        cell_skipped.append(
+                            {"file": rel, "reason": f"size {size}B > {max_file_mb}MB cap"}
+                        )
+                        target.unlink(missing_ok=True)  # never leave a stale copy behind
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(agg.read_bytes())
+            # The exported plan points into the bundle, not at this machine's runs/ dir: an
+            # absolute path leaks the home directory and resolves nowhere else. The stored plan
+            # is untouched.
+            portable = _bundle_relative_plan(plan)
+            (dest / "plan.json").write_text(portable.model_dump_json(indent=2))
+            sweep_block = {
+                "sweep_id": target_id, "plan_exported": True, **portable.view(),
+                "skipped": cell_skipped,
+            }
 
         index: dict[str, Any] = {
             "exported_at": now().isoformat(),
@@ -1961,16 +2003,37 @@ class Lab:
         return index
 
     def _exportable_manifest_json(self, job_id: str) -> str:
-        """The stored manifest as ``export`` writes it: verbatim, except an inline secret in
-        ``entrypoint_command`` is masked (see :func:`_mask_command_secrets`). The stored manifest
-        is never touched — it stays the reproducibility record."""
+        """The stored manifest as ``export`` writes it: verbatim, except that an inline secret in
+        ``entrypoint_command`` is masked (see :func:`_mask_command_secrets`) and local paths are
+        made relative to the job's own bundle dir — ``artifacts[].path`` becomes
+        ``output/<name>`` and a local ``code.diff_ref`` its path beside the manifest — since an
+        absolute path leaks the home directory and resolves on no other machine. The stored
+        manifest is never touched — it stays the reproducibility record."""
         raw = self.store.manifest_path(job_id).read_text()
         m = self.manifest(job_id)
+        update: dict[str, Any] = {}
         masked = _mask_command_secrets(m.run.entrypoint_command)
-        if masked == m.run.entrypoint_command:
-            return raw  # nothing secret-shaped: byte-identical copy, as before
-        run = m.run.model_copy(update={"entrypoint_command": masked})
-        return m.model_copy(update={"run": run}).model_dump_json(indent=2)
+        if masked != m.run.entrypoint_command:
+            update["run"] = m.run.model_copy(update={"entrypoint_command": masked})
+        artifacts = [a.model_copy(update={"path": f"output/{a.name}"}) for a in m.artifacts]
+        if artifacts != m.artifacts:
+            update["artifacts"] = artifacts
+        rel_diff = self._job_relative(job_id, m.code.diff_ref)
+        if rel_diff is not None:
+            update["code"] = m.code.model_copy(update={"diff_ref": rel_diff})
+        if not update:
+            return raw  # nothing to mask or relativize: byte-identical copy, as before
+        return m.model_copy(update=update).model_dump_json(indent=2)
+
+    def _job_relative(self, job_id: str, path: str | None) -> str | None:
+        """``path`` relative to the job's run dir when it is an absolute path inside it (where
+        export mirrors the job's files), else ``None`` — a URI or bundle key is left alone."""
+        if not path or not Path(path).is_absolute():
+            return None
+        try:
+            return Path(path).relative_to(self.store.job_dir(job_id)).as_posix()
+        except ValueError:
+            return None
 
     def sweep_summary(self, sweep_id: str) -> dict[str, Any]:
         """Aggregate a sweep's outcomes for trustworthy reporting (preemptions, fallback, spend)."""
