@@ -295,6 +295,9 @@ def scaffold(root: Path, *, check: bool = False) -> dict[str, Any]:
         "refreshed": [],
         "merged": [],
         "conflicts": [],
+        # The `<dest>.new` copies written beside conflicting files (would be, under `check`).
+        # Not every conflict gets one: a user-edited `.mcp.json` lab entry is left alone.
+        "new_copies": [],
         "unchanged": [],
         # Which version this project was scaffolded for, and which it is moving to. A refreshed
         # file nobody re-reads is not delivery: `--row-key` shipped 2026-08-06 and the consuming
@@ -332,6 +335,7 @@ def scaffold(root: Path, *, check: bool = False) -> dict[str, Any]:
             else:
                 # Edited by the user (or predates the state file): never clobber.
                 report["conflicts"].append(entry.dest)
+                report["new_copies"].append(entry.dest + ".new")
                 writes.append((target.with_name(target.name + ".new"), payload))
                 if entry.dest in recorded:
                     new_hashes[entry.dest] = recorded[entry.dest]
@@ -401,7 +405,11 @@ def scaffold(root: Path, *, check: bool = False) -> dict[str, Any]:
     )
 
     if check:
-        report["ok"] = not (report["created"] or report["refreshed"] or report["merged"])
+        # A conflict is drift too — a user-edited file `lab init` will not resolve on its own —
+        # and surfacing drift is what a CI `--check` is for.
+        report["ok"] = not (
+            report["created"] or report["refreshed"] or report["merged"] or report["conflicts"]
+        )
         return report
 
     for path, data in writes:
