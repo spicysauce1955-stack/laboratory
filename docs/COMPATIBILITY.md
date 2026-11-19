@@ -121,6 +121,16 @@ upgrade note.
   MCP tool always returned, instead of Python's `str()` form with a space; both parse with
   `datetime.fromisoformat`.
 
+  The same change now covers **every** timestamp the CLI prints as JSON (`lab list`'s
+  `created_at`, `lab status`'s `started_at`/`ended_at`, `--done-file` snapshots, …): ISO-8601
+  with a `T`, identical to the MCP tools. And CLI JSON is now **strict**: a non-finite float (a
+  diverged loss logged as `NaN`/`Infinity`) prints as `null`, as the MCP tools always returned it,
+  instead of the bare `NaN`/`Infinity` tokens a strict parser (`jq`, `JSON.parse`) rejects along
+  with the whole payload. Neither is a frozen surface — the CLI's frozen part is its names, flags
+  and exit codes — and a caller using `datetime.fromisoformat` / Python's `json` is unaffected.
+  `lab logs` still prints the log tail as plain text (the MCP tool wraps the same lines in
+  `{"lines": […]}`); that has always been the command's documented behaviour.
+
   `no_heartbeat` means the queue holds **no heartbeat object at all** — no tick has ever completed
   against it — and is deliberately **silent**: with nothing published there is no host to call
   old, and the absence is already reported as `heartbeat_age_s: null`. It replaces the `unknown` a

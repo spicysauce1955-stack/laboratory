@@ -6,8 +6,9 @@ Wired to the local backend by default; structured JSON output mirrors the MCP §
 from __future__ import annotations
 
 import atexit
-import json
 import errno
+import json
+import math
 import os
 import shutil
 import sys
@@ -15,7 +16,7 @@ import tempfile
 import traceback
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -331,11 +332,46 @@ def _lab_for_mirrored_or_fail(job_id: str) -> Lab:
         _fail(2, msg)
 
 
+def _json_default(o: Any) -> Any:
+    """``json.dumps`` hook for what it cannot encode: dates as ISO-8601 (``T`` separator, the
+    form the MCP tools return), anything else as ``str`` — which is what this used to do for
+    datetimes too, printing ``2026-11-19 10:24:56+00:00`` on the CLI and ``…T10:24:56…`` over
+    MCP for the same field."""
+    if isinstance(o, date):  # datetime is a date subclass
+        return o.isoformat()
+    return str(o)
+
+
+def _finite(obj: Any) -> Any:
+    """``obj`` with every non-finite float (NaN, ±Infinity) replaced by ``None``, recursively.
+
+    Python's ``json`` writes those as bare ``NaN``/``Infinity`` tokens, which are not JSON: a
+    strict parser (``jq``, ``JSON.parse``) rejects the whole payload, so one diverged loss made
+    ``lab metrics`` unreadable. ``null`` is what the MCP tools return for the same value.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_finite(v) for v in obj]
+    return obj
+
+
+def _dumps(obj: Any) -> str:
+    """Strict JSON for anything the CLI prints or writes for a caller to parse."""
+    try:
+        return json.dumps(obj, indent=2, default=_json_default, allow_nan=False)
+    except ValueError:  # a non-finite float somewhere: the rare case pays for the walk
+        return json.dumps(_finite(obj), indent=2, default=_json_default, allow_nan=False)
+
+
 def _emit(obj: Any) -> None:
     """Print a command's JSON payload, and annotate the open ledger call with its ids/digest.
 
     Nearly every command funnels its result through here, which makes it the one place to learn
-    what a call produced without touching each command.
+    what a call produced without touching each command. Output is strict JSON (``null`` for a
+    non-finite float) with ISO-8601 timestamps — see :func:`_dumps`.
     """
     call = events.current()
     if call is not None:
@@ -344,7 +380,7 @@ def _emit(obj: Any) -> None:
             call.result(**digest_of(obj))
         except Exception as e:  # noqa: BLE001 — annotating the ledger must never fail a command
             events_store.debug(f"annotate failed: {e}")
-    typer.echo(json.dumps(obj, indent=2, default=str))
+    typer.echo(_dumps(obj))
 
 
 def _fail(code: int, cause: BaseException | str | None = None) -> NoReturn:
@@ -1196,7 +1232,7 @@ def wait(
         _fail(2, msg)
     the_lab = _lab_for_wait(ids[0])
     on_update = (
-        (lambda s: atomic_write_text(done_file, json.dumps(s, indent=2, default=str)))
+        (lambda s: atomic_write_text(done_file, _dumps(s)))
         if done_file is not None
         else None
     )
