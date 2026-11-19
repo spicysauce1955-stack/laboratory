@@ -183,7 +183,8 @@ def test_mcp_metrics_logs_fetch_read_mirrored_manifest(tmp_path: Path, monkeypat
     mt, lg, ft = asyncio.run(go())
     # No local supervision ever happened for this job, so there is nothing real to report --
     # the point is that these calls succeed instead of raising ToolError("not found").
-    assert mt == {"series": {}}
+    # (`max_points`/`truncated` are the bounded-metrics fields every metrics payload carries.)
+    assert mt == {"series": {}, "max_points": 200, "truncated": {}}
     assert isinstance(lg["lines"], list)
     assert ft == {"local_paths": [], "artifacts": []}
 
