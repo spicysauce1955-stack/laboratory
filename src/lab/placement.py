@@ -829,11 +829,17 @@ def candidates(
     try:
         cat = _catalog()
         accel = _split_accelerators(res.accelerators)
+        regions = None
         if accel is not None:
-            regions = cat.get_region_zones_for_accelerators(
-                accel[0], accel[1], use_spot=use_spot, clouds=cloud
-            )
-        else:
+            try:
+                regions = cat.get_region_zones_for_accelerators(
+                    accel[0], accel[1], use_spot=use_spot, clouds=cloud
+                )
+            except AttributeError:
+                # SkyPilot's vast_catalog does not implement the accelerator lookup at all; the
+                # instance type is already resolved for this accelerator, so ask by that instead.
+                regions = None
+        if regions is None:
             regions = cat.get_region_zones_for_instance_type(
                 instance_type, use_spot=use_spot, clouds=cloud
             )

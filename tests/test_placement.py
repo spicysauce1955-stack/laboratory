@@ -341,3 +341,26 @@ def test_validate_placement_is_a_noop_without_pins(catalog):
 @pytest.mark.parametrize("memory,expected", [("32GB", "32"), ("32", "32"), ("8+", "8+"), (None, None)])
 def test_catalog_memory_normalisation(memory, expected):
     assert P._catalog_memory(ResourceRequest(memory=memory)) == expected
+
+
+def test_a_catalog_without_the_accelerator_lookup_falls_back_to_the_instance_type(monkeypatch):
+    """SkyPilot's vast_catalog has no get_region_zones_for_accelerators (it raises AttributeError,
+    'Module "vast_catalog" does not implement ...'), so every Vast GPU job got no candidates: no
+    price band from estimate() and no capacity-memo narrowing, with only a stderr line to show
+    for it (seen on a real RTX4090 smoke launch, 2026-11-19). The instance type is already
+    resolved, and the instance-type lookup is implemented for Vast — use it."""
+    cat = fake_catalog()
+
+    def _not_implemented(*a, **kw):
+        raise AttributeError(
+            'Module "vast_catalog" does not implement the "get_region_zones_for_accelerators" '
+            "method"
+        )
+
+    cat.get_region_zones_for_accelerators = _not_implemented
+    monkeypatch.setattr(P, "_catalog", lambda: cat)
+    res = ResourceRequest(cloud="vast", accelerators="RTX4090:1")
+
+    got = P.candidates(res, instance_type="1x-RTX_4090-32-65536")
+
+    assert [c.region for c in got] and len(got) == len(_ZONES)
