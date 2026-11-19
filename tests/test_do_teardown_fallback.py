@@ -41,6 +41,9 @@ class _Droplets:
 
 
 class _Volumes:
+    """pydo's shape: ``get`` of a missing volume returns DO's 404 body rather than raising, and a
+    delete DO accepts really removes the volume (teardown now reads each one back by id)."""
+
     def __init__(self, volumes, delete_error=None):
         self._volumes = volumes
         self.deleted: list[str] = []
@@ -49,10 +52,17 @@ class _Volumes:
     def list(self, **kw):
         return {"volumes": self._volumes}
 
+    def get(self, volume_id, **kw):
+        for v in self._volumes:
+            if str(v["id"]) == str(volume_id):
+                return {"volume": v}
+        return {"id": "not_found", "message": "The resource you were accessing could not be found."}
+
     def delete(self, volume_id, **kw):
         if self._delete_error is not None:
             raise self._delete_error
         self.deleted.append(volume_id)
+        self._volumes = [v for v in self._volumes if str(v["id"]) != str(volume_id)]
 
 
 class _Client:

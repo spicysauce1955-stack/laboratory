@@ -182,6 +182,11 @@ class JobManifest(BaseModel):
     # provider. None = no teardown was ever recorded. Treat an unrecognised value as
     # "unknown", never as "succeeded".
     teardown_status: str | None = None
+    # The evidence behind `teardown_status`, written on every teardown, success included: how it
+    # was done (`via`, `attempts`), what died, and on DO which volumes were verified gone by id.
+    # Job E (2026-11-19) recorded a false "succeeded" and nothing on record could say why.
+    # Compact and additive; None on manifests from before it existed.
+    teardown_detail: dict[str, Any] | None = None
     metrics_uri: str | None = None
     logs_uri: str | None = None
     artifacts_uri: str | None = None  # durable object-store prefix, e.g. r2://lab-artifacts/<id>

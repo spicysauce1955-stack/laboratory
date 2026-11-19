@@ -35,6 +35,7 @@ from lab.backends.skypilot import (
     ProvisionTimeout,
     boot_allowance_s,
     build_task,
+    cluster_do_volume_ids,
     cluster_name_for,
     confirm_success,
     map_job_status,
@@ -44,6 +45,7 @@ from lab.backends.skypilot import (
     wasteful_provision_timeout_warning,
     provision_with_watchdog,
     tear_down_and_record,
+    teardown_found_resources,
     vast_balance,
     vast_hourly_for_cluster,
 )
@@ -750,6 +752,42 @@ class PartialsFetcher:
             f"({st['attempts']} attempt(s) over {elapsed / 60:.0f} min) — {consequence}"
         )
         events.note("partials.empty", phase=phase, attempts=st["attempts"])
+
+
+# One DO volume listing while the job runs. Short: it sits on the supervisor's own thread (at UP,
+# then on heartbeats until it has seen the volume), and a slow DO API must not stall supervision.
+DO_VOLUME_MEMO_TIMEOUT_S = 30.0
+
+
+def remember_do_volumes(store: JobStore, job_id: str, cluster: str) -> list[str]:
+    """Record the ids of the DO volumes named after ``cluster`` in ``_runtime.json``.
+
+    Called while the job runs, when the volume is attached to a live droplet and has been for
+    minutes — the one time a listing describes it reliably. At teardown those ids are verified gone
+    by a direct ``volumes.get`` (``robust_teardown``), so the verdict no longer rests on a listing
+    taken while DO is in the middle of deleting the volume, which is how job E (2026-11-19)
+    recorded ``succeeded`` over a volume that was still billing two hours later.
+
+    Merges with what is already recorded, so a restarted supervisor (``--adopt``) keeps an earlier
+    one's memory. Returns the ids found this time. Best-effort and bounded: it never raises, since
+    losing this memory costs only the strongest form of the check, never the teardown.
+    """
+    try:
+        found = _bounded_call(
+            lambda: cluster_do_volume_ids(cluster),
+            what="do-volumes",
+            timeout_s=DO_VOLUME_MEMO_TIMEOUT_S,
+        )
+    except Exception as e:  # noqa: BLE001 — a memo, not a gate
+        print(f"[lab] could not record this job's DO volume ids (teardown still lists): {e}")
+        events.note("do_volumes.remember_failed", cluster=cluster, error=str(e)[:200])
+        return []
+    if found:
+        recorded = [str(v) for v in store.read_runtime(job_id).get("do_volume_ids") or []]
+        store.write_runtime(
+            job_id, do_volume_ids=recorded + [v for v in found if v not in recorded]
+        )
+    return found
 
 
 def _hourly_cost(handle: Any) -> float | None:
@@ -1561,6 +1599,88 @@ def install_signal_handlers() -> list[str]:
     return installed
 
 
+def _catalog_cost(manifest: JobManifest) -> CostInfo | None:
+    """A rate for a job stopped before its box reported UP, from the catalog for its spec.
+
+    The normal path prices the *launched* handle at UP; an abort before then has no handle. The
+    top of the catalog band is used — exact on DO, whose prices do not vary by region, and an
+    upper bound elsewhere, the safe direction for a spend total. ``None`` when the catalog cannot
+    price the spec; never raises.
+    """
+    from lab import placement
+
+    try:
+        est = placement.estimate(manifest.resources)
+    except Exception as e:  # noqa: BLE001 — pricing must never get in the teardown's way
+        print(f"[lab] could not price the aborted job from the catalog: {e}")
+        return None
+    if est is None:
+        return None
+    return CostInfo(
+        hourly_usd=est.worst_hourly_usd,
+        compute_hourly_usd=est.high_usd,
+        storage_hourly_usd=est.storage_usd,
+        hourly_basis=(
+            f"catalog estimate, top of band — stopped before the box reported UP, so there was "
+            f"no launched handle to price: {est.basis}"
+        ),
+        estimated_usd=actual_cost(est.worst_hourly_usd, parse_duration(manifest.resources.timeout)),
+        cap_hourly_usd=manifest.resources.max_hourly_usd,
+    )
+
+
+def record_cost_after_abort(store: JobStore, job_id: str) -> None:
+    """Price an aborted job the way the normal path does: ``hourly x supervisor wall``.
+
+    Job F (2026-11-19) was cancelled four minutes into a DO run, before its box reported UP —
+    the moment the normal path writes ``CostInfo`` — so it recorded none, and ``lab list``'s spend
+    left a real rental out under ``unknown_cost_jobs``.
+
+    * A rate recorded at UP is **finalized** (duration and ``actual_usd``), never re-priced.
+    * With no rate, the job is priced from the catalog (:func:`_catalog_cost`) — but only when
+      the teardown is evidence that a machine existed (:func:`teardown_found_resources`, or a
+      volume the supervisor remembered). A launch that never created anything stays without a
+      ``CostInfo``: putting money nobody spent in the total is the opposite error.
+    * A ``CostInfo`` whose rate was unreadable stays as it is — an honest unknown.
+
+    Wall is ``started_at`` to ``ended_at``, the same span the normal path bills. Never raises.
+    """
+    try:
+        m = store.read_manifest(job_id)
+        if m.started_at is None:
+            return
+        cost = m.cost
+        if cost is None:
+            remembered = store.read_runtime(job_id).get("do_volume_ids")
+            if not (teardown_found_resources(m.teardown_detail) or remembered):
+                return
+            cost = _catalog_cost(m)
+            if cost is None:
+                return
+        elif cost.actual_usd is not None or cost.hourly_usd is None:
+            return
+        wall = duration_seconds(m.started_at, m.ended_at or now())
+        store.update_manifest(
+            job_id,
+            cost=cost.model_copy(
+                update={"duration_seconds": wall, "actual_usd": actual_cost(cost.hourly_usd, wall)}
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 — accounting, after the teardown; never mask the unwind
+        _emit(f"[lab] recording the aborted job's cost failed: {type(e).__name__}: {e}\n")
+
+
+def _user_cancel_in_flight(store: JobStore, job_id: str) -> bool:
+    """Has ``lab cancel`` recorded its intent? It writes ``cancelling`` to ``_runtime.json``
+    *before* it SIGTERMs the supervisor (R9), so this is what tells a cancel from any other
+    signal. An unreadable runtime file is "no": a real interruption must never be misfiled as a
+    deliberate one."""
+    try:
+        return bool(store.read_runtime(job_id).get("cancelling"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # The default ladder is 5+15+30+60+120 = 230s of `sky.down` retries before the provider-direct
 # fallback even starts. A process that has been signalled cannot count on that much time — a
 # system shutdown SIGKILLs 90s later by default — and the fallback is the half that actually asks
@@ -1637,6 +1757,9 @@ def _teardown_on_abort(
                 )
     except Exception as e:  # noqa: BLE001 — never mask the exception we are unwinding on
         _emit(f"[lab] teardown after abort ({why}) failed: {type(e).__name__}: {e}\n")
+    # After the teardown, never before it: the destroy is the cost-critical half, and this is only
+    # the bill for what ran. Needs `ended_at`, which the block above has just written.
+    record_cost_after_abort(store, job_id)
 
 
 def _provision_budget_s(res: ResourceRequest, cloud: str) -> float:
@@ -1831,7 +1954,9 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                     # teardown — and a supervisor killed in that window leaves it there for good.
                     # Rotation only continues after a *confirmed* teardown, so no alarm is lost.
                     if store.read_manifest(job_id).teardown_status is not None:
-                        store.update_manifest(job_id, teardown_status=None)
+                        # The detail goes with it: evidence about a box that no longer exists
+                        # beside a status that has been cleared would read as this one's.
+                        store.update_manifest(job_id, teardown_status=None, teardown_detail=None)
                     request_id = _launch_with_retry(sky, task, cluster)
                     inflight_request = request_id
 
@@ -1991,6 +2116,10 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             #     the backstop below never got its turn. It streams on a daemon thread joined
             #     against the remaining budget, and the queue is probed meanwhile so an uncapped
             #     job notices a run that ended under a stream that did not (see `_LogStream`).
+            # The box is UP on both paths: remember its DO volume while a listing still describes
+            # it truthfully, so teardown can verify it gone by id (job E). Retried on heartbeats
+            # until seen — one cheap listing per minute at most, and none once it has the id.
+            do_volumes_known = cloud == "do" and bool(remember_do_volumes(store, job_id, cluster))
             partials.start()
             stream = _LogStream(sky, cluster, sky_job_id)
             stream.start()
@@ -2000,8 +2129,11 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             )
 
             def _beat() -> None:
+                nonlocal do_volumes_known
                 partials.beat()
                 stream.reattach_if_dropped()
+                if cloud == "do" and not do_volumes_known:
+                    do_volumes_known = bool(remember_do_volumes(store, job_id, cluster))
 
             max_wait = remaining_wall_budget(manifest.resources.timeout, anchor, boot_s=boot_s)
             if max_wait <= 0:
@@ -2204,9 +2336,12 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             # The instance vanished (preemption inferred), but we can't confirm the Vast rental is
             # actually gone — flag it so `lab wait` exits 3 and the operator can run `lab reconcile`
             # before any auto-resubmitter builds on a potentially-still-billing orphan (FR-C2).
+            detail = dict(store.read_manifest(job_id).teardown_detail or {})
+            detail["overridden"] = "preempted but the provider teardown is unconfirmed"
             store.update_manifest(
                 job_id,
                 teardown_status="failed",
+                teardown_detail=detail,
                 end_reason="preempted but teardown unconfirmed — see `lab reconcile`",
             )
             teardown_ok = False
@@ -2221,7 +2356,18 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         outcome is durable in the other place that matters — `tear_down_and_record` writes
         `teardown_status` on the manifest, which is what `lab wait` (exit 3/6) and `lab reconcile`
         read.
+
+        A SIGTERM sent by ``lab cancel`` is the supervisor doing what it was asked, not failing:
+        it closes ``ok`` with ``cancelled_by_user`` in the call's result (job F, 2026-11-19, was
+        listed among ``lab history --failures`` as ``SupervisorTerminated``). The ``cancelling``
+        intent that ``lab cancel`` writes *before* signalling is the only evidence accepted — the
+        same signal from anything else stays ``interrupted``, a failure.
         """
+        if isinstance(exc, SupervisorTerminated) and _user_cancel_in_flight(store, job_id):
+            call.result(cancelled_by_user=True, signal=exc.signal_name)
+            outcome, error = "ok", None
+        else:
+            error = events.error_dict(exc)
         # `teardown` is what this abort is about to *do*, not merely whether a machine was ever
         # asked for: a rotated job reaches here with its abandoned attempt already destroyed, and
         # a ledger that claimed a teardown either way could not be used to audit this path.
@@ -2232,7 +2378,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             teardown=machine_requested and not attempt_torn_down,
         )
         exit_code = exc.code if isinstance(exc, SystemExit) and isinstance(exc.code, int) else None
-        events.finish(call, outcome=outcome, exit_code=exit_code, error=events.error_dict(exc))
+        events.finish(call, outcome=outcome, exit_code=exit_code, error=error)
         _teardown_on_abort(
             store,
             job_id,
