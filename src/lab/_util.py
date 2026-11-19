@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
 import math
 import os
 import re
 import shlex
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -126,12 +130,59 @@ def parse_duration(value: str | float | None) -> float | None:
     return seconds
 
 
+def _umask() -> int:
+    """The process umask, read without changing it (``os.umask`` can only be read by setting it,
+    which would race any thread creating a file meanwhile). Linux exposes it in /proc."""
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("Umask:"):
+                return int(line.split()[1], 8)
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0o022
+
+
 def atomic_write_text(path: Path, text: str) -> None:
-    """Write via a same-directory temp file + ``os.replace`` so readers never see a torn file."""
+    """Write via a same-directory temp file + ``os.replace`` so readers never see a torn file.
+
+    The temp file is unique per call (``mkstemp``). It used to be a fixed ``<file>.tmp``, so two
+    concurrent writers truncated and interleaved into the same temp file and one renamed the
+    other's half-written bytes into place — a 4-process stress read 4,269 torn files, and the
+    loser of the rename race raised FileNotFoundError. The result gets the permissions a plain
+    ``write_text`` would have given it, not mkstemp's owner-only 0600.
+
+    This makes each *write* atomic; it does not make a read-modify-write safe. Callers that load,
+    change and save a shared file hold :func:`file_lock` around all three.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, 0o666 & ~_umask())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+@contextmanager
+def file_lock(path: Path) -> Iterator[None]:
+    """Hold an exclusive ``flock`` on ``<path>.lock`` — for a read-modify-write of ``path``.
+
+    A sibling lock file rather than ``path`` itself, because ``atomic_write_text`` replaces
+    ``path``'s inode on every write and a lock on a replaced inode excludes nobody.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_name(path.name + ".lock"), "a") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def tail_last_line(path: Path, max_bytes: int = 1024) -> tuple[str | None, datetime | None]:

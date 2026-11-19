@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from lab import events
-from lab._util import atomic_write_text
+from lab._util import atomic_write_text, file_lock
 from lab.models import ResourceRequest
 from pydantic import BaseModel
 
@@ -195,9 +195,12 @@ class CheckCache:
     def put(self, key: str, result: CheckResult, *, now_s: float | None = None) -> None:
         now_s = time.time() if now_s is None else now_s
         try:
-            data = self._load()
-            data[key] = {"at": now_s, "result": result.model_dump()}
-            atomic_write_text(self.path, json.dumps(data, sort_keys=True))
+            # Locked load-modify-save: concurrent preflights (a sweep's shards) otherwise drop
+            # each other's entries.
+            with file_lock(self.path):
+                data = self._load()
+                data[key] = {"at": now_s, "result": result.model_dump()}
+                atomic_write_text(self.path, json.dumps(data, sort_keys=True))
         except Exception:  # noqa: BLE001 — a cache write must never fail a submit
             pass
 

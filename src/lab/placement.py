@@ -39,7 +39,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Iterable, TypeVar, cast
 
-from lab._util import atomic_write_text
+from lab._util import atomic_write_text, file_lock
 from lab.models import ResourceRequest
 
 _F = TypeVar("_F", bound=Callable[..., Any])
@@ -255,13 +255,16 @@ class CapacityMemo:
             return
         now_s = time.time() if now_s is None else now_s
         try:
-            entries = self._live(self._load(), now_s=now_s)  # prune expired while we are here
-            for z in zones:
-                entries[self._key(cloud, instance_type, z)] = now_s
-                events.note("placement.zone_exhausted", zone=z)
-            atomic_write_text(
-                self.path, json.dumps({"version": 1, "entries": entries}, sort_keys=True)
-            )
+            # Locked load-modify-save: the shards of one sweep record concurrently, and without
+            # the lock each overwrote the others' zones — the exact case this memo exists for.
+            with file_lock(self.path):
+                entries = self._live(self._load(), now_s=now_s)  # prune expired while here
+                for z in zones:
+                    entries[self._key(cloud, instance_type, z)] = now_s
+                    events.note("placement.zone_exhausted", zone=z)
+                atomic_write_text(
+                    self.path, json.dumps({"version": 1, "entries": entries}, sort_keys=True)
+                )
         except Exception as e:  # noqa: BLE001 — a memo write must never fail a job
             _note(f"[lab] capacity memo write skipped: {e}")
 
@@ -517,21 +520,23 @@ class DeadHostMemo:
 
         now_s = time.time() if now_s is None else now_s
         try:
-            entries = self._live(self._load(), now_s=now_s)  # prune expired while we are here
-            entries.setdefault(key, []).append(now_s)
-            entries[key] = entries[key][-MAX_STRIKES_KEPT:]
-            if len(entries) > MAX_MEMO_KEYS:
-                # Evict whole keys oldest-last-strike first: the least recent evidence is the
-                # least useful, and an unbounded cache is a different bug from the one we fix.
-                ordered = sorted(entries.items(), key=lambda kv: max(kv[1]), reverse=True)
-                entries = dict(ordered[:MAX_MEMO_KEYS])
-            # The field is `host`, not `key`: `lab.events.sanitize` is a deny-list and masks a
-            # param literally named "key" as a probable secret — which would have redacted the
-            # one thing this note exists to record.
-            events.note("placement.dead_host", host=key, strikes=len(entries.get(key, [])))
-            atomic_write_text(
-                self.path, json.dumps({"version": 1, "entries": entries}, sort_keys=True)
-            )
+            # Locked load-modify-save, as in CapacityMemo.record: concurrent strikes must count.
+            with file_lock(self.path):
+                entries = self._live(self._load(), now_s=now_s)  # prune expired while here
+                entries.setdefault(key, []).append(now_s)
+                entries[key] = entries[key][-MAX_STRIKES_KEPT:]
+                if len(entries) > MAX_MEMO_KEYS:
+                    # Evict whole keys oldest-last-strike first: the least recent evidence is the
+                    # least useful, and an unbounded cache is a different bug from the one we fix.
+                    ordered = sorted(entries.items(), key=lambda kv: max(kv[1]), reverse=True)
+                    entries = dict(ordered[:MAX_MEMO_KEYS])
+                # The field is `host`, not `key`: `lab.events.sanitize` is a deny-list and masks
+                # a param literally named "key" as a probable secret — which would have redacted
+                # the one thing this note exists to record.
+                events.note("placement.dead_host", host=key, strikes=len(entries.get(key, [])))
+                atomic_write_text(
+                    self.path, json.dumps({"version": 1, "entries": entries}, sort_keys=True)
+                )
         except Exception as e:  # noqa: BLE001 — a memo write must never fail a job
             _note(f"[lab] dead-host memo write skipped: {e}")
 
