@@ -77,11 +77,21 @@ def _shape_key(res: ResourceRequest) -> str:
     regions are *candidates*, and the quota checks ask about the cheapest candidates. Caught live —
     a `--price-cap 0.001` run left no candidates at all, fell back to checking us-central1, and
     cached that under the key an uncapped run of the same size would look up.
+
+    ``memory`` (and ``gpus``) belong for the same reason: they change the instance type the
+    catalog resolves, hence its vCPU count, hence the ``quota_cpu`` verdict.
     """
     return (
-        f"{res.cpus}/{res.disk_size}/{res.accelerators}/{res.region}/{res.zone}"
-        f"/{res.use_spot}/{res.spot_fallback}/{res.max_hourly_usd}"
+        f"{res.cpus}/{res.memory}/{res.gpus}/{res.disk_size}/{res.accelerators}/{res.region}"
+        f"/{res.zone}/{res.use_spot}/{res.spot_fallback}/{res.max_hourly_usd}"
     )
+
+
+# Only verdicts that let a launch proceed are cached. A ``fail`` is the one verdict the user is
+# about to act on — it carries a fix — so serving it from cache for 24h (apis/iam) or 1h (quota)
+# kept preflight refusing every submit after the fix had been applied. A ``skip`` means "could not
+# answer", which is not a finding worth remembering.
+_CACHEABLE: frozenset[Status] = frozenset({"ok", "warn"})
 
 
 # Project-level permissions SkyPilot needs on GCP. Verified against the live project: GCP's
@@ -174,9 +184,11 @@ class CheckCache:
             name = str(entry["result"]["name"])
             if now_s - float(entry["at"]) >= _TTL_S.get(name, _DEFAULT_TTL_S):
                 return None
-            return CheckResult.model_validate(entry["result"])
+            result = CheckResult.model_validate(entry["result"])
         except Exception:  # noqa: BLE001
             return None
+        # An older version cached `fail` verdicts; never serve one (see _CACHEABLE).
+        return result if result.status in _CACHEABLE else None
 
     def put(self, key: str, result: CheckResult, *, now_s: float | None = None) -> None:
         now_s = time.time() if now_s is None else now_s
@@ -624,15 +636,16 @@ def run_checks(
     """Run a cloud's preflight checks in order.
 
     ``quick`` restricts to :data:`QUICK_CHECKS` — the subset cheap and decisive enough to run on
-    the submit path. Results are cached per (cloud, project, check) with per-check TTLs so the
-    automatic preflight usually costs no API calls at all.
+    the submit path. Passing results are cached per (cloud, project, check) with per-check TTLs so
+    the automatic preflight usually costs no API calls at all. ``use_cache=False`` re-asks every
+    check but still writes its fresh answers back, so the next cached run reads them.
     """
     key = cloud or "vast"
     checks = _REGISTRY.get(key)
     if checks is None:
         return [_skip("cloud", f"no checks defined for {key!r}")]
     res = resources or ResourceRequest(cloud=cloud)
-    cache = CheckCache.for_home(home) if (home is not None and use_cache) else None
+    cache = CheckCache.for_home(home) if home is not None else None
 
     ctx: dict[str, Any] = {}
     out: list[CheckResult] = []
@@ -642,7 +655,7 @@ def run_checks(
         cacheable = cache if name not in _NEVER_CACHE else None
         shape = _shape_key(res) if name in _SHAPE_DEPENDENT else "-"
         cache_key = f"{key}|{ctx.get('project', '-')}|{name}|{shape}"
-        cached = cacheable.get(cache_key) if cacheable is not None else None
+        cached = cacheable.get(cache_key) if (cacheable is not None and use_cache) else None
         if cached is not None:
             out.append(cached)
             events.note("doctor.check", name=name, status=cached.status, detail=cached.detail)
@@ -654,8 +667,7 @@ def run_checks(
             result = _skip(name, f"check errored: {str(e)[:160]}")
         out.append(result)
         events.note("doctor.check", name=name, status=result.status, detail=result.detail)
-        # A `skip` means "could not answer", which is not a finding worth remembering.
-        if cacheable is not None and result.status != "skip":
+        if cacheable is not None and result.status in _CACHEABLE:
             cacheable.put(cache_key, result)
     return out
 

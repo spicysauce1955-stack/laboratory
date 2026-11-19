@@ -220,6 +220,10 @@ def test_shape_key_separates_specs_that_would_get_different_verdicts():
         base.model_copy(update={"region": "europe-west1"}),
         base.model_copy(update={"zone": "europe-west1-b"}),
         base.model_copy(update={"use_spot": False}),
+        # `--memory` changes the instance type the catalog resolves, hence its vCPU count, hence
+        # the quota_cpu verdict — it was missing, so a `--memory 8` verdict served `--memory 64`.
+        base.model_copy(update={"memory": "64GB"}),
+        base.model_copy(update={"gpus": 2}),
     ]
     keys = [D._shape_key(base)] + [D._shape_key(v) for v in variants]
     assert len(set(keys)) == len(keys), "two distinguishable specs share a cache key"
@@ -249,8 +253,57 @@ def test_skips_are_not_cached(tmp_path):
     """"Could not answer" is not a finding worth remembering — the next run should retry."""
     cache = D.CheckCache.for_home(tmp_path)
     cache.put("k", D._skip("apis", "timeout"))
-    # put() itself stores whatever it is given; run_checks is what declines to cache a skip.
-    assert cache.get("k") is not None
+    # put() stores whatever it is given; run_checks declines to cache a skip, and get() never
+    # serves one either way.
+    assert cache.get("k") is None
+
+
+def _api_toggle_registry(monkeypatch, state):
+    def _adc(res, ctx):
+        ctx["creds"], ctx["project"] = object(), "proj-x"
+        return D._ok("adc", "x")
+
+    def _apis(res, ctx):
+        if state["api_on"]:
+            return D._ok("apis", "on")
+        return D._fail("apis", "disabled: compute", "gcloud services enable compute")
+
+    monkeypatch.setitem(
+        D._REGISTRY, "gcp", (("adc", _adc), ("project", D.check_project), ("apis", _apis))
+    )
+
+
+def test_a_fixed_failure_stops_blocking_at_once(monkeypatch, tmp_path):
+    """A `fail` was cached for 24h (apis/iam) or 1h (quota), so after the user ran the very fix
+    the check printed, preflight kept refusing every submit from cache — and `--no-cache` could
+    not clear it, because it bypassed the cache in both directions. A definitive negative is
+    exactly the verdict the user is about to act on; it must be re-asked every time."""
+    state = {"api_on": False}
+    _api_toggle_registry(monkeypatch, state)
+    res = ResourceRequest(cloud="gcp", cpus=4)
+
+    assert [r.name for r in D.preflight("gcp", res, home=tmp_path)] == ["apis"]
+    state["api_on"] = True  # the user runs the suggested `gcloud services enable`
+
+    assert D.preflight("gcp", res, home=tmp_path) == []
+
+
+def test_a_fail_written_by_an_older_version_is_not_served(tmp_path):
+    cache = D.CheckCache.for_home(tmp_path)
+    cache.put("gcp|p|apis|-", D._fail("apis", "disabled", "enable it"))
+    assert cache.get("gcp|p|apis|-") is None
+
+
+def test_no_cache_still_refreshes_the_cache(monkeypatch, tmp_path):
+    """`lab doctor --no-cache` asks every question fresh; its answers should then be what the
+    next cached preflight reads, not be thrown away."""
+    state = {"api_on": True}
+    _api_toggle_registry(monkeypatch, state)
+    res = ResourceRequest(cloud="gcp")
+
+    D.run_checks("gcp", res, home=tmp_path, use_cache=False)
+
+    assert D.CheckCache.for_home(tmp_path).get("gcp|proj-x|apis|-") is not None
 
 
 def test_corrupt_cache_reads_as_empty(tmp_path):
