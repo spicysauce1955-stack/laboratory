@@ -45,6 +45,7 @@ from lab.backends.skypilot import (
     wasteful_provision_timeout_warning,
     provision_with_watchdog,
     tear_down_and_record,
+    teardown_found_resources,
     vast_balance,
     vast_hourly_for_cluster,
 )
@@ -1598,6 +1599,77 @@ def install_signal_handlers() -> list[str]:
     return installed
 
 
+def _catalog_cost(manifest: JobManifest) -> CostInfo | None:
+    """A rate for a job stopped before its box reported UP, from the catalog for its spec.
+
+    The normal path prices the *launched* handle at UP; an abort before then has no handle. The
+    top of the catalog band is used — exact on DO, whose prices do not vary by region, and an
+    upper bound elsewhere, the safe direction for a spend total. ``None`` when the catalog cannot
+    price the spec; never raises.
+    """
+    from lab import placement
+
+    try:
+        est = placement.estimate(manifest.resources)
+    except Exception as e:  # noqa: BLE001 — pricing must never get in the teardown's way
+        print(f"[lab] could not price the aborted job from the catalog: {e}")
+        return None
+    if est is None:
+        return None
+    return CostInfo(
+        hourly_usd=est.worst_hourly_usd,
+        compute_hourly_usd=est.high_usd,
+        storage_hourly_usd=est.storage_usd,
+        hourly_basis=(
+            f"catalog estimate, top of band — stopped before the box reported UP, so there was "
+            f"no launched handle to price: {est.basis}"
+        ),
+        estimated_usd=actual_cost(est.worst_hourly_usd, parse_duration(manifest.resources.timeout)),
+        cap_hourly_usd=manifest.resources.max_hourly_usd,
+    )
+
+
+def record_cost_after_abort(store: JobStore, job_id: str) -> None:
+    """Price an aborted job the way the normal path does: ``hourly x supervisor wall``.
+
+    Job F (2026-11-19) was cancelled four minutes into a DO run, before its box reported UP —
+    the moment the normal path writes ``CostInfo`` — so it recorded none, and ``lab list``'s spend
+    left a real rental out under ``unknown_cost_jobs``.
+
+    * A rate recorded at UP is **finalized** (duration and ``actual_usd``), never re-priced.
+    * With no rate, the job is priced from the catalog (:func:`_catalog_cost`) — but only when
+      the teardown is evidence that a machine existed (:func:`teardown_found_resources`, or a
+      volume the supervisor remembered). A launch that never created anything stays without a
+      ``CostInfo``: putting money nobody spent in the total is the opposite error.
+    * A ``CostInfo`` whose rate was unreadable stays as it is — an honest unknown.
+
+    Wall is ``started_at`` to ``ended_at``, the same span the normal path bills. Never raises.
+    """
+    try:
+        m = store.read_manifest(job_id)
+        if m.started_at is None:
+            return
+        cost = m.cost
+        if cost is None:
+            remembered = store.read_runtime(job_id).get("do_volume_ids")
+            if not (teardown_found_resources(m.teardown_detail) or remembered):
+                return
+            cost = _catalog_cost(m)
+            if cost is None:
+                return
+        elif cost.actual_usd is not None or cost.hourly_usd is None:
+            return
+        wall = duration_seconds(m.started_at, m.ended_at or now())
+        store.update_manifest(
+            job_id,
+            cost=cost.model_copy(
+                update={"duration_seconds": wall, "actual_usd": actual_cost(cost.hourly_usd, wall)}
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 — accounting, after the teardown; never mask the unwind
+        _emit(f"[lab] recording the aborted job's cost failed: {type(e).__name__}: {e}\n")
+
+
 def _user_cancel_in_flight(store: JobStore, job_id: str) -> bool:
     """Has ``lab cancel`` recorded its intent? It writes ``cancelling`` to ``_runtime.json``
     *before* it SIGTERMs the supervisor (R9), so this is what tells a cancel from any other
@@ -1685,6 +1757,9 @@ def _teardown_on_abort(
                 )
     except Exception as e:  # noqa: BLE001 — never mask the exception we are unwinding on
         _emit(f"[lab] teardown after abort ({why}) failed: {type(e).__name__}: {e}\n")
+    # After the teardown, never before it: the destroy is the cost-critical half, and this is only
+    # the bill for what ran. Needs `ended_at`, which the block above has just written.
+    record_cost_after_abort(store, job_id)
 
 
 def _provision_budget_s(res: ResourceRequest, cloud: str) -> float:

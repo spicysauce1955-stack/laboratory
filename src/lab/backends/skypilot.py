@@ -1968,6 +1968,21 @@ def teardown_detail(outcome: dict[str, Any], cloud: str) -> dict[str, Any]:
     return compact
 
 
+def teardown_found_resources(detail: dict[str, Any] | None) -> bool:
+    """Is this ``teardown_detail`` evidence that a machine of the job existed?
+
+    True when a provider-direct fallback destroyed something, or a DO volume of the cluster was
+    known or discovered — SkyPilot creates the droplet first and its volume right after, so a
+    volume is a droplet that existed. ``sky.down`` returning on its own proves nothing either way.
+    """
+    if not detail:
+        return False
+    if detail.get("destroyed"):
+        return True
+    volumes = detail.get("do_volumes") or {}
+    return bool(volumes.get("known") or volumes.get("discovered"))
+
+
 def tear_down_and_record(
     sky_mod: Any,
     cluster: str,
