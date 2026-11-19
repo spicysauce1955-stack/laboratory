@@ -1553,8 +1553,13 @@ def _teardown_on_abort(
     why: str,
     launched: bool,
     torn_down: bool,
+    request_id: Any = None,
 ) -> None:
     """Stop the machine for a supervisor unwinding out of ``_impl`` on an unplanned exception.
+
+    ``request_id`` is a launch request that may still be in flight on the API server. It is
+    ``api_cancel``ed *before* the teardown: a launch still queued server-side would otherwise
+    provision after we tore down, onto a cluster name nobody supervises any more.
 
     Every *expected* exit from ``_impl`` tears down on its own way out. This covers the ones that
     are not expected — a signal, a Ctrl-C, a bug — which previously recorded nothing and left the
@@ -1579,6 +1584,11 @@ def _teardown_on_abort(
     sky_mod = sys.modules.get("sky")
     if sky_mod is None:  # pragma: no cover — implied by `launched`; kept as a hard guard
         return
+    if request_id is not None:
+        try:
+            sky_mod.api_cancel(request_id)
+        except Exception as e:  # noqa: BLE001 — best-effort; the teardown below is the real net
+            _emit(f"[lab] api_cancel of the in-flight launch failed: {type(e).__name__}: {e}\n")
     try:
         if not torn_down:
             tear_down_and_record(
@@ -1658,8 +1668,13 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
     # earlier one recorded is not evidence about the cluster it was just told to attach to.
     attempt_torn_down = False
 
+    # The launch request that may still be running on the API server, for the abort path to
+    # `api_cancel` (see `_teardown_on_abort`). Set at each launch; cleared once provisioning has
+    # returned, after which the request is finished and there is nothing left to cancel.
+    inflight_request: Any = None
+
     def _impl() -> int:
-        nonlocal machine_requested, attempt_torn_down, manifest
+        nonlocal machine_requested, attempt_torn_down, manifest, inflight_request
         if not adopt:
             started = now()
             store.update_manifest(job_id, status=JobState.running, started_at=started)
@@ -1794,6 +1809,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                     if store.read_manifest(job_id).teardown_status is not None:
                         store.update_manifest(job_id, teardown_status=None)
                     request_id = _launch_with_retry(sky, task, cluster)
+                    inflight_request = request_id
 
                     # Did we just draw a machine we have already watched fail? Only asked when
                     # there is an attempt left to spend on the answer, and only when the memo
@@ -1872,6 +1888,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                 # The box is UP and the job submitted: the run phase starts here, and so does the
                 # local wall-clock deadline. Durable, so a supervisor restart (`--adopt`) budgets
                 # from the same moment instead of from the launch request.
+                inflight_request = None  # the launch request has completed
                 run_anchor = now()
                 store.write_runtime(job_id, run_anchor_at=run_anchor.isoformat())
                 # Record cost up-front so a running job already shows it (FR-I2). The host is UP now,
@@ -2200,6 +2217,7 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
             why=why,
             launched=machine_requested,
             torn_down=attempt_torn_down,
+            request_id=inflight_request,
         )
 
     try:
