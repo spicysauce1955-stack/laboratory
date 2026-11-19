@@ -1140,8 +1140,9 @@ def wait(
     ),
     fail_fast: bool = typer.Option(
         False, "--fail-fast",
-        help="exit 4 as soon as any job is failed/timed_out (preempted/cancelled don't trip it); "
-        "surviving jobs are NOT cancelled — `pending` in the summary names them",
+        help="exit 4 as soon as any job is failed/timed_out (preempted/cancelled don't trip it), "
+        "also when every job has already finished; surviving jobs are NOT cancelled — `pending` "
+        "in the summary names them",
     ),
 ) -> None:
     """Block until the job(s) reach a terminal state, then exit (FR-G1).

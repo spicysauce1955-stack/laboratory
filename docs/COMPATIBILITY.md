@@ -27,7 +27,12 @@ upgrade note.
   On `lab wait`, 3 outranks 6 outranks 4 outranks 1: a *confirmed* leak is the most urgent
   signal, an unverifiable one is still a money signal, and both outrank the fail-fast notice and
   the `--timeout` give-up — a job that already finished with a leaked teardown is billing whether
-  or not another job in the same wait is still running (that case used to exit 1). Exit 5 and 6
+  or not another job in the same wait is still running (that case used to exit 1). `--fail-fast`
+  trips (exit 4, `failed_fast: true`) whenever any job in the wait failed or timed out, including
+  when every job had already finished by the time it was seen; it used to require a still-running
+  survivor, so a lone failing job exited 0 and a multi-job verdict depended on poll timing.
+  Without `--fail-fast` a failed job is still exit 0: the code describes the wait and the
+  teardown, and the experiment's outcome is `jobs[].state`. Exit 5 and 6
   were added in v0.7.0; a caller that treats "non-zero" as failure is unaffected, one that
   enumerates codes must learn them.
 
