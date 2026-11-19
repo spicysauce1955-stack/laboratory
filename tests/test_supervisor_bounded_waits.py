@@ -99,6 +99,24 @@ def test_a_half_open_stream_cannot_outlive_the_wall_clock_budget(
     assert store.read_manifest("j1").status is JobState.timed_out
 
 
+def test_a_spent_budget_does_not_sleep_a_poll_interval_before_giving_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reviewer's own reproduction runs at the real POLL_S: one look, then out — not one
+    look, a 10s nap, and only then a deadline check."""
+    import time
+
+    monkeypatch.setattr(runner_mod, "POLL_S", 30.0)
+    running = [{"job_id": 1, "status": _Status("RUNNING")}]
+    sky = _sky(tail_logs=lambda *a, **k: None, queue=lambda *a, **k: running)
+
+    t0 = time.monotonic()
+    state, reached, lost = runner_mod._wait_terminal(sky, "lab-j1", None, 0.0)
+
+    assert time.monotonic() - t0 < 5.0
+    assert state is JobState.running and reached is False and lost is None
+
+
 def test_a_wedged_queue_poll_cannot_outlive_the_wall_clock_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, release: threading.Event
 ) -> None:

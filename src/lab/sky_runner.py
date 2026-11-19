@@ -278,7 +278,12 @@ def _wait_terminal(
         if name in _TERMINAL_NAMES:
             reached = True
             break
-        time.sleep(poll_s)
+        # Never sleep past the deadline: with the budget spent this is the one look, and a full
+        # poll interval of napping after it only delays the backstop it exists to enforce.
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_s, remaining))
         if heartbeat_s and on_heartbeat is not None:
             if time.time() - last_beat >= heartbeat_s:
                 last_beat = time.time()
