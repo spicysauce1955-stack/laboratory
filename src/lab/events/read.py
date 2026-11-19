@@ -10,6 +10,7 @@ from lab._util import now as _now
 from lab._util import parse_duration
 from lab.events import store
 from lab.events.models import Event, Note
+from lab.events.stats import action_key
 
 
 class _ManifestStore(Protocol):
@@ -215,7 +216,10 @@ def read(
     if project:
         events = [e for e in events if e.project.get("name") == project]
     if action:
-        events = [e for e in events if e.action == action]
+        # One command, either surface's spelling (`sweep-aggregate` / `sweep_aggregate`) — the
+        # same key `lab history --stats` groups by, so a row there drills down to all its calls.
+        wanted = action_key(action)
+        events = [e for e in events if action_key(e.action) == wanted]
     if session:
         events = [e for e in events if e.session == session]
     if job:

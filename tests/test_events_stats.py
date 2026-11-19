@@ -164,6 +164,41 @@ def test_upgrading_leaves_a_signature_with_no_ids_alone() -> None:
     assert upgrade_signature("unknown") == "unknown"
 
 
+def test_one_command_reached_from_both_surfaces_is_one_action_row() -> None:
+    """The CLI records `sweep-aggregate` (and a group leaf as `queue list`); the MCP tool of the
+    same name records `sweep_aggregate` / `queue_list`. Same command, same row — split, each
+    half under-reports the failure rate and the failure looks half as common as it is."""
+    err = {"type": "LabError", "message": "no shard plan"}
+    events = [
+        Event(id="1", ts=NOW, session="s", seq=0, surface="cli", action="sweep-aggregate",
+              outcome="error", duration_ms=10, error=err),
+        Event(id="2", ts=NOW, session="s", seq=1, surface="mcp", action="sweep_aggregate",
+              outcome="ok", duration_ms=30),
+        Event(id="3", ts=NOW, session="s", seq=2, surface="cli", action="queue list",
+              outcome="ok", duration_ms=5),
+        Event(id="4", ts=NOW, session="s", seq=3, surface="mcp", action="queue_list",
+              outcome="ok", duration_ms=5),
+        Event(id="5", ts=NOW, session="s", seq=4, surface="mcp", action="sweep_aggregate",
+              outcome="error", duration_ms=20, error=err),
+    ]
+    view = stats(events)
+    rows = {a.action: a for a in view.actions}
+    # The CLI's spelling labels the row: it is what a person types to repeat the command.
+    assert set(rows) == {"sweep-aggregate", "queue list"}
+    assert rows["sweep-aggregate"].calls == 3 and rows["sweep-aggregate"].failures == 2
+    assert rows["queue list"].calls == 2
+    assert view.signatures[0].actions == ["sweep-aggregate"]
+    # The raw records are untouched: grouping is a read-side concern.
+    assert [e.action for e in events][:2] == ["sweep-aggregate", "sweep_aggregate"]
+    assert [e.surface for e in events][:2] == ["cli", "mcp"]
+
+
+def test_an_action_seen_only_over_mcp_keeps_its_mcp_spelling() -> None:
+    view = stats([Event(id="1", ts=NOW, session="s", seq=0, surface="mcp",
+                        action="fetch_artifacts", outcome="ok", duration_ms=1)])
+    assert [a.action for a in view.actions] == ["fetch_artifacts"]
+
+
 def test_stats_counts_calls_failures_and_failure_rate() -> None:
     view = stats([_event("1"), _event("2", outcome="error"), _event("3", action="doctor")])
     submit = next(a for a in view.actions if a.action == "submit")

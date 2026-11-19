@@ -168,6 +168,25 @@ def test_read_job_filter_matches_job_ids_list_membership(
     assert [e.id for e in read(job="j-3")] == ["a"]
 
 
+def test_read_action_filter_matches_either_surfaces_spelling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`lab history --action sweep-aggregate` must reach the MCP calls the stats row counted."""
+    monkeypatch.setenv("LAB_EVENTS_DIR", str(tmp_path / "events"))
+    monkeypatch.delenv("LAB_EVENTS", raising=False)
+    store.append(_open("a", action="sweep-aggregate"), when=NOW)
+    store.append(_close("a"), when=NOW)
+    store.append(_open("b", action="sweep_aggregate", surface="mcp"), when=NOW)
+    store.append(_close("b"), when=NOW)
+    store.append(_open("c", action="sweep"), when=NOW)
+    store.append(_close("c"), when=NOW)
+    for spelling in ("sweep-aggregate", "sweep_aggregate"):
+        assert {e.id for e in read(action=spelling)} == {"a", "b"}
+    assert {e.action for e in read(action="sweep-aggregate")} == {
+        "sweep-aggregate", "sweep_aggregate",  # rows keep what each surface recorded
+    }
+
+
 def test_read_since_uses_the_duration_parser(_ledger: None) -> None:
     assert [e.id for e in read(since="2d", now_=NOW)] == ["a"]
     assert {e.id for e in read(since="30d", now_=NOW)} == {"a", "b"}

@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Any
 
 from lab.events.models import Event
-from lab.events.stats import cost_usd, signature, stats
+from lab.events.stats import action_key, action_labels, cost_usd, signature, stats
 
 _DANGLING_KEY = "never closed (running-or-died)"
 _WS_RUN = re.compile(r"\s+")
@@ -86,6 +86,7 @@ def report(events: Sequence[Event], *, since: datetime | None = None) -> str:
         key=lambda kv: -_severity(len(kv[1]), sum(cost_usd(e) for e in kv[1])),
     )
 
+    labels = action_labels(events)
     lines += [
         "## Triage",
         "",
@@ -94,7 +95,7 @@ def report(events: Sequence[Event], *, since: datetime | None = None) -> str:
     ]
     for i, (key, group) in enumerate(ranked, 1):
         usd = sum(cost_usd(e) for e in group)
-        actions = ", ".join(sorted({e.action for e in group}))
+        actions = ", ".join(sorted({labels[action_key(e.action)] for e in group}))
         lines.append(
             f"| F{i} | {_escape_cell(_inline(key))} | {len(group)} | ${usd:.4f} | "
             f"{_escape_cell(_inline(actions))} |"

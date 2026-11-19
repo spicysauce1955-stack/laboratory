@@ -114,6 +114,33 @@ def same_signature(stored: str, current: str) -> bool:
     )
 
 
+_ACTION_SEPARATORS = re.compile(r"[\s_-]+")
+
+
+def action_key(action: str) -> str:
+    """One key per command, whichever surface recorded it.
+
+    The CLI records a top-level command by its name (``sweep-aggregate``) and a group leaf as
+    ``"<group> <leaf>"`` (``queue list``, ``cli._group_action``); the MCP tool of the same
+    command records ``sweep_aggregate`` / ``queue_list``. Folding ``-``, ``_`` and whitespace
+    together is what makes them one row. Only the *grouping* uses this: every record keeps the
+    action and the ``surface`` it was written with.
+    """
+    return _ACTION_SEPARATORS.sub(" ", action.strip().lower())
+
+
+def action_labels(events: Sequence[Event]) -> dict[str, str]:
+    """The display name for each :func:`action_key` among ``events``.
+
+    The CLI's spelling when one is present — it is what a person types to run the command again
+    — otherwise whatever was recorded. ``min`` keeps the choice independent of event order.
+    """
+    spellings: dict[str, dict[bool, set[str]]] = defaultdict(lambda: defaultdict(set))
+    for event in events:
+        spellings[action_key(event.action)][event.surface == "cli"].add(event.action)
+    return {key: min(by_cli[True] or by_cli[False]) for key, by_cli in spellings.items()}
+
+
 def cost_usd(event: Event) -> float:
     """``result`` is whatever the entrypoint wrote to JSON — ``cost_usd`` can be any JSON value,
     not just a number. A non-numeric value is treated as no cost rather than raised, so one
@@ -124,12 +151,13 @@ def cost_usd(event: Event) -> float:
 
 def stats(events: Sequence[Event], *, since: datetime | None = None) -> StatsView:
     """Per-action failure rates, ranked error signatures, and the money spent on failures."""
+    labels = action_labels(events)
     by_action: dict[str, list[Event]] = defaultdict(list)
     by_sig: dict[str, list[Event]] = defaultdict(list)
     usd_burned = 0.0
     dangling = 0
     for event in events:
-        by_action[event.action].append(event)
+        by_action[labels[action_key(event.action)]].append(event)
         if event.outcome is None:
             dangling += 1
         if event.failed:
@@ -155,7 +183,7 @@ def stats(events: Sequence[Event], *, since: datetime | None = None) -> StatsVie
             count=len(group),
             first_seen=min(e.ts for e in group),
             last_seen=max(e.ts for e in group),
-            actions=sorted({e.action for e in group}),
+            actions=sorted({labels[action_key(e.action)] for e in group}),
             usd=round(sum(cost_usd(e) for e in group), 4),
         )
         for sig, group in by_sig.items()
