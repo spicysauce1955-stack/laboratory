@@ -32,6 +32,20 @@
 # power-off AND delete of the new droplet are BOTH confirmed (never unconditionally). Every path
 # that leaves a droplet powered off but not deleted prints a LEFTOVER DROPLET warning -- DO bills
 # for powered-off droplets, and nothing else in this project's tooling would ever notice one.
+#
+# A later review (2026-11) closed five more holes, each now exercised by
+# tests/test_deploy_script.py against a fake world (no droplet, no bucket):
+#   - the new droplet gets the controller's DigitalOcean credential (SkyPilot's DO provisioner
+#     reads only ~/.config/doctl/config.yaml), verified in preflight -- without it the `--cloud do`
+#     smoke job could never launch and every deploy would end in rollback;
+#   - after the pause ack, the drain is re-checked with no wait: a job the old ticker launched
+#     between the drain and the ack would otherwise be orphaned by step 5's power-off;
+#   - rollback drains the new droplet's own jobs (unpaused, so they can be observed) before
+#     retiring it, and never powers off or deletes it while any of them is still in flight;
+#   - a queue that was paused before the deploy is refused, never resumed behind the operator;
+#   - every failure path decides which droplet keeps ticking from the droplets' *real* power
+#     state, and after any resume confirms an unpaused tick actually happened (ZERO TICKERS
+#     otherwise, loudly).
 set -euo pipefail
 
 TAG="${1:-}"
@@ -56,6 +70,10 @@ DROPLET_NAME="lab-scheduler-$(date -u +%Y%m%dT%H%M%SZ)"
 REGION="nyc3"
 SIZE="s-1vcpu-1gb"
 DRAIN_TIMEOUT="${LAB_DEPLOY_DRAIN_TIMEOUT:-30m}"
+# Rollback's own drain (the new droplet's jobs, see rollback()). Shorter than the forward drain:
+# the host being drained is the one that just failed its smoke test, and it keeps launching while
+# the queue is unpaused -- a busy queue will not drain, and the hold state that follows is safe.
+ROLLBACK_DRAIN_TIMEOUT="${LAB_DEPLOY_ROLLBACK_DRAIN_TIMEOUT:-10m}"
 # 2 tick cycles at the systemd timer's ~60s cadence, plus headroom -- see step 2's comment.
 PAUSE_ACK_TIMEOUT_S="${LAB_DEPLOY_PAUSE_ACK_TIMEOUT_S:-120}"
 VERIFY_TIMEOUT_S="${LAB_DEPLOY_VERIFY_TIMEOUT_S:-1200}"
@@ -178,6 +196,21 @@ confirm_live_ticker() {
   return 1
 }
 
+# Wait for a *completed* tick to report the pause (heartbeat_paused) -- see step 2b.
+wait_pause_ack() {
+  local deadline hb_paused=""
+  deadline=$(( $(date +%s) + PAUSE_ACK_TIMEOUT_S ))
+  while (( $(date +%s) < deadline )); do
+    # Tolerate one flaky read (matches steps 4/7's pattern) rather than aborting on a single R2
+    # hiccup during what should be a sub-two-minute wait.
+    hb_paused="$(uv run lab queue list | json_field heartbeat_paused)" || hb_paused=""
+    [[ "$hb_paused" == "True" ]] && return 0
+    sleep 5
+  done
+  echo "no scheduler confirmed observing the pause within ${PAUSE_ACK_TIMEOUT_S}s (last heartbeat_paused: ${hb_paused:-<none>})" >&2
+  return 1
+}
+
 # One immediate drain read, no waiting: is anything launching/launched right now? Returns 0 only
 # on a clean, readable answer; otherwise DRAIN_BLOCKING names what is in flight (or says the
 # queue could not be read -- an unreadable entry may be in flight too, so that is not clean).
@@ -206,6 +239,7 @@ RENDERED=""
 PAUSED=0
 RESUMED=0
 PRE_PAUSED=0            # the queue was paused before this deploy touched it: never resume it
+HOLD_FOR_MANUAL=0       # rollback stopped in a deliberate safe hold: cleanup() must not undo it
 RESUME_EPOCH=0
 PREFLIGHT_HOST=""       # the old scheduler's heartbeat host, read in preflight
 OLD_DROPLET_ID=""
@@ -225,6 +259,10 @@ cleanup() {
   (( CLEANUP_DONE )) && return "$rc"
   CLEANUP_DONE=1
   [[ -n "$RENDERED" ]] && rm -f "$RENDERED"
+  if (( HOLD_FOR_MANUAL == 1 )); then
+    echo "cleanup: rollback stopped in a deliberate hold (see MANUAL ACTION above) -- leaving it exactly as it is" >&2
+    return "$rc"
+  fi
   if (( rc != 0 && PAUSED == 1 && RESUMED == 0 )); then
     echo "deploy failed while queue was paused -- recovering safely" >&2
     local safe_to_resume=1 survivor=""
@@ -442,17 +480,8 @@ say "2b. wait for the old scheduler to acknowledge the pause (not just our own w
 if [[ "$DRY_RUN" == "--dry-run" ]]; then
   echo "[dry-run] poll lab queue list until heartbeat_paused == true"
 else
-  pause_ack_deadline=$(( $(date +%s) + PAUSE_ACK_TIMEOUT_S ))
-  hb_paused=""
-  while (( $(date +%s) < pause_ack_deadline )); do
-    # Tolerate one flaky read (matches steps 4/7's pattern) rather than aborting on a single R2
-    # hiccup during what should be a sub-two-minute wait.
-    hb_paused="$(uv run lab queue list | json_field heartbeat_paused)" || hb_paused=""
-    [[ "$hb_paused" == "True" ]] && break
-    sleep 5
-  done
-  if [[ "$hb_paused" != "True" ]]; then
-    echo "old scheduler never confirmed observing the pause within ${PAUSE_ACK_TIMEOUT_S}s (last heartbeat_paused: ${hb_paused:-<none>}) -- it may still be able to launch a job; not proceeding. cleanup will resume the queue." >&2
+  if ! wait_pause_ack; then
+    echo "the old scheduler may still be able to launch a job; not proceeding. cleanup will resume the queue." >&2
     exit 1
   fi
   echo "old scheduler confirmed paused"
@@ -576,61 +605,92 @@ else
   resume_queue || { echo "resume failed -- cleanup will retry it" >&2; exit 1; }
 fi
 
-# Every step here is best-effort: this runs after set -e could otherwise be triggered by any one
-# of them, and aborting rollback() halfway is worse than either endpoint state. New droplet is
-# taken out of service (by numeric ID -- `droplet-action` rejects a name) BEFORE the queue
-# resumes -- exactly one unpaused ticker at every instant, same invariant as the forward path.
-# RESUMED is reset to 0 right after rollback's own pause succeeds so the outer cleanup() trap's
-# safety net is re-armed for the duration of this sequence: if the script dies partway through
-# rollback itself (e.g. a hung --wait gets killed), cleanup() still attempts a resume instead of
-# leaving the queue paused forever with nobody told.
+# rollback() stops here, in a state that is safe to leave indefinitely: the queue PAUSED (nothing
+# launches, nothing double-launches), the new droplet left exactly as it is -- ON, so the
+# supervisors it runs keep enforcing timeouts and tearing down the jobs it launched -- and the old
+# droplet not powered on next to it. Powering off or deleting the new droplet with work in flight
+# would orphan those jobs (DO keeps billing, their regs stay `launched` forever, since only the
+# new droplet's disk holds their manifests). cleanup() leaves a held state alone.
+rollback_hold() {
+  HOLD_FOR_MANUAL=1
+  local old_state
+  old_state="$(droplet_status "$OLD_DROPLET_ID")"
+  echo "MANUAL ACTION REQUIRED -- rollback stopped in a safe hold: $1
+  queue:       PAUSED (nothing launches until a human resumes it)
+  new droplet: $NEW_DROPLET_ID ($DROPLET_NAME) -- left running: it owns every job it launched
+  old droplet: $OLD_DROPLET_ID -- status '${old_state:-<unreadable>}'
+Then EITHER keep the new host (it was verified alive at step 4; only the smoke test failed):
+  uv run lab queue resume                 # and delete the old droplet by hand later
+OR finish the rollback once the new host's jobs are done:
+  uv run lab queue resume; uv run lab queue wait-drain --timeout 2h
+  uv run lab queue pause                  # then wait for heartbeat_paused=true in 'uv run lab queue list'
+  doctl compute droplet-action power-on $OLD_DROPLET_ID --wait
+  doctl compute droplet-action power-off $NEW_DROPLET_ID --wait
+  uv run lab queue resume; doctl compute droplet delete $NEW_DROPLET_ID --force" >&2
+}
+
+# Smoke failed after step 6 resumed the queue with the new droplet as its only ticker -- so by
+# now it may have launched real jobs whose supervisors run ON IT. Order matters at every step:
+#   1. drain FIRST, unpaused: a paused scheduler never observes a job finishing (the same
+#      self-deadlock drain-before-pause exists for), and these jobs must finish under the
+#      supervisor that launched them;
+#   2. pause, wait for the ack, and re-check the drain with no wait (a launch can land between
+#      the two, exactly as at step 2c) -- anything still in flight -> safe hold, never retire;
+#   3. power the old droplet ON and confirm it by its real state BEFORE the new one goes off
+#      (both ticking while paused is harmless; neither ticking while resumed is an outage);
+#   4. power the new one off, confirmed the same way -- unconfirmed -> hold, both may tick;
+#   5. resume, and prove the old droplet really ticks unpaused;
+#   6. only then delete the new droplet: nothing of its is in flight (step 2).
+# RESUMED is reset to 0 once rollback's own pause succeeds, re-arming cleanup()'s safety net: a
+# death mid-rollback still gets a recovery attempt (which now reads the droplets' real state)
+# instead of a silently paused queue.
 rollback() {
   echo "rolling back: old droplet resumes service, new droplet is discarded" >&2
-  # Re-arm honestly: rollback is about to power the old droplet back ON, so the invariant
-  # cleanup()'s safety net relies on (OLD_DROPLET_OFF implies the old droplet is actually off)
-  # must not stay stale through a death mid-rollback.
-  OLD_DROPLET_OFF=0
+  echo "rollback: waiting up to $ROLLBACK_DRAIN_TIMEOUT for jobs the new droplet launched to finish (unpaused, so they can be seen finishing)" >&2
+  uv run lab queue wait-drain --timeout "$ROLLBACK_DRAIN_TIMEOUT" ||
+    echo "rollback: not drained -- pausing anyway; whatever is still in flight decides below" >&2
   if uv run lab queue pause; then
     RESUMED=0
   else
-    echo "rollback: pause FAILED -- queue may still be resumed with the new droplet ticking, check manually" >&2
+    rollback_hold "the pause FAILED -- the queue is still RUNNING with the new droplet as its only ticker"
+    return 1
   fi
-  # Track power-off/delete success independently -- NEW_DROPLET_CREATED must only be cleared once
-  # BOTH are confirmed, the same way RESUMED is only set on confirmed success, never assumed. If
-  # either fails, leaving the flag set means a later cleanup() (should the script die after this
-  # point) still knows there may be a live droplet to check on, instead of wrongly believing there
-  # is nothing left to worry about.
-  local new_poweroff_ok=1
+  if ! wait_pause_ack; then
+    rollback_hold "the new droplet never acknowledged the pause -- it may still launch"
+    return 1
+  fi
+  if ! drain_now; then
+    rollback_hold "jobs the new droplet launched are still in flight: $DRAIN_BLOCKING"
+    return 1
+  fi
+  if ! power_to on "$OLD_DROPLET_ID"; then
+    rollback_hold "the old droplet ($OLD_DROPLET_ID) could not be confirmed powered back on -- retiring the new one would leave ZERO tickers"
+    return 1
+  fi
+  OLD_DROPLET_OFF=0
+  local new_off=0
   if (( NEW_DROPLET_CREATED == 1 )); then
     if ! resolve_new_droplet_id; then
-      echo "rollback: could not resolve a droplet ID for the new droplet ($DROPLET_NAME) by name -- it may or may not exist; leaving NEW_DROPLET_CREATED set for cleanup() to check" >&2
-      new_poweroff_ok=0
-    elif ! doctl compute droplet-action power-off "$NEW_DROPLET_ID" --wait; then
-      echo "rollback: power-off of new droplet ($NEW_DROPLET_ID) FAILED -- it may still be ticking, check manually" >&2
-      new_poweroff_ok=0
+      rollback_hold "the new droplet's ID ($DROPLET_NAME) cannot be resolved, so it cannot be confirmed off -- BOTH droplets may be ticking (harmless only while paused)"
+      return 1
     fi
+    if ! power_to off "$NEW_DROPLET_ID"; then
+      rollback_hold "the new droplet ($NEW_DROPLET_ID) could not be confirmed off -- BOTH droplets may be ticking (harmless only while paused)"
+      return 1
+    fi
+    new_off=1
   fi
-  doctl compute droplet-action power-on "$OLD_DROPLET_ID" --wait ||
-    echo "rollback: power-on of old droplet ($OLD_DROPLET_ID) FAILED -- old droplet may still be off, check manually" >&2
-  if uv run lab queue resume; then
-    RESUMED=1
+  if resume_queue; then
+    confirm_live_ticker "$PREFLIGHT_HOST" || true
   else
     echo "rollback: resume FAILED -- queue left paused, MANUAL ACTION REQUIRED: run 'lab queue resume'" >&2
   fi
-  local new_delete_ok=0
   if (( NEW_DROPLET_CREATED == 1 )); then
-    if [[ "$NEW_DROPLET_ID" =~ ^[0-9]+$ ]] && doctl compute droplet delete "$NEW_DROPLET_ID" --force; then
-      new_delete_ok=1
-    else
-      echo "rollback: delete of new droplet ($NEW_DROPLET_ID) FAILED or ID unresolved -- it may still exist, check manually" >&2
-    fi
-  fi
-  if (( NEW_DROPLET_CREATED == 1 )); then
-    if (( new_poweroff_ok == 1 && new_delete_ok == 1 )); then
+    if doctl compute droplet delete "$NEW_DROPLET_ID" --force; then
       NEW_DROPLET_CREATED=0
     else
-      echo "rollback: new droplet ($NEW_DROPLET_ID) teardown NOT fully confirmed (power-off ok=$new_poweroff_ok, delete ok=$new_delete_ok) -- it may still exist; leaving it tracked and flagging for manual verification" >&2
-      warn_leftover_droplet "$NEW_DROPLET_ID" "$DROPLET_NAME" "$new_poweroff_ok"
+      echo "rollback: delete of new droplet ($NEW_DROPLET_ID) FAILED -- it is powered off but may still exist" >&2
+      warn_leftover_droplet "$NEW_DROPLET_ID" "$DROPLET_NAME" "$new_off"
     fi
   fi
 }

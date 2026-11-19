@@ -40,8 +40,29 @@ job. If step 1's drain-wait times out, the message names the blocking `reg_id`s;
 past it is to cancel or wait out those registrations by hand (`lab queue cancel <reg_id>` or let
 them finish).
 
-Four env vars tune timeouts and one failure-mode default:
+**A failed smoke test rolls back only what is safe to roll back.** By then step 6 has resumed the
+queue with the new droplet as its only ticker, so it may have launched real jobs whose supervisors
+run *on it*. Rollback first waits (unpaused, `LAB_DEPLOY_ROLLBACK_DRAIN_TIMEOUT`) for those to
+finish, pauses, waits for the pause ack and re-checks; it then powers the old droplet on and
+confirms it by its real status *before* powering the new one off, resumes, and confirms the old
+host is really ticking — and only then deletes the new droplet. If anything is still in flight,
+or a power action cannot be confirmed, it stops in a **safe hold** instead: queue paused, new
+droplet left running (it owns its jobs), the old one untouched, and a `MANUAL ACTION REQUIRED`
+block naming the in-flight registrations and the exact commands for either way forward.
+
+**Every failure path reads the droplets' real power state.** `doctl ... --wait` can exit non-zero
+after the action took effect, so the script decides which droplet keeps ticking from
+`doctl compute droplet get <id> --format Status`, never from the exit code alone, and after any
+failure-path resume it waits for proof that a scheduler ticked unpaused — or prints
+`ZERO TICKERS?` with both droplet ids.
+
+Env vars tune timeouts and one failure-mode default:
 - `LAB_DEPLOY_DRAIN_TIMEOUT` (default `30m`) — step 1, waiting for in-flight jobs to clear.
+- `LAB_DEPLOY_ROLLBACK_DRAIN_TIMEOUT` (default `10m`) — rollback, waiting for the new droplet's
+  own jobs before retiring it (shorter: the host being drained just failed its smoke test and
+  keeps launching while unpaused; the hold that follows a timeout is safe).
+- `LAB_DEPLOY_TICKER_CONFIRM_TIMEOUT_S` (default `180`) — after a failure-path resume, how long to
+  wait for proof that a scheduler is ticking unpaused again.
 - `LAB_DEPLOY_VERIFY_TIMEOUT_S` (default `1200`) — step 4, waiting for the new droplet's first
   heartbeat (boot + package installs on a 1 vCPU/1GB droplet is realistically 10+ minutes).
 - `LAB_DEPLOY_SMOKE_TIMEOUT_S` (default `1800`) — step 7, waiting for the smoke job to finish.

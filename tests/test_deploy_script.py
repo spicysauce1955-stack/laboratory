@@ -255,6 +255,45 @@ def test_a_launch_between_the_drain_and_the_pause_ack_aborts_the_cutover(world) 
     assert not r.paused  # cleanup resumed: the old scheduler keeps supervising reg-race
 
 
+# ------------------------------------------------------------------------------ #3 rollback drains
+
+
+def test_rollback_drains_the_new_droplets_jobs_before_retiring_it(world) -> None:  # type: ignore[no-untyped-def]
+    """Smoke failed, but the resumed new droplet had already launched a real job. Rollback waits
+    (unpaused, so it can be observed) for it to finish, then completes."""
+    r = world({"smoke": "failed", "on_resume_launch": [{"reg_id": "reg-n1", "finish_after_s": 300}]})
+    assert r.rc != 0
+    assert r.state["regs"]["reg-n1"]["state"] == "succeeded"
+    pause_i = max(i for i, c in enumerate(r.lab_calls) if c[:2] == ["queue", "pause"])
+    drain_i = max(i for i, c in enumerate(r.lab_calls) if c[:2] == ["queue", "wait-drain"]
+                  and "0" not in c and "0s" not in c)
+    assert drain_i < pause_i  # drained BEFORE pausing (pausing stops the sync)
+    assert r.droplet("new")["deleted"] and r.droplet("old")["status"] == "active"
+    assert not r.paused
+
+
+def test_rollback_never_retires_a_new_droplet_that_still_owns_running_jobs(world) -> None:  # type: ignore[no-untyped-def]
+    """The new droplet's supervisors are the only thing tearing its jobs down. Deleting (or even
+    powering off) it with jobs in flight orphans them: DO keeps billing and the regs stay
+    `launched` forever. The rollback stops in a safe hold instead and names the jobs."""
+    r = world({"smoke": "failed", "on_resume_launch": [{"reg_id": "reg-n1"}]})  # never finishes
+    assert r.rc != 0
+    assert ["delete", "new"] not in r.actions
+    assert ["poweroff", "new"] not in r.actions
+    assert r.droplet("new")["status"] == "active"
+    assert r.paused  # nothing launches while a human decides
+    assert ["poweron", "old"] not in r.actions  # never two tickers
+    assert "reg-n1" in r.err and "MANUAL" in r.err
+
+
+def test_rollback_with_nothing_in_flight_restores_the_old_droplet(world) -> None:  # type: ignore[no-untyped-def]
+    r = world({"smoke": "failed"})
+    assert r.rc != 0
+    assert r.droplet("new")["deleted"]
+    assert r.droplet("old")["status"] == "active" and not r.paused
+    assert "ticking" in r.out + r.err  # the surviving ticker was confirmed, not assumed
+
+
 # ------------------------------------------------------------------------------ #10 operator's pause
 
 
@@ -305,6 +344,22 @@ def test_zero_tickers_after_a_failure_is_reported_loudly(world) -> None:  # type
     assert r.rc != 0
     assert "ZERO TICKERS" in r.err
     assert f"power-on {OLD_ID}" in r.err or f"power-on\" {OLD_ID}" in r.err or OLD_ID in r.err
+
+
+def test_a_failed_old_power_on_during_rollback_never_leaves_zero_tickers_resumed(world) -> None:  # type: ignore[no-untyped-def]
+    r = world({"smoke": "failed", "poweron": {"old": {"rc": 1, "effect": False}}})
+    assert r.rc != 0
+    assert r.droplet("old")["status"] == "off"
+    assert r.droplet("new")["status"] == "active" and not r.droplet("new").get("deleted")
+    assert r.paused  # held for a human, not resumed into an outage
+    assert "MANUAL" in r.err
+
+
+def test_a_power_on_that_errors_but_worked_completes_the_rollback(world) -> None:  # type: ignore[no-untyped-def]
+    r = world({"smoke": "failed", "poweron": {"old": {"rc": 1, "effect": True}}})
+    assert r.rc != 0  # a rollback is still a failed deploy
+    assert r.droplet("old")["status"] == "active" and r.droplet("new")["deleted"]
+    assert not r.paused
 
 
 # ------------------------------------------------------------------------------ unchanged paths
