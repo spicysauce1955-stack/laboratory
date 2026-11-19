@@ -1,7 +1,8 @@
 #cloud-config
 # Rendered by deploy/scheduler/deploy.sh via envsubst. Placeholders: $TAG, $DROPLET_NAME,
 # $LAB_R2_ENDPOINT, $LAB_R2_BUCKET, $AWS_ACCESS_KEY_ID, $AWS_SECRET_ACCESS_KEY, $VAST_API_KEY,
-# $VAST_API_KEY_B64 (same value, base64 -- see the runcmd step below for why both exist).
+# $VAST_API_KEY_B64 (same value, base64 -- see the runcmd step below for why both exist),
+# $DOCTL_CONFIG_B64 (a minimal doctl config.yaml carrying the controller's DO token, base64).
 # Runs once, as root, on first boot. No SSH involved anywhere in this file.
 
 hostname: $DROPLET_NAME
@@ -45,10 +46,23 @@ runcmd:
   # `"`, `` ` ``, `$`, `\`, or `'` would otherwise break out of the quoting here (real operator
   # keys are not guaranteed to avoid those). Base64's alphabet has none of them, so it's safe in
   # any quoting context regardless of what the real key contains.
+  # ~/.config itself owned by `lab` (an `install -d` of a subdirectory would create it as root,
+  # leaving the service user unable to add e.g. ~/.config/gcloud later).
+  - install -d -o lab -g lab -m 0755 /home/lab/.config
   - install -d -o lab -g lab -m 0700 /home/lab/.config/vastai
   - 'bash -c "echo \"$VAST_API_KEY_B64\" | base64 -d > /home/lab/.config/vastai/vast_api_key"'
   - chown lab:lab /home/lab/.config/vastai/vast_api_key
   - chmod 600 /home/lab/.config/vastai/vast_api_key
+
+  # DigitalOcean credential for the service user. SkyPilot's DO provisioner -- and through it
+  # every `--cloud do` launch, robust_teardown's DO-direct fallback and reconcile's DO pass --
+  # reads ONLY ~/.config/doctl/config.yaml (no env var), so without this file deploy.sh's
+  # `--cloud do` smoke job can never launch. Base64 for the same quoting reason as the Vast key;
+  # written under umask 077 so it is never world-readable, even for an instant.
+  - install -d -o lab -g lab -m 0700 /home/lab/.config/doctl
+  - 'bash -c "umask 077; echo \"$DOCTL_CONFIG_B64\" | base64 -d > /home/lab/.config/doctl/config.yaml"'
+  - chown lab:lab /home/lab/.config/doctl/config.yaml
+  - chmod 600 /home/lab/.config/doctl/config.yaml
 
   # Install the pinned laboratory release as the `lab` user (puts the entrypoint at
   # /home/lab/.local/bin/lab — root's uv tool install would land under 0700 /root/.local/bin,

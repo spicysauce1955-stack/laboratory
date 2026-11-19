@@ -54,6 +54,17 @@ always needed: `~/.config/vastai/vast_api_key`, `~/.cloudflare/r2.credentials`,
 whichever of `LAB_R2_ENDPOINT`/`LAB_R2_BUCKET` aren't already exported from there, same rule as
 the rest of the lab: real env always wins over the file).
 
+**The new droplet also gets this machine's DigitalOcean token**, written as the `lab` user's
+`~/.config/doctl/config.yaml` — the only place SkyPilot's DO provisioner reads a credential from.
+Without it the `--cloud do` smoke job could never launch (every deploy would roll back), no DO
+registration could launch on the host, and `robust_teardown`'s DO-direct fallback would be dead
+there. `deploy/scheduler/do_token.py` finds the token doctl itself uses — `$DIGITALOCEAN_ACCESS_TOKEN`,
+else the current context of `$XDG_CONFIG_HOME/doctl/config.yaml`, `~/.config/doctl/config.yaml` or
+a snap install's `~/snap/doctl/current/.config/doctl/config.yaml` (two files that disagree are
+refused; export the variable to choose) — and preflight proves it authenticates (`doctl account
+get`) before anything is touched. It is never printed; like the Vast key it travels only base64-
+encoded inside the rendered cloud-init.
+
 Full design + the two real bugs an adversarial review caught before this shipped:
 `docs/superpowers/specs/2026-08-27-scheduler-deploy-cutover-design.md`.
 

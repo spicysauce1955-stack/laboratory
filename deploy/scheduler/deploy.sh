@@ -191,6 +191,7 @@ command -v doctl >/dev/null || { echo "doctl not found on PATH" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "python3 not found on PATH" >&2; exit 1; }
 command -v envsubst >/dev/null || { echo "envsubst not found on PATH" >&2; exit 1; }
 command -v base64 >/dev/null || { echo "base64 not found on PATH" >&2; exit 1; }
+command -v uv >/dev/null || { echo "uv not found on PATH" >&2; exit 1; }
 VAST_KEY_FILE="${HOME}/.config/vastai/vast_api_key"
 R2_CRED_FILE="${HOME}/.cloudflare/r2.credentials"
 [[ -f "$VAST_KEY_FILE" ]] || { echo "missing $VAST_KEY_FILE" >&2; exit 1; }
@@ -222,6 +223,31 @@ AWS_ACCESS_KEY_ID="$(awk -F' *= *' '/aws_access_key_id/{print $2; exit}' "$R2_CR
 AWS_SECRET_ACCESS_KEY="$(awk -F' *= *' '/aws_secret_access_key/{print $2; exit}' "$R2_CRED_FILE")"
 [[ -n "$AWS_ACCESS_KEY_ID" && -n "$AWS_SECRET_ACCESS_KEY" ]] || {
   echo "could not read aws_access_key_id/aws_secret_access_key from $R2_CRED_FILE" >&2; exit 1; }
+
+# DigitalOcean credential for the NEW droplet. SkyPilot's DO provisioner reads ONLY the doctl
+# config file (~/.config/doctl/config.yaml), never an env var -- and the new host has none unless
+# we ship one. Without it the `--cloud do` smoke job at step 7 can never launch (every deploy would
+# end in rollback), no DO registration can launch there, and robust_teardown's DO-direct fallback
+# is dead on the host whose whole job is unattended teardown. The token is the one this machine's
+# doctl uses (do_token.py: $DIGITALOCEAN_ACCESS_TOKEN, else the current context of the doctl
+# config, including a snap install's), proven to authenticate before anything is touched, and
+# never printed: it travels only as base64 inside the rendered cloud-init (mode 0600, deleted on
+# exit), like the Vast key.
+DO_TOKEN="$(uv run --quiet python "$SCRIPT_DIR/do_token.py")" || {
+  echo "preflight: no usable DigitalOcean credential to give the new droplet (reason above) -- refusing before anything is touched" >&2
+  exit 1
+}
+do_status="$(DIGITALOCEAN_ACCESS_TOKEN="$DO_TOKEN" doctl account get --format Status --no-header 2>/dev/null)" || do_status=""
+do_status="${do_status//[[:space:]]/}"
+case "$do_status" in
+  active|warning)
+    echo "preflight: the DigitalOcean credential for the new droplet authenticates (account status: $do_status)" ;;
+  *)
+    echo "preflight: the DigitalOcean token that would be shipped to the new droplet does not authenticate ('doctl account get' -> '${do_status:-<failed>}') -- refusing before anything is touched" >&2
+    exit 1 ;;
+esac
+DOCTL_CONFIG_B64="$(printf 'access-token: %s\ncontext: default\n' "$DO_TOKEN" | base64 | tr -d '\n')"
+unset DO_TOKEN do_status
 
 # Independently validate that the OLD droplet is actually the live one before anything is
 # touched -- this both catches a bucket mismatch (above) immediately, and confirms there really
@@ -306,7 +332,7 @@ RENDERED="$(mktemp)"
 TAG="$TAG" DROPLET_NAME="$DROPLET_NAME" LAB_R2_ENDPOINT="$LAB_R2_ENDPOINT" \
   LAB_R2_BUCKET="$LAB_R2_BUCKET" AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
   AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" VAST_API_KEY="$VAST_API_KEY" \
-  VAST_API_KEY_B64="$VAST_API_KEY_B64" \
+  VAST_API_KEY_B64="$VAST_API_KEY_B64" DOCTL_CONFIG_B64="$DOCTL_CONFIG_B64" \
   envsubst < "$SCRIPT_DIR/cloud-init.yaml.tmpl" > "$RENDERED"
 # `droplet create` (unlike `droplet-action`) accepts a name, but we need the numeric ID for every
 # later droplet-action call, so capture it directly via --format/--no-header instead of a
@@ -452,7 +478,7 @@ rollback() {
 say "7. smoke test -- one real registration, through the new scheduler"
 if [[ "$DRY_RUN" != "--dry-run" ]]; then
   reg_json="$(uv run lab register -c "uv run experiments/example_capacity.py" \
-    --cloud do --timeout 10m --max-cost 1 --expires +1h)" || {
+    --cloud "do" --timeout 10m --max-cost 1 --expires +1h)" || {
     echo "smoke registration command failed" >&2; rollback; exit 1; }
   reg_id="$(echo "$reg_json" | json_field reg_id)" || {
     echo "could not parse reg_id from smoke registration output: $reg_json" >&2; rollback; exit 1; }
