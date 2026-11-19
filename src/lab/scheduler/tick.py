@@ -587,7 +587,15 @@ class Scheduler:
         # Deliberately a FRESH single read, never the tick's MarkerSnapshot: its entire purpose is
         # to observe a cancel that landed after the evaluation loop began, and the next statement
         # after it rents a machine. Bounded by launches per tick, not by queue size.
-        if self.queue.cancel_requested(reg.reg_id):  # spec §5 cancel race: re-check pre-submit
+        # Both re-checks fail CLOSED: a marker read that errors (network blip, a token without
+        # HeadObject) is "don't launch this tick", never "no marker" — the next statement after
+        # them spends money, and the entry simply retries on the next tick.
+        try:
+            cancelled = self.queue.cancel_requested(reg.reg_id)  # spec §5 cancel race
+        except Exception as e:  # noqa: BLE001 — a bad read must not kill the tick (§5)
+            self._marker_check_failed(reg, rep, "cancel", e)
+            return
+        if cancelled:
             self._transition(reg, RegState.cancelled, reason="cancelled by user")
             rep.cancelled.append(reg.reg_id)
             return
@@ -597,7 +605,12 @@ class Scheduler:
         # A hold that does not hold spends money the operator just said not to spend. Back to
         # `pending`, never `cancelled` — a hold is reversible, and `lab queue release` must be able
         # to launch this entry later.
-        if self.queue.held(reg.reg_id):
+        try:
+            held = self.queue.held(reg.reg_id)
+        except Exception as e:  # noqa: BLE001 — a bad read must not kill the tick (§5)
+            self._marker_check_failed(reg, rep, "hold", e)
+            return
+        if held:
             self._transition(reg, RegState.pending, reason="held")
             rep.skipped[reg.reg_id] = "held"
             return
@@ -628,6 +641,15 @@ class Scheduler:
             self.queue.mirror_manifest(self.store.read_manifest(job_id))
         except Exception as e:  # noqa: BLE001 — mirroring is best-effort visibility, not launch
             rep.errors.append(f"{reg.reg_id}: initial mirror failed: {e}"[:300])
+
+    def _marker_check_failed(
+        self, reg: Registration, rep: TickReport, kind: str, error: Exception
+    ) -> None:
+        """A pre-submit marker re-check could not be read: back to `pending`, nothing rented."""
+        reason = f"pre-submit {kind} marker check failed, retrying next tick: {error}"[:300]
+        self._transition(reg, RegState.pending, reason=reason)
+        rep.skipped[reg.reg_id] = reason
+        rep.errors.append(f"{reg.reg_id}: {reason}"[:300])
 
     def _repair_launching(self, reg: Registration, rep: TickReport) -> None:
         """A tick crashed mid-launch (spec §5): decide from evidence, after a grace period."""

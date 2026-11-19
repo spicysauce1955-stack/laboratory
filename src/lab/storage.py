@@ -19,6 +19,23 @@ R2_CREDENTIALS_FILE = Path.home() / ".cloudflare" / "r2.credentials"
 DEFAULT_BUCKET = "lab-artifacts"
 
 
+def _error_code(e: BaseException) -> str | None:
+    """The S3 error code a boto exception carries, or None. Never raises.
+
+    getattr's default only applies when the attribute is *missing* — a `.response` (or nested
+    "Error") that is present-but-None (some non-ClientError boto/network exceptions, or a non-AWS
+    S3-compatible error body) would otherwise crash the caller's handler with AttributeError
+    instead of its own re-raise (2026-09-05 `queue list` incident). `.response` itself can be
+    present-but-not-a-dict (a bare string), and so can `Error` — both read as "no recognized
+    error code" rather than crashing on `.get()`.
+    """
+    response = getattr(e, "response", None) or {}
+    error = response.get("Error") if isinstance(response, dict) else None
+    error = error or {}
+    code = error.get("Code") if isinstance(error, dict) else None
+    return str(code) if code is not None else None
+
+
 def r2_enabled() -> bool:
     """True if R2 is configured (endpoint + some credential source)."""
     if not os.environ.get("LAB_R2_ENDPOINT"):
@@ -97,31 +114,26 @@ class R2Store:
         try:
             body: bytes = self._s3.get_object(Bucket=self.bucket, Key=key)["Body"].read()
         except Exception as e:  # noqa: BLE001 — boto raises dynamic ClientError subclasses
-            # getattr's default only applies when the attribute is *missing* — a `.response` (or
-            # nested "Error") that is present-but-None (some non-ClientError boto/network
-            # exceptions, or a non-AWS S3-compatible error body) would otherwise crash this
-            # handler with AttributeError instead of the raise below (2026-09-05 `queue list`
-            # incident).
-            response = getattr(e, "response", None) or {}
-            # `.response` itself can be present-but-not-a-dict (a bare string, same class of
-            # non-AWS S3-compatible provider quirk as `Error` below) — treat that the same as
-            # "no recognized error code" rather than crashing on `.get("Error")`.
-            error = response.get("Error") if isinstance(response, dict) else None
-            error = error or {}
-            # `Error` itself can be present-but-not-a-dict (a non-AWS S3-compatible provider, or
-            # a genuinely malformed response, returning a bare string) — treat that the same as
-            # "no recognized error code" rather than crashing on `.get("Code")`.
-            error_code = error.get("Code") if isinstance(error, dict) else None
-            if "NoSuchKey" in str(e) or error_code in ("NoSuchKey", "404"):
+            if "NoSuchKey" in str(e) or _error_code(e) in ("NoSuchKey", "404"):
                 return None
             raise
         return body.decode()
 
     def exists(self, key: str) -> bool:
+        """True if the object exists, False only when the store *says* it does not.
+
+        Every other failure — a network blip, a token without HeadObject (403), throttling — is
+        re-raised, never answered with False. The callers that matter are the scheduler's fresh
+        pre-submit cancel/hold re-checks (spec §5), where False means "go ahead and rent the
+        machine": an "I could not ask" read as "no marker" made both fail open. A HEAD has no
+        body, so botocore reports a missing key as the bare status code ``"404"``.
+        """
         try:
             self._s3.head_object(Bucket=self.bucket, Key=key)
-        except Exception:  # noqa: BLE001
-            return False
+        except Exception as e:  # noqa: BLE001 — boto raises dynamic ClientError subclasses
+            if _error_code(e) in ("404", "NoSuchKey", "NotFound"):
+                return False
+            raise
         return True
 
     def delete(self, key: str) -> None:
