@@ -194,13 +194,16 @@ def _per_combination(column: Any, name: str, count: int) -> list[Any]:
         else:
             single = False
     if single:
-        what = "its answer" if name == HIT_KEY else f"extra column {name!r}"
-        noun = "answer" if name == HIT_KEY else "value"
+        needs = (
+            "it must return one answer"
+            if name == HIT_KEY
+            else f"its extra column {name!r} must hold one value"
+        )
         raise TypeError(
-            f"evaluate is called in batch mode with {count} combination(s) per call, so {what} "
-            f"must hold one {noun} per combination (a list or array), but it returned the single "
-            f"value {column!r}. Return one {noun} per combination, or evaluate one combination "
-            "at a time (no batch_size in grid_search, batched=False in find_boundary)"
+            f"evaluate is called in batch mode with {count} combination(s) per call, so {needs} "
+            f"per combination (a list or array), but it returned the single value {column!r}. "
+            "Return one per combination, or evaluate one combination at a time (no batch_size "
+            "in grid_search, batched=False in find_boundary)"
         )
     if len(values) != count:
         raise ValueError(
