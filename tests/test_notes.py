@@ -138,6 +138,46 @@ def test_matching_ignores_a_note_from_a_different_signature(tmp_path: Path) -> N
     assert notes.match(signature="LabError: no offer") == []
 
 
+def test_a_note_filed_under_a_job_specific_signature_fires_for_the_next_job(
+    tmp_path: Path,
+) -> None:
+    """Before signatures normalised real job ids, an "unknown job id" note was keyed on
+    `'<sha>-<n>-7486e1'` — the one job it was written about — and could never fire again. The
+    stored key is upgraded on read, so those notes start doing their job without a migration."""
+    from lab.events.stats import signature
+
+    legacy = "Exit: unknown job id '<sha>-<n>-7486e1' — not in local runs/"
+    notes.write(text="the job ran from the other checkout", signature=legacy)
+
+    later = signature(
+        {"type": "Exit", "message": "unknown job id '20261120-081512-a0b1c2' — not in local runs/"}
+    )
+    assert [n.text for n in notes.match(signature=later)] == ["the job ran from the other checkout"]
+    # ...and a note filed today under the new key is matched by the same lookup.
+    notes.write(text="filed today", signature=later)
+    assert [n.text for n in notes.match(signature=later)] == [
+        "filed today", "the job ran from the other checkout",
+    ]
+
+
+def test_a_legacy_signature_cut_at_the_length_cap_still_matches(tmp_path: Path) -> None:
+    """The old normaliser left ~13 more characters per id, so a long message hit the 120-char
+    cap earlier: the upgraded stored key is then a strict prefix of today's signature."""
+    from lab.events.stats import signature
+
+    tail = "x" * 200
+    job, other = "20261119-102456-7486e1", "20261120-081512-a0b1c2"
+    # What the old normaliser stored: the id rewritten as `<sha>-<n>-7486e1`, then cut at 120.
+    legacy_message = f"unknown job id '<sha>-<n>-7486e1' {tail}"[:120]
+    notes.write(text="long one", signature=f"Exit: {legacy_message}")
+
+    later = signature({"type": "Exit", "message": f"unknown job id '{other}' {tail}"})
+    assert [n.text for n in notes.match(signature=later)] == ["long one"]
+    # A *different* failure sharing only the generic head of the message must not match.
+    unrelated = signature({"type": "Exit", "message": f"unknown job id '{job}' " + "y" * 200})
+    assert notes.match(signature=unrelated) == []
+
+
 def test_matching_finds_a_note_by_entrypoint_and_cloud(tmp_path: Path) -> None:
     notes.write(text="DO caps out at 8 boxes", facets={"entrypoint": "census.py", "cloud": "do"})
 

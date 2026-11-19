@@ -926,7 +926,9 @@ def history(
     project = None if all_projects else repo_root().name
     found = events.read(
         since=since, project=project, action=action, session=session, job=job,
-        failures_only=failures, limit=None,
+        # +1: room for this call's own open row, which `_exclude_self` drops. A bound lets the
+        # reader stop at the newest day file that satisfies it instead of parsing the ledger.
+        failures_only=failures, limit=limit + 1 if limit > 0 and not stats else None,
     )
     found = _exclude_self(found)
     if not stats:

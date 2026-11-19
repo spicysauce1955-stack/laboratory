@@ -168,6 +168,25 @@ def test_read_job_filter_matches_job_ids_list_membership(
     assert [e.id for e in read(job="j-3")] == ["a"]
 
 
+def test_read_action_filter_matches_either_surfaces_spelling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`lab history --action sweep-aggregate` must reach the MCP calls the stats row counted."""
+    monkeypatch.setenv("LAB_EVENTS_DIR", str(tmp_path / "events"))
+    monkeypatch.delenv("LAB_EVENTS", raising=False)
+    store.append(_open("a", action="sweep-aggregate"), when=NOW)
+    store.append(_close("a"), when=NOW)
+    store.append(_open("b", action="sweep_aggregate", surface="mcp"), when=NOW)
+    store.append(_close("b"), when=NOW)
+    store.append(_open("c", action="sweep"), when=NOW)
+    store.append(_close("c"), when=NOW)
+    for spelling in ("sweep-aggregate", "sweep_aggregate"):
+        assert {e.id for e in read(action=spelling)} == {"a", "b"}
+    assert {e.action for e in read(action="sweep-aggregate")} == {
+        "sweep-aggregate", "sweep_aggregate",  # rows keep what each surface recorded
+    }
+
+
 def test_read_since_uses_the_duration_parser(_ledger: None) -> None:
     assert [e.id for e in read(since="2d", now_=NOW)] == ["a"]
     assert {e.id for e in read(since="30d", now_=NOW)} == {"a", "b"}
@@ -243,6 +262,150 @@ def test_read_since_accepts_an_absolute_date(_ledger: None) -> None:
 
 def test_read_limit_applies_after_filtering(_ledger: None) -> None:
     assert len(read(limit=1)) == 1
+
+
+# --- a read touches only the day files it needs ------------------------------------------------
+#
+# Every `lab history`/`lab report` used to parse the whole ledger whatever it asked for: ~1.0 s
+# and 251 MB RSS on a 33 MB ledger, per call. The fix reads newest-first and stops — skipping
+# day files wholly before `since`, and every older file once `limit` is satisfied — and the
+# property that makes it safe is that the output is unchanged. `_reference_read` is the old
+# algorithm, kept verbatim so every query below is checked against it.
+
+END = datetime(2026, 8, 20, 18, 0, tzinfo=timezone.utc)  # the last fixture day
+
+
+def _reference_read(*, since=None, project=None, action=None, session=None, job=None,
+                    failures_only=False, limit=None, now_=None):
+    from lab.events.stats import action_key
+
+    events = fold(store.iter_records(store.day_files()))
+    if since:
+        cutoff = since_cutoff(since, now_=now_)
+        if cutoff is not None:
+            events = [e for e in events if e.ts >= cutoff]
+    if project:
+        events = [e for e in events if e.project.get("name") == project]
+    if action:
+        events = [e for e in events if action_key(e.action) == action_key(action)]
+    if session:
+        events = [e for e in events if e.session == session]
+    if job:
+        events = [e for e in events
+                  if job == e.refs.get("job_id") or job in (e.refs.get("job_ids") or [])]
+    if failures_only:
+        events = [e for e in events if e.failed]
+    return events[:limit] if limit else events
+
+
+def _many_days(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, days: int = 10) -> None:
+    """A ledger with every shape the fold has to get right across files: calls straddling UTC
+    midnight (open on day N, close on day N+1), dangling opens, a close written before its
+    open, identical timestamps, two projects, both spellings of one action, and failures."""
+    monkeypatch.setenv("LAB_EVENTS_DIR", str(tmp_path / "events"))
+    monkeypatch.delenv("LAB_EVENTS", raising=False)
+    first = END.replace(hour=0) - timedelta(days=days - 1)
+    for d in range(days):
+        day = first + timedelta(days=d)
+        for i in range(6):
+            id_ = f"{d:02d}-{i}"
+            ts = day + timedelta(hours=1 + 3 * i)
+            if i == 5:  # straddles midnight: closes in the next day's file
+                ts = day + timedelta(hours=23, minutes=59, seconds=59)
+            if i == 2:  # a tie with call 1
+                ts = day + timedelta(hours=4)
+            opened = _open(
+                id_, ts=ts.isoformat(), session=f"s{d % 3}",
+                action=["submit", "sweep-aggregate", "sweep_aggregate", "status"][i % 4],
+                project={"name": "lab" if (d + i) % 3 else "other"},
+            )
+            closed = _close(
+                id_, ts=(ts + timedelta(seconds=30)).isoformat(),
+                outcome="error" if (d * 7 + i) % 4 == 0 else "ok",
+                refs={"job_id": f"job-{d % 4}"} if i % 2 else {"job_ids": [f"job-{d % 5}"]},
+                error={"type": "LabError", "message": f"boom {d}"} if (d * 7 + i) % 4 == 0
+                else None,
+            )
+            if d == 4 and i == 3:
+                store.append(opened, when=ts)  # dangling: the process died
+                continue
+            if i == 4:  # the close lands in the file first
+                store.append(closed, when=ts)
+                store.append(opened, when=ts)
+                continue
+            store.append(opened, when=ts)
+            store.append(closed, when=ts + timedelta(seconds=30))
+
+
+QUERIES = [
+    {},
+    {"limit": 1}, {"limit": 2}, {"limit": 5}, {"limit": 6}, {"limit": 7}, {"limit": 13},
+    {"limit": 1000},
+    {"since": "1d"}, {"since": "36h"}, {"since": "3d", "limit": 4}, {"since": "100d"},
+    {"since": "2026-08-15"}, {"since": "2026-08-15T23:59:59"}, {"since": "2026-08-21"},
+    {"project": "other", "limit": 3}, {"project": "lab", "since": "2d"},
+    {"action": "sweep-aggregate", "limit": 4}, {"action": "sweep_aggregate"},
+    {"session": "s1", "limit": 2}, {"job": "job-2"}, {"job": "job-3", "limit": 2},
+    {"failures_only": True, "limit": 3}, {"failures_only": True, "since": "4d"},
+    {"project": "lab", "failures_only": True, "action": "submit", "limit": 2},
+]
+
+
+@pytest.mark.parametrize("query", QUERIES, ids=[str(q) for q in QUERIES])
+def test_a_bounded_read_returns_exactly_what_a_full_read_did(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, query: dict
+) -> None:
+    _many_days(tmp_path, monkeypatch)
+    got = [row(e, full=True) for e in read(now_=END, **query)]
+    want = [row(e, full=True) for e in _reference_read(now_=END, **query)]
+    assert got == want
+
+
+def _spy_reads(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    opened: list[str] = []
+    real = store.iter_records
+
+    def spy(paths):
+        for path in paths:
+            opened.append(Path(path).name)
+            yield from real([path])
+
+    monkeypatch.setattr(store, "iter_records", spy)
+    return opened
+
+
+def test_a_since_window_never_opens_a_day_file_wholly_before_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _many_days(tmp_path, monkeypatch)
+    opened = _spy_reads(monkeypatch)
+    read(since="1d", now_=END)  # cutoff 2026-08-19T18:00: the 19th and 20th can hold it, and
+    # the 21st holds only the close of a call opened just before midnight on the 20th.
+    assert opened == ["2026-08-21.jsonl", "2026-08-20.jsonl", "2026-08-19.jsonl"]
+
+
+def test_a_satisfied_limit_stops_before_the_older_day_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _many_days(tmp_path, monkeypatch)
+    opened = _spy_reads(monkeypatch)
+    assert len(read(limit=3)) == 3
+    # Newest first — the 21st holds only a straddling close, the 20th fills the limit — and
+    # nothing older is opened.
+    assert opened == ["2026-08-21.jsonl", "2026-08-20.jsonl"]
+
+
+def test_a_read_with_an_unparseable_day_file_name_still_reads_everything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`day_files()` globs `????-??-??.jsonl`. A file whose name is not a date says nothing
+    about which records it holds, so it must not be skipped — and it disables the shortcuts."""
+    _many_days(tmp_path, monkeypatch)
+    stray = Path(store.events_dir()) / "back-up-xx.jsonl"
+    stray.write_text(json.dumps(_open("zz", ts=(END - timedelta(days=30)).isoformat())) + "\n")
+    got = [e.id for e in read(since="1d", now_=END)]
+    assert got == [e.id for e in _reference_read(since="1d", now_=END)]
+    assert "zz" in [e.id for e in read(limit=1000)]
 
 
 def test_row_is_brief_by_default_and_detailed_with_full() -> None:

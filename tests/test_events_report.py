@@ -37,6 +37,16 @@ def test_report_records_attempted_observed_and_cost_per_finding() -> None:
     assert "j-1" in text  # the job id, so the reader can reach the manifest and logs.txt
 
 
+def test_the_triage_table_names_a_command_once_whichever_surface_called_it() -> None:
+    events = [
+        _event("a", action="sweep-aggregate"),
+        _event("b", action="sweep_aggregate", surface="mcp"),
+    ]
+    text = report(events)
+    row = next(line for line in text.splitlines() if line.startswith("| F1 |"))
+    assert row.rstrip().endswith("| sweep-aggregate |")
+
+
 def test_a_clean_window_says_so_rather_than_printing_an_empty_table() -> None:
     text = report([Event(id="a", ts=NOW, session="s", seq=0, surface="cli", action="list",
                          outcome="ok", duration_ms=5)])
