@@ -1518,6 +1518,15 @@ class Lab:
         sky_ok = sky_versions().compatible
         sky_pass = "ran" if sky_ok else "skipped (client/server version skew)"
 
+        from lab.backends.skypilot import GcpNotConfigured, list_do_volumes, list_gcp_disks
+        from lab.backends.skypilot import list_gcp_instances
+
+        # Every provider snapshot is taken BEFORE the protected set is read below, never after.
+        # A job's manifest is created before its launch is requested, so any machine visible in
+        # a snapshot belongs to a manifest that already existed when the snapshot was taken — and
+        # is therefore protected by a `list_jobs()` read afterwards. The other order let a shard a
+        # sweep submitted mid-reconcile appear in the sky/DO/GCP listing with no protection, and
+        # `--apply --yes` (or the scheduler's auto_reconcile) destroyed it.
         vast_pass = "ran"
         try:
             instances = list_vast_instances()
@@ -1526,6 +1535,38 @@ class Lab:
             vast_pass = "skipped (vastai-sdk not installed)"
         except Exception as e:  # noqa: BLE001
             raise LabError(f"could not list Vast.ai rentals: {e}") from e
+
+        # DO/GCP ground truth for the ghost pass (and the sky orphan pass): Vast has the
+        # provider-direct rental listing above; for DO/GCP SkyPilot's own tracked state is the
+        # signal. Fetched once and shared — a second live `sky.status()` round-trip per reconcile
+        # is pure waste, and `sky` talks to a local API server this call is not otherwise gated
+        # on. Under skew it is not fetched at all (see `sky_live` below).
+        sky_status_recs: list[Any] = self._sky_status_records() if sky_ok else []
+
+        # DO block volumes (best-effort): skipped silently when DO isn't configured (no doctl),
+        # since not every account uses DigitalOcean.
+        volumes: list[dict[str, Any]] | None
+        try:
+            volumes = list_do_volumes()
+        except Exception:  # noqa: BLE001 — DO not configured/unavailable: skip the volume pass
+            volumes = None
+
+        def _gcp_list(what: str, lister: Callable[[], list[dict[str, Any]]]) -> tuple[
+            list[dict[str, Any]] | None, str
+        ]:
+            """Run one GCP listing, distinguishing "GCP isn't set up here" (skip, and say so in
+            the report) from "the API failed" (raise — a leak pass that swallows an API error
+            reports clean while blind). The two passes are independent: an instance-API hiccup
+            must not also hide leaked disks, which are the slow, quiet leak."""
+            try:
+                return lister(), "ran"
+            except GcpNotConfigured as e:
+                return None, f"skipped ({e})"
+            except Exception as e:  # noqa: BLE001
+                raise LabError(f"could not list GCP {what}: {e}") from e
+
+        gcp_instances, gcp_pass = _gcp_list("instances", list_gcp_instances)
+        gcp_disks, gcp_disk_pass = _gcp_list("disks", list_gcp_disks)
 
         unsupervised: list[dict[str, str]] = []
         running_clusters: dict[str, str] = {}
@@ -1758,16 +1799,10 @@ class Lab:
 
         matched_jobs = {protected[c] for c in matched_clusters if c in protected}
 
-        # DO/GCP ground truth for the ghost pass: Vast has the provider-direct rental listing
-        # above; DO/GCP have no such API called here, so SkyPilot's own tracked state is the only
-        # signal. Fetched once and handed to `_sky_status_orphans` below too — a second live
-        # `sky.status()` round-trip per reconcile is pure waste, and one worth avoiding since
-        # `sky` talks to a local API server this call is not otherwise gated on. `None` means
-        # unverifiable (skew) rather than "confirmed gone" — a job on a cloud we cannot check must
-        # not become a false ghost just because it was never going to appear in Vast's rental list
-        # (found live 2026-08-27: every healthy DO job was unconditionally reported as a ghost for
-        # exactly this reason).
-        sky_status_recs: list[Any] = self._sky_status_records() if sky_ok else []
+        # `None` means unverifiable (skew) rather than "confirmed gone" — a job on a cloud we
+        # cannot check must not become a false ghost just because it was never going to appear in
+        # Vast's rental list (found live 2026-08-27: every healthy DO job was unconditionally
+        # reported as a ghost for exactly this reason).
         sky_live: set[str] | None = None
         if sky_ok:
             sky_live = {
@@ -1826,17 +1861,11 @@ class Lab:
 
         # DO block-volume pass (best-effort): sky.down deletes the volume with its droplet, but a
         # partial teardown can leave a detached `lab-*` volume that the instance passes above can't
-        # see (its droplet is gone) — yet it keeps billing. Skipped silently when DO isn't
-        # configured (no doctl), since not every account uses DigitalOcean.
+        # see (its droplet is gone) — yet it keeps billing. `volumes` was listed up front.
         from lab.backends.skypilot import do_volume_orphans as _find_do_volume_orphans
-        from lab.backends.skypilot import list_do_volumes
 
         do_volume_orphans: list[dict[str, Any]] = []
         do_volumes_destroyed: list[Any] = []
-        try:
-            volumes = list_do_volumes()
-        except Exception:  # noqa: BLE001 — DO not configured/unavailable: skip the volume pass
-            volumes = None
         if volumes is not None:
             do_volume_orphans = _ours_only(
                 "do_volume_orphans",
@@ -1860,33 +1889,17 @@ class Lab:
         # GCP pass (best-effort): out-of-band instance + unattached-disk sweep via the compute
         # API — `sky.status` only sees clusters SkyPilot still tracks, and a GCP persistent disk
         # that outlives its VM keeps billing (same failure mode as the DO volume leak). Skipped
-        # silently when GCP isn't configured (no ADC), since not every account uses GCP.
-        from lab.backends.skypilot import GcpNotConfigured, delete_gcp_disk, delete_gcp_instance
+        # when GCP isn't configured (no ADC); both listings were taken up front.
+        from lab.backends.skypilot import delete_gcp_disk, delete_gcp_instance
         from lab.backends.skypilot import gcp_disk_orphans as _find_gcp_disk_orphans
         from lab.backends.skypilot import gcp_instance_orphans as _find_gcp_instance_orphans
-        from lab.backends.skypilot import gcp_project, gcp_unmatched_lab_names, list_gcp_disks
-        from lab.backends.skypilot import list_gcp_instances
-
-        def _gcp_list(what: str, lister: Callable[[], list[dict[str, Any]]]) -> tuple[
-            list[dict[str, Any]] | None, str
-        ]:
-            """Run one GCP listing, distinguishing "GCP isn't set up here" (skip, and say so in
-            the report) from "the API failed" (raise — a leak pass that swallows an API error
-            reports clean while blind). The two passes are independent: an instance-API hiccup
-            must not also hide leaked disks, which are the slow, quiet leak."""
-            try:
-                return lister(), "ran"
-            except GcpNotConfigured as e:
-                return None, f"skipped ({e})"
-            except Exception as e:  # noqa: BLE001
-                raise LabError(f"could not list GCP {what}: {e}") from e
+        from lab.backends.skypilot import gcp_project, gcp_unmatched_lab_names
 
         gcp_orphans: list[dict[str, Any]] = []
         gcp_destroyed: list[str] = []
         gcp_disk_orphans: list[dict[str, Any]] = []
         gcp_disks_destroyed: list[str] = []
 
-        gcp_instances, gcp_pass = _gcp_list("instances", list_gcp_instances)
         if gcp_instances is not None:
             gcp_orphans = _ours_only(
                 "gcp_orphans",
@@ -1903,7 +1916,6 @@ class Lab:
                     except Exception as e:  # noqa: BLE001
                         _unconfirmed("gcp_orphans", inst, e)
 
-        gcp_disks, gcp_disk_pass = _gcp_list("disks", list_gcp_disks)
         if gcp_disks is not None:
             gcp_disk_orphans = _ours_only(
                 "gcp_disk_orphans",
