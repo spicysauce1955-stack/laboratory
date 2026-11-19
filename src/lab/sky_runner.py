@@ -1645,6 +1645,13 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
                     # teardown recorded is about a box that no longer exists, so it cannot stand
                     # in for the one this request is about to create.
                     attempt_torn_down = False
+                    # The same is true of the manifest, which is what `lab wait` reads: left
+                    # standing, the abandoned attempt's `succeeded` reads as a confirmed
+                    # all-clear for this machine from the terminal-status write until the final
+                    # teardown — and a supervisor killed in that window leaves it there for good.
+                    # Rotation only continues after a *confirmed* teardown, so no alarm is lost.
+                    if store.read_manifest(job_id).teardown_status is not None:
+                        store.update_manifest(job_id, teardown_status=None)
                     request_id = _launch_with_retry(sky, task, cluster)
 
                     # Did we just draw a machine we have already watched fail? Only asked when
