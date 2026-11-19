@@ -96,6 +96,19 @@ resolve_new_droplet_id() {
   return 1
 }
 
+# One immediate drain read, no waiting: is anything launching/launched right now? Returns 0 only
+# on a clean, readable answer; otherwise DRAIN_BLOCKING names what is in flight (or says the
+# queue could not be read -- an unreadable entry may be in flight too, so that is not clean).
+DRAIN_BLOCKING=""
+drain_now() {
+  local out=""
+  DRAIN_BLOCKING=""
+  out="$(uv run lab queue wait-drain --timeout 0s)" && return 0
+  DRAIN_BLOCKING="$(echo "$out" | python3 -c "import json,sys; print(' '.join(json.load(sys.stdin).get('blocking') or []))" 2>/dev/null)" || DRAIN_BLOCKING=""
+  [[ -n "$DRAIN_BLOCKING" ]] || DRAIN_BLOCKING="<could not read the queue -- unreadable entries may be in flight>"
+  return 1
+}
+
 # Safety net: if the script dies while the queue is paused and was never resumed (by us or by
 # rollback()), recover to a safe state rather than leaving a stalled ticker for a human to
 # discover hours later. If a new droplet was created but never proven, it is powered off (using
@@ -355,6 +368,22 @@ else
     exit 1
   fi
   echo "old scheduler confirmed paused"
+fi
+
+# The ack proves the old scheduler has STOPPED launching -- not that it launched nothing between
+# step 1's drain and the ack. A tick already past its `read_control()` when the pause landed still
+# launches, and step 5's power-off would then kill that job's only supervisor: DO keeps billing
+# and the registration stays `launched` forever. One more drain read, with no wait (after the
+# ack nothing new can start, and a paused scheduler would never observe a job finishing anyway).
+say "2c. re-check the drain now that the old scheduler has stopped launching"
+if [[ "$DRY_RUN" == "--dry-run" ]]; then
+  echo "[dry-run] lab queue wait-drain --timeout 0s; abort if anything is launching/launched"
+else
+  if ! drain_now; then
+    echo "a registration was launched between step 1's drain and the pause ack (in flight: $DRAIN_BLOCKING) -- powering off the old droplet would orphan it. Aborting before anything is built; cleanup resumes the queue so the old scheduler keeps supervising it. Re-run once it has finished." >&2
+    exit 1
+  fi
+  echo "still drained after the pause ack"
 fi
 
 say "3. create new droplet"

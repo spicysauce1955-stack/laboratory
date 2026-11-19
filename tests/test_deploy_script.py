@@ -240,6 +240,21 @@ def test_a_do_token_that_does_not_authenticate_refuses_before_touching_anything(
     _no_secret_leaked(r)
 
 
+# ------------------------------------------------------------------------------ #2 re-drain after the ack
+
+
+def test_a_launch_between_the_drain_and_the_pause_ack_aborts_the_cutover(world) -> None:  # type: ignore[no-untyped-def]
+    """The old ticker's in-progress tick can launch after step 1's drain but before it observes
+    the pause. Step 5 would then power off that job's only supervisor (DO keeps billing, the reg
+    is stuck `launched`). The deploy must notice and abort with the old host still serving."""
+    r = world({"on_pause_launch": {"reg_id": "reg-race"}})
+    assert r.rc != 0
+    assert "reg-race" in r.err
+    assert r.droplet("new") is None  # nothing built
+    assert r.droplet("old")["status"] == "active"
+    assert not r.paused  # cleanup resumed: the old scheduler keeps supervising reg-race
+
+
 # ------------------------------------------------------------------------------ #10 operator's pause
 
 
