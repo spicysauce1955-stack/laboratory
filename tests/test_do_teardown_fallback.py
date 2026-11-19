@@ -247,10 +247,15 @@ class TestSuccessfulTeardownStillVerifiesTheVolume:
                 volume_error=RuntimeError("attached volume cannot be deleted"),
             ),
         )
+        # The detach-retry ladder (5+10+15+30s) is bound as a default argument, so the
+        # `backoffs=(0,)` below doesn't reach it; without this the test sleeps a real minute.
+        slept: list[float] = []
+        monkeypatch.setattr(m.time, "sleep", slept.append)
 
         out = m.robust_teardown(_OkSky(), CLUSTER, cloud="do", backoffs=(0,))
 
         assert out["status"] == "failed"
+        assert slept == list(m._VOLUME_DETACH_BACKOFFS)  # it really did retry the detach race
 
     def test_an_unverifiable_volume_state_is_unknown_not_success(self, monkeypatch):
         """The droplet is confirmed gone; the storage is not. That is exactly `unknown` (R10)."""

@@ -19,6 +19,11 @@ import os
 from pathlib import Path
 
 ENV_FILENAME = ".env"
+# `LAB_DOTENV=0` turns the loader off. The test suite sets it: every in-process CLI test calls
+# `load_lab_env(repo_root())`, which used to pull the developer's real R2 endpoint and bucket into
+# the pytest process, after which tests uploaded job bundles and sweep aggregates to the real
+# bucket (2026-11-19: 362 code_diff bundles carrying the checkout's untracked files).
+DISABLE_VAR = "LAB_DOTENV"
 # Path-valued: resolved against the repo root and existence-checked, because google.auth reads it
 # from whatever cwd the job runs in and reports a missing file as an opaque auth failure.
 _PATH_VARS = ("GOOGLE_APPLICATION_CREDENTIALS",)
@@ -34,6 +39,8 @@ def load_lab_env(repo: Path | None = None) -> list[str]:
     Returns names only, never values: callers print this, and a value here would be a credential
     (FR-J1). Raises :class:`FileNotFoundError` if a path-valued setting points at a missing file.
     """
+    if os.environ.get(DISABLE_VAR) == "0":
+        return []  # the test suite (or a caller that wants a clean slate) opted out
     root = Path(repo) if repo is not None else Path.cwd()
     env_file = root / ENV_FILENAME
     if not env_file.is_file():

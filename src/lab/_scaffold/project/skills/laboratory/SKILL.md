@@ -92,6 +92,28 @@ If asked to *write* a new experiment, the entrypoint MUST:
 | Accept grid overrides as `key=value` argv         | e.g. Hydra picks up `seed=3 K=200` from `sys.argv` |
 | Report the config it actually consumed            | Write `$LAB_RUN_DIR/effective_config.json` (one call: `lab.experiment.get_overrides(known={...})`) |
 
+**Optional: find which parameters pass a test.** `lab.search.grid_search(evaluate, {"name": [values]})`
+runs your `evaluate` on every combination and writes each one that answered True to
+`$LAB_RUN_DIR/hits.jsonl`, plus `search/tested` / `search/hits` progress to `metrics.jsonl`.
+All model code stays in `evaluate`, so it works with any simulator. **In a sharded sweep, make the
+seed the first grid key and summarise on it** — `hits.jsonl` alone leaves every seed looking
+missing to `sweep-aggregate` (it reads only `results.csv`), so `sweep-retry` would re-buy them all:
+
+```python
+seeds = [int(s) for s in get_overrides(known={"seeds"})["seeds"].split(",")]  # "0,1,2,3"
+grid_search(evaluate, {"seed": seeds, "gain": [0.5, 1.0, 2.0]}, summary_axis="seed")
+```
+
+`summary_axis="seed"` writes one `seed,tested,hits` row per seed to `results.csv`, zero-hit seeds
+included, each as soon as that seed is done (so a shard killed at its cap keeps the seeds it
+finished). Prefer this to calling `grid_search` once per seed; if you must loop, pass
+`append=True`, or each call erases the previous seed's hits. An empty `hits.jsonl` means "nothing
+passed" **only if the job succeeded** — a crashed or timed-out job leaves the same empty file.
+`lab.search.find_boundary` narrows one numeric parameter to where the answer flips; it assumes a
+**single** False→True transition (it cannot detect more) and writes nothing to `hits.jsonl` — its
+return value is its only output. `lab.search.crosses_threshold(trace, threshold)` is a ready-made
+True/False test for a trace.
+
 **The config-consumption handshake (field-report #1).** A *succeeded* job whose argv
 overrides were never consumed (no `effective_config.json`, or the file omits submitted keys)
 is **flipped to `failed`** at the succeeded transition — a typo'd or stale key must not

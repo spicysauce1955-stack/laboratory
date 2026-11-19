@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -86,7 +87,11 @@ def test_get_text_reraises_when_error_key_is_none_instead_of_crashing():
         store.get_text("some/key")
 
 
-@pytest.mark.skipif(not r2_enabled(), reason="R2 not configured (set LAB_R2_ENDPOINT + creds)")
+@pytest.mark.live_cloud
+@pytest.mark.skipif(
+    os.environ.get("LAB_TEST_LIVE") != "1" or not r2_enabled(),
+    reason="live R2 test: opt in with LAB_TEST_LIVE=1 and a configured LAB_R2_ENDPOINT",
+)
 def test_r2_round_trip(tmp_path: Path):
     store = R2Store.from_env()
     assert store is not None

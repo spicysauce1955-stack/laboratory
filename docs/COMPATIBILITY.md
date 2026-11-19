@@ -141,7 +141,15 @@ upgrade note.
   members the same way fields can be added: `teardown_status` grew a third non-null value,
   `"unknown"` (v0.7.0), meaning the destroy's outcome could not be read and nothing could verify
   it. `CostInfo` grew `cap_hourly_usd` and `over_cap` (v0.8.0), the cap a job was submitted under and whether the rental honoured it; `over_cap` is three-state, where `null` means the check did not run (no cap, or no price readable) and is not the same as `false`. **Treat an unrecognised value as `unknown`, never as success** — that rule is what makes
-  adding one safe. `logs.txt` gained a leading UTC timestamp per line in v0.7.0
+  adding one safe. After v0.12.0 an artifact record's `type` for a `*.jsonl` file (`hits.jsonl`,
+  `metrics.jsonl`) reads `"table"` where it read `"other"`, in the manifest's `artifacts` and in
+  `fetch_artifacts` output (an older manifest keeps `"other"` until its artifacts are next
+  collected by `lab fetch`, `lab export` or `sweep-aggregate`). A
+  `lab export` bundle therefore now carries those files under `output/`, under the same
+  `--max-file-mb` cap as any table. A sweep plan's cells (and the `sweep-aggregate` /
+  `sweep-retry` cell view) gained `hits_ref` and `hits`, the cell's concatenated `lab.search`
+  `hits.jsonl` and its count; both are `null` on a plan written before them or when no shard
+  searched. `logs.txt` gained a leading UTC timestamp per line in v0.7.0
   (`LAB_LOG_TIMESTAMPS=0` restores the old format); its *content* has never been frozen, but
   anything parsing it should expect the prefix. A newer lab always reads
   manifests written by an older one; new fields are optional. Every manifest records
@@ -152,8 +160,8 @@ upgrade note.
 
 Everything under `lab.*` that is not the above — module layout, internal signatures, the
 `lab.core.Lab` Python API — plus the test suite, `research/`, `docs/`, the field reports, and
-this repo's own `.claude/` and `experiments/`. Import from `lab.experiment` and `lab.metrics`
-(the contract helpers) and drive everything else through the CLI or MCP.
+this repo's own `.claude/` and `experiments/`. Import from `lab.experiment`, `lab.metrics` and
+`lab.search` (the experiment-side helpers) and drive everything else through the CLI or MCP.
 
 ## What `lab init` owns
 

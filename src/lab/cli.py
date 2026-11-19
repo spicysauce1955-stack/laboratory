@@ -1058,7 +1058,8 @@ def sweep_aggregate(
     ),
 ) -> None:
     """Row-concatenate each cell's shard results into one per-cell result (P1-2). By default
-    partial rows from non-succeeded shards are included (stamped + listed in seeds_partial)."""
+    partial rows from non-succeeded shards are included (stamped + listed in seeds_partial).
+    Shards' lab.search hits.jsonl are concatenated per cell too (cell hits_ref / hits)."""
     try:
         plan = _lab().aggregate_sweep(sweep_id, include_partial=not strict, row_key=row_key)
     except LabError as e:

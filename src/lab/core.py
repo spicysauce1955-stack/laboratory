@@ -15,6 +15,7 @@ import itertools
 import json
 import math
 import platform
+import posixpath
 import re
 import shlex
 import time
@@ -61,7 +62,7 @@ from lab.models import (
     SweepCell,
     SweepPlan,
 )
-from lab.aggregate import merge_seed_rows
+from lab.aggregate import merge_hits, merge_seed_rows
 from lab.partials import PARTIAL_DIR
 from lab.sharding import parse_seeds, partition_seeds, seeds_to_arg
 from lab.store import JobStore, cell_id_for
@@ -301,6 +302,24 @@ def _parse_row_key(row_key: str | list[str], seed_column: str) -> list[str]:
             "(presence/retry accounting is keyed on seeds)"
         )
     return cols
+
+
+def _mirror_sweep_aggregate(path: Path, key: str) -> None:
+    """Best-effort R2 copy of a sweep's per-cell aggregate; the local file stays authoritative.
+
+    One behaviour for both cell files (result table and search hits): a failed upload is
+    printed and noted, never raised, because the aggregate can always be recomputed from the
+    shards while the run that produced them cannot."""
+    if not r2_enabled():
+        return
+    r2 = R2Store.from_env()
+    if r2 is None:
+        return
+    try:
+        r2.upload_file(path, key)
+    except Exception as e:  # noqa: BLE001 — local aggregate stays authoritative
+        print(f"[lab] aggregate R2 mirror failed, keeping local copy: {e}")
+        events.note("storage.upload_failed", key=key, error=str(e))
 
 
 def _submit_stagger_s() -> float:
@@ -843,7 +862,16 @@ class Lab:
         ``include_partial=False`` restores succeeded-only aggregation. Running/queued shards are
         always excluded (their file is still moving under the heartbeat rsync), as are shards whose
         config was unconsumed (wrong-config rows are what the fail-closed check exists to kill).
+
+        Search hits: when any included shard wrote a ``lab.search`` ``hits.jsonl``, the cell also
+        gets one concatenated ``hits.jsonl`` beside the result aggregate (:func:`merge_hits`;
+        same inclusion rules, every hit stamped ``_shard_status``), recorded as ``hits_ref`` /
+        ``hits`` on the cell. Seed presence is judged by the result table alone — a hit never
+        makes a seed present. When no included shard has one, a cell hits file left by an earlier
+        aggregate is removed, so the plan, the file and an export bundle cannot disagree.
         """
+        from lab.search import HITS_FILE  # local: lab.search imports numpy; keep it off CLI startup
+
         plan = self.sweep_plan(sweep_id)
         for cell in plan.cells:
             if row_key is not None:
@@ -851,6 +879,7 @@ class Lab:
                 # via write_sweep_plan, so later aggregates/retries inherit it).
                 cell.row_key = _parse_row_key(row_key, cell.seed_column)
             shard_texts: list[tuple[str, str]] = []
+            shard_hits: list[tuple[str, str]] = []
             for jid in cell.shard_job_ids:
                 m = self.manifest(jid)
                 if m.status not in _TERMINAL_STATES:
@@ -860,30 +889,42 @@ class Lab:
                 if m.unconsumed_config:
                     continue  # ran different config than requested — never aggregate its rows
                 self.fetch_artifacts(jid)  # ensure the local copy exists (R2 fallback inside)
-                rf = self.store.output_dir(jid) / cell.results_file
+                out = self.store.output_dir(jid)
+                rf = out / cell.results_file
                 if rf.exists():
                     shard_texts.append((rf.read_text(), m.status.value))
+                hf = out / HITS_FILE
+                if hf.exists():
+                    shard_hits.append((hf.read_text(), m.status.value))
             merged, present, partial = merge_seed_rows(
                 shard_texts, cell.seed_column, row_key=cell.row_key
             )
+            # Both merges run before anything is written: a fatal line in either leaves this
+            # cell's files exactly as they were.
+            merged_hits, n_hits = merge_hits(shard_hits, row_key=cell.row_key)
             cell.seeds_present = present
             cell.seeds_partial = partial
             present_set = set(present)
             cell.missing_seeds = [s for s in cell.seeds_expected if s not in present_set]
             cell.status = "complete" if not cell.missing_seeds else "incomplete"
+            csv_key = f"{sweep_id}/cells/{cell.cell_id}/{cell.results_file}"
             if merged:
                 dest = Path(cell.aggregate_ref)
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_text(merged)
-                if r2_enabled():
-                    r2 = R2Store.from_env()
-                    if r2 is not None:
-                        rel = f"{sweep_id}/cells/{cell.cell_id}/{cell.results_file}"
-                        try:
-                            r2.upload_file(dest, rel)
-                        except Exception as e:  # noqa: BLE001 — local aggregate stays authoritative
-                            print(f"[lab] aggregate R2 mirror failed, keeping local copy: {e}")
-                            events.note("storage.upload_failed", key=rel, error=str(e))
+                _mirror_sweep_aggregate(dest, csv_key)
+            hits_dest = Path(cell.aggregate_ref).with_name(HITS_FILE)
+            if shard_hits:
+                # Written even when empty: an empty file is "searched, nothing passed".
+                hits_dest.parent.mkdir(parents=True, exist_ok=True)
+                hits_dest.write_text(merged_hits)
+                cell.hits_ref, cell.hits = str(hits_dest), n_hits
+                _mirror_sweep_aggregate(
+                    hits_dest, posixpath.join(posixpath.dirname(csv_key), HITS_FILE)
+                )
+            else:
+                hits_dest.unlink(missing_ok=True)
+                cell.hits_ref, cell.hits = None, None
         self.store.write_sweep_plan(plan)
         return plan
 
@@ -1389,11 +1430,16 @@ class Lab:
             plan = self.sweep_plan(target_id)
             (dest / "plan.json").write_text(self.store.sweep_plan_path(target_id).read_text())
             for cell in plan.cells:
-                agg = Path(cell.aggregate_ref)
-                if agg.exists():
-                    target = dest / "cells" / cell.cell_id / agg.name
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(agg.read_bytes())
+                # The result aggregate, plus the search-hits aggregate when the plan records one
+                # (keyed on the plan, not on the file, so a stale file is never bundled).
+                aggs = [Path(cell.aggregate_ref)]
+                if cell.hits_ref is not None:
+                    aggs.append(Path(cell.hits_ref))
+                for agg in aggs:
+                    if agg.exists():
+                        target = dest / "cells" / cell.cell_id / agg.name
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(agg.read_bytes())
             sweep_block = {"sweep_id": target_id, "plan_exported": True, **plan.view()}
 
         index: dict[str, Any] = {

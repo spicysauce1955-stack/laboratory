@@ -127,4 +127,5 @@ testpaths = ["tests"]
 addopts = "-q -m 'not packaging'"
 markers = [
     "packaging: builds a wheel and installs it into a clean venv (slow; run in CI and at release)",
+    "live_cloud: talks to a real cloud or bucket; skipped unless LAB_TEST_LIVE=1",
 ]
