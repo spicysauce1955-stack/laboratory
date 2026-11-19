@@ -27,12 +27,15 @@ imports nothing from ``lab.store`` or ``lab.core``.
 
 from __future__ import annotations
 
+import csv
 import itertools
 import json
+import math
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -40,8 +43,18 @@ from lab.experiment import _resolve_run_dir
 
 HITS_FILE = "hits.jsonl"
 HIT_KEY = "hit"
+SUMMARY_FILE = "results.csv"
+"""Written only with ``summary_axis``; the default ``--results-file`` that sweep-aggregate reads."""
 
 Outcome = tuple[bool, dict[str, Any]]
+
+
+class AxisCount(NamedTuple):
+    """One value of the ``summary_axis``: combinations tested with it, and how many passed."""
+
+    value: Any
+    tested: int
+    hits: int
 
 
 @dataclass(frozen=True)
@@ -49,6 +62,10 @@ class SearchResult:
     tested: int
     hits: int
     hits_path: Path
+    summary_path: Path | None = None
+    """``results.csv``, when ``summary_axis`` was given."""
+    summary: tuple[AxisCount, ...] = ()
+    """One entry per ``summary_axis`` value, in grid order, zero-hit values included."""
 
 
 def crosses_threshold(trace: Any, threshold: float) -> bool:
@@ -189,18 +206,87 @@ def _encode_row(params: Mapping[str, Any], extras: Mapping[str, Any]) -> str:
         raise
 
 
+class _Summary:
+    """Per-value counts for one grid axis, kept as ``results.csv`` rows: ``<axis>,tested,hits``.
+
+    Every value of an axis is tested by the same number of combinations, so only hits are counted,
+    and only when they happen. The first axis is the outermost loop of :func:`itertools.product`:
+    its values finish one after another, so each row is appended the moment its value is done and
+    a killed job keeps them. Any other axis's values all finish together, at the very end.
+    """
+
+    def __init__(self, path: Path, axis: str, axes: Mapping[str, Sequence[Any]]) -> None:
+        names = list(axes)
+        if axis not in axes:
+            raise ValueError(f"summary_axis {axis!r} is not a grid key; the grid has {names}")
+        self.header = [axis, "tested", "hits"]
+        if axis in self.header[1:]:
+            raise ValueError(f"summary_axis {axis!r} would clash with a results.csv column")
+        self.cells = [str(_plain(value)) for value in axes[axis]]
+        repeated = sorted(cell for cell, n in Counter(self.cells).items() if n > 1)
+        if repeated:
+            raise ValueError(
+                f"summary_axis {axis!r} repeats {repeated}: each value gets exactly one row "
+                "(sweep-aggregate refuses a seed listed twice)"
+            )
+        position = names.index(axis)
+        self.path = path
+        self.values = list(axes[axis])
+        self.stride = math.prod(len(axes[name]) for name in names[position + 1 :])
+        self.per_value = math.prod(len(values) for values in axes.values()) // len(self.values)
+        self.streams = position == 0
+        self.hits = [0] * len(self.values)
+        self.written = 0
+
+    def start(self) -> None:
+        with self.path.open("w", newline="") as f:
+            csv.writer(f, lineterminator="\n").writerow(self.header)
+
+    def count_hit(self, combination: int) -> None:
+        """Count a pass at ``combination``, its index in grid order."""
+        self.hits[(combination // self.stride) % len(self.values)] += 1
+
+    def advance(self, tested: int) -> None:
+        """Append the rows of every first-axis value whose combinations are all done."""
+        if self.streams:
+            self._write_through(tested // self.per_value)
+
+    def finish(self) -> tuple[AxisCount, ...]:
+        self._write_through(len(self.values))
+        return tuple(
+            AxisCount(value, self.per_value, hits)
+            for value, hits in zip(self.values, self.hits, strict=True)
+        )
+
+    def _write_through(self, done: int) -> None:
+        if done <= self.written:
+            return
+        with self.path.open("a", newline="") as f:
+            csv.writer(f, lineterminator="\n").writerows(
+                [self.cells[i], self.per_value, self.hits[i]] for i in range(self.written, done)
+            )
+        self.written = done
+
+
 def grid_search(
     evaluate: Callable[..., Any],
     grid: Mapping[str, Iterable[Any]],
     *,
     batch_size: int | None = None,
     run_dir: str | Path | None = None,
+    summary_axis: str | None = None,
 ) -> SearchResult:
     """Run ``evaluate`` on every combination in ``grid`` and log the ones that pass.
 
     ``grid`` maps ``evaluate`` keyword names to their values, which need not be numeric. Use a
     closure or :func:`functools.partial` for anything held fixed. A log left by an earlier search
     in the same directory is replaced.
+
+    ``summary_axis`` names a grid key whose every value gets a ``results.csv`` row,
+    ``<axis>,tested,hits``, zero-hit values included: pass ``"seed"`` in a sharded sweep, so that
+    ``sweep-aggregate`` sees every seed the job finished (it reads only ``results.csv``). Put that
+    key first in ``grid`` and each row is written as soon as its value is done; otherwise the rows
+    are written when the search ends.
     """
     if batch_size is not None and batch_size < 1:
         raise ValueError(f"batch_size must be at least 1, got {batch_size}")
@@ -210,10 +296,14 @@ def grid_search(
     for name, values in axes.items():
         for value in values:
             _check_loggable(name, value, "grid parameter")
+    base = _resolve_run_dir(run_dir)
+    summary = None if summary_axis is None else _Summary(base / SUMMARY_FILE, summary_axis, axes)
 
-    path = _resolve_run_dir(run_dir) / HITS_FILE
+    path = base / HITS_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("")
+    if summary is not None:
+        summary.start()
 
     names = list(axes)
     combinations = itertools.product(*axes.values())
@@ -225,17 +315,28 @@ def grid_search(
             # A bad extra column is refused at the first answer rather than the first pass,
             # which in a search with few hits can be hours in. Checked once, not per row.
             _encode_row(params[0], outcomes[0][1])
-        lines = [
-            _encode_row(p, extras)
-            for p, (hit, extras) in zip(params, outcomes, strict=True)
-            if hit
-        ]
+        lines = []
+        for offset, (p, (hit, extras)) in enumerate(zip(params, outcomes, strict=True)):
+            if hit:
+                lines.append(_encode_row(p, extras))
+                if summary is not None:
+                    summary.count_hit(tested + offset)
         if lines:
             with path.open("a") as f:
                 f.writelines(lines)
         tested += len(params)
         hits += len(lines)
-    return SearchResult(tested=tested, hits=hits, hits_path=path)
+        if summary is not None:
+            summary.advance(tested)
+    if summary is None:
+        return SearchResult(tested=tested, hits=hits, hits_path=path)
+    return SearchResult(
+        tested=tested,
+        hits=hits,
+        hits_path=path,
+        summary_path=summary.path,
+        summary=summary.finish(),
+    )
 
 
 def find_boundary(

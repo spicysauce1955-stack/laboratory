@@ -9,7 +9,15 @@ from typing import Any
 import numpy as np
 import pytest
 
-from lab.search import HITS_FILE, crosses_threshold, find_boundary, grid_search
+from lab.aggregate import merge_seed_rows
+from lab.search import (
+    HITS_FILE,
+    SUMMARY_FILE,
+    AxisCount,
+    crosses_threshold,
+    find_boundary,
+    grid_search,
+)
 
 
 def read_hits(run_dir: Path) -> list[dict[str, Any]]:
@@ -185,6 +193,172 @@ def test_an_extra_column_of_the_wrong_length_is_refused(tmp_path):
             batch_size=2,
             run_dir=tmp_path,
         )
+
+
+# --- summary_axis: one results.csv row per value, for sweep-aggregate ----------------------------
+
+
+def hit_when_seed_is_one(seed: int, a: int) -> bool:
+    return seed == 1 and a > 1
+
+
+def test_there_is_no_summary_unless_asked_for(tmp_path):
+    result = grid_search(hit_when_seed_is_one, {"seed": [0, 1], "a": [1, 2]}, run_dir=tmp_path)
+    assert not (tmp_path / SUMMARY_FILE).exists()
+    assert (result.summary_path, result.summary) == (None, ())
+
+
+def test_the_summary_has_a_row_for_every_value_even_with_no_hits(tmp_path):
+    grid_search(
+        hit_when_seed_is_one,
+        {"seed": [0, 1, 2], "a": [1, 2, 3]},
+        summary_axis="seed",
+        run_dir=tmp_path,
+    )
+    assert (tmp_path / SUMMARY_FILE).read_text() == "seed,tested,hits\n0,3,0\n1,3,2\n2,3,0\n"
+
+
+def test_an_inner_axis_can_be_summarised(tmp_path):
+    grid_search(
+        hit_when_seed_is_one,
+        {"a": [1, 2, 3], "seed": [0, 1, 2]},
+        summary_axis="seed",
+        run_dir=tmp_path,
+    )
+    assert (tmp_path / SUMMARY_FILE).read_text() == "seed,tested,hits\n0,3,0\n1,3,2\n2,3,0\n"
+
+
+def test_batching_does_not_change_the_summary(tmp_path):
+    def batched(seed: list[int], a: list[int]) -> list[bool]:
+        return [hit_when_seed_is_one(s, x) for s, x in zip(seed, a)]
+
+    for size in (2, 4, 9):
+        grid_search(
+            batched,
+            {"a": [1, 2, 3], "seed": [0, 1, 2]},
+            summary_axis="seed",
+            batch_size=size,
+            run_dir=tmp_path / str(size),
+        )
+        text = (tmp_path / str(size) / SUMMARY_FILE).read_text()
+        assert text == "seed,tested,hits\n0,3,0\n1,3,2\n2,3,0\n"
+
+
+def test_the_summary_is_returned(tmp_path):
+    result = grid_search(
+        hit_when_seed_is_one, {"seed": [0, 1], "a": [1, 2]}, summary_axis="seed", run_dir=tmp_path
+    )
+    assert result.summary_path == tmp_path / SUMMARY_FILE
+    assert result.summary == (AxisCount(0, 2, 0), AxisCount(1, 2, 1))
+    assert result.summary[1].hits == 1
+
+
+def test_finished_values_of_the_first_axis_survive_a_crash(tmp_path):
+    def evaluate(seed: int, a: int) -> bool:
+        if seed == 2:
+            raise RuntimeError("killed at the wall-clock cap")
+        return a > 1
+
+    with pytest.raises(RuntimeError):
+        grid_search(
+            evaluate, {"seed": [0, 1, 2], "a": [1, 2]}, summary_axis="seed", run_dir=tmp_path
+        )
+    assert (tmp_path / SUMMARY_FILE).read_text() == "seed,tested,hits\n0,2,1\n1,2,1\n"
+
+
+def test_a_batch_spanning_two_values_writes_only_the_finished_one_before_a_crash(tmp_path):
+    def evaluate(seed: list[int], a: list[int]) -> list[bool]:
+        if 2 in seed:
+            raise RuntimeError("killed")
+        return [True] * len(seed)
+
+    # batches: (0,1) (0,2) (1,1) | (1,2) (2,1) (2,2) -> only seed 0 is finished when it dies
+    with pytest.raises(RuntimeError):
+        grid_search(
+            evaluate,
+            {"seed": [0, 1, 2], "a": [1, 2]},
+            summary_axis="seed",
+            batch_size=3,
+            run_dir=tmp_path,
+        )
+    assert (tmp_path / SUMMARY_FILE).read_text() == "seed,tested,hits\n0,2,2\n"
+
+
+def test_an_inner_summary_axis_is_written_only_when_the_search_ends(tmp_path):
+    def evaluate(a: int, seed: int) -> bool:
+        if a == 2:
+            raise RuntimeError("killed")
+        return True
+
+    with pytest.raises(RuntimeError):
+        grid_search(
+            evaluate, {"a": [1, 2], "seed": [0, 1]}, summary_axis="seed", run_dir=tmp_path
+        )
+    assert (tmp_path / SUMMARY_FILE).read_text() == "seed,tested,hits\n"
+
+
+def test_a_new_search_replaces_an_old_summary(tmp_path):
+    grid_search(lambda seed: True, {"seed": [0, 1]}, summary_axis="seed", run_dir=tmp_path)
+    grid_search(lambda seed: True, {"seed": [5]}, summary_axis="seed", run_dir=tmp_path)
+    assert (tmp_path / SUMMARY_FILE).read_text() == "seed,tested,hits\n5,1,1\n"
+
+
+def test_sweep_aggregate_reads_every_seed_as_present(tmp_path):
+    grid_search(
+        hit_when_seed_is_one,
+        {"seed": [0, 1, 2], "a": [1, 2]},
+        summary_axis="seed",
+        run_dir=tmp_path,
+    )
+    merged, present, partial = merge_seed_rows(
+        [((tmp_path / SUMMARY_FILE).read_text(), "succeeded")], seed_column="seed"
+    )
+    assert (present, partial) == ([0, 1, 2], [])
+    assert merged.splitlines()[0] == "seed,tested,hits,_shard_status"
+
+
+def test_sweep_aggregate_keeps_the_seeds_a_crashed_shard_finished(tmp_path):
+    def evaluate(seed: int, a: int) -> bool:
+        if seed == 2:
+            raise RuntimeError("killed")
+        return False
+
+    with pytest.raises(RuntimeError):
+        grid_search(
+            evaluate, {"seed": [0, 1, 2], "a": [1, 2]}, summary_axis="seed", run_dir=tmp_path
+        )
+    _, present, partial = merge_seed_rows(
+        [((tmp_path / SUMMARY_FILE).read_text(), "timed_out")], seed_column="seed"
+    )
+    assert (present, partial) == ([0, 1], [0, 1])
+
+
+def test_numpy_seeds_are_written_as_plain_integers(tmp_path):
+    grid_search(lambda seed: False, {"seed": np.arange(2)}, summary_axis="seed", run_dir=tmp_path)
+    assert (tmp_path / SUMMARY_FILE).read_text() == "seed,tested,hits\n0,1,0\n1,1,0\n"
+
+
+def test_a_summary_axis_that_is_not_in_the_grid_is_refused_before_touching_anything(tmp_path):
+    (tmp_path / HITS_FILE).write_text('{"a": 1}\n')
+    calls: list[int] = []
+
+    with pytest.raises(ValueError, match="summary_axis"):
+        grid_search(
+            lambda a: calls.append(a) or True, {"a": [1]}, summary_axis="seed", run_dir=tmp_path
+        )
+    assert calls == []
+    assert (tmp_path / HITS_FILE).read_text() == '{"a": 1}\n'
+    assert not (tmp_path / SUMMARY_FILE).exists()
+
+
+def test_a_summary_axis_with_a_repeated_value_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="repeat"):
+        grid_search(lambda seed: True, {"seed": [0, 1, 1]}, summary_axis="seed", run_dir=tmp_path)
+
+
+def test_a_summary_axis_named_like_a_count_column_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="clash"):
+        grid_search(lambda hits: True, {"hits": [0]}, summary_axis="hits", run_dir=tmp_path)
 
 
 # --- refusing results that would corrupt the log -------------------------------------------------
