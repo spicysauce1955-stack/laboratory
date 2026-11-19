@@ -224,6 +224,18 @@ you changed — it writes `<file>.new` beside it and warns. It never touches `py
 Commit `.lab-scaffold.json`: without it, `lab init` cannot tell a file it wrote from one you
 edited, and treats everything as yours.
 
+`.skyignore` is special because SkyPilot reads **only** it once it exists, so anything git-ignored
+but missing from it is rsynced to the remote box. A `.skyignore` that `lab init` created starts
+with a `# lab-init: managed …` line; while that line is there, `lab init` adds whatever the
+project has git-ignored since (patterns, plus anchored paths for what only a nested
+`.gitignore` hides), and `lab init --check` reports the file as stale until it has. Delete the
+line to manage the file by hand — `.lab-scaffold.json` then records it as yours (`"skyignore":
+"user"`) and `lab init` never edits it again. A `.skyignore` you wrote yourself is never
+rewritten: it is often there precisely to upload git-ignored data, so `lab init` warns on stderr
+and lists what it uploads in the report's `skyignore_uploads`, but does not fail `--check` for it.
+A `.skyignore` created by an earlier `lab init` (no marker, no ownership recorded) is recognised
+by the header it carries and gets the marker on the next run.
+
 ## Upgrading
 
 ```bash

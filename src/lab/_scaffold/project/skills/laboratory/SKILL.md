@@ -69,6 +69,14 @@ provenance and under whose `runs/` results land.
   `uv run lab init`. Opening the project in Claude Code should offer the `lab`
   server; once enabled, the tools below appear as `mcp__lab__submit`, etc. If
   they are missing, run `uv run lab init --check`.
+- **Git-ignored a secret? Re-run `uv run lab init`.** SkyPilot uploads the
+  working tree minus `.skyignore` — and reads *only* that file once it exists,
+  never `.gitignore`. A `.skyignore` that `lab init` created (first line
+  `# lab-init: managed …`) is kept in step with the git-ignore each time
+  `lab init` runs, and `lab init --check` fails until it is. A `.skyignore`
+  without that line is the user's and is never edited; `lab init` then names
+  the git-ignored paths it uploads (`skyignore_uploads`) — read that list before
+  a remote run.
 - **Dirty trees are captured, not lost (fail-closed provenance, FR-B1).**
   Manifests pin `HEAD`; if the tree is dirty the lab **auto-snapshots the
   uncommitted changes** (tracked diff + untracked files) and records a

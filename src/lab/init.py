@@ -115,15 +115,27 @@ def _is_skill(dest: str) -> bool:
 # twice: as translated *patterns* (so a file git-ignored tomorrow stays off the box too) and as
 # anchored *paths* for anything git ignores today that the patterns cannot express (nested
 # `.gitignore` files, global excludes, hidden directories SkyPilot's glob does not descend into).
-# An existing `.skyignore` is the user's deliberate override — often precisely to upload
+# A `.skyignore` the user wrote is their deliberate override — often precisely to upload
 # git-ignored data — so it is never rewritten; init only warns about what it lets through.
+#
+# One `lab init` created is different: it is a copy of the git-ignore, and a copy goes stale the
+# moment the project git-ignores something new (the 2026-11 stress run: `private_keys/` appended
+# to `.gitignore`, `init --check` said ok, re-running init left it out, and the directory would
+# have been rsynced). So a created file carries `_SKYIGNORE_MARKER` as its first line, and while
+# that line is there `lab init` adds what the git-ignore gained (and `--check` calls the file
+# stale). Deleting the marker hands the file to the user. A file created before the marker
+# existed is recognised by the carried-over header (or the scaffold's own first line) it holds.
 
 _SKYIGNORE = ".skyignore"
+_SKYIGNORE_MARKER = (
+    "# lab-init: managed — `lab init` adds what you git-ignore later. Delete this line to keep "
+    "it from ever editing this file."
+)
 _SKYIGNORE_CARRIED_HEADER = (
     "# --- Carried over from this project's git-ignore by `lab init` ---\n"
     "# Before this file existed SkyPilot excluded what git ignores; now it reads ONLY this file.\n"
-    "# These lines keep what git ignored off the remote box. Something you git-ignore LATER is\n"
-    "# not picked up here: add secrets to this file too.\n"
+    "# These lines keep what git ignored off the remote box; `lab init` adds what you git-ignore\n"
+    "# later for as long as the marker line at the top of this file is there.\n"
 )
 #: How many paths a warning names before summarising the rest.
 _WARN_LIST_MAX = 20
@@ -235,19 +247,53 @@ def _named(paths: list[str]) -> str:
     return shown + (f" (+{more} more)" if more > 0 else "")
 
 
+def _carry_over(root: Path, current: list[str]) -> list[str]:
+    """The ``.skyignore`` lines that would keep everything git ignores off the box, beyond the
+    ``current`` lines: the git-ignore's patterns as translated lines (so a file git-ignored
+    tomorrow stays off too), then anchored paths for whatever git ignores today that no line
+    covers (nested ``.gitignore`` files, global excludes, hidden directories SkyPilot's glob
+    does not descend into)."""
+    patterns, _ = _git_ignore_patterns(root)
+    # The scaffold's `runs` (file or dir) already covers a git-ignored `runs/`; not the reverse.
+    present = {ln.strip() for ln in current}
+    carried = [ln for ln in patterns if ln not in present and ln.rstrip("/") not in present]
+    ignored_now = _git_ignored_paths(root) or []
+    covered = _skyignore_excludes(root, [*current, *carried])
+    snapshot = ["/" + glob.escape(p) for p in _uncovered(ignored_now, covered)]
+    return carried + [ln for ln in snapshot if ln not in present]
+
+
+def _skyignore_is_managed(text: str, payload: str, recorded: str | None) -> bool:
+    """Whether ``lab init`` owns this ``.skyignore``.
+
+    The marker decides. Without it, an ownership ``recorded`` in ``.lab-scaffold.json`` means
+    the marker was there once and someone deleted it — the documented way to take the file over.
+    Only a project with no record at all (scaffolded before the marker existed) falls back to the
+    content: the carried-over header or the scaffold's own first line, which only lab init wrote.
+    """
+    lines = [ln.strip() for ln in text.splitlines()]
+    if _SKYIGNORE_MARKER in lines:
+        return True
+    if recorded is not None or any(ln.startswith("# lab-init:") for ln in lines):
+        return False
+    first_payload = next((ln.strip() for ln in payload.splitlines() if ln.strip()), None)
+    legacy_header = _SKYIGNORE_CARRIED_HEADER.splitlines()[0]
+    return legacy_header in lines or bool(lines and first_payload and lines[0] == first_payload)
+
+
+def _skyignore_uploads(root: Path, lines: list[str]) -> list[str]:
+    """Git-ignored paths a ``.skyignore`` holding ``lines`` would still upload."""
+    ignored_now = _git_ignored_paths(root)
+    if not ignored_now:
+        return []
+    return _uncovered(ignored_now, _skyignore_excludes(root, lines))
+
+
 def _seed_skyignore(root: Path, payload: str) -> tuple[str, list[str]]:
     """The body of a newly created ``.skyignore`` and the warnings that announce it."""
-    patterns, dropped = _git_ignore_patterns(root)
-    # The scaffold's `runs` (file or dir) already covers a git-ignored `runs/`; not the reverse.
-    own = {ln.strip() for ln in payload.splitlines()}
-    carried = [ln for ln in patterns if ln not in own and ln.rstrip("/") not in own]
-    ignored_now = _git_ignored_paths(root) or []
-    body_lines = [*payload.splitlines(), *carried]
-    snapshot = [
-        "/" + glob.escape(p) for p in _uncovered(ignored_now, _skyignore_excludes(root, body_lines))
-    ]
-    carried += snapshot
-    body = payload if payload.endswith("\n") else payload + "\n"
+    _, dropped = _git_ignore_patterns(root)
+    carried = _carry_over(root, payload.splitlines())
+    body = _SKYIGNORE_MARKER + "\n" + (payload if payload.endswith("\n") else payload + "\n")
     if carried:
         body += "\n" + _SKYIGNORE_CARRIED_HEADER + "\n".join(carried) + "\n"
 
@@ -256,7 +302,8 @@ def _seed_skyignore(root: Path, payload: str) -> tuple[str, list[str]]:
         warnings.append(
             f"created {_SKYIGNORE}: SkyPilot reads ONLY this file once it exists (not .gitignore), "
             f"so lab init carried your git-ignore over to keep it off remote boxes: "
-            f"{_named(carried)}. Git-ignore something later? Add it to {_SKYIGNORE} too."
+            f"{_named(carried)}. Git-ignore something later? Re-run `lab init` (or "
+            f"`lab init --check` in CI) to carry it over too."
         )
     if dropped:
         warnings.append(
@@ -267,19 +314,64 @@ def _seed_skyignore(root: Path, payload: str) -> tuple[str, list[str]]:
     return body, warnings
 
 
-def _existing_skyignore_warnings(root: Path, text: str) -> list[str]:
-    """For a ``.skyignore`` the user already has: what git ignores that it will upload anyway."""
-    ignored_now = _git_ignored_paths(root)
-    if not ignored_now:
-        return []
-    uploaded = _uncovered(ignored_now, _skyignore_excludes(root, text.splitlines()))
+def _user_skyignore_warning(uploaded: list[str]) -> list[str]:
+    """For a ``.skyignore`` the user owns: what git ignores that it will upload anyway."""
     if not uploaded:
         return []
     return [
         f"{_SKYIGNORE} exists, so SkyPilot ignores .gitignore: these git-ignored path(s) WILL be "
         f"uploaded to remote boxes: {_named(uploaded)}. If any is a secret, add it to "
-        f"{_SKYIGNORE} (lab init never rewrites that file)."
+        f"{_SKYIGNORE} (lab init never rewrites a {_SKYIGNORE} you manage)."
     ]
+
+
+def _appended(text: str, lines: list[str]) -> str:
+    if not lines:
+        return text
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text + "\n".join(lines) + "\n"
+
+
+@dataclass(frozen=True)
+class _SkyignoreSync:
+    body: str | None  # the new file, or None: leave it as it is
+    owner: str  # "lab" | "user" — recorded in .lab-scaffold.json
+    uploads: list[str]  # git-ignored paths it uploads once this run is done (check: as it is)
+    warnings: list[str]
+
+
+def _sync_skyignore(
+    root: Path, text: str, missing: list[str], *, recorded: str | None, check: bool
+) -> _SkyignoreSync:
+    """An existing ``.skyignore``. ``missing`` are scaffold lines the file lacks, appended either
+    way as for any ignore file. A managed file also gains what the git-ignore gained since it was
+    written; a user's file is reported on and never rewritten beyond ``missing``."""
+    payload = (_payload_root() / "dot-skyignore").read_text()
+    lines = text.splitlines()
+    if not _skyignore_is_managed(text, payload, recorded):
+        uploads = _skyignore_uploads(root, [*lines, *missing])
+        body = _appended(text, missing) if missing else None
+        return _SkyignoreSync(body, "user", uploads, _user_skyignore_warning(uploads))
+    stripped = {ln.strip() for ln in lines}
+    added = _carry_over(root, [*lines, *missing])
+    marked = _SKYIGNORE_MARKER in stripped
+    if not added and not missing and marked:
+        return _SkyignoreSync(None, "lab", _skyignore_uploads(root, lines), [])
+    body = _appended(text if marked else _SKYIGNORE_MARKER + "\n" + text, missing)
+    warnings = []
+    if added:
+        if _SKYIGNORE_CARRIED_HEADER.splitlines()[0] not in stripped:
+            body += "\n" + _SKYIGNORE_CARRIED_HEADER
+        body = _appended(body, added)
+        verb = "would add" if check else "added"
+        warnings.append(
+            f"lab init {verb} what you git-ignored since {_SKYIGNORE} was written, so it stays "
+            f"off remote boxes: {_named(added)}. (Delete the `lab-init: managed` line at the top "
+            f"of {_SKYIGNORE} to manage it by hand.)"
+        )
+    uploads = _skyignore_uploads(root, lines if check else body.splitlines())
+    return _SkyignoreSync(body, "lab", uploads, warnings)
 
 
 def scaffold(root: Path, *, check: bool = False) -> dict[str, Any]:
@@ -315,7 +407,11 @@ def scaffold(root: Path, *, check: bool = False) -> dict[str, Any]:
         # Things the caller must say out loud (on stderr): today, what a created `.skyignore`
         # carried over from the git-ignore and what an existing one lets through.
         "warnings": [],
+        # Git-ignored paths the project's `.skyignore` uploads to remote boxes once this run is
+        # done (under `check`: as it stands). SkyPilot reads only `.skyignore` once it exists.
+        "skyignore_uploads": [],
     }
+    skyignore_owner: str | None = state.get("skyignore")
     writes: list[tuple[Path, bytes]] = []
     new_hashes: dict[str, str] = {}
 
@@ -385,8 +481,18 @@ def scaffold(root: Path, *, check: bool = False) -> dict[str, Any]:
             present = set(existing_text.splitlines())
             missing = [ln for ln in wanted_lines if ln not in present]
             if entry.dest == _SKYIGNORE and target.is_file():
-                after = existing_text + "\n" + "\n".join(missing)
-                report["warnings"].extend(_existing_skyignore_warnings(root, after))
+                sync = _sync_skyignore(
+                    root, existing_text, missing, recorded=skyignore_owner, check=check
+                )
+                skyignore_owner = sync.owner
+                report["skyignore_uploads"] = sync.uploads
+                report["warnings"].extend(sync.warnings)
+                if sync.body is None:
+                    report["unchanged"].append(entry.dest)
+                else:
+                    report["merged"].append(entry.dest)
+                    writes.append((target, sync.body.encode()))
+                continue
             if not missing:
                 report["unchanged"].append(entry.dest)
                 continue
@@ -394,6 +500,7 @@ def scaffold(root: Path, *, check: bool = False) -> dict[str, Any]:
                 body = payload.decode()
                 if entry.dest == _SKYIGNORE:
                     body, notes = _seed_skyignore(root, body)
+                    skyignore_owner = "lab"
                     report["warnings"].extend(notes)
                 report["created"].append(entry.dest)
             else:
@@ -422,8 +529,10 @@ def scaffold(root: Path, *, check: bool = False) -> dict[str, Any]:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
 
-    (root / STATE_FILE).write_text(
-        json.dumps({"lab_version": __version__, "files": new_hashes}, indent=2, sort_keys=True)
-        + "\n"
-    )
+    new_state: dict[str, Any] = {"lab_version": __version__, "files": new_hashes}
+    if skyignore_owner is not None:
+        # Who owns `.skyignore` ("lab" while its marker line is there, "user" once it is gone),
+        # so a deleted marker is read as a hand-over rather than as a pre-marker lab file.
+        new_state["skyignore"] = skyignore_owner
+    (root / STATE_FILE).write_text(json.dumps(new_state, indent=2, sort_keys=True) + "\n")
     return report
