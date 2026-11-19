@@ -30,6 +30,39 @@ _TERMINAL = {
 
 
 
+_TAIL_BLOCK = 64 * 1024
+# A log with almost no '\n' (a progress bar redrawn with '\r') would otherwise be read whole while
+# looking for line breaks; past this, the tail is taken from what was read.
+_TAIL_MAX_BYTES = 16 * 1024 * 1024
+
+
+def tail_lines(path: Path, n: int | None) -> list[str]:
+    """The last ``n`` lines of ``path``: all of them for ``None``, none for ``n <= 0``.
+
+    Reads backwards from the end in blocks, so showing 100 lines of a multi-GB log costs about 100
+    lines of I/O, and decodes with ``errors="replace"``: an experiment's stdout is not promised to
+    be UTF-8, and one stray byte used to crash ``lab logs``. A block boundary can split a
+    multi-byte character, but only inside the first, partial line, which is always dropped.
+    """
+    if n is not None and n <= 0:
+        return []
+    with path.open("rb") as f:
+        if n is None:
+            return f.read().decode("utf-8", errors="replace").splitlines()
+        pos = f.seek(0, os.SEEK_END)
+        buf = b""
+        # n+1 line breaks guarantee n whole lines after the first (possibly partial) one.
+        while pos > 0 and buf.count(b"\n") <= n and len(buf) < _TAIL_MAX_BYTES:
+            step = min(_TAIL_BLOCK, pos)
+            pos -= step
+            f.seek(pos)
+            buf = f.read(step) + buf
+    lines = buf.decode("utf-8", errors="replace").splitlines()
+    if pos > 0:
+        lines = lines[1:]  # began mid-line (or mid-character)
+    return lines[-n:]
+
+
 def _kill(pid: int, *, group: bool) -> None:
     try:
         (os.killpg if group else os.kill)(pid, signal.SIGTERM)
@@ -80,8 +113,7 @@ class LocalBackend:
         p = self.store.logs_path(job_id)
         if not p.exists():
             return []
-        lines = p.read_text().splitlines()
-        return lines[-tail:] if tail else lines
+        return tail_lines(p, tail)
 
     def cancel(self, job_id: str) -> JobState:
         m = self.store.read_manifest(job_id)

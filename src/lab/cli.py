@@ -691,7 +691,7 @@ def status(job_id: str) -> None:
 
 
 @app.command()
-def logs(job_id: str, tail: int = typer.Option(100)) -> None:
+def logs(job_id: str, tail: int = typer.Option(100, help="last N lines (0 = none)")) -> None:
     """Tail a job's logs (FR-D1); scheduler-launched jobs fall back to the mirrored manifest
     (spec §4.3), same as `lab status`."""
     for line in _lab_for_mirrored_or_fail(job_id).logs(job_id, tail=tail):

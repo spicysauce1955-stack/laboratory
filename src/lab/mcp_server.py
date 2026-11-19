@@ -438,7 +438,8 @@ def build_server(lab: Lab) -> FastMCP:
 
     @mcp.tool
     def logs(job_id: str, tail: int | None = 100) -> dict[str, Any]:
-        """Tail a job's logs; returns {lines: [...]} (FR-D1). Scheduler-launched (deferred) jobs
+        """Tail a job's logs; returns {lines: [...]} (FR-D1). tail=N gives the last N lines,
+        tail=0 none, tail=None the whole log. Scheduler-launched (deferred) jobs
         fall back to the mirrored manifest (spec §4.3), matching `status`; since their logs only
         live durably on the scheduler host, this may legitimately return an empty list rather
         than an error."""
