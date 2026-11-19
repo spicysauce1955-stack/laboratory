@@ -1587,10 +1587,20 @@ def _teardown_on_abort(
         if store.read_manifest(job_id).status in (JobState.queued, JobState.running):
             # Nothing supervises this job any more, so `running` can only go stale — that is what
             # made `lab wait` hang for its full timeout and drove the operator's 5-minute status
-            # poller. A concurrent `lab cancel` sets `cancelled` first; any terminal state stands.
-            store.update_manifest(
-                job_id, status=JobState.failed, ended_at=now(), end_reason=why[:300]
-            )
+            # poller. Any terminal state already written stands.
+            #
+            # `lab cancel` records its intent (`cancelling` in `_runtime.json`) and SIGTERMs us
+            # *before* it marks the job terminal (R9). That SIGTERM is a cancel, not a crash: once
+            # this writes `failed`, recovery can never repair it, so a cancel whose caller is then
+            # killed would read as a supervisor failure forever.
+            if store.read_runtime(job_id).get("cancelling"):
+                store.update_manifest(
+                    job_id, status=JobState.cancelled, ended_at=now(), end_reason="cancelled by user"
+                )
+            else:
+                store.update_manifest(
+                    job_id, status=JobState.failed, ended_at=now(), end_reason=why[:300]
+                )
     except Exception as e:  # noqa: BLE001 — never mask the exception we are unwinding on
         _emit(f"[lab] teardown after abort ({why}) failed: {type(e).__name__}: {e}\n")
 
@@ -2054,7 +2064,10 @@ def run_job(job_dir: Path, adopt: bool = False) -> int:
         # the classifier only ever *trusts* a succeeded/failed terminal, never invents one.
         timed_out = (store.output_dir(job_id) / TIMEOUT_SENTINEL).exists()
         fresh = store.read_manifest(job_id)
-        cancel_requested = fresh.status == JobState.cancelled
+        # `lab cancel` writes its intent to `_runtime.json` before anything terminal (R9).
+        cancel_requested = fresh.status == JobState.cancelled or bool(
+            store.read_runtime(job_id).get("cancelling")
+        )
         use_spot = (
             fresh.backend.launched_spot
             if fresh.backend.launched_spot is not None
