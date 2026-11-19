@@ -25,11 +25,13 @@
 # (NEW_DROPLET_VERIFIED) AND the old droplet's own power-off at step 5 is independently confirmed
 # (OLD_DROPLET_OFF), in which case the new droplet is the intended sole ticker and powering it off
 # would be wrong; NEW_DROPLET_VERIFIED alone doesn't prove that, since step 5 is a separate,
-# later, independently-fallible call. rollback() re-arms that same safety net (RESUMED=0,
-# OLD_DROPLET_OFF=0) for the duration of its own sequence,
-# so a death mid-rollback still gets a resume attempt from the outer trap instead of leaving the
-# queue paused forever with no message, and only clears NEW_DROPLET_CREATED once its own
-# power-off AND delete of the new droplet are BOTH confirmed (never unconditionally). Every path
+# later, independently-fallible call. rollback() re-arms that same safety net (RESUMED=0 once its
+# own pause lands; OLD_DROPLET_OFF=0 once the old droplet is confirmed back on) for the duration
+# of its own sequence, so a death mid-rollback still gets a recovery attempt from the outer trap
+# instead of leaving the queue paused forever with no message, and only clears
+# NEW_DROPLET_CREATED once the new droplet is confirmed off AND deleted (never
+# unconditionally); a rollback that stops in its deliberate safe hold (HOLD_FOR_MANUAL) is left
+# exactly as it is by cleanup(). Every path
 # that leaves a droplet powered off but not deleted prints a LEFTOVER DROPLET warning -- DO bills
 # for powered-off droplets, and nothing else in this project's tooling would ever notice one.
 #
