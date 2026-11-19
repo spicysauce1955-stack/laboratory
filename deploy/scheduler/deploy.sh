@@ -60,6 +60,9 @@ DRAIN_TIMEOUT="${LAB_DEPLOY_DRAIN_TIMEOUT:-30m}"
 PAUSE_ACK_TIMEOUT_S="${LAB_DEPLOY_PAUSE_ACK_TIMEOUT_S:-120}"
 VERIFY_TIMEOUT_S="${LAB_DEPLOY_VERIFY_TIMEOUT_S:-1200}"
 SMOKE_TIMEOUT_S="${LAB_DEPLOY_SMOKE_TIMEOUT_S:-1800}"
+# After any resume on a failure path: how long to wait for proof that some scheduler is really
+# ticking unpaused again (3 tick cycles).
+TICKER_CONFIRM_TIMEOUT_S="${LAB_DEPLOY_TICKER_CONFIRM_TIMEOUT_S:-180}"
 
 # LEFTOVER DROPLET warnings: DO bills for a powered-off droplet, and `lab reconcile`'s DO pass
 # only covers detached volumes, never droplets -- nothing else in this project's tooling would
@@ -96,6 +99,85 @@ resolve_new_droplet_id() {
   return 1
 }
 
+# A droplet's REAL power state as DigitalOcean reports it ("active", "off", ...), or empty when it
+# cannot be read (three tries). A command's exit code is not the droplet's state:
+# `droplet-action ... --wait` can exit non-zero after the action took effect (an API timeout
+# mid-wait), and choosing which droplet keeps ticking from the exit code alone could leave zero
+# tickers with the queue resumed.
+droplet_status() {
+  local id="$1" st="" attempt
+  [[ "$id" =~ ^[0-9]+$ ]] || { echo ""; return 0; }
+  for attempt in 1 2 3; do
+    (( attempt > 1 )) && sleep 5
+    st="$(doctl compute droplet get "$id" --format Status --no-header 2>/dev/null)" || st=""
+    st="${st//[[:space:]]/}"
+    [[ -n "$st" ]] && break
+  done
+  echo "$st"
+}
+
+# Power a droplet off/on and report what actually HAPPENED: 0 when DigitalOcean then reports the
+# wanted state -- even if doctl exited non-zero (a mid-wait timeout, or a 422 "already off") --
+# and 1 otherwise, including when the state cannot be read at all. A failed command is followed
+# by up to a minute of status reads, because an action that timed out mid-wait may still land.
+power_to() {
+  local want="$1" id="$2" action wanted st="" attempt
+  if [[ "$want" == "off" ]]; then action="power-off"; wanted="off"; else action="power-on"; wanted="active"; fi
+  doctl compute droplet-action "$action" "$id" --wait && return 0
+  echo "doctl $action $id exited non-zero -- reading the droplet's real state before deciding anything" >&2
+  for attempt in 1 2 3 4 5 6; do
+    (( attempt > 1 )) && sleep 10
+    st="$(droplet_status "$id")"
+    if [[ "$st" == "$wanted" ]]; then
+      echo "droplet $id reports '$st' -- the $action did take effect" >&2
+      return 0
+    fi
+  done
+  echo "droplet $id reports '${st:-<unreadable>}' after a failed $action" >&2
+  return 1
+}
+
+# The ONLY place this script resumes the queue. Refuses a queue that was paused before the deploy
+# started: that pause is an operator's, and un-pausing it behind their back is exactly what an
+# earlier version of this script did at step 6, in cleanup() and in rollback().
+resume_queue() {
+  if (( PRE_PAUSED == 1 )); then
+    echo "NOT RESUMING: the queue was paused before this deploy started -- that pause is not ours to undo" >&2
+    return 1
+  fi
+  RESUME_EPOCH="$(date +%s)"
+  if uv run lab queue resume; then
+    RESUMED=1
+    return 0
+  fi
+  return 1
+}
+
+# After a resume on any failure path: prove some scheduler has really ticked UNPAUSED since the
+# resume (a heartbeat younger than the resume, with heartbeat_paused false) -- optionally a given
+# host. A resumed queue with nobody ticking is an outage that looks healthy (nothing launches,
+# nothing tears down deferred jobs), so it is reported as ZERO TICKERS, loudly.
+confirm_live_ticker() {
+  local want_host="${1:-}" json="" hb="" host="" age="" deadline
+  deadline=$(( $(date +%s) + TICKER_CONFIRM_TIMEOUT_S ))
+  while (( $(date +%s) < deadline )); do
+    sleep 10
+    json="$(uv run lab queue list)" || json=""
+    hb="$(echo "$json" | json_field heartbeat_paused)" || hb=""
+    host="$(echo "$json" | json_field host)" || host=""
+    age="$(echo "$json" | json_field heartbeat_age_s)" || age=""
+    if [[ "$hb" == "False" && "$age" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
+      && python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)" \
+        "$age" "$(( $(date +%s) - RESUME_EPOCH ))" \
+      && [[ -z "$want_host" || "$host" == "$want_host" ]]; then
+      echo "confirmed: '$host' is ticking unpaused again"
+      return 0
+    fi
+  done
+  echo "ZERO TICKERS? the queue is resumed but no scheduler${want_host:+ ($want_host)} has ticked unpaused within ${TICKER_CONFIRM_TIMEOUT_S}s (last seen: host='${host:-?}' heartbeat_paused='${hb:-?}' age='${age:-?}s'). Nothing is launching or tearing down deferred jobs. Read both droplets' state ('doctl compute droplet get <id> --format Status --no-header' for old $OLD_DROPLET_ID${NEW_DROPLET_ID:+ and new $NEW_DROPLET_ID}) and power exactly ONE of them on ('doctl compute droplet-action power-on <id> --wait') -- never both." >&2
+  return 1
+}
+
 # One immediate drain read, no waiting: is anything launching/launched right now? Returns 0 only
 # on a clean, readable answer; otherwise DRAIN_BLOCKING names what is in flight (or says the
 # queue could not be read -- an unreadable entry may be in flight too, so that is not clean).
@@ -124,6 +206,9 @@ RENDERED=""
 PAUSED=0
 RESUMED=0
 PRE_PAUSED=0            # the queue was paused before this deploy touched it: never resume it
+RESUME_EPOCH=0
+PREFLIGHT_HOST=""       # the old scheduler's heartbeat host, read in preflight
+OLD_DROPLET_ID=""
 NEW_DROPLET_CREATED=0
 NEW_DROPLET_VERIFIED=0
 NEW_DROPLET_POWERED_OFF=0
@@ -142,10 +227,20 @@ cleanup() {
   [[ -n "$RENDERED" ]] && rm -f "$RENDERED"
   if (( rc != 0 && PAUSED == 1 && RESUMED == 0 )); then
     echo "deploy failed while queue was paused -- recovering safely" >&2
-    local safe_to_resume=1
+    local safe_to_resume=1 survivor=""
     if (( NEW_DROPLET_CREATED == 1 )); then
+      # Step 5 not confirmed (it failed, or we died between steps 4 and 5): ask DigitalOcean
+      # whether the old droplet is in fact off before choosing which droplet keeps ticking. A
+      # power-off that exited non-zero but took effect, followed by powering the new one off too,
+      # used to leave ZERO tickers with the queue resumed.
+      if (( NEW_DROPLET_VERIFIED == 1 && OLD_DROPLET_OFF == 0 )) \
+        && [[ "$(droplet_status "$OLD_DROPLET_ID")" == "off" ]]; then
+        echo "old droplet ($OLD_DROPLET_ID) reports 'off' although its power-off was never confirmed -- the verified new droplet is the sole ticker" >&2
+        OLD_DROPLET_OFF=1
+      fi
       if (( NEW_DROPLET_VERIFIED == 1 && OLD_DROPLET_OFF == 1 )); then
-        echo "new droplet ($NEW_DROPLET_ID) was already verified alive at step 4 and the old droplet is off (step 5 confirmed) -- it's the intended sole ticker; not powering it off before resuming" >&2
+        echo "new droplet ($NEW_DROPLET_ID) was already verified alive at step 4 and the old droplet is off -- it's the intended sole ticker; not powering it off before resuming" >&2
+        survivor="$DROPLET_NAME"
       elif ! resolve_new_droplet_id; then
         echo "MANUAL ACTION REQUIRED: a new droplet may exist (matching $DROPLET_NAME) but its ID could not be resolved -- check the DO console before resuming. Not auto-resuming." >&2
         warn_leftover_droplet "" "$DROPLET_NAME" 0
@@ -158,34 +253,26 @@ cleanup() {
         echo "new droplet ($NEW_DROPLET_ID) was already powered off at step 4 -- skipping redundant power-off" >&2
         warn_leftover_droplet "$NEW_DROPLET_ID" "$DROPLET_NAME" 1
         NEW_DROPLET_CREATED=0
+        survivor="$PREFLIGHT_HOST"
       else
-        # Don't assume a redundant power-off is a harmless no-op against the real API -- ask
-        # first. An unreadable status is treated the same as "not confirmed off": fall through to
-        # the existing attempt-then-fail-safe path below.
-        local new_status
-        new_status="$(doctl compute droplet get "$NEW_DROPLET_ID" --format Status --no-header 2>/dev/null)" || new_status=""
-        if [[ "$new_status" == "off" ]]; then
-          echo "new droplet ($NEW_DROPLET_ID) already reports status 'off' -- skipping redundant power-off" >&2
+        # power_to judges by the droplet's real state, so a power-off rejected with 422 "already
+        # powered off" counts as done rather than as a false MANUAL ACTION alarm.
+        echo "powering off unproven new droplet ($NEW_DROPLET_ID) before resuming -- avoids two unpaused tickers" >&2
+        if power_to off "$NEW_DROPLET_ID"; then
           warn_leftover_droplet "$NEW_DROPLET_ID" "$DROPLET_NAME" 1
-          # No behavioral effect below (nothing re-reads this after cleanup() returns -- the
-          # process is exiting) -- kept as a true-state assertion / symmetry with rollback()'s
-          # bookkeeping, in case a future refactor reads it.
           NEW_DROPLET_CREATED=0
+          survivor="$PREFLIGHT_HOST"
         else
-          echo "powering off unproven new droplet ($NEW_DROPLET_ID) before resuming -- avoids two unpaused tickers" >&2
-          if doctl compute droplet-action power-off "$NEW_DROPLET_ID" --wait; then
-            warn_leftover_droplet "$NEW_DROPLET_ID" "$DROPLET_NAME" 1
-            NEW_DROPLET_CREATED=0  # see comment above
-          else
-            echo "MANUAL ACTION REQUIRED: could not power off new droplet ($NEW_DROPLET_ID) -- power it off by hand, THEN run 'lab queue resume'. Not auto-resuming while it might still be ticking." >&2
-            safe_to_resume=0
-          fi
+          echo "MANUAL ACTION REQUIRED: could not power off new droplet ($NEW_DROPLET_ID) -- power it off by hand, THEN run 'lab queue resume'. Not auto-resuming while it might still be ticking." >&2
+          safe_to_resume=0
         fi
       fi
+    else
+      survivor="$PREFLIGHT_HOST"
     fi
     if (( safe_to_resume == 1 )); then
-      if uv run lab queue resume; then
-        RESUMED=1
+      if resume_queue; then
+        confirm_live_ticker "$survivor" || true
       else
         echo "MANUAL ACTION REQUIRED: run 'lab queue resume'" >&2
       fi
@@ -293,6 +380,7 @@ else
     exit 1
   fi
   echo "preflight: queue is live, last heartbeat from '$preflight_host' ${preflight_age}s ago"
+  PREFLIGHT_HOST="$preflight_host"
   # A queue someone else paused is not ours to resume -- and it cannot be deployed through either:
   # a paused scheduler syncs nothing, so step 1's drain could never observe a job finishing, and
   # the step-7 smoke job could never launch. Refuse, touching nothing (PAUSED stays 0, so cleanup
@@ -468,12 +556,25 @@ else
 fi
 
 say "5. power off old droplet (reversible, not deleted)"
-run doctl compute droplet-action power-off "$OLD_DROPLET_ID" --wait
-[[ "$DRY_RUN" == "--dry-run" ]] || OLD_DROPLET_OFF=1
+if [[ "$DRY_RUN" == "--dry-run" ]]; then
+  echo "[dry-run] doctl compute droplet-action power-off $OLD_DROPLET_ID --wait (confirmed by its real status)"
+else
+  # Judged by the droplet's real state, not doctl's exit code: a power-off that exits non-zero
+  # but took effect must not send cleanup off to power the new droplet down too (zero tickers).
+  if power_to off "$OLD_DROPLET_ID"; then
+    OLD_DROPLET_OFF=1
+  else
+    echo "could not confirm the old droplet ($OLD_DROPLET_ID) is off -- not resuming with possibly two tickers; cleanup decides from its real state" >&2
+    exit 1
+  fi
+fi
 
 say "6. resume -- exactly one unpaused ticker from here on"
-run uv run lab queue resume
-[[ "$DRY_RUN" == "--dry-run" ]] || RESUMED=1
+if [[ "$DRY_RUN" == "--dry-run" ]]; then
+  echo "[dry-run] uv run lab queue resume"
+else
+  resume_queue || { echo "resume failed -- cleanup will retry it" >&2; exit 1; }
+fi
 
 # Every step here is best-effort: this runs after set -e could otherwise be triggered by any one
 # of them, and aborting rollback() halfway is worse than either endpoint state. New droplet is

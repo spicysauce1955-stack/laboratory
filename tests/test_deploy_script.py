@@ -277,6 +277,36 @@ def test_a_pause_landing_during_the_drain_is_not_undone(world) -> None:  # type:
     assert r.droplet("new") is None
 
 
+# ------------------------------------------------------------------------------ #13 which ticker survives
+
+
+def test_an_old_power_off_that_errors_but_worked_still_completes_the_cutover(world) -> None:  # type: ignore[no-untyped-def]
+    """`power-off --wait` can exit non-zero (an API timeout mid-wait) after the droplet really
+    went off. Cleanup then powered the new droplet off too and resumed: zero tickers."""
+    r = world({"poweroff": {"old": {"rc": 1, "effect": True}}})
+    assert r.rc == 0, r.err
+    assert r.droplet("new")["status"] == "active"
+    assert not r.paused
+
+
+def test_an_old_power_off_that_really_failed_keeps_the_old_droplet_serving(world) -> None:  # type: ignore[no-untyped-def]
+    r = world({"poweroff": {"old": {"rc": 1, "effect": False}}})
+    assert r.rc != 0
+    assert r.droplet("old")["status"] == "active"
+    assert r.droplet("new")["status"] == "off"  # never two unpaused tickers
+    assert not r.paused
+    assert "ticking" in r.out + r.err
+
+
+def test_zero_tickers_after_a_failure_is_reported_loudly(world) -> None:  # type: ignore[no-untyped-def]
+    """The old droplet went off despite the error, and its status cannot be read: cleanup cannot
+    know, powers the new one off to rule out two tickers, and then must SAY that nobody ticks."""
+    r = world({"poweroff": {"old": {"rc": 1, "effect": True}}, "status_unreadable": ["old"]})
+    assert r.rc != 0
+    assert "ZERO TICKERS" in r.err
+    assert f"power-on {OLD_ID}" in r.err or f"power-on\" {OLD_ID}" in r.err or OLD_ID in r.err
+
+
 # ------------------------------------------------------------------------------ unchanged paths
 
 
