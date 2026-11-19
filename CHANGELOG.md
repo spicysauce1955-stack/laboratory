@@ -83,8 +83,13 @@ was found that way rather than reported from the field, and every fix carries a 
   while the box runs and verified gone by id (a direct read must 404); anything unverifiable is
   `failed` or `unknown`, never `succeeded`. Every teardown records a `teardown_detail` on the
   manifest, so the next incident is explainable.
-- **DigitalOcean reworded its detach-race rejection** ("cannot delete attached volume"), so the
-  retry ladder never engaged and a routine `lab cancel` reported a leak (exit 3).
+- **A `lab cancel`led DigitalOcean job leaked its volume.** DO now words its detach-race rejection
+  "cannot delete attached volume" and answers it with more than one status, so the retry ladder
+  never engaged; and `cancel` tore down from the CLI while the SIGTERMed supervisor tore down too,
+  racing it. DO's wording now decides the race at any status, `cancel` lets a live supervisor
+  finish its own teardown, and a volume counts as gone only after two `not_found` reads (DO's
+  read-by-id flapped once, live). Verified on real DigitalOcean: cancel → volume deleted and
+  verified gone, `lab wait` exit 0.
 - **A cancelled remote job recorded no cost**, so spend missed real rentals, and a user cancel
   counted as a failure in the ledger.
 - **False `teardown failed` / exit 3 from DigitalOcean's volume-detach race** on the fallback and
