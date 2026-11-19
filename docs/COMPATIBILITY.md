@@ -108,6 +108,13 @@ upgrade note.
   which is how `--price-cap` was once lost on the deferred path. It is a diagnostic, never a gate;
   nothing refuses to register because of it.
 
+  The MCP `register` / `register_sweep` tools gained the deferred-path arguments `lab register` /
+  `lab register-sweep` already had — `price_cap`, `price_cap_strict`, `region`, `zone`,
+  `use_spot`, `spot_fallback`, `accelerator_pool`, `max_launch_attempts`, `gpus`, plus `hold`
+  (register) and `with_pkg` (register_sweep) — and the MCP `doctor` tool gained `use_cache`
+  (`lab doctor --no-cache`). All additive with the CLI's defaults; a test now diffs every
+  CLI command against its MCP tool so the two cannot drift silently again.
+
   `lab queue list` and the MCP `queue_list` tool now return one shared view (`lab.queue_view`):
   the MCP tool gained the `scheduler_skew` block and each entry's `cancel_requested`, both
   additive. The CLI's `entries[].expires_at` is now ISO-8601 with a `T` separator, the form the

@@ -404,8 +404,9 @@ def build_server(lab: Lab) -> FastMCP:
         region: str | None = None,
         zone: str | None = None,
         use_spot: bool = False,
+        use_cache: bool = True,
     ) -> dict[str, Any]:
-        """Check whether a launch on this cloud would work, BEFORE it costs a provision — run this when a submit fails to provision, or before the first job on a new cloud/shape. Returns {cloud, ok, checks:[{name,status,detail,fix}], blocking:[...]} where status is ok|warn|fail|skip. Verifies credentials (including SkyPilot's API-server daemon, which does not inherit .env), project, billing, enabled APIs, IAM permissions, and quota for the requested shape, then reports the catalog's instance type and price band. GCP GPU quota is checked at both levels Google enforces: a project can hold regional NVIDIA_*_GPUS quota and still be blocked by a global GPUS_ALL_REGIONS of 0. status="skip" means the check could not answer and is never a blocker; only "fail" is a definitive negative."""
+        """Check whether a launch on this cloud would work, BEFORE it costs a provision — run this when a submit fails to provision, or before the first job on a new cloud/shape. Returns {cloud, ok, checks:[{name,status,detail,fix}], blocking:[...]} where status is ok|warn|fail|skip. Verifies credentials (including SkyPilot's API-server daemon, which does not inherit .env), project, billing, enabled APIs, IAM permissions, and quota for the requested shape, then reports the catalog's instance type and price band. GCP GPU quota is checked at both levels Google enforces: a project can hold regional NVIDIA_*_GPUS quota and still be blocked by a global GPUS_ALL_REGIONS of 0. status="skip" means the check could not answer and is never a blocker; only "fail" is a definitive negative. use_cache=False re-runs every check instead of reusing cached results (e.g. right after fixing credentials or quota)."""
         from lab.core import default_disk_gb, validate_cloud
         from lab.doctor import doctor_view, run_checks
 
@@ -418,7 +419,7 @@ def build_server(lab: Lab) -> FastMCP:
             cloud=cloud, region=region, zone=zone, use_spot=use_spot,
         )
         resources = resources.model_copy(update={"disk_size": default_disk_gb(resources)})
-        return doctor_view(cloud, run_checks(cloud, resources, home=home))
+        return doctor_view(cloud, run_checks(cloud, resources, home=home, use_cache=use_cache))
 
     @mcp.tool
     def metrics(
@@ -571,8 +572,18 @@ def build_server(lab: Lab) -> FastMCP:
         offer_query: str | None = None,
         max_cost: float | None = None,
         after: list[str] | None = None,
+        gpus: int | None = None,
+        accelerator_pool: str | None = None,
+        max_launch_attempts: int | None = None,
+        region: str | None = None,
+        zone: str | None = None,
+        price_cap: float | None = None,
+        price_cap_strict: bool = False,
+        use_spot: bool = False,
+        spot_fallback: bool = True,
+        hold: bool = False,
     ) -> dict[str, Any]:
-        """Register a deferred job: launched by the scheduler when all triggers hold (time window HH:MM-HH:MM, Vast price <= max_hourly $/h, after=reg_ids succeeded). expires (+3d / ISO) is the required run-by guardrail; worst-case cost = max_hourly x timeout. cloud picks the skypilot cloud: vast (default) | do | gcp — max_hourly/offer_query gate on Vast offers and are rejected for other clouds."""
+        """Register a deferred job: launched by the scheduler when all triggers hold (time window HH:MM-HH:MM, Vast price <= max_hourly $/h, after=reg_ids succeeded). expires (+3d / ISO) is the required run-by guardrail; worst-case cost = max_hourly x timeout. cloud picks the skypilot cloud: vast (default) | do | gcp — max_hourly/offer_query gate on Vast offers and are rejected for other clouds. max_hourly is a wait-until trigger; price_cap is the ceiling on the launched machine's compute $/hr (same semantics as submit: not a hard ceiling on Vast, whose rentals can bill above SkyPilot's catalog), and price_cap_strict=True destroys a machine that bills above it — this matters most here, since a deferred job launches unattended and an unnoticed overrun bills longest. region/zone pin placement; use_spot uses spot instances and spot_fallback=False makes it spot-only; accelerator_pool/max_launch_attempts rotate accelerators on a launch that dies in provisioning (off by default, never raises price_cap). hold=True registers it held (state "held"; released with `lab queue release`)."""
         from datetime import datetime
 
         if accelerators and timeout is None:
@@ -596,20 +607,27 @@ def build_server(lab: Lab) -> FastMCP:
             command=command,
             seed=seed,
             resources=ResourceRequest(
-                cpus=cpus, memory=memory, accelerators=accelerators, cloud=cloud, timeout=timeout
+                cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, cloud=cloud,
+                region=region, zone=zone, max_hourly_usd=price_cap,
+                price_cap_strict=price_cap_strict,
+                accelerator_pool=accelerator_pool, max_launch_attempts=max_launch_attempts,
+                timeout=timeout, use_spot=use_spot, spot_fallback=spot_fallback,
             ),
             submitted_by="agent",
         )
+        queue = default_queue()
         try:
             reg = sched_register(
-                lab.repo, default_queue(), spec, triggers,
+                lab.repo, queue, spec, triggers,
                 Guardrails(expires_at=expires_at, max_cost_usd=max_cost),
             )
         except Exception as e:  # noqa: BLE001
             raise ToolError(str(e)) from e
+        if hold:  # as `lab register --hold` does; keep the two in step if that ordering changes
+            queue.hold(reg.reg_id)
         return {
             "reg_id": reg.reg_id,
-            "state": reg.state.value,
+            "state": "held" if hold else reg.state.value,
             "expires_at": _iso(reg.guardrails.expires_at),
             "worst_case_cost_usd": worst_case_cost(triggers, spec.resources),
         }
@@ -632,12 +650,25 @@ def build_server(lab: Lab) -> FastMCP:
         offer_query: str | None = None,
         max_cost: float | None = None,
         sweep_max_cost: float | None = None,
+        gpus: int | None = None,
+        accelerator_pool: str | None = None,
+        max_launch_attempts: int | None = None,
+        region: str | None = None,
+        zone: str | None = None,
+        price_cap: float | None = None,
+        price_cap_strict: bool = False,
+        use_spot: bool = False,
+        spot_fallback: bool = True,
+        with_pkg: list[str] | None = None,
     ) -> dict[str, Any]:
         """Register a parameter grid as N deferred points sharing one sweep_id + ceiling + bundle;
         the always-on scheduler paces them (subject to triggers and the queue-wide max_concurrent
         control) and stops launching once finished-spend hits sweep_max_cost (it never kills a
         running point). grid is {key: [values]}. expires (+3d / ISO) is the required run-by
         guardrail. cloud: vast (default) | do | gcp — max_hourly/offer_query are Vast-only.
+        price_cap/price_cap_strict, region/zone, use_spot/spot_fallback,
+        accelerator_pool/max_launch_attempts and gpus apply to every point, with the same
+        semantics as on register; with_pkg layers extra runtime packages via uv run --with.
         Returns {sweep_id, count, reg_ids}."""
         from datetime import datetime
 
@@ -660,10 +691,13 @@ def build_server(lab: Lab) -> FastMCP:
         queue = default_queue()
         try:
             sweep_id, regs = sched_register_sweep(
-                lab.repo, queue, command, grid,
+                lab.repo, queue, wrap_with_extras(command, with_pkg), grid,
                 resources=ResourceRequest(
-                    cpus=cpus, memory=memory, accelerators=accelerators, cloud=cloud,
-                    timeout=timeout
+                    cpus=cpus, memory=memory, gpus=gpus, accelerators=accelerators, cloud=cloud,
+                    region=region, zone=zone, max_hourly_usd=price_cap,
+                    price_cap_strict=price_cap_strict,
+                    accelerator_pool=accelerator_pool, max_launch_attempts=max_launch_attempts,
+                    timeout=timeout, use_spot=use_spot, spot_fallback=spot_fallback,
                 ),
                 triggers=triggers,
                 guardrails=Guardrails(expires_at=expires_at, max_cost_usd=max_cost),
