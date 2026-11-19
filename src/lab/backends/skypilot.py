@@ -677,12 +677,62 @@ def list_do_droplets(client: Any | None = None) -> list[dict[str, Any]]:
 
 # DO detaches a block volume from a destroyed droplet *asynchronously*, so a delete issued the
 # instant `sky.down` returns can be refused for a volume that is seconds away from deletable.
-# DO's wording, verbatim from the 2026-08-23 manifest that alarmed.
-_VOLUME_DETACH_MARKER = "attached volume cannot be deleted"
+#
+# DO's wording is not stable, so neither is a literal. 2026-08-23 said "attached volume cannot be
+# deleted" (a 409, raised by pydo as `ResourceExistsError`); 2026-11-19 said "cannot delete
+# attached volume" (not a 409: a plain `HttpResponseError`). The fix for the first was a substring
+# test on its exact text, so the rewording silently disabled every retry ladder at once and a
+# volume that was merely mid-detach was recorded `failed` (job F, `lab wait` exit 3). Both
+# orderings are matched, plus the "volume is attached" phrasing the same fact invites next.
+_VOLUME_DETACH_RE = re.compile(
+    r"attached\s+volume\s+(?:cannot|can\s*not|can't)\s+be\s+deleted"
+    r"|(?:cannot|can\s*not|can't|unable\s+to)\s+delete\s+(?:an?\s+|the\s+)?attached\s+volume"
+    r"|volume\s+is\s+(?:still\s+)?attached"
+)
+# Statuses that mean something other than "not yet", whatever the body happens to say: no
+# credentials, no permission, nothing there, throttled, or DO itself failing. Waiting a minute
+# fixes none of them, and the ladder must never delay that alarm.
+_NOT_A_DETACH_STATUS = frozenset({401, 403, 404, 429})
 # Measured live that day, not guessed: job 20260823-093644-873c9d ended at 12:07:24Z, its volume
 # still listed `attached` at 12:07:37 and was gone by 12:07:58. ~60s of ladder covers that with
 # room to spare, and costs nothing on the common path where the first delete is accepted.
 _VOLUME_DETACH_BACKOFFS = (5, 10, 15, 30)
+
+
+def _exception_chain(exc: BaseException, *, depth: int = 5) -> list[BaseException]:
+    """``exc`` and what it was raised from (``__cause__``/``__context__``), de-duplicated."""
+    out: list[BaseException] = []
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and len(out) < depth and id(cur) not in seen:
+        seen.add(id(cur))
+        out.append(cur)
+        cur = cur.__cause__ or cur.__context__
+    return out
+
+
+def is_volume_detach_race(exc: BaseException) -> bool:
+    """Is this DO refusal to delete a volume the asynchronous-detach race ("not yet")?
+
+    Reads the structure pydo raises, not just ``str(exc)``: azure-core's ``HttpResponseError``
+    carries DO's JSON message on ``.error.message`` and the HTTP status on ``.status_code``, and
+    SkyPilot's DO helpers re-raise it as ``DigitalOceanError(...) from err``, so the whole chain is
+    read. The status can only *disqualify* — DO has answered this race with a 409 and with a
+    non-409, so no status identifies it — while an auth/permission/not-found/throttle/5xx status
+    rules it out whatever the text says.
+    """
+    texts: list[str] = []
+    for link in _exception_chain(exc):
+        status = getattr(link, "status_code", None)
+        if isinstance(status, int) and (status in _NOT_A_DETACH_STATUS or status >= 500):
+            return False
+        texts.append(str(link))
+        for holder in (getattr(link, "error", None), link):
+            message = getattr(holder, "message", None)
+            if isinstance(message, str):
+                texts.append(message)
+    text = " ".join(" ".join(texts).lower().split())
+    return bool(_VOLUME_DETACH_RE.search(text))
 
 
 def _do_sweep_leftover_volumes(
@@ -740,7 +790,7 @@ def _do_sweep_leftover_volumes(
                 deleted.append(vol["id"])
             except Exception as e:  # noqa: BLE001 — found and un-removable is a real alarm
                 entry = f"volume {vol.get('name')}: {type(e).__name__}: {e}"
-                (detaching if _VOLUME_DETACH_MARKER in entry.lower() else terminal).append(entry)
+                (detaching if is_volume_detach_race(e) else terminal).append(entry)
         failures = terminal + detaching
         if not failures:
             return deleted, []
@@ -839,7 +889,7 @@ def delete_do_volumes(
                 gone.append(vol_id)
             except Exception as e:  # noqa: BLE001 — classified: retry "not yet", report "never"
                 failed[vol_id] = e
-                if _VOLUME_DETACH_MARKER in f"{type(e).__name__}: {e}".lower():
+                if is_volume_detach_race(e):
                     detaching.append(vol_id)
         pending = detaching
     return gone, {k: e for k, e in failed.items() if k not in gone}
