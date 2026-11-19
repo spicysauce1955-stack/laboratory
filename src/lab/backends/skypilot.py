@@ -2029,7 +2029,8 @@ def tear_down_and_record(
             f"TEARDOWN OUTCOME UNKNOWN for cluster {cluster!r}: {outcome['error']} after "
             f"{outcome['attempts']} sky.down attempts. The machine may already be gone OR may "
             f"still be billing — this cannot be told from the client. Verify against the "
-            f"provider itself (`doctl compute droplet list`, `gcloud compute instances list "
+            f"provider itself (`doctl compute droplet list` and `doctl compute volume list`, "
+            f"`gcloud compute instances list "
             f"--filter=\"name~'^lab-'\"`, `vastai show_instances`), then `lab reconcile "
             f"--apply --yes` if anything remains."
         )
@@ -2046,6 +2047,20 @@ def tear_down_and_record(
                 "(add `--yes` when unattended: with no tty --apply refuses and destroys "
                 "nothing), and check "
                 "`gcloud compute instances list --filter=\"name~'^lab-'\"`."
+            )
+        elif cloud == "do" and outcome.get("do_fallback_used"):
+            remedy = (
+                "AND do-direct fallback. Run `lab reconcile --apply` to stop the bleed (add "
+                "`--yes` when unattended: with no tty --apply refuses and destroys nothing), "
+                "and check `doctl compute droplet list` / `doctl compute volume list`."
+            )
+        elif cloud == "do":
+            # sky.down took: the droplet is gone and only its block volume failed the check.
+            # Saying "no fallback" here pointed operators at the wrong resource (job F).
+            remedy = (
+                "— sky.down destroyed the droplet; its block volume is what remains. Run "
+                "`lab reconcile --apply` (add `--yes` when unattended), whose DO volume pass "
+                "removes detached `lab-*` volumes, and check `doctl compute volume list`."
             )
         else:
             remedy = (
@@ -2066,6 +2081,11 @@ def tear_down_and_record(
         annotation = (
             f"sky.down failed ({outcome['error']}); gcp-direct fallback destroyed "
             f"{outcome.get('gcp_destroyed')}"
+        )
+    elif outcome.get("do_fallback_used"):
+        annotation = (
+            f"sky.down failed ({outcome['error']}); do-direct fallback destroyed "
+            f"{outcome.get('do_destroyed')}"
         )
     if annotation is not None:
         print(f"[lab] {annotation}")
