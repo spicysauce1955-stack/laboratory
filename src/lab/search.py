@@ -215,7 +215,9 @@ class _Summary:
     a killed job keeps them. Any other axis's values all finish together, at the very end.
     """
 
-    def __init__(self, path: Path, axis: str, axes: Mapping[str, Sequence[Any]]) -> None:
+    def __init__(
+        self, path: Path, axis: str, axes: Mapping[str, Sequence[Any]], *, append: bool
+    ) -> None:
         names = list(axes)
         if axis not in axes:
             raise ValueError(f"summary_axis {axis!r} is not a grid key; the grid has {names}")
@@ -237,10 +239,22 @@ class _Summary:
         self.streams = position == 0
         self.hits = [0] * len(self.values)
         self.written = 0
+        self.fresh = True
+        if append and path.exists():
+            with path.open(newline="") as f:
+                existing = next(csv.reader(f), [])
+            if existing and existing != self.header:
+                raise ValueError(
+                    f"{path} has the header {existing}, not {self.header}: append=True only "
+                    "adds rows to a summary of the same axis"
+                )
+            self.fresh = not existing
 
     def start(self) -> None:
-        with self.path.open("w", newline="") as f:
-            csv.writer(f, lineterminator="\n").writerow(self.header)
+        """Write the header, unless appending to a summary that already has one."""
+        if self.fresh:
+            with self.path.open("w", newline="") as f:
+                csv.writer(f, lineterminator="\n").writerow(self.header)
 
     def count_hit(self, combination: int) -> None:
         """Count a pass at ``combination``, its index in grid order."""
@@ -275,18 +289,21 @@ def grid_search(
     batch_size: int | None = None,
     run_dir: str | Path | None = None,
     summary_axis: str | None = None,
+    append: bool = False,
 ) -> SearchResult:
     """Run ``evaluate`` on every combination in ``grid`` and log the ones that pass.
 
     ``grid`` maps ``evaluate`` keyword names to their values, which need not be numeric. Use a
     closure or :func:`functools.partial` for anything held fixed. A log left by an earlier search
-    in the same directory is replaced.
+    in the same directory is replaced, unless ``append=True``: then this search's hits (and
+    summary rows) go after the ones already there.
 
     ``summary_axis`` names a grid key whose every value gets a ``results.csv`` row,
     ``<axis>,tested,hits``, zero-hit values included: pass ``"seed"`` in a sharded sweep, so that
     ``sweep-aggregate`` sees every seed the job finished (it reads only ``results.csv``). Put that
     key first in ``grid`` and each row is written as soon as its value is done; otherwise the rows
-    are written when the search ends.
+    are written when the search ends. Make the seed a grid key rather than calling this once per
+    seed; if you do loop, pass ``append=True`` or each call erases the previous seed's results.
     """
     if batch_size is not None and batch_size < 1:
         raise ValueError(f"batch_size must be at least 1, got {batch_size}")
@@ -297,11 +314,18 @@ def grid_search(
         for value in values:
             _check_loggable(name, value, "grid parameter")
     base = _resolve_run_dir(run_dir)
-    summary = None if summary_axis is None else _Summary(base / SUMMARY_FILE, summary_axis, axes)
+    summary = (
+        None
+        if summary_axis is None
+        else _Summary(base / SUMMARY_FILE, summary_axis, axes, append=append)
+    )
 
     path = base / HITS_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("")
+    if append:
+        path.touch()
+    else:
+        path.write_text("")
     if summary is not None:
         summary.start()
 

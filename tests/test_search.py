@@ -361,6 +361,63 @@ def test_a_summary_axis_named_like_a_count_column_is_refused(tmp_path):
         grid_search(lambda hits: True, {"hits": [0]}, summary_axis="hits", run_dir=tmp_path)
 
 
+# --- append: one search per call, one log ---------------------------------------------------------
+
+
+def test_append_keeps_the_hits_of_earlier_searches(tmp_path):
+    for seed in (0, 1, 2):
+        grid_search(
+            lambda seed, a: a > 1, {"seed": [seed], "a": [1, 2]}, append=True, run_dir=tmp_path
+        )
+    assert read_hits(tmp_path) == [{"seed": 0, "a": 2}, {"seed": 1, "a": 2}, {"seed": 2, "a": 2}]
+
+
+def test_append_starts_a_log_that_does_not_exist_yet(tmp_path):
+    grid_search(lambda a: True, {"a": [1]}, append=True, run_dir=tmp_path / "fresh")
+    assert read_hits(tmp_path / "fresh") == [{"a": 1}]
+
+
+def test_append_adds_summary_rows_under_a_single_header(tmp_path):
+    for seed in (0, 1, 2):
+        grid_search(
+            hit_when_seed_is_one,
+            {"seed": [seed], "a": [1, 2, 3]},
+            summary_axis="seed",
+            append=True,
+            run_dir=tmp_path,
+        )
+    text = (tmp_path / SUMMARY_FILE).read_text()
+    assert text == "seed,tested,hits\n0,3,0\n1,3,2\n2,3,0\n"
+    _, present, _ = merge_seed_rows([(text, "succeeded")], seed_column="seed")
+    assert present == [0, 1, 2]
+
+
+def test_append_refuses_a_summary_with_another_header_before_touching_anything(tmp_path):
+    (tmp_path / SUMMARY_FILE).write_text("alpha,tested,hits\n0.5,3,1\n")
+    (tmp_path / HITS_FILE).write_text('{"alpha": 0.5}\n')
+    calls: list[int] = []
+
+    with pytest.raises(ValueError, match="header"):
+        grid_search(
+            lambda seed: calls.append(seed) or True,
+            {"seed": [0]},
+            summary_axis="seed",
+            append=True,
+            run_dir=tmp_path,
+        )
+    assert calls == []
+    assert (tmp_path / SUMMARY_FILE).read_text() == "alpha,tested,hits\n0.5,3,1\n"
+    assert (tmp_path / HITS_FILE).read_text() == '{"alpha": 0.5}\n'
+
+
+def test_append_writes_a_header_into_an_empty_summary(tmp_path):
+    (tmp_path / SUMMARY_FILE).write_text("")
+    grid_search(
+        lambda seed: True, {"seed": [0]}, summary_axis="seed", append=True, run_dir=tmp_path
+    )
+    assert (tmp_path / SUMMARY_FILE).read_text() == "seed,tested,hits\n0,1,1\n"
+
+
 # --- refusing results that would corrupt the log -------------------------------------------------
 
 
