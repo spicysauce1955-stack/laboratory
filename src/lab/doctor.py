@@ -684,14 +684,49 @@ def check_vast_balance(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult
     return _ok("balance", f"${bal:.2f}")
 
 
+def _do_credential_paths() -> list[Path]:
+    """Where SkyPilot looks for doctl's config — ``POSSIBLE_CREDENTIALS_PATHS`` in
+    ``sky/provision/do/utils.py``, replicated (it is computed at SkyPilot's import time) and
+    pinned to it by a drift test. Note what is *not* here: ``$DIGITALOCEAN_TOKEN`` (SkyPilot never
+    reads it), ``~/.config`` when ``$XDG_CONFIG_HOME`` points elsewhere, and the snap package's
+    ``~/snap/doctl/current/.config``."""
+    return [
+        Path(os.path.expanduser("~/Library/Application Support/doctl/config.yaml")),
+        Path(
+            os.path.expanduser(
+                os.path.join(os.getenv("XDG_CONFIG_HOME", "~/.config/"), "doctl/config.yaml")
+            )
+        ),
+    ]
+
+
 def check_do_token(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
-    path = Path.home() / ".config" / "doctl" / "config.yaml"
-    if os.environ.get("DIGITALOCEAN_TOKEN") or path.exists():
-        return _ok("token", "DigitalOcean credentials present")
+    """A doctl config where SkyPilot reads it — the only DO credential SkyPilot uses.
+
+    This used to accept ``$DIGITALOCEAN_TOKEN`` or ``~/.config/doctl/config.yaml``: SkyPilot
+    ignores the first, and does not read the second once ``$XDG_CONFIG_HOME`` is set, so the check
+    passed launches that then died with "No credentials found" after the submit.
+    """
+    paths = _do_credential_paths()
+    found = next((p for p in paths if p.exists()), None)
+    if found is not None:
+        return _ok("token", f"doctl config at {found}")
+    unread = []
+    if os.environ.get("DIGITALOCEAN_TOKEN") or os.environ.get("DIGITALOCEAN_ACCESS_TOKEN"):
+        unread.append("DIGITALOCEAN_TOKEN is set, but SkyPilot never reads it")
+    snap = Path.home() / "snap" / "doctl" / "current" / ".config" / "doctl" / "config.yaml"
+    if snap.exists():
+        unread.append(f"the snap doctl config at {snap} exists, but SkyPilot does not read snap")
+    stray = Path.home() / ".config" / "doctl" / "config.yaml"
+    if stray.exists() and stray not in paths:
+        unread.append(f"{stray} exists, but XDG_CONFIG_HOME points SkyPilot elsewhere")
+    detail = "no doctl config where SkyPilot reads it (" + ", ".join(map(str, paths)) + ")"
+    if unread:
+        detail += "; " + "; ".join(unread)
     return _fail(
         "token",
-        "no DigitalOcean token found",
-        "doctl auth init (writes ~/.config/doctl/config.yaml), or set DIGITALOCEAN_TOKEN",
+        detail,
+        f"doctl auth init (writes {paths[1]}), or copy/symlink an existing doctl config there",
     )
 
 

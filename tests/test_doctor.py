@@ -474,6 +474,72 @@ def test_expired_cache_entry_is_ignored(tmp_path):
 
 
 # --------------------------------------------------------------------------------------------
+# DigitalOcean token: exactly where SkyPilot looks (sky/provision/do/utils.py)
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("DIGITALOCEAN_TOKEN", raising=False)
+    monkeypatch.delenv("DIGITALOCEAN_ACCESS_TOKEN", raising=False)
+    return tmp_path
+
+
+def _doctl_config(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("access-token: x\n")
+
+
+def test_do_token_in_the_env_alone_is_not_enough(home, monkeypatch):
+    """SkyPilot never reads DIGITALOCEAN_TOKEN — it builds its client from doctl's config file —
+    so an env-only token passed this check and the launch then died with "No credentials found"."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", "dop_v1_fake")
+    result = D.check_do_token(ResourceRequest(cloud="do"), {})
+    assert result.status == "fail"
+    assert "DIGITALOCEAN_TOKEN" in result.detail
+
+
+def test_do_token_under_xdg_config_home_is_found(home, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "xdg"))
+    _doctl_config(home / "xdg" / "doctl" / "config.yaml")
+    assert D.check_do_token(ResourceRequest(cloud="do"), {}).status == "ok"
+
+
+def test_with_xdg_config_home_set_the_dot_config_copy_is_not_read(home, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "xdg"))
+    _doctl_config(home / ".config" / "doctl" / "config.yaml")
+    assert D.check_do_token(ResourceRequest(cloud="do"), {}).status == "fail"
+
+
+def test_do_token_at_the_macos_path_is_found(home):
+    _doctl_config(home / "Library" / "Application Support" / "doctl" / "config.yaml")
+    assert D.check_do_token(ResourceRequest(cloud="do"), {}).status == "ok"
+
+
+def test_the_snap_doctl_config_is_named_as_unread(home):
+    """The snap package keeps its config under ~/snap; SkyPilot does not look there."""
+    _doctl_config(home / "snap" / "doctl" / "current" / ".config" / "doctl" / "config.yaml")
+    result = D.check_do_token(ResourceRequest(cloud="do"), {})
+    assert result.status == "fail"
+    assert "snap" in result.detail
+
+
+def test_do_token_paths_match_skypilots_own_list(home):
+    """A drift guard: the paths checked are the paths the installed SkyPilot reads."""
+    import importlib.util
+
+    # Its list is computed at import time from HOME/XDG_CONFIG_HOME, so execute a private copy of
+    # the module under this test's environment rather than reloading the shared one.
+    spec = importlib.util.find_spec("sky.provision.do.utils")
+    assert spec is not None and spec.loader is not None
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    assert [str(p) for p in D._do_credential_paths()] == list(fresh.POSSIBLE_CREDENTIALS_PATHS)
+
+
+# --------------------------------------------------------------------------------------------
 # Misc
 # --------------------------------------------------------------------------------------------
 
