@@ -90,7 +90,12 @@ def catch_up(state: dict[str, Any]) -> None:
     host = _droplet(state, host_role)
     assert host is not None
     paused = bool(state["control"]["paused"])
-    state["heartbeat"] = {"host": host["name"], "paused": paused, "at": state["clock"]}
+    if host_role == "old" and state["scenario"].get("legacy_old_host"):
+        # A host older than v0.12.0 writes no `paused` into its heartbeat at all (the production
+        # scheduler did exactly this on 2026-11-19); it still honours control.paused per tick.
+        state["heartbeat"] = {"host": host["name"], "at": state["clock"]}
+    else:
+        state["heartbeat"] = {"host": host["name"], "paused": paused, "at": state["clock"]}
     state["tick_count"] = state.get("tick_count", 0) + 1
     if paused:
         return  # a paused tick syncs nothing (Scheduler.tick)
@@ -134,7 +139,7 @@ def lab(state: dict[str, Any], args: list[str]) -> int:
         print(json.dumps({
             "host": hb["host"] if hb else None,
             "heartbeat_age_s": (state["clock"] - hb["at"]) if hb else None,
-            "heartbeat_paused": hb["paused"] if hb else None,
+            "heartbeat_paused": hb.get("paused") if hb else None,
             "tick_count": state.get("tick_count"),
             "control": state["control"],
             "entries": [{"reg_id": k, "state": r["state"]} for k, r in state["regs"].items()],
