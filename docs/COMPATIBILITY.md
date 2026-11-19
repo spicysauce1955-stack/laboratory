@@ -154,10 +154,12 @@ upgrade note.
   |---|---|---|---|---|
   | `lab metrics` / `metrics` | `--max-points N` / `max_points` | `200` per series, the **newest** | `0` = every point | `series` unchanged; gained `max_points` and `truncated: {name: {returned, omitted}}` (`{}` when nothing was cut) |
   | `lab metrics` / `metrics` | `--downsample` / `downsample` | off | — | the cap spread evenly over the whole series, newest point always kept |
+  | `lab list` / `list` | `--limit N` (`-n`) / `limit` | the **newest** `100` jobs, rows still oldest-to-newest | `0` = every job | gained `jobs_total`, `jobs_omitted`, `limit`; `spend` still covers every job |
 
   This **changes a default**: a caller that read every point from `series` now gets the newest
   200 of each series, and `truncated` says so — check it, or pass `--max-points 0` /
-  `max_points=0` for the old behaviour. `since_step` keeps its meaning (points with a larger
+  `max_points=0` for the old behaviour. Likewise `jobs` holds at most 100 rows unless you pass
+  `--limit 0` / `limit=0`; `jobs_omitted` is non-zero whenever rows were left out. `since_step` keeps its meaning (points with a larger
   step) and composes with the cap; it is now answered from the end of the file, stopping a
   series at its first step at or below `since_step`. That is exact for a series whose steps
   never go backwards; a series the reader sees go backwards is read in full, and a counter reset

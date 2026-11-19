@@ -39,6 +39,7 @@ from lab.env import load_lab_env
 from lab.events import store as events_store
 from lab.events.annotate import digest_of, refs_from
 from lab.events.sanitize import sanitize_argv
+from lab.list_view import DEFAULT_LIST_LIMIT, list_view
 from lab.manifest import git_work_tree, repo_root
 from lab.metrics import DEFAULT_MAX_POINTS
 from lab.models import JobManifest, JobSpec, ResourceRequest
@@ -1161,29 +1162,23 @@ def list_jobs(
         "named in spend.unsupervised_suspect_jobs. Jobs whose rate was never readable are named "
         "in spend.unknown_cost_jobs, never counted as $0.",
     ),
+    limit: int = typer.Option(
+        DEFAULT_LIST_LIMIT, "--limit", "-n", min=0,
+        help="the newest N jobs (0 = every job); jobs_omitted says how many were left out. "
+        "spend always covers every job",
+    ),
 ) -> None:
-    """List jobs, with this project's realized spend so far (FR-H1, FR-I2)."""
-    the_lab = _lab()
-    jobs = the_lab.list_jobs()
-    spend = the_lab.spend(jobs, alert_usd=spend_alert)
-    if spend["alert"] is not None:
+    """List jobs, with this project's realized spend so far (FR-H1, FR-I2).
+
+    Bounded by default to the newest --limit (100) jobs, in the listing's usual oldest-to-newest
+    order; `jobs_total`/`jobs_omitted` say what the page left out. `spend` covers every job.
+    """
+    view = list_view(_lab(), limit=limit, spend_alert=spend_alert)
+    if view["spend"]["alert"] is not None:
         # A $45 crossing was found ~2 landings late in a retrospective audit. Say it the moment
         # it is read — on stderr, so stdout stays the JSON a caller parses.
-        print(spend["alert"]["message"], file=sys.stderr)
-    _emit(
-        {
-            "jobs": [
-                {
-                    "job_id": j.job_id,
-                    "sweep_id": j.sweep_id,
-                    "status": j.status.value,
-                    "created_at": j.created_at,
-                }
-                for j in jobs
-            ],
-            "spend": spend,
-        }
-    )
+        print(view["spend"]["alert"]["message"], file=sys.stderr)
+    _emit(view)
 
 
 @app.command()

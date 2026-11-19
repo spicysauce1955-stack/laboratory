@@ -342,11 +342,14 @@ the local output is empty (e.g. after a fresh clone).
 `{job_id}` → `{"state": "cancelled"}`. Stops the job and tears the machine down.
 
 ### `mcp__lab__list`
-`{spend_alert?}` → `{"jobs": [{job_id, sweep_id, status, created_at}, ...],
+`{spend_alert?, limit=100}` → `{"jobs": [{job_id, sweep_id, status, created_at}, ...],
+"jobs_total", "jobs_omitted", "limit",
 "spend": {realized_usd, jobs_counted, running_usd, running_jobs,
-unknown_cost_jobs, unsupervised_suspect_jobs, scope, alert}}`. All jobs in
-`runs/`, plus **realized spend
-so far** — derived from the manifests on every read, so there is no meter to
+unknown_cost_jobs, unsupervised_suspect_jobs, scope, alert}}`. The **newest
+`limit` jobs** in `runs/` (oldest-to-newest; `jobs_omitted` counts the older
+ones left out, `limit=0` returns all — for one sweep use `sweep_status`
+instead), plus **realized spend
+so far** over *every* job, not just the page — derived from the manifests on every read, so there is no meter to
 drift. `running_usd` counts live jobs at rate x elapsed, so the total moves
 *before* a landing rather than after it — **bounded by each job's own
 `--timeout`** (24h if it declares none), so a manifest a dead supervisor left at
@@ -814,6 +817,7 @@ past its cause costs real time. Each row below is a rule that was once right.
 | "`lab <cmd> --help` exits non-deterministically, so `--help` rows in `lab history` are noise." | That was `rich` raising on a closed stdout pipe; `--help` exits 0. A `usage_error` row is now a real usage error. | v0.7.0 |
 | "`--price-cap` is a hard ceiling." | **Still not true, and worth knowing exactly how.** SkyPilot applies it to its own catalog, which under-reports Vast ~4x. Since v0.8.0 the cheapest *live* Vast offer is checked before renting (an impossible cap fails the submit for free) and the *billed* rate is compared after boot and recorded as `cost.over_cap`. The optimizer can still land above the cheapest offer, so pass `--price-cap-strict` if the ceiling must hold, and bound real exposure with `--timeout`. | v0.8.0 |
 | "`reconcile`'s `ghosts` list is Vast-only — a healthy DO/GCP job may show up there as a false positive, so don't trust it for those backends." | Ghost detection now cross-checks every cloud's own SkyPilot-tracked state, not just Vast rental labels; a healthy DO/GCP job is no longer misreported. Each entry's cause is named in the additive `ghost_reasons`. | v0.10.0 |
+| "`mcp__lab__list` / `lab list` return every job." | They return the **newest 100** (`limit`/`--limit`, `0` = all) and count the rest in `jobs_omitted`; `spend` still covers every job. 10k jobs measured 1.24 MB over MCP. | v0.13.0 |
 | "`mcp__lab__metrics` / `lab metrics` return every point of every series." | They return the **newest 200 points per series** by default and name what they cut in `truncated` (`{name: {returned, omitted}}`). `max_points=0` (`--max-points 0`) returns everything; `downsample=true` (`--downsample`) spreads the cap over the whole run. One unbounded read measured 27.7 MB over MCP. | v0.13.0 |
 | "There's no way to see what's actually running right now except `lab list` (this project only) or eyeballing `reconcile`'s rental counts." | `lab ps` / `mcp__lab__ps` gives a project-agnostic, machine-wide "what's running" view — closes a real gap found live, when both of the above were checked during an incident and neither surfaced jobs running in a *different* project. | v0.10.0 |
 | "`lab fetch`/`lab metrics`/`lab logs` don't work from the laptop for scheduler-launched jobs — only `lab status` reads the mirror." | The three now fall back to the mirrored manifest too (built over an ephemeral job store, never the real local one, so `cancel`/`reconcile` still correctly treat the job as not locally supervised). | v0.11.0 |

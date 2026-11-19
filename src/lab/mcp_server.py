@@ -32,6 +32,7 @@ from lab.core import Lab, LabError, default_lab, job_status_view, resolve_backen
 from lab.env import load_lab_env
 from lab.events import store as events_store
 from lab.events.annotate import digest_of, refs_from
+from lab.list_view import DEFAULT_LIST_LIMIT, list_view
 from lab.manifest import repo_root
 from lab.metrics import DEFAULT_MAX_POINTS
 from lab.models import JobManifest, JobSpec, ResourceRequest
@@ -580,22 +581,14 @@ def build_server(lab: Lab) -> FastMCP:
             raise ToolError(str(e)) from e
 
     @mcp.tool(name="list")
-    def list_jobs(spend_alert: float | None = None) -> dict[str, Any]:
-        """List jobs; returns {jobs: [...], spend: {...}} (FR-H1, FR-I2). `spend` is this project's realized USD so far, derived from the job manifests on every read (there is no meter): landed jobs at their recorded actual cost, still-running jobs at rate x elapsed-so-far (that part is `running_usd`, and it is included in `realized_usd`) BOUNDED by each job's own --timeout (24h when it declares none), because a manifest left at `running` by a dead supervisor would otherwise add money nobody spent on every read; jobs that hit that bound are named in `unsupervised_suspect_jobs` (probably orphaned — confirm with `reconcile`) and the total is a lower bound for them. Jobs whose rate was never readable are named in `unknown_cost_jobs` and left OUT of the total — never counted as $0. `scope` states exactly what is and is not included; read it before quoting the number. spend_alert=<usd> sets a threshold: `spend.alert` stays null until the total reaches it, then carries {threshold_usd, realized_usd, over_by_usd, message}."""
-        the_lab = _lab()
-        jobs = the_lab.list_jobs()
-        return {
-            "jobs": [
-                {
-                    "job_id": j.job_id,
-                    "sweep_id": j.sweep_id,
-                    "status": j.status.value,
-                    "created_at": _iso(j.created_at),
-                }
-                for j in jobs
-            ],
-            "spend": the_lab.spend(jobs, alert_usd=spend_alert),
-        }
+    def list_jobs(
+        spend_alert: float | None = None, limit: int = DEFAULT_LIST_LIMIT
+    ) -> dict[str, Any]:
+        """List jobs; returns {jobs: [...], jobs_total, jobs_omitted, limit, spend: {...}} (FR-H1, FR-I2). BOUNDED: `jobs` is the newest `limit` (default 100) jobs, oldest-to-newest; `jobs_omitted` says how many older ones were left out, and limit=0 returns every job. `spend` always covers every job, not just the page. `spend` is this project's realized USD so far, derived from the job manifests on every read (there is no meter): landed jobs at their recorded actual cost, still-running jobs at rate x elapsed-so-far (that part is `running_usd`, and it is included in `realized_usd`) BOUNDED by each job's own --timeout (24h when it declares none), because a manifest left at `running` by a dead supervisor would otherwise add money nobody spent on every read; jobs that hit that bound are named in `unsupervised_suspect_jobs` (probably orphaned — confirm with `reconcile`) and the total is a lower bound for them. Jobs whose rate was never readable are named in `unknown_cost_jobs` and left OUT of the total — never counted as $0. `scope` states exactly what is and is not included; read it before quoting the number. spend_alert=<usd> sets a threshold: `spend.alert` stays null until the total reaches it, then carries {threshold_usd, realized_usd, over_by_usd, message}."""
+        try:
+            return list_view(_lab(), limit=limit, spend_alert=spend_alert)
+        except ValueError as e:
+            raise ToolError(str(e)) from e
 
     @mcp.tool(name="ps")
     def ps() -> dict[str, Any]:
