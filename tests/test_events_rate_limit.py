@@ -324,3 +324,26 @@ def test_concurrent_pollers_write_exactly_one_pair(tmp_path: Path) -> None:
         if line.strip()
     ]
     assert len(lines) == 2, f"expected one open/close pair, got {len(lines)} lines"
+
+
+def test_a_poll_that_ended_first_but_locks_second_is_still_inside_the_window(tmp_path, monkeypatch):
+    """`now` is the call's end time, read before the stamp's lock. Two pollers ending ms apart can
+    take the lock in the other order, so the later locker sees the stamp slightly in its *future*.
+    That used to read as "the clock moved backwards → record", which is how 16 concurrent polls
+    left two pairs ~15% of the time (test_concurrent_pollers_write_exactly_one_pair)."""
+    from datetime import timedelta
+
+    monkeypatch.setenv("LAB_EVENTS_DIR", str(tmp_path / "ev"))
+    t = datetime(2026, 11, 19, 12, 0, tzinfo=timezone.utc)
+    assert store.claim_read_slot("status", "p", now=t, min_interval_s=60) is True
+    early = t - timedelta(milliseconds=40)
+    assert store.claim_read_slot("status", "p", now=early, min_interval_s=60) is False
+
+
+def test_a_clock_that_really_jumped_back_more_than_a_window_still_records(tmp_path, monkeypatch):
+    from datetime import timedelta
+
+    monkeypatch.setenv("LAB_EVENTS_DIR", str(tmp_path / "ev"))
+    t = datetime(2026, 11, 19, 12, 0, tzinfo=timezone.utc)
+    assert store.claim_read_slot("status", "p", now=t, min_interval_s=60) is True
+    assert store.claim_read_slot("status", "p", now=t - timedelta(hours=2), min_interval_s=60)
