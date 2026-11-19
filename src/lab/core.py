@@ -100,6 +100,15 @@ _MIRROR_MIN_INTERVAL_S = 30.0
 # minutes on the way out. Still null after that is a verdict, not lag: the warning is then earned.
 _MIRROR_SETTLE_S = 75.0
 
+# How long :meth:`Lab._settle_teardown` keeps re-reading a job whose own local supervisor is still
+# alive. Terminal status is written *before* teardown runs, and teardown can take minutes: sky.down
+# retries (up to ~230s) and DigitalOcean's volume-detach ladder (5+10+15+30s). A clean DO smoke job
+# on 2026-11-19 finished tearing down 28s after terminal — past the 15s settle — so `lab wait`
+# warned "teardown not confirmed" on a clean run, the false alarm R10 says the lab cannot afford.
+# A live supervisor means the answer is still coming; a dead one means it never will, so this only
+# ever extends the wait while there is someone left to write the verdict.
+_SUPERVISOR_SETTLE_MAX_S = 600.0
+
 
 class LabError(RuntimeError):
     """Fail-loud lab error (FR-F3)."""
@@ -2515,13 +2524,34 @@ class Lab:
                 events.note("wait.settle_unreadable", job_id=m.job_id, error=str(e))
                 return m
 
+        def _supervisor_alive(m: JobManifest) -> bool:
+            """The local supervisor that owns this job's teardown is still running. Anything that
+            can't be read (no runtime file, a mirrored job, a store without runtimes) is "no"."""
+            if m.job_id in mirrored_ids:
+                return False
+            try:
+                rt = self.store.read_runtime(m.job_id)
+            except Exception:  # noqa: BLE001 — can't tell is never a reason to keep waiting
+                return False
+            pid = rt.get("runner_pid")
+            return bool(pid) and pid_alive(pid, start_time=rt.get("runner_start_time"))
+
         step, budget = min(interval, 5.0), attempts * min(interval, 5.0)
         if any(m.job_id in mirrored_ids for m in _unsettled(manifests)):
             step, budget = min(_MIRROR_MIN_INTERVAL_S, _MIRROR_SETTLE_S), _MIRROR_SETTLE_S
         spent = 0.0
-        # Budgeted by intended sleep, not wall clock: the settle's cost is the sleeping.
-        while _unsettled(manifests) and spent < budget:
-            nap = min(step, budget - spent)
+        # Budgeted by intended sleep, not wall clock: the settle's cost is the sleeping. Past the
+        # ordinary budget it continues only while a supervisor is still tearing down (see
+        # _SUPERVISOR_SETTLE_MAX_S), so a job whose verdict can no longer arrive warns on time.
+        while True:
+            pending = _unsettled(manifests)
+            if not pending:
+                break
+            if spent >= budget and (
+                spent >= _SUPERVISOR_SETTLE_MAX_S or not any(map(_supervisor_alive, pending))
+            ):
+                break
+            nap = min(step, budget - spent) if spent < budget else step
             time.sleep(nap)
             spent += nap
             manifests = [_reread(m) for m in manifests]

@@ -447,3 +447,66 @@ def test_wait_summary_settles_offender_teardown_on_fail_fast(monkeypatch, tmp_pa
     summary = _FakeLab().wait_summary(["j1", "j2"], interval=0.01, timeout=5, fail_fast=True)
     assert summary["failed_fast"] is True
     assert summary["teardown_leaks"] == ["j1"]  # settled to its real value, not unconfirmed
+
+
+class _Runtime:
+    def __init__(self, runtime):
+        self._runtime = runtime
+
+    def read_runtime(self, job_id):
+        return self._runtime
+
+
+def test_wait_keeps_settling_while_the_supervisor_is_still_tearing_down(monkeypatch, tmp_path):
+    """Terminal status is written before teardown runs, and a DO teardown (sky.down plus the
+    volume-detach ladder) took 28s on a clean smoke job, 2026-11-19: past the 15s settle, so wait
+    warned "teardown not confirmed" on a clean run. While the job's own supervisor is alive, the
+    teardown is still in progress — keep reading."""
+    import os
+
+    monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+    at_terminal = _terminal("j1", provisioner="skypilot", teardown=None)
+    settled = _terminal("j1", provisioner="skypilot", teardown="succeeded")
+    reads = {"n": 0}
+
+    class _FakeLab(_SummaryMixin):
+        store = _Runtime({"runner_pid": os.getpid()})  # this process: alive
+
+        def wait(self, ids, *, interval, timeout, **kwargs):
+            return [at_terminal]
+
+        def manifest(self, job_id):
+            reads["n"] += 1
+            return settled if reads["n"] > 6 else at_terminal  # ~30s of naps before it lands
+
+    _patch_store(monkeypatch, tmp_path, _FakeLab())
+    done = tmp_path / "done.json"
+    result = CliRunner().invoke(app, ["wait", "j1", "--done-file", str(done)])
+
+    assert result.exit_code == 0
+    assert json.loads(done.read_text())["teardown_unconfirmed"] == []
+    assert "not confirmed" not in result.output
+
+
+def test_a_dead_supervisor_does_not_extend_the_settle(monkeypatch, tmp_path):
+    """Nobody is left to record the teardown: warn after the ordinary settle, no longer."""
+    monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+    term = _terminal("j1", provisioner="skypilot", teardown=None)
+    reads = {"n": 0}
+
+    class _FakeLab(_SummaryMixin):
+        store = _Runtime({"runner_pid": 2**22 + 7})  # above pid_max: not a live process
+
+        def wait(self, ids, *, interval, timeout, **kwargs):
+            return [term]
+
+        def manifest(self, job_id):
+            reads["n"] += 1
+            return term
+
+    _patch_store(monkeypatch, tmp_path, _FakeLab())
+    done = tmp_path / "done.json"
+    CliRunner().invoke(app, ["wait", "j1", "--done-file", str(done)])
+
+    assert json.loads(done.read_text())["teardown_unconfirmed"] == ["j1"]
+    assert reads["n"] <= 6  # the ordinary three re-reads (plus the summary's own), not minutes
