@@ -43,7 +43,12 @@ from lab.models import JobManifest, JobSpec, ResourceRequest
 from lab.queue_view import queue_list_view
 from lab.scheduler.models import Guardrails, Triggers
 from lab.scheduler.price import PriceFeed
-from lab.scheduler.queue import QueueStore, default_queue, wait_for_queue_drain
+from lab.scheduler.queue import (
+    QueueStore,
+    UnreadableEntriesError,
+    default_queue,
+    wait_for_queue_drain,
+)
 from lab.scheduler.register import parse_expires, parse_window
 from lab.scheduler.register import register as sched_register
 from lab.scheduler.register import register_sweep as sched_register_sweep
@@ -1792,11 +1797,17 @@ def queue_wait_drain(
     to run before pausing the queue for a scheduler redeploy (never pause first: pausing stops
     the sync that would let this ever observe a real drain)."""
     try:
-        timeout_s = parse_duration(timeout)
+        # 0 is "check once, don't wait" — the redeploy's race check runs exactly that.
+        timeout_s = parse_duration(timeout, allow_zero=True)
     except ValueError as e:
         raise typer.BadParameter(f"bad --timeout {timeout!r}: {e}") from e
     queue = default_queue()
-    blocking = wait_for_queue_drain(queue, interval=interval, timeout=timeout_s)
+    try:
+        blocking = wait_for_queue_drain(queue, interval=interval, timeout=timeout_s)
+    except UnreadableEntriesError as e:
+        # Fail closed, but as data: an entry that can't be read may be in flight.
+        _emit({"drained": False, "blocking": [], "unreadable": sorted(e.reg_ids)})
+        _fail(1, str(e))
     if blocking:
         _emit({"drained": False, "blocking": [r.reg_id for r in blocking]})
         _fail(1, f"{len(blocking)} registration(s) still in flight after timeout")

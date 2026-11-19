@@ -97,7 +97,7 @@ def _parse_compound(s: str) -> float | None:
     return sum(float(number) * _UNITS[unit] for number, unit in parts)
 
 
-def parse_duration(value: str | float | None) -> float | None:
+def parse_duration(value: str | float | None, *, allow_zero: bool = False) -> float | None:
     """Parse a wall-clock limit (FR-I1). ``'2h'``/``'30m'``/``'45s'``/``'1d'``, a compound
     (``'3h30m'``, ``'1d2h'``, ``'1h30m15s'``), or plain seconds (string or number).
 
@@ -112,7 +112,10 @@ def parse_duration(value: str | float | None) -> float | None:
     The result must be a positive, finite length of time. ``float()`` happily reads ``inf``,
     ``nan``, ``1e400`` and ``-5``: a cap that never fires, one that compares false everywhere, and
     one that pays for a provision and kills it at once. ``0`` is refused too, because every
-    ``parse_duration(...) or default`` caller reads it as "no limit".
+    ``parse_duration(...) or default`` caller reads it as "no limit". ``allow_zero=True`` admits
+    ``0`` for the one kind of caller where it is meaningful and not a limit: a wait whose zero
+    means "check once, don't wait" (``lab queue wait-drain --timeout 0s``, which the scheduler
+    redeploy runs as its race check).
     """
     if value is None:
         return None
@@ -129,7 +132,7 @@ def parse_duration(value: str | float | None) -> float | None:
             f"invalid duration {value!r}: expected <n>s / <n>m / <n>h / <n>d, a compound like "
             "3h30m (largest unit first, each unit at most once), or a plain number of seconds"
         )
-    if not math.isfinite(seconds) or seconds <= 0:
+    if not math.isfinite(seconds) or seconds < 0 or (seconds == 0 and not allow_zero):
         raise ValueError(f"invalid duration {value!r}: must be a positive, finite length of time")
     return seconds
 
