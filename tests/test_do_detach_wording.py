@@ -171,3 +171,51 @@ class TestReconcilesVolumeDelete:
 
         assert gone == [] and "vol-1" in failures
         assert do.slept == [], "a permission error will not fix itself in a minute"
+
+
+class TestAnAbortPathContextDoesNotVeto:
+    """Live smoke run, 2026-11-19: a `lab cancel`led DO job recorded `failed` after ONE pass while
+    the identical rejection on a timed-out job (same release, same account) was retried and
+    deleted on pass two. The cancel's teardown runs inside the supervisor's SIGTERM handler, so
+    the delete's exception carried an implicit ``__context__`` — whatever was being handled when
+    the signal landed — and the classifier read that unrelated link's HTTP status as a veto."""
+
+    def _with_context(self, ctx: BaseException) -> BaseException:
+        try:
+            raise ctx
+        except BaseException:  # noqa: BLE001
+            try:
+                raise http_error(422, NEW_DETACH)
+            except BaseException as e:  # noqa: BLE001
+                return e
+
+    @pytest.mark.parametrize("status", [404, 429, 500, 503])
+    def test_an_unrelated_handled_exception_does_not_decide_the_verdict(self, status: int):
+        assert m.is_volume_detach_race(self._with_context(http_error(status, "upstream")))
+
+    def test_an_explicit_cause_still_counts(self):
+        """SkyPilot's rewrap is `raise DigitalOceanError(...) from err` — a real cause."""
+        try:
+            raise RuntimeError("Error: 403 Forbidden") from http_error(403, NEW_DETACH)
+        except RuntimeError as e:
+            assert not m.is_volume_detach_race(e)
+
+
+def test_a_throttled_or_5xx_delete_is_retried_and_never_reads_as_refused(monkeypatch):
+    """A 429/5xx says nothing about the volume; it must not become `failed` (exit 3) on pass one."""
+    do = _install(monkeypatch, _account(NEW_DETACH, 422, detach_s=0.0))
+    calls = {"n": 0}
+    real_delete = do.volumes.delete
+
+    def flaky_delete(*a: Any, **kw: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise http_error(503, "service unavailable", error_id="service_unavailable")
+        return real_delete(*a, **kw)
+
+    monkeypatch.setattr(do.volumes, "delete", flaky_delete)
+    do.droplets.destroy(DROPLET_ID)
+
+    s = m.settle_do_volumes(["vol-1"], client=do)
+
+    assert s.gone == ["vol-1"] and not s.refused and s.passes >= 2

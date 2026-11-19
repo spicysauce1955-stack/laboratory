@@ -700,15 +700,30 @@ _VOLUME_DETACH_BACKOFFS = (5, 10, 15, 30)
 
 
 def _exception_chain(exc: BaseException, *, depth: int = 5) -> list[BaseException]:
-    """``exc`` and what it was raised from (``__cause__``/``__context__``), de-duplicated."""
+    """``exc`` and what it was explicitly raised from (``raise … from``), de-duplicated.
+
+    Only ``__cause__``, never the implicit ``__context__``: a delete issued inside an ``except``
+    block — the supervisor's SIGTERM abort path is one — carries whatever was being handled when
+    the signal landed, and that unrelated link's HTTP status used to veto a genuine detach race.
+    A `lab cancel`led DO job recorded a false-then-real `failed` that way (smoke run 2026-11-19).
+    """
     out: list[BaseException] = []
     seen: set[int] = set()
     cur: BaseException | None = exc
     while cur is not None and len(out) < depth and id(cur) not in seen:
         seen.add(id(cur))
         out.append(cur)
-        cur = cur.__cause__ or cur.__context__
+        cur = cur.__cause__
     return out
+
+
+def _http_status(exc: BaseException) -> int | None:
+    """The HTTP status of ``exc`` or of what it was explicitly raised from, if any."""
+    for link in _exception_chain(exc):
+        status = getattr(link, "status_code", None)
+        if isinstance(status, int):
+            return status
+    return None
 
 
 def is_volume_detach_race(exc: BaseException) -> bool:
@@ -908,6 +923,11 @@ def _settle_one_do_volume(
         text = _one_line(f"{type(e).__name__}: {e}")
         if is_volume_detach_race(e):
             return "detaching", text, e  # the reply itself proves the volume is still there
+        status = _http_status(e)
+        if status is not None and (status == 429 or status >= 500):
+            # Throttled or a server-side failure says nothing about the volume: retry along the
+            # ladder, and if it never clears it is "cannot tell" (`unknown`), never `failed`.
+            return "unverified", f"DO answered {status}; volume state unknown: {text}", e
         if state == "present":
             return "refused", text, e
         return "unverified", f"could not be read ({info}) and the delete failed: {text}", e
