@@ -1,6 +1,6 @@
 """MCP server exposing the lab as structured tools (FR-F1, spec §9).
 
-Run (stdio):  uv run python -m lab.mcp_server
+Run (stdio):  uv run python -m lab.mcp_server   (or ``lab mcp``; both go through ``run_stdio``)
 
 Tools return JSON-serializable dicts so FastMCP emits ``structuredContent``. Unknown jobs and
 submission errors raise ``ToolError`` (fail-loud, FR-F3). ``submit`` chooses the backend
@@ -11,11 +11,14 @@ manifest), mirroring the CLI. ``build_server(lab)`` lets tests inject a Lab at a
 
 from __future__ import annotations
 
+import io
+import os
 import shutil
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -37,6 +40,53 @@ from lab.store import JobStore
 
 def _iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt else None
+
+
+class _StdoutForDiagnostics(io.TextIOBase):
+    """``sys.stdout`` while the stdio server runs: text goes to stderr, ``.buffer`` is the
+    transport's private copy of the real stdout (the stdio transport wraps ``sys.stdout.buffer``
+    when it starts, and nothing else should ever reach that stream)."""
+
+    def __init__(self, transport: IO[bytes]) -> None:
+        super().__init__()
+        self._transport = transport
+
+    @property
+    def buffer(self) -> IO[bytes]:
+        return self._transport
+
+    def write(self, s: str) -> int:
+        return sys.stderr.write(s)
+
+    def flush(self) -> None:
+        sys.stderr.flush()
+
+    def fileno(self) -> int:
+        return sys.stderr.fileno()
+
+    def isatty(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+
+def run_stdio(server: FastMCP) -> None:
+    """Serve ``server`` over stdio with stdout reserved for JSON-RPC.
+
+    Over stdio the server's stdout *is* the protocol stream, and plenty of code a tool reaches
+    prints to it: diagnostics written for the CLI's terminal (an export whose artifact fetch
+    failed, a teardown falling back to a provider API), libraries, and child processes that
+    inherit fd 1. Each such line used to land in the JSON-RPC stream as a non-JSON message. So the
+    transport gets a duplicate of the real stdout to itself, and fd 1 — plus any ``print()`` or
+    ``sys.stdout`` write, including through a stream object captured before this ran — is pointed
+    at stderr, where a stdio client already expects diagnostics.
+    """
+    sys.stdout.flush()
+    transport = os.fdopen(os.dup(sys.stdout.fileno()), "wb")
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    sys.stdout = _StdoutForDiagnostics(transport)
+    server.run()
 
 
 def _since_cutoff(since: str | None) -> datetime | None:
@@ -794,4 +844,4 @@ def build_server(lab: Lab) -> FastMCP:
 if __name__ == "__main__":
     # Before default_lab(): the .env carries the cloud project/credentials the backends read.
     load_lab_env(repo_root())
-    build_server(default_lab()).run()
+    run_stdio(build_server(default_lab()))

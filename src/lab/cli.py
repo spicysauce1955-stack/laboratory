@@ -632,9 +632,9 @@ def lint(
 @app.command()
 def mcp() -> None:
     """Run the MCP server on stdio (the command scaffolded into ``.mcp.json``)."""
-    from lab.mcp_server import build_server
+    from lab.mcp_server import build_server, run_stdio
 
-    build_server(default_lab()).run()
+    run_stdio(build_server(default_lab()))  # stdout is the JSON-RPC stream; diagnostics -> stderr
 
 
 @app.command()
