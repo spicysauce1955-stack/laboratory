@@ -140,6 +140,9 @@ def world(tmp_path: Path):  # type: ignore[no-untyped-def]
             "scenario": scen,
             "simulated_to": T0,
         }
+        if scen.get("legacy_old_host"):
+            state["heartbeat"].pop("paused")
+            state["tick_count"] = 1000
         state_p.write_text(json.dumps(state))
         clock_p.write_text(str(T0))
         env = {
@@ -385,3 +388,31 @@ def test_dry_run_mutates_nothing(world) -> None:  # type: ignore[no-untyped-def]
     assert r.lab_calls == [] or all(c[:2] == ["queue", "list"] for c in r.lab_calls)
     assert r.actions == [] and r.droplet("new") is None
     _no_secret_leaked(r)
+
+
+# ------------------------------------------------------------------------------ a pre-0.12 old host
+
+
+def test_a_legacy_old_host_without_heartbeat_paused_still_cuts_over(world) -> None:  # type: ignore[no-untyped-def]
+    """The first real run (2026-11-19) aborted at 2b: the production host predates v0.12.0 and its
+    heartbeat carries no `heartbeat_paused`, so the ack could never be observed and no pre-0.12
+    host could ever be upgraded. Its tick_count still proves a tick started after the pause."""
+    r = world(scenario={"legacy_old_host": True})
+    assert r.rc == 0, r.err
+    assert r.droplet("old")["deleted"] and r.droplet("new")["status"] == "active"
+    assert "predates heartbeat_paused" in r.out
+
+
+def test_a_legacy_host_launch_in_the_pause_window_still_aborts(world) -> None:  # type: ignore[no-untyped-def]
+    r = world(scenario={"legacy_old_host": True, "on_pause_launch": {"reg_id": "reg-late"}})
+    assert r.rc != 0
+    assert r.droplet("new") is None  # never built
+    assert not r.paused
+
+
+def test_a_legacy_host_resumed_after_a_failure_is_confirmed_ticking(world) -> None:  # type: ignore[no-untyped-def]
+    """The same run printed ZERO TICKERS? after resuming, though the old host was ticking: the
+    check waited for `heartbeat_paused == false`, which a legacy host never writes."""
+    r = world(scenario={"legacy_old_host": True, "on_pause_launch": {"reg_id": "reg-late"}})
+    assert "ZERO TICKERS" not in r.err, r.err
+    assert "ticking unpaused again" in r.out

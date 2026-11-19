@@ -76,13 +76,15 @@ DRAIN_TIMEOUT="${LAB_DEPLOY_DRAIN_TIMEOUT:-30m}"
 # the host being drained is the one that just failed its smoke test, and it keeps launching while
 # the queue is unpaused -- a busy queue will not drain, and the hold state that follows is safe.
 ROLLBACK_DRAIN_TIMEOUT="${LAB_DEPLOY_ROLLBACK_DRAIN_TIMEOUT:-10m}"
-# 2 tick cycles at the systemd timer's ~60s cadence, plus headroom -- see step 2's comment.
-PAUSE_ACK_TIMEOUT_S="${LAB_DEPLOY_PAUSE_ACK_TIMEOUT_S:-120}"
+# Two full tick cycles plus headroom -- see step 2's comment. A host older than v0.12.0 can only
+# acknowledge by completing two ticks after the pause (it writes no heartbeat_paused), and the
+# production host measured ~90s per tick on 2026-11-19, so 120s could never have been enough.
+PAUSE_ACK_TIMEOUT_S="${LAB_DEPLOY_PAUSE_ACK_TIMEOUT_S:-360}"
 VERIFY_TIMEOUT_S="${LAB_DEPLOY_VERIFY_TIMEOUT_S:-1200}"
 SMOKE_TIMEOUT_S="${LAB_DEPLOY_SMOKE_TIMEOUT_S:-1800}"
 # After any resume on a failure path: how long to wait for proof that some scheduler is really
-# ticking unpaused again (3 tick cycles).
-TICKER_CONFIRM_TIMEOUT_S="${LAB_DEPLOY_TICKER_CONFIRM_TIMEOUT_S:-180}"
+# ticking unpaused again (3+ tick cycles at the ~90s a real host measured).
+TICKER_CONFIRM_TIMEOUT_S="${LAB_DEPLOY_TICKER_CONFIRM_TIMEOUT_S:-360}"
 
 # LEFTOVER DROPLET warnings: DO bills for a powered-off droplet, and `lab reconcile`'s DO pass
 # only covers detached volumes, never droplets -- nothing else in this project's tooling would
@@ -178,7 +180,7 @@ resume_queue() {
 # host. A resumed queue with nobody ticking is an outage that looks healthy (nothing launches,
 # nothing tears down deferred jobs), so it is reported as ZERO TICKERS, loudly.
 confirm_live_ticker() {
-  local want_host="${1:-}" json="" hb="" host="" age="" deadline
+  local want_host="${1:-}" json="" hb="" host="" age="" tc="" t0="" deadline
   deadline=$(( $(date +%s) + TICKER_CONFIRM_TIMEOUT_S ))
   while (( $(date +%s) < deadline )); do
     sleep 10
@@ -186,6 +188,18 @@ confirm_live_ticker() {
     hb="$(echo "$json" | json_field heartbeat_paused)" || hb=""
     host="$(echo "$json" | json_field host)" || host=""
     age="$(echo "$json" | json_field heartbeat_age_s)" || age=""
+    tc="$(echo "$json" | json_field tick_count)" || tc=""
+    # A host older than v0.12.0 never writes heartbeat_paused (see wait_pause_ack): two completed
+    # ticks after the resume prove it is alive and that a tick began after the resume landed.
+    if [[ ( -z "$hb" || "$hb" == "None" ) && "$tc" =~ ^[0-9]+$ ]] \
+      && [[ -z "$want_host" || "$host" == "$want_host" ]]; then
+      if [[ -z "$t0" ]]; then
+        t0="$tc"
+      elif (( tc >= t0 + 2 )); then
+        echo "confirmed: '$host' is ticking unpaused again (a host older than v0.12.0: proven by tick_count $t0 -> $tc, it writes no heartbeat_paused)"
+        return 0
+      fi
+    fi
     if [[ "$hb" == "False" && "$age" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
       && python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)" \
         "$age" "$(( $(date +%s) - RESUME_EPOCH ))" \
@@ -199,14 +213,31 @@ confirm_live_ticker() {
 }
 
 # Wait for a *completed* tick to report the pause (heartbeat_paused) -- see step 2b.
+#
+# A host older than v0.12.0 writes no heartbeat_paused at all -- the production scheduler did not,
+# and the first real deploy (2026-11-19) aborted here, so no pre-0.12 host could ever be upgraded.
+# Every release since v0.5.0 reads control.paused at the START of a tick, skips launching when
+# paused, and writes tick_count at the END; ticks never overlap (a systemd oneshot). So with T0 =
+# the tick_count read after our pause write, tick T0+2 began after tick T0+1 finished, i.e. after
+# the write: it saw the pause. Anything T0+1 launched first is what step 2c's re-check is for.
 wait_pause_ack() {
-  local deadline hb_paused=""
+  local deadline json="" hb_paused="" tc="" t0=""
   deadline=$(( $(date +%s) + PAUSE_ACK_TIMEOUT_S ))
   while (( $(date +%s) < deadline )); do
     # Tolerate one flaky read (matches steps 4/7's pattern) rather than aborting on a single R2
-    # hiccup during what should be a sub-two-minute wait.
-    hb_paused="$(uv run lab queue list | json_field heartbeat_paused)" || hb_paused=""
+    # hiccup during the wait.
+    json="$(uv run lab queue list)" || json=""
+    hb_paused="$(echo "$json" | json_field heartbeat_paused)" || hb_paused=""
     [[ "$hb_paused" == "True" ]] && return 0
+    tc="$(echo "$json" | json_field tick_count)" || tc=""
+    if [[ ( -z "$hb_paused" || "$hb_paused" == "None" ) && "$tc" =~ ^[0-9]+$ ]]; then
+      if [[ -z "$t0" ]]; then
+        t0="$tc"
+      elif (( tc >= t0 + 2 )); then
+        echo "old scheduler predates heartbeat_paused (pre-v0.12.0); pause proven by two completed ticks after it (tick_count $t0 -> $tc)"
+        return 0
+      fi
+    fi
     sleep 5
   done
   echo "no scheduler confirmed observing the pause within ${PAUSE_ACK_TIMEOUT_S}s (last heartbeat_paused: ${hb_paused:-<none>})" >&2
