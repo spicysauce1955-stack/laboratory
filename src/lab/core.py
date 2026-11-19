@@ -18,6 +18,7 @@ import platform
 import posixpath
 import re
 import shlex
+import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterable
@@ -42,6 +43,7 @@ from lab.manifest import (
     git_work_tree,
     is_dirty,
     repo_root,
+    resolve_commit,
     uv_lock_sha256,
 )
 from lab import events, placement, pricing
@@ -64,8 +66,9 @@ from lab.models import (
 )
 from lab.aggregate import merge_hits, merge_seed_rows
 from lab.partials import PARTIAL_DIR
+from lab.redact import redact
 from lab.sharding import parse_seeds, partition_seeds, seeds_to_arg
-from lab.store import JobStore, cell_id_for
+from lab.store import JobStore, cell_id_for, injected_override_keys
 
 if TYPE_CHECKING:  # import-time only: `lab.scheduler.queue` is reached lazily (module cycle)
     from lab.scheduler.queue import QueueStore
@@ -100,6 +103,25 @@ _MIRROR_SETTLE_S = 75.0
 
 class LabError(RuntimeError):
     """Fail-loud lab error (FR-F3)."""
+
+
+class SweepSubmitError(LabError):
+    """A sweep (or sweep-retry) refused partway, after some of its jobs had already launched.
+
+    Those jobs are running — and, on a remote backend, billing — so the caller must learn which
+    they are and which sweep they belong to; a bare error used to leave them orphaned from any
+    record the caller held. ``details`` is the structured form a shell emits next to ``error``;
+    the message names the same ids for surfaces that only carry text (MCP's ``ToolError``).
+    """
+
+    def __init__(self, message: str, *, sweep_id: str, job_ids: list[str]) -> None:
+        super().__init__(message)
+        self.sweep_id = sweep_id
+        self.job_ids = list(job_ids)
+
+    @property
+    def details(self) -> dict[str, Any]:
+        return {"sweep_id": self.sweep_id, "job_ids": self.job_ids}
 
 
 class MirrorReadError(LabError):
@@ -288,6 +310,48 @@ def check_sweep_admission(
     return worst
 
 
+def _mask_command_secrets(command: str) -> str:
+    """``command`` with inline secrets masked, for copies that leave the store (``lab export``).
+
+    The manifest records the command verbatim, so ``HF_TOKEN=hf_… python x.py`` or
+    ``--api-key …`` would land in a bundle that exists to be committed (FR-J1). Every judgement
+    is the event ledger's own (:mod:`lab.events.sanitize`), applied per shell token:
+
+    * ``NAME=value`` in env-variable form (upper-case identifier, i.e. an env prefix): masked if
+      the name is secret-shaped (``*TOKEN``, ``*_KEY``, …) or the value is.
+    * any other ``k=v`` (a config override): masked only if the value itself is secret-shaped —
+      a hyperparameter named ``max_tokens`` is not a credential.
+    * ``--flag=value`` / ``--flag value``: masked as the ledger masks argv.
+
+    A command with nothing to mask comes back byte-identical (no re-quoting); one that cannot be
+    tokenized falls back to the ledger's free-text masking.
+    """
+    from lab.events.sanitize import mask_text, sanitize_argv, sanitize_params
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return mask_text(command)
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        name, eq, value = tok.partition("=")
+        if tok.startswith("-"):
+            if eq or i + 1 == len(tokens) or tokens[i + 1].startswith("-"):
+                out.append(sanitize_argv([tok])[0])
+            else:  # `--flag value`: judge the value together with the flag that names it
+                out.extend([tok, str(sanitize_argv([tok, tokens[i + 1]])[1])])
+                i += 1
+        elif eq and name.isidentifier():
+            judged_as = name if name.isupper() else "value"
+            out.append(f"{name}={sanitize_params({judged_as: value})[judged_as]}")
+        else:
+            out.append(tok)
+        i += 1
+    return command if out == tokens else redact(shlex.join(out))
+
+
 def _parse_row_key(row_key: str | list[str], seed_column: str) -> list[str]:
     """Parse/validate a row-key spec ('seed,alpha' or a list). Must include the seed column —
     presence/retry accounting is keyed on seeds. Pure; raises :class:`LabError`."""
@@ -318,7 +382,7 @@ def _mirror_sweep_aggregate(path: Path, key: str) -> None:
     try:
         r2.upload_file(path, key)
     except Exception as e:  # noqa: BLE001 — local aggregate stays authoritative
-        print(f"[lab] aggregate R2 mirror failed, keeping local copy: {e}")
+        print(f"[lab] aggregate R2 mirror failed, keeping local copy: {e}", file=sys.stderr)
         events.note("storage.upload_failed", key=key, error=str(e))
 
 
@@ -335,6 +399,25 @@ def _submit_stagger_s() -> float:
         return max(0.0, float(os.environ.get("LAB_SUBMIT_STAGGER_S", "1.5")))
     except ValueError:
         return 1.5
+
+
+def _partial_sweep_error(
+    sweep_id: str,
+    job_ids: list[str],
+    planned: int | None,
+    cause: BaseException,
+    *,
+    next_step: str,
+) -> SweepSubmitError:
+    """The error for a sweep that stopped after launching ``job_ids`` (see SweepSubmitError)."""
+    of = f" of {planned}" if planned is not None else ""
+    return SweepSubmitError(
+        f"sweep {sweep_id} stopped after launching {len(job_ids)}{of} jobs: {cause}. "
+        f"Already launched (running, and billing if remote — `lab cancel <id>` to stop): "
+        f"{', '.join(job_ids)}. {next_step}.",
+        sweep_id=sweep_id,
+        job_ids=job_ids,
+    )
 
 
 def build_sweep_point_spec(
@@ -511,6 +594,9 @@ class Lab:
         # Lazily built, then reused for this Lab's lifetime — see `_queue` / `_backend_for`.
         self._queue_store: QueueStore | None = None
         self._backends: dict[str, Backend] = {}
+        # Manifests the most recent `list_jobs` could not read: [{job_id, error}] (see there).
+        self.unreadable_jobs: list[dict[str, str]] = []
+        self._warned_unreadable: set[str] = set()
 
     def preflight(self, spec: JobSpec) -> None:
         """Refuse a remote launch that a cheap local check proves cannot work (FR-F3).
@@ -548,7 +634,25 @@ class Lab:
 
         ``code`` overrides git introspection — used by the scheduler, which submits from an
         extracted bundle (not a git repo) with provenance captured at registration time.
+
+        ``spec.code_ref`` other than the current commit runs *that* commit's committed tree: it
+        is snapshotted (``_code_ref_tree``) and launched from there with ``code`` pinned to it —
+        the mechanism ``confirm`` uses. It used to be accepted and silently ignored, so the
+        working tree ran while the caller believed another commit had.
         """
+        if code is None:
+            pinned = self._code_ref_commit(spec.code_ref)
+            if pinned is not None:
+                return self._sibling_lab(self._code_ref_tree(pinned)).submit(
+                    spec,
+                    allow_dirty=allow_dirty,
+                    sweep_id=sweep_id,
+                    cell_id=cell_id,
+                    code=CodeRef(git_commit=pinned, git_dirty=False),
+                    registration_id=registration_id,
+                    confirms=confirms,
+                    preflight=preflight,
+                )
         if preflight:
             self.preflight(spec)
         # Before a job id exists, let alone a manifest or a rental: a cap nothing on offer can
@@ -602,7 +706,10 @@ class Lab:
                             r2.upload_file(Path(blob), rel)
                             diff_ref = r2.uri(rel)
                         except Exception as e:  # noqa: BLE001 — local diff_ref stays fail-closed
-                            print(f"[lab] diff R2 upload failed, keeping local copy: {e}")
+                            print(
+                                f"[lab] diff R2 upload failed, keeping local copy: {e}",
+                                file=sys.stderr,
+                            )
                             events.note("storage.upload_failed", key=rel, error=str(e))
             code = CodeRef(
                 git_commit=current_commit(self.repo), git_dirty=dirty, diff_ref=diff_ref
@@ -642,6 +749,8 @@ class Lab:
                 resolved_config=spec.config or {},
                 seed=seed,
                 allow_unknown_config=spec.allow_unknown_config,
+                # What the unconsumed-config audit may judge: config keys that ride the argv.
+                config_overrides=injected_override_keys(spec.command, spec.config),
             ),
             resources=spec.resources,
             backend=BackendInfo(provisioner=self.backend.name),
@@ -651,17 +760,59 @@ class Lab:
         self.backend.submit(manifest)
         return job_id
 
+    def _code_ref_commit(self, code_ref: str) -> str | None:
+        """The commit a non-HEAD ``code_ref`` pins, or ``None`` when the ordinary working-tree
+        path applies (``HEAD``, or a ref that names the current commit). Raises
+        :class:`LabError` for a ref that names no commit — never falls back to running HEAD."""
+        if code_ref.strip() in ("", "HEAD"):
+            return None
+        pinned = resolve_commit(self.repo, code_ref.strip())
+        if pinned is None:
+            raise LabError(
+                f"code_ref {code_ref!r} is not a commit in {self.repo} — pass a commit SHA, "
+                "branch or tag that exists there (e.g. after `git fetch`), or omit it for HEAD"
+            )
+        return None if pinned == current_commit(self.repo) else pinned
+
+    def _code_ref_tree(self, commit: str) -> Path:
+        """The committed tree of ``commit``, extracted once under ``<home>/_code_ref/<sha>``.
+
+        Built with the same bundle mechanism ``confirm`` uses (committed tree only, never the
+        working tree's dirt), into a temp dir then renamed into place, so a tree a running job
+        may be executing from is never rewritten under it and concurrent submits of one commit
+        (a sweep's points) share a single snapshot.
+        """
+        from lab.scheduler.bundle import create_bundle, extract_bundle  # avoid import cycle
+
+        root = self.home / "_code_ref"
+        dest = root / commit
+        if dest.is_dir():
+            return dest
+        root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=root, prefix=".build-") as td:
+            tar, _ = create_bundle(self.repo, Path(td), commit=commit, include_dirty=False)
+            tree = extract_bundle(tar, Path(td) / "tree")
+            try:
+                tree.rename(dest)
+            except OSError:
+                if not dest.is_dir():  # not a lost race with another submit: a real failure
+                    raise
+        return dest
+
     def find_cached(self, spec: JobSpec, *, require_clean: bool = True) -> str | None:
         """Return a prior SUCCEEDED job with the same commit+command+config+seed, else None (FR-B5).
 
         With ``require_clean`` (default), a dirty working tree disables caching and only clean-tree
         jobs are eligible — a dirty commit doesn't fully capture the code, so reusing its result
-        isn't safe.
+        isn't safe. A ``code_ref`` pinning another commit is keyed on that commit (whose committed
+        tree is what would run, so the working tree's state is irrelevant).
         """
-        if require_clean and is_dirty(self.repo):
+        pinned = self._code_ref_commit(spec.code_ref)
+        if pinned is None and require_clean and is_dirty(self.repo):
             return None
         seed = spec.seed if spec.seed is not None else 0
-        key = cache_key(current_commit(self.repo), spec.command, spec.config, seed)
+        commit = pinned if pinned is not None else current_commit(self.repo)
+        key = cache_key(commit, spec.command, spec.config, seed)
         for m in self.list_jobs():
             if m.status is not JobState.succeeded or (require_clean and m.code.git_dirty):
                 continue
@@ -751,45 +902,57 @@ class Lab:
         sweep_id = f"sweep-{_new_job_id()}"
         all_job_ids: list[str] = []
         plan_cells: list[SweepCell] = []
-        stagger = _submit_stagger_s() if self.backend.name != "local" else 0.0
         for cell in cells:
             coords = {k: str(v) for k, v in cell.items()}
             cid = cell_id_for(coords)
-            shard_job_ids: list[str] = []
-            for shard in shards:
-                if all_job_ids and stagger:
-                    time.sleep(stagger)  # don't stampede the local SkyPilot API server
-                    events.note("core.submit_stagger", seconds=stagger, shard=shard[0])
-                point = {**cell, seed_axis_key: seeds_to_arg(shard)}
-                spec = build_sweep_point_spec(
-                    command, point, seed=shard[0], resources=resources,
-                    code_ref=code_ref, submitted_by=submitted_by,
-                    allow_unknown_config=allow_unknown_config,
-                )
-                jid = self.submit(
-                    spec, allow_dirty=allow_dirty, sweep_id=sweep_id, cell_id=cid
-                )
-                shard_job_ids.append(jid)
-                all_job_ids.append(jid)
             plan_cells.append(
                 SweepCell(
                     coords=coords,
                     cell_id=cid,
                     seeds_expected=seed_set,
                     shard_seeds=shards,
-                    shard_job_ids=shard_job_ids,
+                    shard_job_ids=[],  # filled as each shard launches
                     results_file=results_file,
                     seed_column=seed_column,
                     row_key=row_key_cols,
                     aggregate_ref=str(self.home / sweep_id / "cells" / cid / results_file),
                 )
             )
-        self.store.write_sweep_plan(
-            SweepPlan(
-                sweep_id=sweep_id, created_at=now(), command=command,
-                seed_axis_key=seed_axis_key, cells=plan_cells,
-            )
+        plan = SweepPlan(
+            sweep_id=sweep_id, created_at=now(), command=command,
+            seed_axis_key=seed_axis_key, cells=plan_cells,
         )
+        stagger = _submit_stagger_s() if self.backend.name != "local" else 0.0
+        try:
+            for cell, plan_cell in zip(cells, plan_cells):
+                for shard in shards:
+                    if all_job_ids and stagger:
+                        time.sleep(stagger)  # don't stampede the local SkyPilot API server
+                        events.note("core.submit_stagger", seconds=stagger, shard=shard[0])
+                    point = {**cell, seed_axis_key: seeds_to_arg(shard)}
+                    spec = build_sweep_point_spec(
+                        command, point, seed=shard[0], resources=resources,
+                        code_ref=code_ref, submitted_by=submitted_by,
+                        allow_unknown_config=allow_unknown_config,
+                    )
+                    jid = self.submit(
+                        spec, allow_dirty=allow_dirty, sweep_id=sweep_id, cell_id=plan_cell.cell_id
+                    )
+                    plan_cell.shard_job_ids.append(jid)
+                    all_job_ids.append(jid)
+        except BaseException as e:
+            if not all_job_ids:
+                raise  # nothing launched: there is no sweep to report, just the refusal
+            # Persist what launched, so aggregate/retry/export see these jobs and `sweep-retry`
+            # can submit the rest once the cause is fixed.
+            self.store.write_sweep_plan(plan)
+            if not isinstance(e, Exception):
+                raise  # Ctrl-C/SystemExit: the plan is saved; don't dress the signal up
+            raise _partial_sweep_error(
+                sweep_id, all_job_ids, n_jobs, e,
+                next_step=f"`lab sweep-retry {sweep_id}` submits the rest once that is fixed",
+            ) from e
+        self.store.write_sweep_plan(plan)
         return sweep_id, all_job_ids
 
     def _sweep_unsharded(
@@ -824,16 +987,24 @@ class Lab:
         sweep_id = f"sweep-{_new_job_id()}"
         job_ids: list[str] = []
         stagger = _submit_stagger_s() if self.backend.name != "local" else 0.0
-        for point in points:
-            if job_ids and stagger:
-                time.sleep(stagger)  # don't stampede the local SkyPilot API server
-                events.note("core.submit_stagger", seconds=stagger, shard=None)
-            spec = build_sweep_point_spec(
-                command, point, seed=seed, resources=resources,
-                code_ref=code_ref, submitted_by=submitted_by,
-                allow_unknown_config=allow_unknown_config,
-            )
-            job_ids.append(self.submit(spec, allow_dirty=allow_dirty, sweep_id=sweep_id))
+        try:
+            for point in points:
+                if job_ids and stagger:
+                    time.sleep(stagger)  # don't stampede the local SkyPilot API server
+                    events.note("core.submit_stagger", seconds=stagger, shard=None)
+                spec = build_sweep_point_spec(
+                    command, point, seed=seed, resources=resources,
+                    code_ref=code_ref, submitted_by=submitted_by,
+                    allow_unknown_config=allow_unknown_config,
+                )
+                job_ids.append(self.submit(spec, allow_dirty=allow_dirty, sweep_id=sweep_id))
+        except Exception as e:
+            if not job_ids:
+                raise
+            raise _partial_sweep_error(
+                sweep_id, job_ids, len(points), e,
+                next_step="the launched points carry this sweep_id (`lab export`, `lab list`)",
+            ) from e
         return sweep_id, job_ids
 
     def sweep_plan(self, sweep_id: str) -> SweepPlan:
@@ -881,7 +1052,7 @@ class Lab:
             shard_texts: list[tuple[str, str]] = []
             shard_hits: list[tuple[str, str]] = []
             for jid in cell.shard_job_ids:
-                m = self.manifest(jid)
+                m = self._fresh_manifest(jid)  # a dead supervisor must not pin a shard `running`
                 if m.status not in _TERMINAL_STATES:
                     continue  # still moving under the heartbeat rsync — never read mid-flight
                 if not include_partial and m.status is not JobState.succeeded:
@@ -938,6 +1109,29 @@ class Lab:
         non-terminal state (queued/running), that shard is skipped — no duplicate in-flight jobs.
         """
         plan = self.aggregate_sweep(sweep_id)  # refresh present/missing from current shard states
+        launched: list[str] = []
+        try:
+            self._retry_cells(plan, launched, allow_dirty=allow_dirty)
+        except BaseException as e:
+            if not launched:
+                raise
+            # Same rule as `sweep`: what launched is persisted, so a re-run of retry sees it as
+            # in flight instead of buying it a second time, and the caller learns the ids.
+            self.store.write_sweep_plan(plan)
+            if not isinstance(e, Exception):
+                raise
+            raise _partial_sweep_error(
+                sweep_id, launched, None, e,
+                next_step=f"`lab sweep-retry {sweep_id}` resumes once that is fixed",
+            ) from e
+        self.store.write_sweep_plan(plan)
+        return self.aggregate_sweep(sweep_id)
+
+    def _retry_cells(self, plan: SweepPlan, launched: list[str], *, allow_dirty: bool) -> None:
+        """:meth:`retry_sweep`'s submit loop. Appends each launched id to its cell *and* to
+        ``launched`` as it goes, so a refusal partway leaves both accurate."""
+        sweep_id = plan.sweep_id
+        any_shard = next((j for c in plan.cells for j in c.shard_job_ids), None)
         for cell in plan.cells:
             if cell.status != "incomplete":
                 continue
@@ -947,7 +1141,7 @@ class Lab:
             # exact strings): a full-shard in-flight retry "2,3" must suppress a narrowed "3".
             in_flight_seed_sets: list[set[int]] = []
             for jid in cell.shard_job_ids:
-                m = self.manifest(jid)
+                m = self._fresh_manifest(jid)  # a dead supervisor is not an in-flight retry
                 if m.status not in _TERMINAL_STATES:
                     sub = m.run.resolved_config.get(plan.seed_axis_key)
                     if sub is not None:
@@ -955,10 +1149,20 @@ class Lab:
                             in_flight_seed_sets.append(set(parse_seeds(str(sub))))
                         except ValueError:
                             pass  # unparseable subset — can't prove coverage, don't suppress
-            # inherit the original shard resources (timeout/backend/etc.) from an existing shard
-            # [0] is safe: an incomplete cell always has >=1 shard (seeds_expected is non-empty)
-            base_manifest = self.manifest(cell.shard_job_ids[0])
+            # Inherit the original shard resources (timeout/backend/etc.) from an existing shard:
+            # this cell's own, or — for a cell a refused sweep never reached — any of the sweep's
+            # (every shard of a sweep is submitted with the same resources).
+            base_id = cell.shard_job_ids[0] if cell.shard_job_ids else any_shard
+            if base_id is None:
+                raise LabError(f"sweep {sweep_id} has no launched shard to inherit resources from")
+            base_manifest = self.manifest(base_id)
             base_resources = base_manifest.resources
+            # Launch where the sweep ran. Both shells build a local-backend Lab for sweep-retry
+            # whatever the sweep used, so `self.submit` turned a retried cpu/skypilot shard into a
+            # local subprocess that still carried the remote resources (`provisioner=local
+            # cloud=do`) — work silently moved off the box it was sized for.
+            launcher = self._lab_on(base_manifest.backend.provisioner)
+            stagger = _submit_stagger_s() if launcher.backend.name != "local" else 0.0
             for shard in cell.shard_seeds:
                 # Partial recovery (field-report #2): resubmit only the seeds still missing from
                 # this shard — a timed-out shard's recovered rows are kept, not re-bought.
@@ -973,12 +1177,30 @@ class Lab:
                     plan.command, point, seed=shard_missing[0], resources=base_resources,
                     allow_unknown_config=base_manifest.run.allow_unknown_config,
                 )
-                jid = self.submit(
+                if launched and stagger:
+                    time.sleep(stagger)  # same API-server cold-start guard as `sweep`
+                jid = launcher.submit(
                     spec, allow_dirty=allow_dirty, sweep_id=sweep_id, cell_id=cell.cell_id
                 )
                 cell.shard_job_ids.append(jid)
-        self.store.write_sweep_plan(plan)
-        return self.aggregate_sweep(sweep_id)
+                launched.append(jid)
+
+    def _lab_on(self, provisioner: str) -> Lab:
+        """This Lab, or one sharing its repo/home/store that launches through ``provisioner``.
+
+        The launch-side twin of :meth:`_backend_for`: for re-launching work (``retry_sweep``)
+        under the backend that ran it, rather than whichever backend the calling shell built.
+        """
+        if provisioner == self.backend.name:
+            return self
+        try:
+            backend = self._backend_for(provisioner)
+        except ImportError as e:  # e.g. the skypilot extra is not installed on this machine
+            raise LabError(
+                f"this work ran on the {provisioner!r} backend, which cannot be loaded here "
+                f"({e}); install that extra to relaunch it"
+            ) from e
+        return Lab(backend=backend, repo=self.repo, home=self.home)
 
     def _sibling_lab(self, repo: Path) -> Lab:
         """A Lab rooted at ``repo`` (e.g. an extracted bundle) over the same backend kind, sharing
@@ -1049,6 +1271,9 @@ class Lab:
             seed=m.run.seed,
             resources=m.resources,
             submitted_by="agent",
+            # The original's own opt-out: without it a run that legitimately succeeded with
+            # unconsumed keys re-runs under the fail-closed audit and always "fails" to confirm.
+            allow_unknown_config=m.run.allow_unknown_config,
         )
         confirm_id = bundle_lab.submit(
             spec,
@@ -1059,7 +1284,11 @@ class Lab:
         if not wait:
             result["verdict"] = "pending"
             return result
-        (rerun,) = self.wait([confirm_id], timeout=timeout)
+        # A local re-run's manifest is a free filesystem read and usually lands within a second,
+        # so wait's 10s default would leave every local confirm idle for a whole interval. Remote
+        # re-runs keep the 10s cadence: provisioning alone takes minutes.
+        interval = 0.5 if bundle_lab.backend.name == "local" else 10.0
+        (rerun,) = self.wait([confirm_id], timeout=timeout, interval=interval)
         if rerun.status not in _TERMINAL_STATES:
             # wait gave up before the re-run finished — it's still alive (and, on a remote backend,
             # still billing until it tears down). Don't call a running job failed.
@@ -1097,28 +1326,83 @@ class Lab:
         out = self.store.output_dir(job_id)
         has_local = out.exists() and any(out.iterdir())
         if not has_local and r2_enabled():  # local copy gone — pull the durable copy from R2
-            try:
-                manifest = self.store.read_manifest(job_id)
-                r2 = R2Store.from_env()
-                if manifest.artifacts_uri and r2 is not None:
-                    r2.download_dir(job_id, out)
-                if r2 is not None and not (out.exists() and any(out.iterdir())):
-                    # Nothing durable from the end-of-run upload — which is the *normal* state of
-                    # a job whose supervisor died, since `artifacts_uri` is written on the same
-                    # line as that upload. The mid-run mirror (`lab.partials`) is then the only
-                    # copy of rows that were paid for, so fall back to it. It lands the
-                    # `_PARTIAL.json` marker alongside the tables, so what arrives is
-                    # self-describing: `sweep-aggregate` still stamps these rows from the
-                    # producing job's own (non-succeeded) status, exactly as for a partial shard.
-                    r2.download_dir(f"{job_id}/{PARTIAL_DIR}", out)
-            except ImportError as e:
-                # R2 env configured but the `r2` extra isn't installed — the fallback is
-                # best-effort recovery, never a reason to fail a local operation.
-                print(f"[lab] R2 fallback unavailable ({e}); using local state only")
+            self._r2_fallback(job_id, out)
         return self.backend.collect_artifacts(job_id, dest or str(self.store.job_dir(job_id)))
+
+    def _r2_fallback(self, job_id: str, out: Path) -> None:
+        """Best-effort recovery of a job's outputs from R2 when the local copy is missing.
+
+        Never raises for an R2 problem: ``sweep-aggregate``/``sweep-retry`` call this per shard,
+        and one shard's network or credential error used to abort the whole sweep with a
+        traceback and empty stdout. A failure is a stderr line plus a ledger note, and the
+        caller carries on with local state (an absent results file reads as missing seeds).
+
+        Skipped for a local-backend job: nothing on that path uploads to R2 or mirrors partials,
+        so there is nothing to recover, and asking would only spend a network round trip (or
+        fail). The one exception is a manifest that itself records a durable ``artifacts_uri`` —
+        then there *is* something to fetch, whoever launched it.
+        """
+        manifest = self.store.read_manifest(job_id)
+        local = manifest.backend.provisioner == "local"
+        if local and not manifest.artifacts_uri:
+            return
+        try:
+            r2 = R2Store.from_env()
+            if manifest.artifacts_uri and r2 is not None:
+                r2.download_dir(job_id, out)
+            if r2 is not None and not local and not (out.exists() and any(out.iterdir())):
+                # Nothing durable from the end-of-run upload — which is the *normal* state of
+                # a job whose supervisor died, since `artifacts_uri` is written on the same
+                # line as that upload. The mid-run mirror (`lab.partials`) is then the only
+                # copy of rows that were paid for, so fall back to it. It lands the
+                # `_PARTIAL.json` marker alongside the tables, so what arrives is
+                # self-describing: `sweep-aggregate` still stamps these rows from the
+                # producing job's own (non-succeeded) status, exactly as for a partial shard.
+                r2.download_dir(f"{job_id}/{PARTIAL_DIR}", out)
+        except ImportError as e:
+            # R2 env configured but the `r2` extra isn't installed — the fallback is
+            # best-effort recovery, never a reason to fail a local operation.
+            print(f"[lab] R2 fallback unavailable ({e}); using local state only", file=sys.stderr)
+            events.note("storage.fallback_unavailable", job_id=job_id, error=str(e))
+        except Exception as e:  # noqa: BLE001 — network/credential errors: same best-effort rule
+            print(
+                f"[lab] R2 fallback for {job_id} failed ({type(e).__name__}: {e}); "
+                "using local state only",
+                file=sys.stderr,
+            )
+            events.note("storage.fallback_failed", job_id=job_id, error=str(e))
 
     def manifest(self, job_id: str) -> JobManifest:
         return self.store.read_manifest(job_id)
+
+    def _fresh_manifest(self, job_id: str) -> JobManifest:
+        """A local job's manifest, refreshed through *its own* backend while it is non-terminal.
+
+        A raw read leaves a shard whose supervisor died frozen at ``running`` forever: the sweep
+        readers then never aggregate it, and ``sweep-retry`` treats it as in flight and never
+        resubmits it. ``backend.status`` is what notices the dead runner and writes the terminal
+        manifest (and, on skypilot, attempts the teardown that never ran) — the same refresh
+        :meth:`_resolve_manifest` does for ``wait``. Routed through :meth:`_backend_for` because
+        ``sweep-aggregate``/``sweep-retry`` build a local-backend Lab whatever ran the shards.
+
+        Terminal manifests are returned as read (nothing left to notice). A refresh that cannot
+        run — e.g. the skypilot extra is not installed here — falls back to the recorded state
+        with a stderr line: a stale ``running`` is the old behaviour, never a crash.
+        """
+        m = self.manifest(job_id)
+        if m.status in _TERMINAL_STATES:
+            return m
+        try:
+            self._backend_for(m.backend.provisioner).status(job_id)
+        except Exception as e:  # noqa: BLE001 — a refresh is best-effort; the read still answers
+            print(
+                f"[lab] could not refresh {job_id} through its {m.backend.provisioner} backend "
+                f"({type(e).__name__}: {e}); using its recorded state",
+                file=sys.stderr,
+            )
+            events.note("core.refresh_failed", job_id=job_id, error=str(e))
+            return m
+        return self.manifest(job_id)
 
     def _queue(self) -> QueueStore:
         """The scheduler's queue store, built once per :class:`Lab` and then reused.
@@ -1235,7 +1519,33 @@ class Lab:
         return manifests, mirrored
 
     def list_jobs(self) -> list[JobManifest]:
-        return [self.store.read_manifest(j) for j in self.store.list_job_ids()]
+        """Every readable manifest in this project's store.
+
+        One unreadable manifest (corrupt JSON, or a schema an older/newer lab wrote) used to
+        raise out of here and take down ``list``, ``status``/``wait`` and reconcile for the whole
+        project. It is now skipped with a stderr warning (once per Lab) and named in
+        :attr:`unreadable_jobs`, which :meth:`spend` and :meth:`reconcile` carry into their
+        output — skipped is never the same as absent: reconcile keeps such a job's machine
+        protected, because for all it knows that job is running.
+        """
+        manifests: list[JobManifest] = []
+        unreadable: list[dict[str, str]] = []
+        for job_id in self.store.list_job_ids():
+            try:
+                manifests.append(self.store.read_manifest(job_id))
+            except (OSError, ValueError) as e:  # ValueError covers pydantic's ValidationError
+                reason = f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"[:300]
+                unreadable.append({"job_id": job_id, "error": reason})
+                if job_id not in self._warned_unreadable:
+                    self._warned_unreadable.add(job_id)
+                    print(
+                        f"[lab] skipping unreadable manifest {job_id} ({reason}); see "
+                        f"{self.store.manifest_path(job_id)}",
+                        file=sys.stderr,
+                    )
+                    events.note("core.manifest_unreadable", job_id=job_id, error=reason)
+        self.unreadable_jobs = unreadable
+        return manifests
 
     def spend(
         self,
@@ -1259,6 +1569,9 @@ class Lab:
             self.list_jobs() if manifests is None else manifests, at=now()
         )
         summary["alert"] = pricing.spend_alert(summary, threshold_usd=alert_usd)
+        # Jobs `list_jobs` had to skip: their spend is unknown, so name them like
+        # `unknown_cost_jobs` rather than let the total silently read as complete.
+        summary["unreadable_jobs"] = [u["job_id"] for u in self.unreadable_jobs]
         return summary
 
     def ps(self) -> dict[str, Any]:
@@ -1363,10 +1676,13 @@ class Lab:
             try:
                 self.fetch_artifacts(jid)  # R2 fallback for outputs that only live durably
             except Exception as e:  # noqa: BLE001 — export what exists locally
-                print(f"[lab] export: fetch_artifacts({jid}) failed, exporting local state: {e}")
+                print(
+                    f"[lab] export: fetch_artifacts({jid}) failed, exporting local state: {e}",
+                    file=sys.stderr,
+                )
             jdir = dest / jid
             jdir.mkdir(parents=True, exist_ok=True)
-            (jdir / "manifest.json").write_text(self.store.manifest_path(jid).read_text())
+            (jdir / "manifest.json").write_text(self._exportable_manifest_json(jid))
             (jdir / "resolved_config.json").write_text(
                 json.dumps(m.run.resolved_config, indent=2, sort_keys=True, default=str)
             )
@@ -1376,8 +1692,8 @@ class Lab:
                 (jdir / "code_diff.tar.gz").write_bytes(diff.read_bytes())
                 files.append("code_diff.tar.gz")
             if include_logs and self.store.logs_path(jid).exists():
-                (jdir / "logs.txt").write_text(
-                    self.store.logs_path(jid).read_text(errors="replace")
+                (jdir / "logs.txt").write_text(  # FR-J1: the bundle is meant to be committed
+                    redact(self.store.logs_path(jid).read_text(errors="replace"))
                 )
                 files.append("logs.txt")
             # Notes travel with the run. `runs/` is git-ignored, so the bundle is the only route
@@ -1452,9 +1768,25 @@ class Lab:
         atomic_write_text(dest / "index.json", json.dumps(index, indent=2, default=str))
         return index
 
+    def _exportable_manifest_json(self, job_id: str) -> str:
+        """The stored manifest as ``export`` writes it: verbatim, except an inline secret in
+        ``entrypoint_command`` is masked (see :func:`_mask_command_secrets`). The stored manifest
+        is never touched — it stays the reproducibility record."""
+        raw = self.store.manifest_path(job_id).read_text()
+        m = self.manifest(job_id)
+        masked = _mask_command_secrets(m.run.entrypoint_command)
+        if masked == m.run.entrypoint_command:
+            return raw  # nothing secret-shaped: byte-identical copy, as before
+        run = m.run.model_copy(update={"entrypoint_command": masked})
+        return m.model_copy(update={"run": run}).model_dump_json(indent=2)
+
     def sweep_summary(self, sweep_id: str) -> dict[str, Any]:
         """Aggregate a sweep's outcomes for trustworthy reporting (preemptions, fallback, spend)."""
-        ms = [m for m in self.list_jobs() if m.sweep_id == sweep_id]
+        ms = [
+            m if m.status in _TERMINAL_STATES else self._fresh_manifest(m.job_id)
+            for m in self.list_jobs()
+            if m.sweep_id == sweep_id
+        ]
 
         def spend(m: JobManifest) -> float:
             return m.cost.actual_usd if m.cost and m.cost.actual_usd else 0.0
@@ -1609,6 +1941,16 @@ class Lab:
                 aliases.add(str(recorded))
             for alias in aliases:
                 protected[alias] = j.job_id
+        # A manifest `list_jobs` could not read is not evidence its job ended: it may be a running
+        # job whose file another lab version wrote. Skipping it must not unprotect its machine —
+        # that would make it an "orphan" and destroy a live job's box (the 2026-08-20 shape).
+        unreadable_ids = [u["job_id"] for u in self.unreadable_jobs]
+        for job_id in unreadable_ids:
+            aliases = {cluster_name_for(job_id), f"lab-{job_id}"}
+            if recorded := self.store.read_runtime(job_id).get("cluster"):
+                aliases.add(str(recorded))
+            for alias in aliases:
+                protected.setdefault(alias, job_id)
 
         me = local_project()
         other_projects: list[dict[str, Any]] = []
@@ -1646,6 +1988,7 @@ class Lab:
             # was therefore permanently unattributable, and `--apply` silently refused to clean it
             # up. A job in our own runs/ is ours by definition.
             ours_locally = {j.job_id for j in self.list_jobs()}
+            ours_locally |= {u["job_id"] for u in self.unreadable_jobs}  # ours, if unreadable
             read = {id(item): _lab_identity(identify(item)) for item in items}
             candidates = {c for _, cands in read.values() for c in cands}
             attributions = attribute_jobs(candidates) if candidates else {}
@@ -1976,6 +2319,9 @@ class Lab:
             # (nothing was attempted) and on a fully-confirmed cleanup. Non-empty means the cloud
             # is in a state this tool cannot vouch for — the CLI exits 5 and says to verify.
             "destroy_outcomes": destroy_outcomes,
+            # Jobs whose manifest could not be read. Their machines were kept protected (never
+            # orphaned), so a real leak behind one needs a human: fix or remove the manifest.
+            "unreadable_manifests": unreadable_ids,
             "applied": apply,
         }
 

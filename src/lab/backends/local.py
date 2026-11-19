@@ -67,6 +67,7 @@ class LocalBackend:
             ):
                 return self.store.update_manifest(
                     job_id,
+                    only_if_active=True,  # the runner may have recorded its verdict, then exited
                     status=JobState.failed,
                     ended_at=now(),
                     end_reason="runner exited without recording status",

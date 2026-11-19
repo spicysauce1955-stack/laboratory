@@ -70,6 +70,23 @@ def current_commit(repo: Path) -> str:
     ).strip()
 
 
+def resolve_commit(repo: Path, ref: str) -> str | None:
+    """The full SHA of the commit ``ref`` names in ``repo`` (a SHA, branch, tag, ``HEAD~1``…),
+    or ``None`` when it names no commit there. Never treats ``ref`` as an option."""
+    if not ref or ref.startswith("-"):
+        return None
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", "--end-of-options",
+             f"{ref}^{{commit}}"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, NotADirectoryError):
+        return None
+    return out or None
+
+
 def commit_exists(repo: Path, commit: str) -> bool:
     """True if ``commit`` is present in ``repo`` (so it can be archived/checked out)."""
     return (

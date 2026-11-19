@@ -9,8 +9,13 @@ Layout (per job, under the lab ``home`` dir, default ``runs/``):
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
+import shlex
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +31,31 @@ _TERMINAL_STATES = frozenset(
         JobState.timed_out, JobState.preempted,
     }
 )
+
+
+def argv_override_keys(command: str) -> set[str]:
+    """Keys of the loose ``key=value`` tokens in a shell command (the lab's override convention).
+
+    A superset of the real overrides — it also sees env prefixes and ``--with pkg==x`` specs —
+    so callers intersect it with the config keys they know were injected. Never raises: an
+    unbalanced quote falls back to a whitespace split rather than failing a terminal write.
+    """
+    from lab.experiment import parse_overrides
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    return set(parse_overrides(tokens))
+
+
+def injected_override_keys(command: str, config: dict[str, Any] | None) -> list[str]:
+    """The config keys that actually ride ``command`` as ``key=value`` — what the lab injected.
+
+    A config key that is not on the argv (plain ``submit`` records ``config`` as metadata) is not
+    something the entrypoint could have consumed, so it is not audited either.
+    """
+    return sorted(argv_override_keys(command) & set(config or {}))
 
 
 def cell_id_for(coords: dict[str, Any]) -> str:
@@ -80,8 +110,47 @@ class JobStore:
     def read_manifest(self, job_id: str) -> JobManifest:
         return JobManifest.model_validate_json(self.manifest_path(job_id).read_text())
 
-    def update_manifest(self, job_id: str, **fields: Any) -> JobManifest:
-        """Read-modify-write the manifest's mutable fields (used by runner/backend).
+    def manifest_lock_path(self, job_id: str) -> Path:
+        # A dot-file in the job dir, beside manifest.json and outside output/ (which is what gets
+        # collected, mirrored and exported).
+        return self.job_dir(job_id) / ".manifest.lock"
+
+    @contextmanager
+    def _manifest_lock(self, job_id: str) -> Iterator[None]:
+        """Exclusive per-job ``flock`` around a manifest read-modify-write.
+
+        Several processes write one manifest — the runner/supervisor, ``status`` finalizing a dead
+        runner, ``cancel``, ``collect_artifacts`` — and each used to read, modify and write with
+        nothing in between. A writer that read before another's write landed then wrote its stale
+        copy back over it: a fetch could erase ``teardown_status="failed"`` (the FR-C2 money
+        alarm) and put a terminal job back to ``running``. One open+flock+close per *write*;
+        plain reads take no lock (writes are atomic renames, so a reader never sees a torn file),
+        so status polls stay a free filesystem read. Raises ``FileNotFoundError`` for a job dir
+        that does not exist, exactly as the read it guards would.
+        """
+        fd = os.open(self.manifest_lock_path(job_id), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)  # closing the descriptor releases the lock
+
+    def update_manifest(
+        self, job_id: str, *, only_if_active: bool = False, **fields: Any
+    ) -> JobManifest:
+        """Read-modify-write the manifest's mutable fields (used by runner/backend), under the
+        job's manifest lock (see ``_manifest_lock``).
+
+        Two invariants hold under that lock, whoever the caller is:
+
+        * **A terminal job never moves back to non-terminal.** A ``status`` that would do so is
+          dropped (the rest of the write still lands) — e.g. a runner recording ``running`` after
+          a cancel already landed.
+        * ``only_if_active=True`` makes the whole write conditional on the job still being
+          non-terminal *as read under the lock*, and otherwise returns the current manifest
+          unchanged. The dead-runner finalizers use it: "the pid is gone" is only evidence of a
+          crash if the runner did not record its own verdict first, and a check made before the
+          lock cannot know that.
 
         On any transition to ``succeeded``, snapshot the run's final metric values into the manifest
         (FR-B4 durable baseline) unless the caller supplied them — so every backend's finalize path
@@ -93,35 +162,51 @@ class JobStore:
         than requested is the worst kind of wrong answer (field-report #1). Legacy entrypoints
         (no file) are unaffected. Runs once (guarded on ``config_effective is None``).
         """
-        updated = self.read_manifest(job_id).model_copy(update=fields)
-        if updated.status is JobState.succeeded and not updated.final_metrics:
-            fm = snapshot_final_metrics(self.output_dir(job_id))
-            if fm:
-                updated = updated.model_copy(update={"final_metrics": fm})
-        if updated.status in _TERMINAL_STATES and updated.config_effective is None:
-            updated = self._audit_effective_config(
-                job_id, updated, flip=updated.status is JobState.succeeded
-            )
-        self.write_manifest(updated)
-        return updated
+        with self._manifest_lock(job_id):
+            current = self.read_manifest(job_id)
+            if current.status in _TERMINAL_STATES:
+                if only_if_active:
+                    return current
+                status = fields.get("status")
+                if status is not None and JobState(status) not in _TERMINAL_STATES:
+                    from lab import events
+
+                    events.note(
+                        "store.terminal_regression_refused",
+                        job_id=job_id, current=current.status.value, requested=str(status),
+                    )
+                    fields = {k: v for k, v in fields.items() if k != "status"}
+            updated = current.model_copy(update=fields)
+            if updated.status is JobState.succeeded and not updated.final_metrics:
+                fm = snapshot_final_metrics(self.output_dir(job_id))
+                if fm:
+                    updated = updated.model_copy(update={"final_metrics": fm})
+            if updated.status in _TERMINAL_STATES and updated.config_effective is None:
+                updated = self._audit_effective_config(
+                    job_id, updated, flip=updated.status is JobState.succeeded
+                )
+            self.write_manifest(updated)
+            return updated
 
     def _audit_effective_config(
         self, job_id: str, updated: JobManifest, *, flip: bool
     ) -> JobManifest:
         """The unconsumed-config check (see ``update_manifest``); pure function of output/.
 
-        Audits the ``key=value`` overrides actually passed on the command line (parsed from
-        ``entrypoint_command``) — NOT ``resolved_config``, which plain ``submit`` records as
-        metadata without ever putting it on the argv.
+        Audits only the overrides the lab itself injected — ``run.config_overrides``, recorded at
+        submit as the config keys that ride the argv. Not every ``k=v`` token of the shell
+        command: ``uv run --with scipy==1.11`` and an ``OMP_NUM_THREADS=1 …`` env prefix used to
+        be read as unconsumed config, flipping real successes to failed (and then aggregate
+        dropped their rows and sweep-retry re-bought them). Nor ``resolved_config`` as such,
+        which plain ``submit`` records as metadata without ever putting it on the argv. A legacy
+        manifest (no ``config_overrides``) gets the same intersection computed here.
 
         Runs on EVERY terminal transition so ``unconsumed_config`` is populated for timed-out/
         failed shards too (the aggregator's wrong-config guard depends on it); only a succeeded
         verdict is flipped to ``failed`` (``flip=True``) — the others already aren't successes.
         """
-        import shlex
-
         from lab import events
-        from lab.experiment import parse_overrides, read_effective_config
+        from lab.experiment import read_effective_config
 
         try:
             eff = read_effective_config(self.output_dir(job_id))
@@ -133,7 +218,12 @@ class JobStore:
             return updated  # already non-succeeded; corrupt evidence can't be recorded
         if eff is None:
             return updated  # legacy entrypoint — nothing reported, nothing to audit
-        passed = set(parse_overrides(shlex.split(updated.run.entrypoint_command)))
+        run = updated.run
+        passed = set(
+            run.config_overrides
+            if run.config_overrides is not None
+            else injected_override_keys(run.entrypoint_command, run.resolved_config)
+        )
         passed.discard("seed")  # a grid 'seed' key is consumed by the lab itself (sets LAB_SEED)
         unconsumed = sorted(passed - set(eff))
         updated = updated.model_copy(

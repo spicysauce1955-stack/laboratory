@@ -2083,6 +2083,7 @@ class SkyPilotBackend:
                 cancelling = bool(rt.get("cancelling"))
                 return self.store.update_manifest(
                     job_id,
+                    only_if_active=True,  # a verdict the supervisor recorded before dying stands
                     status=JobState.cancelled if cancelling else JobState.failed,
                     ended_at=now(),
                     end_reason=(
