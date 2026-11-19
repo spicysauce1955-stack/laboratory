@@ -476,6 +476,25 @@ STORAGE_BILLING_CLOUDS = placement.STORAGE_BILLING_CLOUDS
 default_disk_gb = placement.effective_disk_gb
 
 
+# Every name `build_backend` maps; `cpu` is resolve_backend_profile's sugar over skypilot. Exact,
+# case-sensitive names: `Local` is a typo, not a spelling of `local`.
+SUPPORTED_BACKENDS: tuple[str, ...] = ("local", "skypilot", "cpu")
+
+
+def validate_backend(name: str) -> str:
+    """Reject a backend name outside :data:`SUPPORTED_BACKENDS`. Pure.
+
+    ``build_backend`` used to map any name it did not know to the local backend, so
+    ``--backend skypilto``, ``--backend Local`` and MCP ``backend="nonsense"`` all exited 0 and
+    ran the job on this machine — a workload sized for a remote box, with none of its remote
+    timeout or teardown, reported as a success (stress run 2026-11-19). Cloud names have been
+    validated all along (:func:`validate_cloud`); this is the same guard for backends.
+    """
+    if name not in SUPPORTED_BACKENDS:
+        raise LabError(f"unknown backend {name!r}; supported: {', '.join(SUPPORTED_BACKENDS)}")
+    return name
+
+
 def validate_cloud(cloud: str | None) -> str | None:
     """Reject cloud names outside :data:`SUPPORTED_CLOUDS` (None = the Vast default). Pure."""
     if cloud is not None and cloud not in SUPPORTED_CLOUDS:
@@ -515,8 +534,9 @@ def resolve_backend_profile(
     Every skypilot spec — cpu profile or not — also leaves here with an explicit ``disk_size`` on
     the storage-billing clouds, so no path can inherit SkyPilot's 256 GB default. That default was
     only ever noticed on DO, where it 422s loudly; on GCP it provisions fine and quietly doubles a
-    spot job's bill. Pure; no I/O.
+    spot job's bill. Pure; no I/O. An unknown ``backend`` is refused (:func:`validate_backend`).
     """
+    validate_backend(backend)
     validate_cloud(resources.cloud)
     validate_durations(resources)
     if backend != "cpu":
@@ -2826,8 +2846,11 @@ class Lab:
 def build_backend(name: str, *, home: Path, repo: Path) -> Backend:
     """The single name->backend mapping. Both Lab construction paths (``default_lab``,
     ``Lab._sibling_lab``) and the scheduler (``Scheduler.make_lab``) route through here, so a new
-    backend is wired in one place instead of three. Unknown names fall back to ``local``.
+    backend is wired in one place instead of three. An unknown name raises :class:`LabError`
+    (:func:`validate_backend`) — it used to fall back to ``local``, which ran a mistyped remote
+    job on this machine.
     """
+    validate_backend(name)
     if name in ("skypilot", "cpu"):
         from lab.backends.skypilot import SkyPilotBackend  # optional extra; import lazily
 

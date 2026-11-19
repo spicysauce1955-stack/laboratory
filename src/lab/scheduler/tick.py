@@ -18,7 +18,7 @@ from pathlib import Path
 
 from lab import __version__
 from lab._util import now, parse_duration, pid_alive, process_start_time
-from lab.core import Lab, build_backend
+from lab.core import Lab, build_backend, validate_backend
 from lab.models import JobManifest, JobState, ResourceRequest
 from lab.scheduler.bundle import extract_bundle
 from lab.scheduler.models import ControlConfig, Registration, RegState, TickReport
@@ -73,7 +73,7 @@ class Scheduler:
     ) -> None:
         self.queue = queue
         self.home = Path(home)
-        self.backend_name = backend
+        self.backend_name = validate_backend(backend)  # a typo must not launch on this host
         self.now_fn = now_fn
         self.host = host or platform.node()
         self.store = JobStore(self.home)
