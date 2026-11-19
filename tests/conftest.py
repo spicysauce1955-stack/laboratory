@@ -101,6 +101,16 @@ def _no_real_cloud_clients(monkeypatch):
 
     monkeypatch.setattr("lab.backends.skypilot._get_do_client", _refuse)
 
+    def _refuse_vast(*a, **k):
+        # Three tests used to build a real VastAI() here and list the live account's rentals
+        # (seen as a `show_instances()` deprecation warning in a developer run, 2026-11-19).
+        raise AssertionError(
+            "a test tried to build a real Vast.ai client — monkeypatch "
+            "lab.backends.skypilot._get_vast_client in this test"
+        )
+
+    monkeypatch.setattr("lab.backends.skypilot._get_vast_client", _refuse_vast)
+
 
 @pytest.fixture(autouse=True)
 def _hermetic_sky_versions(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
