@@ -11,6 +11,7 @@ VERSION="${1:-}"
 DRY_RUN="${2:-}"
 [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "usage: $0 vX.Y.Z [--dry-run]" >&2; exit 2; }
 BARE="${VERSION#v}"
+SKILL=src/lab/_scaffold/project/skills/laboratory/SKILL.md
 
 cd "$(git rev-parse --show-toplevel)"
 
@@ -43,11 +44,14 @@ run uv version "$BARE"
 # The scaffolded skill declares its own version in frontmatter, and it is what a consumer
 # project reads. It drifted two minor versions once (written at v0.9.0, still saying so at
 # v0.12.0) because nothing kept it honest; test_scaffold_skill_version pins the invariant.
-run sed -i -E "s/^(  version: )\"[0-9]+\.[0-9]+\.[0-9]+\"/\\1\"$BARE\"/" src/lab/_scaffold/project/skills/laboratory/SKILL.md
+run sed -i -E "s/^(  version: )\"[0-9]+\.[0-9]+\.[0-9]+\"/\\1\"$BARE\"/" "$SKILL"
 run uv lock
 if [[ "$DRY_RUN" != "--dry-run" ]]; then
   [[ "$(uv version --short)" == "$BARE" ]] || {
     echo "pyproject version is not $BARE after bump" >&2; exit 1; }
+  # sed exits 0 when its pattern matches nothing, so a reshaped frontmatter would bump nothing.
+  grep -q "^  version: \"$BARE\"" "$SKILL" || {
+    echo "$SKILL does not declare version $BARE after bump" >&2; exit 1; }
 fi
 
 say "tag message from CHANGELOG"
@@ -59,8 +63,15 @@ NOTES="$(awk -v v="## $VERSION " '
 [[ -n "${NOTES//[[:space:]]/}" ]] || { echo "empty CHANGELOG section for $VERSION" >&2; exit 1; }
 
 say "commit + tag + push"
-run git add pyproject.toml uv.lock CHANGELOG.md
+run git add pyproject.toml uv.lock CHANGELOG.md "$SKILL"
 run git commit -m "chore(release): $VERSION"
+# Anything the bump touched but the add above missed would ship stale under the tag (the skill
+# version did, and release CI failed on the tag being cut). Refuse before tagging instead.
+if [[ "$DRY_RUN" != "--dry-run" && -n "$(git status --porcelain)" ]]; then
+  echo "work tree is dirty after the release commit — the bump changed files it did not stage:" >&2
+  git status --porcelain >&2
+  exit 1
+fi
 if [[ "$DRY_RUN" == "--dry-run" ]]; then
   echo "[dry-run] git tag -a $VERSION -m <notes from CHANGELOG>"
 else

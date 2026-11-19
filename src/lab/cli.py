@@ -648,12 +648,17 @@ def init(
     from lab.init import scaffold
 
     report = scaffold(Path.cwd(), check=check)
+    for warning in report.get("warnings", []):
+        print(f"warning: {warning}", file=sys.stderr)
     for dest in report["conflicts"]:
-        print(
-            f"warning: {dest} differs from the version lab ships and was left as-is; "
-            f"the current version is beside it as {dest}.new",
-            file=sys.stderr,
-        )
+        copy = f"{dest}.new" if f"{dest}.new" in report.get("new_copies", []) else None
+        if check:
+            beside = f"; `lab init` would write the current version beside it as {copy}"
+            msg = f"{dest} differs from the version lab ships and would be left as-is"
+        else:
+            beside = f"; the current version is beside it as {copy}"
+            msg = f"{dest} differs from the version lab ships and was left as-is"
+        print(f"warning: {msg}{beside if copy else ''}", file=sys.stderr)
     if report.get("skill_changed"):
         # The one file whose content is *instructions*. A silent refresh is how a capability can
         # ship and still be recorded as impossible eight days later, so say it out loud — on
@@ -669,7 +674,12 @@ def init(
     _emit(report)
     if check and not report["ok"]:
         stale = len(report["created"]) + len(report["refreshed"]) + len(report["merged"])
-        _fail(1, f"init --check: scaffold is stale ({stale} file(s) would change)")
+        conflicts = len(report["conflicts"])
+        _fail(
+            1,
+            f"init --check: scaffold is stale ({stale} file(s) would change, "
+            f"{conflicts} conflict(s) need a hand merge)",
+        )
 
 
 @app.command()

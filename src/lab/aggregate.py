@@ -48,6 +48,12 @@ def merge_seed_rows(
     cross-shard repeat resolves — succeeded rows beat non-succeeded, later-submitted wins among
     equals. Rows that fail to parse are skipped for non-succeeded shards only (a heartbeat-rsynced
     file can end mid-row) and stay fatal for succeeded shards.
+
+    A row is only a row at the header's width: a short or long one is skipped for a non-succeeded
+    shard and fatal for a succeeded one. And a non-succeeded shard's unterminated last line is
+    dropped whatever its width, because ``3,0.4123,10`` cut from ``3,0.4123,100`` has every field
+    and a wrong one. Both close the same hole: a fragment whose seed column parsed counted that
+    seed as present, with a wrong value, and a present seed is never re-bought by sweep-retry.
     """
     if not shard_results:
         return "", [], []
@@ -57,6 +63,9 @@ def merge_seed_rows(
     winners: dict[tuple[str, ...], tuple[int, int, str, int, dict[str, str]]] = {}
     for order, (text, status) in enumerate(shard_results):
         strict = status == "succeeded"
+        if not strict and not text.endswith("\n"):
+            # Only what precedes the last newline is known to be whole.
+            text = text[: text.rfind("\n") + 1]
         reader = csv.reader(io.StringIO(text))
         try:
             this_header = next(reader)
@@ -77,6 +86,13 @@ def merge_seed_rows(
         for raw in reader:
             if not raw:
                 continue
+            if len(raw) != len(header):
+                if strict:
+                    raise ValueError(
+                        f"row {raw} has {len(raw)} field(s), header has {len(header)} "
+                        "(succeeded shard)"
+                    )
+                continue  # a torn or garbled row of a partial shard — skip, keep the rest
             try:
                 seed_val = int(raw[seed_idx])
                 key = tuple(raw[i] for i in key_idxs)
