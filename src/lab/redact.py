@@ -67,12 +67,95 @@ _PATTERNS = (
 )
 
 
+#: Credentials recognisable by shape alone, with no name in front of them: ``(prefix)(body)``.
+#: The prefix is kept so a reader can tell *what* leaked and rotate it; the body is masked.
+#: Every prefix is one a vendor issues so that leaked tokens can be found, so none of them occurs
+#: in ordinary text — and the left boundary keeps ``task-…``/``disk-…`` from reading as ``sk-``.
+#: Length floors sit below the real formats (GitHub 36, HF 34, DO 64…) so a truncated paste is
+#: still caught, and above anything a prose word could reach.
+_TOKEN_SHAPES = (
+    r"(gh[pousr]_)[A-Za-z0-9]{30,}",  # GitHub classic PAT / OAuth / user / server / refresh
+    r"(github_pat_)[A-Za-z0-9_]{40,}",  # GitHub fine-grained PAT
+    # OpenAI / Anthropic-style secret keys. `sk-` alone is too short a prefix to trust on its own,
+    # so the body must be either a long unbroken run (legacy keys, and the all-letter fakes the
+    # stress run used) or contain a digit — `sk-learn-is-a-python-library` is neither.
+    r"(sk-(?:proj|svcacct|admin|ant-(?:api|admin)\d\d)-)[A-Za-z0-9_-]{20,}",
+    r"(sk-)(?:[A-Za-z0-9]{20,}[A-Za-z0-9_-]*|(?=[A-Za-z0-9_-]{20,})[A-Za-z_-]*[0-9][A-Za-z0-9_-]*)",
+    r"((?:sk|rk)_(?:live|test)_)[A-Za-z0-9]{16,}",  # Stripe secret / restricted keys
+    r"(hf_)[A-Za-z0-9]{30,}",  # Hugging Face
+    r"(do[por]_v1_)[A-Za-z0-9]{40,}",  # DigitalOcean PAT / OAuth / refresh token
+    r"(xox[abposre]-)[A-Za-z0-9-]{10,}",  # Slack
+    r"(AIza)[0-9A-Za-z_-]{35}",  # Google API key
+    r"(eyJ)[A-Za-z0-9_-]{2,}\.eyJ[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]*",  # JWT: {"…}.{"…}.signature
+)
+_TOKEN = re.compile(r"(?<![A-Za-z0-9_-])(?:" + "|".join(_TOKEN_SHAPES) + ")")
+
+# A private key is many lines, and no single line of its body says what it is — so the block is
+# masked from BEGIN to END as a unit, with the markers kept (the reader must be able to see that
+# a key was printed, and rotate it). A certificate is public and is left alone.
+_KEY_KIND = r"[A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?"
+_KEY_BEGIN = re.compile(rf"-----BEGIN {_KEY_KIND}-----")
+_KEY_END = re.compile(rf"-----END {_KEY_KIND}-----")
+# What may sit between the markers: base64 lines, `Proc-Type:`-style armour headers, blank lines
+# — each optionally behind the log writer's own timestamp, since an older logs.txt is stamped
+# line by line. The first line that is none of these ends the block even with no END marker:
+# masking the rest of a log after a stray BEGIN would destroy the only copy of the run's output.
+_STAMP_PREFIX = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z ")
+_KEY_LINE = re.compile(
+    r"\s*(?:[A-Za-z0-9+/=]+"
+    r"|(?:Proc-Type|DEK-Info|Version|Comment|Hash|Charset|MessageID):[^\n]*)?\s*"
+)
+
+
+def _masked_span(text: str) -> str:
+    """``text`` (one line's worth of key material) masked, keeping a leading log timestamp."""
+    stamp = _STAMP_PREFIX.match(text)
+    body = text[stamp.end():] if stamp else text
+    return (stamp.group(0) if stamp else "") + (_REDACTED if body.strip() else body)
+
+
+def _mask_key_line(line: str, in_block: bool) -> tuple[str, bool]:
+    """One line through the private-key state machine: ``(masked line, still inside a block)``."""
+    if in_block:
+        end = _KEY_END.search(line)
+        if end is not None:
+            rest, still = _mask_key_line(line[end.end():], False)
+            return _masked_span(line[:end.start()]) + line[end.start():end.end()] + rest, still
+        stamp = _STAMP_PREFIX.match(line)
+        if not _KEY_LINE.fullmatch(line[stamp.end():] if stamp else line):
+            return _mask_key_line(line, False)  # not key material: the block is over
+        return _masked_span(line), True
+    begin = _KEY_BEGIN.search(line)
+    if begin is None:
+        return line, False
+    head, tail = line[:begin.end()], line[begin.end():]
+    if _KEY_END.search(tail) is None:
+        return head + (_REDACTED if tail.strip() else tail), True
+    rest, still = _mask_key_line(tail, True)
+    return head + rest, still
+
+
+def _mask_private_keys(text: str) -> str:
+    if "PRIVATE KEY" not in text:
+        return text
+    out: list[str] = []
+    in_block = False
+    for line in text.split("\n"):
+        masked, in_block = _mask_key_line(line, in_block)
+        out.append(masked)
+    return "\n".join(out)
+
+
 def redact(text: str) -> str:
-    """Mask ``api_key=…`` / ``?…_key=…`` query params and ``Authorization:`` headers in ``text``.
+    """Mask credentials in ``text``: private-key blocks, vendor token shapes (``ghp_…``,
+    ``sk-…``, ``hf_…``, JWTs, …), ``api_key=…`` / ``?…_key=…`` query params and
+    ``Authorization:`` headers.
 
     Idempotent: re-redacting already-masked text is a no-op-equivalent (the masked value carries
     no delimiters, so it just re-masks to the same string).
     """
+    text = _mask_private_keys(text)
+    text = _TOKEN.sub(lambda m: next(g for g in m.groups() if g is not None) + _REDACTED, text)
     for pattern in _PATTERNS:
         text = pattern.sub(rf"\1{_REDACTED}", text)
     return text
@@ -178,6 +261,9 @@ class TimestampingWriter:
         self._started_at: datetime | None = None
         self._last_frame_at = time.monotonic()
         self._closed = False
+        # Inside a private-key block: no single line of a key's body says what it is, so the
+        # line-at-a-time `redact` cannot see one — this carries the BEGIN across lines.
+        self._in_private_key = False
 
     def feed(self, chunk: bytes) -> None:
         """Absorb one read from the pipe and write out every line it completes."""
@@ -256,6 +342,7 @@ class TimestampingWriter:
                 self._advance(self._max_line_chars)
 
     def _emit(self, text: str) -> None:
+        text, self._in_private_key = _mask_key_line(text, self._in_private_key)
         out = redact(text)
         if self._timestamps and out:  # a blank separator line carries no event; leave it blank
             out = f"{_stamp(self._started_at or self._clock())} {out}"

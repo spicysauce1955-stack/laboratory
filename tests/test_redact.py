@@ -1,3 +1,5 @@
+import pytest
+
 from lab.redact import redact
 
 SECRET = "0000000000000000000000000000000000000"
@@ -160,3 +162,148 @@ def test_redact_masks_password_and_secret_json_fields():
     out = redact('{"user": "x", "password": "hunter2", "secret": "s3", "api_key": "k"}')
     assert "hunter2" not in out and '"s3"' not in out and '"k"' not in out
     assert '"user": "x"' in out
+
+
+# --- credential shapes that need no name in front of them (stress run 2026-11-19) -------------
+#
+# `lab export --logs` writes a bundle meant to be committed, and its "redacted" logs.txt carried
+# every one of these verbatim: `redact` only knew the cloud providers' query-param and header
+# shapes. Each fake is built to the real format's length and alphabet; the `FAKE…` variants are
+# the stress run's own (`experiments/leaky.py`), which are all letters and so slip past any
+# entropy bar — the prefix has to be enough.
+
+B62 = "aZ3kQ9xW2mP7vB4nR8tY1cL6jH5gF0dSe2Wq7Lp4Mn8Bv3Cx6Zk"  # base62, deterministic
+TOKENS = {
+    "github classic": "ghp_" + B62[:36],
+    "github oauth": "gho_" + B62[1:37],
+    "github fake": "ghp_FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE",
+    "github fine-grained": "github_pat_11ABCDEFG0" + B62[:12] + "_" + (B62 * 2)[:59],
+    "openai legacy": "sk-" + B62[:48],
+    "openai fake": "sk-FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE",
+    "openai project": "sk-proj-" + (B62 * 3)[:120].replace("Q", "-").replace("W", "_"),
+    "anthropic": "sk-ant-api03-" + (B62 * 2)[:93] + "AA",
+    "stripe": "sk_live_" + B62[:24],
+    "huggingface": "hf_" + B62[:34],
+    "digitalocean": "dop_v1_" + "4c6f0a5e9b3d1c7f" * 4,
+    "digitalocean fake": "dop_v1_" + "FAKE" * 16,
+    "slack bot": "xoxb-8906828836-8906828836-" + B62[:24],
+    "slack user": "xoxp-1234567890-1234567890-1234567890-" + "ab12" * 8,
+    "jwt": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+    "google api key": "AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI",
+}
+
+
+@pytest.mark.parametrize("name", list(TOKENS))
+def test_redact_masks_a_bare_credential_shape(name: str) -> None:
+    token = TOKENS[name]
+    for line in (
+        f"github token {token}",
+        f"export X={token}",  # the name says nothing; the shape has to
+        f'{{"value": "{token}"}}',
+        f"curl -H 'X-Api: {token}' https://example.com",
+        f"{token}",
+    ):
+        out = redact(line)
+        assert token not in out, (name, out)
+        assert "REDACTED" in out
+        assert redact(out) == out  # idempotent
+    # The prefix survives, so a reader can still tell *what* leaked and rotate it.
+    assert redact(f"token {token} used").startswith("token ")
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "pip install scikit-learn sk-learn==1.5",
+        "sk-learn-is-a-python-library-for-machine-learning",  # no digit, hyphenated words
+        "task-0123456789abcdefghijklmnop finished",  # `sk-` inside a word
+        "disk-1234567890abcdefghijklmnopq is full",
+        "risk-free rate 0.04",
+        "ghp_short is not a token",
+        "the hf_hub cache lives in ~/.cache/huggingface",
+        "xoxb is a slack prefix",
+        "eyJ alone is just base64 for {\"",
+        "-----BEGIN CERTIFICATE----- MIIBszCCAVmgAwIBAgIU -----END CERTIFICATE-----",
+        "[lab] provisioning host lab-abc-123 (RTX4090:1)",
+        "step 3 loss=0.25 lr=0.001 seed=3 alpha=0.5",
+    ],
+)
+def test_redact_leaves_lookalikes_alone(line: str) -> None:
+    """The log on disk is the only copy of the experiment's output: masking something that is
+    not a credential destroys data and protects nothing."""
+    assert redact(line) == line
+
+
+PEM_BODY = [
+    "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj",
+    "MzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dVMvDuictGeurT8jNbvJZHtCSuYEvu",
+    "NMoSfm76oqFvAp8Gy0iz5sxjZmSnXyCdPEovGhLa0VzMaQ8s+CLOyS56YyCFGeJZ",
+    "agMOFn0=",
+]
+
+
+def _pem(kind: str = "PRIVATE KEY") -> str:
+    return "\n".join([f"-----BEGIN {kind}-----", *PEM_BODY, f"-----END {kind}-----"])
+
+
+@pytest.mark.parametrize("kind", ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY",
+                                  "OPENSSH PRIVATE KEY", "PGP PRIVATE KEY BLOCK"])
+def test_redact_masks_a_whole_multiline_private_key_block(kind: str) -> None:
+    text = f"loading credentials\n{_pem(kind)}\nstep 3 loss=0.25\n"
+    out = redact(text)
+    for body in PEM_BODY:
+        assert body not in out
+    # The markers stay — a reader must be able to see that a key was printed and rotate it —
+    # and so does everything around the block.
+    assert f"-----BEGIN {kind}-----" in out and f"-----END {kind}-----" in out
+    assert out.startswith("loading credentials\n") and out.endswith("step 3 loss=0.25\n")
+    assert out.count("\n") == text.count("\n")  # line structure intact
+    assert redact(out) == out
+
+
+def test_redact_masks_a_private_key_printed_on_one_line() -> None:
+    line = "-----BEGIN PRIVATE KEY----- MIIFAKEFAKEFAKE -----END PRIVATE KEY-----"
+    out = redact(line)
+    assert "MIIFAKEFAKEFAKE" not in out
+    assert out.startswith("-----BEGIN PRIVATE KEY-----")
+    assert out.endswith("-----END PRIVATE KEY-----")
+
+
+def test_redact_masks_a_timestamped_key_block_from_an_older_log() -> None:
+    """`lab export --logs` redacts logs.txt as it is on disk, and a log written before this fix
+    is timestamped line by line — the body lines carry a stamp in front."""
+    stamped = "\n".join(f"2026-08-21T04:12:33.{i:03d}Z {ln}" for i, ln in enumerate(
+        _pem().splitlines()))
+    out = redact(stamped + "\n2026-08-21T04:12:34.000Z step 3\n")
+    for body in PEM_BODY:
+        assert body not in out
+    assert out.endswith("2026-08-21T04:12:34.000Z step 3\n")
+    assert "2026-08-21T04:12:33.002Z " in out  # stamps survive, so the timeline does
+
+
+def test_a_stray_begin_marker_does_not_swallow_the_rest_of_the_log() -> None:
+    """A key block ends at its END marker *or* at the first line that cannot be key material.
+    Masking everything after a lone BEGIN would destroy the only copy of the run's output."""
+    text = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEF\nstep 3 loss=0.25 done\n"
+    out = redact(text)
+    assert "MIIEvQIBADANBgkqhkiG9w0BAQEF" not in out
+    assert "step 3 loss=0.25 done" in out
+
+
+def test_the_log_writer_masks_a_key_block_that_arrives_line_by_line() -> None:
+    """The supervisor's writer redacts one line at a time, so it has to carry "inside a key
+    block" from one line to the next — no single line of a key's body says what it is."""
+    import io
+
+    from lab.redact import TimestampingWriter
+
+    sink = io.StringIO()
+    w = TimestampingWriter(sink, timestamps=False)
+    for ln in ["before", *_pem("RSA PRIVATE KEY").splitlines(), "after the key"]:
+        w.feed((ln + "\n").encode())
+    w.close()
+    out = sink.getvalue()
+    for body in PEM_BODY:
+        assert body not in out
+    assert out.splitlines()[0] == "before" and out.splitlines()[-1] == "after the key"
+    assert "-----END RSA PRIVATE KEY-----" in out
