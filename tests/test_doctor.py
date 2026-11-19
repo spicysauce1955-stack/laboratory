@@ -199,6 +199,55 @@ def test_no_candidates_means_an_unrepresentative_look(monkeypatch, ctx):
 
 
 # --------------------------------------------------------------------------------------------
+# Disk quota: the metric of the disk type SkyPilot actually provisions
+# --------------------------------------------------------------------------------------------
+
+
+def _with_instance(ctx, instance_type):
+    ctx["estimate"] = types.SimpleNamespace(instance_type=instance_type)
+    return ctx
+
+
+def test_disk_quota_reads_the_ssd_metric_pd_balanced_draws_on(monkeypatch, ctx):
+    """The lab never sets a disk_tier, so SkyPilot's GCP default (MEDIUM) provisions pd-balanced,
+    which GCP meters as SSD_TOTAL_GB. DISKS_TOTAL_GB is pd-standard's quota: reading it blocked
+    launches on a quota they never draw on, and passed ones whose real quota was exhausted."""
+    compute = fake_compute(
+        region_quotas={"us-east1": {"DISKS_TOTAL_GB": (100, 100), "SSD_TOTAL_GB": (500, 0)}}
+    )
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    res = ResourceRequest(cloud="gcp", accelerators="T4:1", disk_size=100, region="us-east1")
+    result = D.check_quota_disk(res, _with_instance(ctx, "n1-highmem-4"))
+    assert result.status == "ok"
+    assert "SSD_TOTAL_GB" in result.detail
+
+
+def test_exhausted_ssd_quota_is_the_definitive_negative(monkeypatch, ctx):
+    compute = fake_compute(
+        region_quotas={"us-east1": {"DISKS_TOTAL_GB": (4096, 0), "SSD_TOTAL_GB": (500, 480)}}
+    )
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    res = ResourceRequest(cloud="gcp", cpus=4, disk_size=50, region="us-east1")
+    assert D.check_quota_disk(res, _with_instance(ctx, "n2-standard-4")).status == "fail"
+
+
+def test_a_hyperdisk_only_series_is_not_judged_by_persistent_disk_quota(monkeypatch, ctx):
+    compute = fake_compute(
+        region_quotas={"us-east1": {"DISKS_TOTAL_GB": (0, 0), "SSD_TOTAL_GB": (0, 0)}}
+    )
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    res = ResourceRequest(cloud="gcp", cpus=4, disk_size=50, region="us-east1")
+    assert D.check_quota_disk(res, _with_instance(ctx, "n4-standard-4")).status == "skip"
+
+
+def test_disk_quota_without_a_resolved_instance_type_cannot_tell(monkeypatch, ctx):
+    compute = fake_compute(region_quotas={"us-east1": {"SSD_TOTAL_GB": (0, 0)}})
+    monkeypatch.setattr(D, "_build", lambda creds, api, version: compute)
+    res = ResourceRequest(cloud="gcp", cpus=4, disk_size=50, region="us-east1")
+    assert D.check_quota_disk(res, ctx).status == "skip"
+
+
+# --------------------------------------------------------------------------------------------
 # Fail-open on error, fail-closed on a definitive negative
 # --------------------------------------------------------------------------------------------
 

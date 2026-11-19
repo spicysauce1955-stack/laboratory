@@ -572,17 +572,57 @@ def check_quota_cpu(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
     return _ok("quota_cpu", f"{want} vCPU: {', '.join(usable)} ok")
 
 
+# The regional quota metric each GCP persistent-disk type draws on. pd-balanced is metered with
+# pd-ssd, not with pd-standard. Hyperdisk types have their own quotas and are deliberately absent:
+# a type missing here is "cannot tell", never a guess.
+_DISK_TYPE_QUOTA_METRIC = {
+    "pd-standard": "DISKS_TOTAL_GB",
+    "pd-balanced": "SSD_TOTAL_GB",
+    "pd-ssd": "SSD_TOTAL_GB",
+}
+
+
+def _gcp_boot_disk_type(instance_type: str | None) -> str | None:
+    """The boot-disk type SkyPilot provisions for this instance type, or None if unknowable.
+
+    The lab never sets ``disk_tier``, so SkyPilot uses its default tier (MEDIUM): pd-balanced on
+    most series, hyperdisk-balanced on n4/a4/a3-ultragpu. Asked of SkyPilot's own mapping
+    (``sky.clouds.GCP._get_disk_type``) so a SkyPilot upgrade that changes it is followed, not
+    contradicted; a private API, hence the broad fallback to "unknown".
+    """
+    if not instance_type:
+        return None
+    try:
+        from sky.clouds import GCP
+
+        return str(GCP._get_disk_type(instance_type, None))
+    except Exception:  # noqa: BLE001 — no sky, or its internals moved: cannot tell
+        return None
+
+
 def check_quota_disk(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
+    """Regional disk quota for the boot disk, in the metric its disk *type* draws on.
+
+    This read ``DISKS_TOTAL_GB`` — pd-standard's quota — while SkyPilot provisions pd-balanced
+    (``SSD_TOTAL_GB``), so it judged every launch by a quota the launch never touches.
+    """
     want = res.disk_size or 0
     if not want:
         return _skip("quota_disk", "no explicit disk size requested")
     creds, project = ctx.get("creds"), ctx.get("project")
     if creds is None or not project:
         return _skip("quota_disk", "no credentials to check with")
+    disk_type = _gcp_boot_disk_type(getattr(ctx.get("estimate"), "instance_type", None))
+    metric = _DISK_TYPE_QUOTA_METRIC.get(disk_type or "")
+    if metric is None:
+        return _skip(
+            "quota_disk",
+            f"boot disk type {disk_type or 'unknown'} has no persistent-disk quota metric to check",
+        )
     try:
         compute = _build(creds, "compute", "v1")
         regions, complete = _quota_regions(res, ctx)
-        quotas = {r: _region_quotas(compute, project, r).get("DISKS_TOTAL_GB") for r in regions}
+        quotas = {r: _region_quotas(compute, project, r).get(metric) for r in regions}
     except Exception as e:  # noqa: BLE001
         return _skip("quota_disk", f"could not read disk quota: {str(e)[:160]}")
     usable = {r: q for r, q in quotas.items() if q is not None and q[0] - q[1] >= want}
@@ -591,11 +631,11 @@ def check_quota_disk(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
             "quota_disk",
             quotas,
             want,
-            "GB of disk (DISKS_TOTAL_GB)",
+            f"GB of {disk_type} ({metric})",
             complete=complete,
-            fix="request a DISKS_TOTAL_GB increase for the region you intend to use",
+            fix=f"request a {metric} increase for the region you intend to use",
         )
-    return _ok("quota_disk", f"{want} GB: {', '.join(usable)} ok")
+    return _ok("quota_disk", f"{want} GB {disk_type} ({metric}): {', '.join(usable)} ok")
 
 
 def check_catalog(res: ResourceRequest, ctx: dict[str, Any]) -> CheckResult:
