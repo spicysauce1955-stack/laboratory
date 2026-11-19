@@ -647,6 +647,8 @@ def init(
     from lab.init import scaffold
 
     report = scaffold(Path.cwd(), check=check)
+    for warning in report.get("warnings", []):
+        print(f"warning: {warning}", file=sys.stderr)
     for dest in report["conflicts"]:
         print(
             f"warning: {dest} differs from the version lab ships and was left as-is; "
