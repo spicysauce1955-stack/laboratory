@@ -3074,8 +3074,12 @@ def _status_fields(
         "notes": notes,
         # Where it actually landed. GCP prices and exhausts per zone, so "which zone" is the
         # difference between a $0.034/hr job and a $0.12/hr one.
+        # A local job ran on this machine, on no cloud: the "vast" default is SkyPilot's, and only
+        # means something for a job a cloud provisioner launched (every local job used to report
+        # `cloud: "vast"`, as did a retried remote shard that ran locally carrying `cloud=do`).
         "placement": {
-            "cloud": m.resources.cloud or "vast",
+            "provisioner": m.backend.provisioner,
+            "cloud": None if m.backend.provisioner == "local" else (m.resources.cloud or "vast"),
             "machine_type": m.backend.machine_type,
             "region": m.backend.region,
             "zone": m.backend.zone,
