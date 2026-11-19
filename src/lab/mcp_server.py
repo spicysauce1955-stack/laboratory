@@ -31,6 +31,7 @@ from lab.events import store as events_store
 from lab.events.annotate import digest_of, refs_from
 from lab.manifest import repo_root
 from lab.models import JobManifest, JobSpec, ResourceRequest
+from lab.queue_view import queue_list_view
 from lab.store import JobStore
 
 
@@ -546,7 +547,7 @@ def build_server(lab: Lab) -> FastMCP:
         wherever it was submitted from."""
         return _lab().ps()
 
-    from lab.scheduler.models import Guardrails, RegState, Triggers
+    from lab.scheduler.models import Guardrails, Triggers
     from lab.scheduler.queue import default_queue
     from lab.scheduler.register import parse_expires, parse_window
     from lab.scheduler.register import register as sched_register
@@ -677,37 +678,8 @@ def build_server(lab: Lab) -> FastMCP:
 
     @mcp.tool
     def queue_list() -> dict[str, Any]:
-        """List deferred registrations: state, job_id, last skip reason, scheduler heartbeat
-        age/host, and heartbeat_paused -- the pause state the *last completed tick* actually
-        observed and acted on (unlike control.paused below, which flips the instant a write
-        lands)."""
-        queue = default_queue()
-        hb = queue.read_heartbeat()
-        age = None
-        if hb and "at" in hb:
-            from lab._util import now
-
-            age = max(0.0, (now() - datetime.fromisoformat(str(hb["at"]))).total_seconds())
-        entries = queue.list_entries()
-        held_ids = queue.held_ids()  # one listing, not a round trip per row (see cli.queue_list)
-        return {
-            "heartbeat_age_s": age,
-            "host": (hb or {}).get("host"),
-            "heartbeat_paused": (hb or {}).get("paused"),
-            "tick_count": (hb or {}).get("tick_count"),
-            "control": queue.read_control().model_dump(),
-            "entries": [
-                {
-                    "reg_id": r.reg_id,
-                    "state": "held" if (r.state is RegState.pending and r.reg_id in held_ids)
-                    else r.state.value,
-                    "job_id": r.job_id,
-                    "last_skip_reason": r.last_skip_reason,
-                    "expires_at": _iso(r.guardrails.expires_at),
-                }
-                for r in entries
-            ],
-        }
+        """List deferred registrations: state, cancel_requested, job_id, last skip reason, expiry; scheduler heartbeat age/host/tick_count; heartbeat_paused -- the pause state the *last completed tick* actually observed and acted on (unlike control.paused, which flips the instant a write lands); and scheduler_skew {verdict, host_version, client_version, detail}. verdict host_older or unknown means the always-on scheduler may be silently dropping registration fields it does not know (that is how price_cap was once lost on the deferred path) -- redeploy it before trusting a newer field; treat an unrecognised verdict as unknown. Diagnostic only, never a gate."""
+        return queue_list_view(default_queue()).payload  # the same view `lab queue list` emits
 
     @mcp.tool
     def queue_show(reg_id: str) -> dict[str, Any]:

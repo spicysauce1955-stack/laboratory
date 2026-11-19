@@ -108,6 +108,12 @@ upgrade note.
   which is how `--price-cap` was once lost on the deferred path. It is a diagnostic, never a gate;
   nothing refuses to register because of it.
 
+  `lab queue list` and the MCP `queue_list` tool now return one shared view (`lab.queue_view`):
+  the MCP tool gained the `scheduler_skew` block and each entry's `cancel_requested`, both
+  additive. The CLI's `entries[].expires_at` is now ISO-8601 with a `T` separator, the form the
+  MCP tool always returned, instead of Python's `str()` form with a space; both parse with
+  `datetime.fromisoformat`.
+
   `no_heartbeat` means the queue holds **no heartbeat object at all** — no tick has ever completed
   against it — and is deliberately **silent**: with nothing published there is no host to call
   old, and the absence is already reported as `heartbeat_age_s: null`. It replaces the `unknown` a
