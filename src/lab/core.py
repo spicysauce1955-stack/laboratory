@@ -1904,19 +1904,25 @@ class Lab:
                 lambda v: str(v.get("name") or v.get("id")),
             )
             if apply and do_volume_orphans:
-                from lab.backends.skypilot import _get_do_client
+                from lab.backends.skypilot import delete_do_volumes
 
-                do_client: Any = None
-                for vol in do_volume_orphans:
-                    vol_id = vol.get("id")
-                    if vol_id is None or not _approved("do_volume_orphans", vol):
-                        continue
+                doomed_vols = [
+                    vol
+                    for vol in do_volume_orphans
+                    if vol.get("id") is not None and _approved("do_volume_orphans", vol)
+                ]
+                if doomed_vols:
+                    # Through the detach ladder: the sky pass above has often just destroyed this
+                    # volume's droplet, and a delete in that instant is refused for a volume DO
+                    # releases seconds later — a false exit 5 (the 2026-08-23 race).
                     try:
-                        do_client = do_client or _get_do_client()  # see the Vast pass
-                        do_client.volumes.delete(volume_id=vol_id)
-                        do_volumes_destroyed.append(vol_id)
-                    except Exception as e:  # noqa: BLE001
-                        _unconfirmed("do_volume_orphans", vol, e)
+                        gone, refused = delete_do_volumes([vol["id"] for vol in doomed_vols])
+                    except Exception as e:  # noqa: BLE001 — no client: none of them were deleted
+                        gone, refused = [], {vol["id"]: e for vol in doomed_vols}
+                    do_volumes_destroyed.extend(gone)
+                    for vol in doomed_vols:
+                        if vol["id"] in refused:
+                            _unconfirmed("do_volume_orphans", vol, refused[vol["id"]])
 
         # GCP pass (best-effort): out-of-band instance + unattached-disk sweep via the compute
         # API — `sky.status` only sees clusters SkyPilot still tracks, and a GCP persistent disk

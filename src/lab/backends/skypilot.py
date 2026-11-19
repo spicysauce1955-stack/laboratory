@@ -784,16 +784,65 @@ def _do_destroy_matching(cluster: str) -> tuple[list[Any], list[str]]:
         except Exception as e:  # noqa: BLE001 — a box we found and could not kill must alarm
             failures.append(f"droplet {d.get('name')}: {type(e).__name__}: {e}")
 
-    for v in list_do_volumes(client):
-        if not str(v.get("name", "")).lower().startswith(prefix):
-            continue
-        try:
-            client.volumes.delete(volume_id=str(v["id"]))
-            destroyed.append(v["id"])
-        except Exception as e:  # noqa: BLE001
-            failures.append(f"volume {v.get('name')}: {type(e).__name__}: {e}")
-
+    # The volume goes through the same detach ladder as the success path. Deleting it in the
+    # same instant its droplet was destroyed is the 2026-08-23 race: DO detaches asynchronously,
+    # refuses the delete for a volume seconds from deletable, and a fallback that *worked* was
+    # recorded `failed` (exit 3). When a droplet would not die its volume stays attached however
+    # long we wait, so the ladder is skipped and the real alarm is not delayed by a minute.
+    swept, leftovers = _do_sweep_leftover_volumes(
+        cluster, backoffs=() if failures else _VOLUME_DETACH_BACKOFFS
+    )
+    destroyed.extend(swept)
+    failures.extend(leftovers)
     return destroyed, failures
+
+
+def delete_do_volumes(
+    volume_ids: list[Any],
+    *,
+    client: Any | None = None,
+    backoffs: tuple[int, ...] = _VOLUME_DETACH_BACKOFFS,
+) -> tuple[list[Any], dict[Any, BaseException]]:
+    """Delete exactly these DO volumes, riding out the asynchronous detach. Returns
+    ``(gone, failures_by_id)``; raises only if no client can be built.
+
+    The id-addressed sibling of :func:`_do_sweep_leftover_volumes`, for ``lab reconcile``, which
+    may only touch the volumes the operator approved rather than everything under a prefix. Same
+    rules, same reasons (2026-08-23): only the detach message is retried; every pass re-lists, and
+    a volume that vanished counts as gone — reconcile's sky pass has usually just destroyed the
+    droplet, and SkyPilot deletes the volume itself moments later. A volume still attached after
+    the whole ladder keeps its error: its droplet is alive, and that is a real alarm.
+    """
+    if client is None:
+        client = _get_do_client()
+    gone: list[Any] = []
+    failed: dict[Any, BaseException] = {}
+    pending = list(volume_ids)
+    for attempt, delay in enumerate((0, *backoffs)):
+        if not pending:
+            break
+        if delay:
+            time.sleep(delay)
+        if attempt:
+            try:
+                listed: set[str] | None = {str(v.get("id")) for v in list_do_volumes(client)}
+            except Exception:  # noqa: BLE001 — cannot tell; the delete below still answers
+                listed = None
+            if listed is not None:
+                vanished = [v for v in pending if str(v) not in listed]
+                gone.extend(vanished)
+                pending = [v for v in pending if v not in vanished]
+        detaching: list[Any] = []
+        for vol_id in pending:
+            try:
+                client.volumes.delete(volume_id=vol_id)
+                gone.append(vol_id)
+            except Exception as e:  # noqa: BLE001 — classified: retry "not yet", report "never"
+                failed[vol_id] = e
+                if _VOLUME_DETACH_MARKER in f"{type(e).__name__}: {e}".lower():
+                    detaching.append(vol_id)
+        pending = detaching
+    return gone, {k: e for k, e in failed.items() if k not in gone}
 
 
 class GcpNotConfigured(RuntimeError):

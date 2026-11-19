@@ -124,6 +124,9 @@ class TestDoDirectFallback:
 
     def test_a_volume_that_will_not_delete_still_alarms(self, monkeypatch):
         """The detached-volume leak is quieter than a droplet but it bills all the same."""
+        # The fallback now rides out the detach race (test_do_detach_race_everywhere.py); a
+        # volume that never detaches still alarms, just after the ladder — which need not be real.
+        monkeypatch.setattr(m.time, "sleep", lambda s: None)
         _patch(
             monkeypatch,
             _Client(
