@@ -111,6 +111,54 @@ def test_a_string_step_is_coerced_or_skipped_never_a_crash(tmp_path: Path):
     assert final_values(read_points(f)) == {"loss": 2.0}
 
 
+def _big_metrics_file(path: Path, n: int) -> Path:
+    f = path / METRICS_FILE
+    with f.open("w") as out:
+        for i in range(n):
+            out.write(json.dumps({"name": "loss", "value": 1.0 / (i + 1), "step": i}) + "\n")
+    return f
+
+
+def _peak_bytes(fn) -> int:  # type: ignore[no-untyped-def]
+    import tracemalloc
+
+    tracemalloc.start()
+    try:
+        fn()
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_a_since_step_poll_streams_instead_of_loading_the_file(tmp_path: Path):
+    """A `lab metrics --since-step` poll returns a handful of points but used to `read_text()`
+    and `splitlines()` the whole file first — 425 MB RSS for 9 points on a 147 MB file. Memory
+    must scale with what is returned, not with the file."""
+    n = 200_000  # ~11 MB on disk
+    f = _big_metrics_file(tmp_path, n)
+    size = f.stat().st_size
+
+    out: list[list[dict]] = []
+    peak = _peak_bytes(lambda: out.append(read_points(f, since_step=n - 10)))
+
+    assert [p["step"] for p in out[0]] == list(range(n - 9, n))
+    assert peak < size / 4, f"peak {peak} bytes for a {size}-byte file"
+
+
+def test_snapshot_final_metrics_streams_too(tmp_path: Path):
+    from lab.metrics import snapshot_final_metrics
+
+    n = 200_000
+    f = _big_metrics_file(tmp_path, n)
+    size = f.stat().st_size
+
+    out: list[dict] = []
+    peak = _peak_bytes(lambda: out.append(snapshot_final_metrics(tmp_path)))
+
+    assert out[0] == {"loss": 1.0 / n}
+    assert peak < size / 4, f"peak {peak} bytes for a {size}-byte file"
+
+
 def test_a_non_finite_step_is_skipped(tmp_path: Path):
     f = tmp_path / METRICS_FILE
     f.write_text(
