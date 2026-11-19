@@ -155,7 +155,6 @@ class Scheduler:
 
     def tick(self) -> TickReport:
         rep = TickReport(at=self.now_fn())
-        self._rep = rep  # used by _relaunch_preempted (single-arg, reuses _launch)
         tick_count = int((self.queue.read_heartbeat() or {}).get("tick_count", 0)) + 1
         self._price_cache: dict[tuple[str | None, str | None], float | None] = {}
         self._best_hourly_seen: dict[str, float] = {}
@@ -507,7 +506,12 @@ class Scheduler:
             return
 
         # Resubmit: carry the incremented counter + accumulated spend forward so the NEXT
-        # preemption sees them.
+        # preemption sees them, and requeue as `pending`. The relaunch itself is NOT done here:
+        # `_evaluate_and_launch` runs later in this same tick over these same `entries`, and
+        # puts the reg through every gate a launch must pass -- max_concurrent, the daily budget,
+        # the per-job cap, the window, not_before, the price trigger, holds and cancels. Calling
+        # `_launch` from here bypassed all of them, and the relaunched reg stayed `pending` in
+        # `entries`, so it was not even counted against max_concurrent.
         updated = reg.model_copy(
             update={
                 "preempt_count": reg.preempt_count + 1,
@@ -521,19 +525,7 @@ class Scheduler:
         )
         self.queue.put_entry(updated)
         entries[entries.index(reg)] = updated  # rest of the tick sees the pending, counter-bumped reg
-        try:
-            self._relaunch_preempted(updated)
-        except Exception as e:  # noqa: BLE001 — a bad entry must not kill the tick (spec §5)
-            rep.errors.append(f"{reg.reg_id}: relaunch error: {e}"[:300])
         rep.synced[reg.reg_id] = "resubmitted (preempted)"
-
-    def _relaunch_preempted(self, reg: Registration) -> None:
-        """Relaunch a counter-bumped, pending reg via the SAME path as a normal launch.
-
-        ``_launch`` model_copies from the passed reg, so the incremented ``preempt_count`` and
-        accumulated ``cumulative_usd`` carried by ``reg`` survive the launched transition.
-        """
-        self._launch(reg, self._rep)
 
     def _expire(self, entries: list[Registration], rep: TickReport) -> None:
         nowt = self.now_fn()

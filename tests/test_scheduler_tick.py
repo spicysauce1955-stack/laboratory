@@ -783,7 +783,7 @@ def test_preempted_registered_job_is_resubmitted_under_budget(tmp_path):
     q.put_entry(q.get_entry("reg-a").model_copy(update={
         "state": RegState.launched, "job_id": "j-spot", "launched_at": utc_now()}))
     relaunched: list[str] = []
-    sched._relaunch_preempted = lambda reg: relaunched.append(reg.reg_id)  # type: ignore[method-assign]
+    sched._launch = lambda reg, rep: relaunched.append(reg.reg_id)  # type: ignore[method-assign]
     sched.tick()
     e = q.get_entry("reg-a")
     assert relaunched == ["reg-a"]
@@ -802,7 +802,7 @@ def test_preempted_stops_at_retry_cap(tmp_path):
     q.put_entry(q.get_entry("reg-a").model_copy(update={
         "state": RegState.launched, "job_id": "j-spot", "launched_at": utc_now(),
         "preempt_count": 2}))  # cap reached (default max_preempt_retries=2)
-    sched._relaunch_preempted = lambda reg: (_ for _ in ()).throw(AssertionError("must not relaunch"))  # type: ignore[method-assign]
+    sched._launch = lambda reg, rep: (_ for _ in ()).throw(AssertionError("must not relaunch"))  # type: ignore[method-assign]
     rep = sched.tick()
     assert q.get_entry("reg-a").state is RegState.failed
     assert rep.synced["reg-a"] == "preempted (retry cap reached)"
@@ -822,7 +822,7 @@ def test_preempted_stops_when_budget_exhausted(tmp_path):
     sched.store.create(m)
     q.put_entry(q.get_entry("reg-a").model_copy(update={
         "state": RegState.launched, "job_id": "j-spot", "cumulative_usd": 0.0}))
-    sched._relaunch_preempted = lambda reg: (_ for _ in ()).throw(AssertionError("must not relaunch"))  # type: ignore[method-assign]
+    sched._launch = lambda reg, rep: (_ for _ in ()).throw(AssertionError("must not relaunch"))  # type: ignore[method-assign]
     rep = sched.tick()
     assert q.get_entry("reg-a").state is RegState.failed
     assert "budget" in rep.synced["reg-a"]
@@ -837,7 +837,7 @@ def test_preempted_with_failed_teardown_is_not_resubmitted(tmp_path):
     sched.store.create(m)
     q.put_entry(q.get_entry("reg-a").model_copy(update={
         "state": RegState.launched, "job_id": "j-spot"}))
-    sched._relaunch_preempted = lambda reg: (_ for _ in ()).throw(AssertionError("must not relaunch"))  # type: ignore[method-assign]
+    sched._launch = lambda reg, rep: (_ for _ in ()).throw(AssertionError("must not relaunch"))  # type: ignore[method-assign]
     rep = sched.tick()
     assert q.get_entry("reg-a").state is RegState.failed
     assert "teardown" in rep.synced["reg-a"]
@@ -853,14 +853,14 @@ def test_tick_report_lists_preempted(tmp_path):
     sched.store.create(m)
     q.put_entry(q.get_entry("reg-a").model_copy(update={
         "state": RegState.launched, "job_id": "j-spot", "launched_at": utc_now()}))
-    sched._relaunch_preempted = lambda reg: None  # type: ignore[method-assign]
+    sched._launch = lambda reg, rep: None  # type: ignore[method-assign]
     rep = sched.tick()
     assert "reg-a" in rep.preempted
 
 
 def test_preemption_resubmit_loop_accumulates_then_hits_retry_cap(tmp_path):
     """Drive preempt -> resubmit -> preempt -> resubmit -> retry-cap through the REAL
-    _handle_preempted (only _relaunch_preempted / _launch are stubbed, to stay deterministic):
+    _handle_preempted (only _launch is stubbed, to stay deterministic):
     preempt_count and cumulative_usd must accumulate across attempts, and the per-point retry cap
     (default 2) must stop the loop by FAILING the reg — never killing a running job."""
     sched, q = _watchdog_sched(tmp_path)
@@ -868,8 +868,8 @@ def test_preemption_resubmit_loop_accumulates_then_hits_retry_cap(tmp_path):
     put_reg(q, tmp_path, "reg-a", command="python x.py",
             expires=utc_now() + timedelta(days=1), max_cost=100.0)
     relaunched: list[str] = []
-    sched._relaunch_preempted = lambda reg: relaunched.append(reg.reg_id)  # type: ignore[method-assign]
-    sched._launch = lambda reg, rep: None  # type: ignore[method-assign]  # no real same-tick relaunch
+    # Records the gated relaunch without performing it (no real same-tick launch).
+    sched._launch = lambda reg, rep: relaunched.append(reg.reg_id)  # type: ignore[method-assign]
 
     def preempt(job_id: str, actual: float) -> None:
         """Point reg-a at a freshly-preempted attempt, preserving its accumulated counters."""
@@ -897,6 +897,90 @@ def test_preemption_resubmit_loop_accumulates_then_hits_retry_cap(tmp_path):
     assert e.state is RegState.failed and "retry cap" in rep.synced["reg-a"]
     assert relaunched == ["reg-a", "reg-a"]  # never relaunched a third time
     assert e.preempt_count == 2 and e.cumulative_usd == 0.7  # unchanged once the cap fires
+
+
+def _preempted_reg_a(sched: Scheduler, q: LocalQueueStore, tmp_path: Path, **kw: object) -> None:
+    put_reg(q, tmp_path, "reg-a", command="python x.py", expires=utc_now() + timedelta(days=1),
+            max_cost=100.0, **kw)  # type: ignore[arg-type]
+    sched.store.create(make_manifest("j-spot", "python x.py", timeout="1h").model_copy(update={
+        "status": JobState.preempted, "registration_id": "reg-a", "teardown_status": "succeeded",
+        "cost": CostInfo(actual_usd=0.4, hourly_usd=0.4, estimated_usd=0.4)}))
+    q.put_entry(q.get_entry("reg-a").model_copy(update={
+        "state": RegState.launched, "job_id": "j-spot", "launched_at": utc_now()}))
+
+
+def _recording_lab(sched: Scheduler) -> list[str]:
+    submitted: list[str] = []
+    n = iter(range(100))
+
+    class FakeLab:
+        def submit(self, spec, **kw):  # type: ignore[no-untyped-def]
+            jid = f"j-new-{next(n)}"
+            sched.store.create(make_manifest(jid, "python x.py", timeout="1h").model_copy(
+                update={"status": JobState.running, "registration_id": kw["registration_id"],
+                        "cost": CostInfo(estimated_usd=0.4)}))
+            submitted.append(kw["registration_id"])
+            return jid
+
+    sched.make_lab = lambda repo: FakeLab()  # type: ignore[method-assign,assignment,return-value]
+    return submitted
+
+
+def test_a_preempt_resubmit_respects_max_concurrent(tmp_path: Path):
+    """The resubmit used to call `_launch` straight from `_sync`, bypassing every gate in
+    `_evaluate_and_launch` -- and the relaunched reg stayed `pending` in the tick's entries, so
+    it was not even counted: two running jobs under max_concurrent=1."""
+    sched, q = _watchdog_sched(tmp_path)
+    q.write_control(ControlConfig(max_concurrent=1))
+    _preempted_reg_a(sched, q, tmp_path)
+    put_reg(q, tmp_path, "reg-b", command="python x.py", expires=utc_now() + timedelta(days=1))
+    submitted = _recording_lab(sched)
+
+    rep = sched.tick()
+
+    assert len(submitted) == 1, submitted
+    states = {r: q.get_entry(r).state for r in ("reg-a", "reg-b")}
+    assert sorted(s.value for s in states.values()) == ["launched", "pending"]
+    assert "max_concurrent" in rep.skipped[next(r for r, s in states.items() if s is RegState.pending)]
+
+
+def test_a_preempt_resubmit_waits_for_its_window(tmp_path: Path):
+    """Outside the registration's launch window, a preempted job waits for the window like any
+    other launch -- it does not relaunch at 2pm because it happened to be preempted at 2pm."""
+    from datetime import time as dtime
+
+    from lab.scheduler.models import DailyWindow
+
+    now_local = utc_now()
+    shut = DailyWindow(
+        start=dtime((now_local.hour + 2) % 24, 0), end=dtime((now_local.hour + 3) % 24, 0)
+    )
+    sched, q = _watchdog_sched(tmp_path)
+    _preempted_reg_a(sched, q, tmp_path, triggers=Triggers(window=shut))
+    submitted = _recording_lab(sched)
+
+    rep = sched.tick()
+
+    assert submitted == []
+    e = q.get_entry("reg-a")
+    assert e.state is RegState.pending and e.preempt_count == 1  # requeued, counted, waiting
+    assert "outside window" in rep.skipped["reg-a"]
+
+
+def test_a_preempt_resubmit_respects_the_daily_budget(tmp_path: Path, monkeypatch):
+    sched, q = _watchdog_sched(tmp_path)
+    q.write_control(ControlConfig(budget_usd_per_day=0.5))
+    _preempted_reg_a(sched, q, tmp_path)
+    q.put_entry(q.get_entry("reg-a").model_copy(update={"spec": q.get_entry("reg-a").spec.model_copy(
+        update={"resources": ResourceRequest(cloud="gcp", timeout="1h")})}))
+    monkeypatch.setattr(Scheduler, "_catalog_hourly", lambda self, res: 0.9)  # 0.9 > 0.5 budget
+    submitted = _recording_lab(sched)
+
+    rep = sched.tick()
+
+    assert submitted == []
+    assert "daily budget" in rep.skipped["reg-a"]
+    assert q.get_entry("reg-a").state is RegState.pending
 
 
 # ------------------------------------------------------------------ Task 12: sweep ceiling
