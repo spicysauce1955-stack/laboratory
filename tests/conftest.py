@@ -37,6 +37,51 @@ def _isolate_event_ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _record_module._current.set(None)
 
 
+# Cloud settings a developer's shell or `.env` can carry. None of them may reach a test: with
+# them set, `r2_enabled()` is true and code under test uploads to the real bucket.
+_CLOUD_ENV = (
+    "LAB_R2_ENDPOINT",
+    "LAB_R2_BUCKET",
+    "DIGITALOCEAN_TOKEN",
+    "DIGITALOCEAN_ACCESS_TOKEN",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_developer_dotenv(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
+    """No test may pick up the developer's `.env` or cloud settings (incident 2026-11-19).
+
+    `lab.cli`'s callback runs `load_lab_env(repo_root())`, so the first in-process CLI test used
+    to load this checkout's real `.env` into `os.environ` for the rest of the session, and every
+    later test that mirrors to R2 wrote to the real bucket. `LAB_DOTENV=0` is inherited by the
+    subprocess CLI tests too. `test_env` tests the loader itself and manages its own variables.
+    """
+    if request.node.get_closest_marker("live_cloud"):
+        return  # explicitly opted in with LAB_TEST_LIVE=1; it needs the real settings
+    for name in _CLOUD_ENV:
+        monkeypatch.delenv(name, raising=False)
+    if request.node.module.__name__ == "test_env":
+        monkeypatch.delenv("LAB_DOTENV", raising=False)  # the loader's own tests need it on
+    else:
+        monkeypatch.setenv("LAB_DOTENV", "0")
+
+    from lab.storage import R2Store
+
+    real_init = R2Store.__init__
+
+    def _fake_clients_only(self, endpoint, bucket="lab-artifacts", client=None):  # type: ignore[no-untyped-def]
+        if client is None:
+            raise AssertionError(
+                "a test tried to build a real R2 (boto3) client — pass a fake `client=` to "
+                "R2Store or monkeypatch the store factory in this test"
+            )
+        real_init(self, endpoint, bucket, client)
+
+    monkeypatch.setattr(R2Store, "__init__", _fake_clients_only)
+
+
 @pytest.fixture(autouse=True)
 def _no_real_cloud_clients(monkeypatch):
     """No test may reach a real provider API by *omission*.

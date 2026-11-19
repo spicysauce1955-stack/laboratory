@@ -276,3 +276,12 @@ def test_no_warning_on_a_host_whose_cwd_is_not_a_repo(tmp_path, monkeypatch, cap
     _warn_if_repo_override_shadows_cwd()
 
     assert capsys.readouterr().err == ""
+
+
+def test_lab_dotenv_0_turns_the_loader_off(tmp_path, monkeypatch):
+    """The suite sets LAB_DOTENV=0 so no test inherits the developer's real R2 settings."""
+    (tmp_path / ".env").write_text("LAB_R2_BUCKET=from-dotenv\n")
+    monkeypatch.delenv("LAB_R2_BUCKET", raising=False)
+    monkeypatch.setenv("LAB_DOTENV", "0")
+    assert load_lab_env(tmp_path) == []
+    assert "LAB_R2_BUCKET" not in os.environ
