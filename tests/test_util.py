@@ -57,6 +57,18 @@ def test_parse_duration_malformed_raises_clear_error():
         assert "could not convert" not in str(exc_info.value)
 
 
+def test_parse_duration_refuses_non_finite_negative_and_zero():
+    """This gates a wall-clock cap on a machine that bills. `inf`/`nan` parsed to a cap that never
+    fires (or compares false everywhere), a negative one to a provision paid for and killed at
+    once, and `0` reads as "no limit" wherever a caller writes `parse_duration(...) or default`."""
+    import pytest
+
+    for bad in ["inf", "nan", "-inf", "infs", "1e400", "-5", "-1h", "0", "0s", "0h0m", float("inf")]:
+        with pytest.raises(ValueError, match="invalid duration"):
+            parse_duration(bad)
+    assert parse_duration("0.5") == 0.5  # positive fractions are still fine
+
+
 def test_parse_duration_compound():
     """`--timeout 3h30m` is the obvious way to write three and a half hours, and it used to fail
     with `could not convert string to float: '3h30'` — twice in the ledger, on two jobs, during
@@ -66,7 +78,7 @@ def test_parse_duration_compound():
     assert parse_duration("1d2h") == 86400 + 7200
     assert parse_duration("1h30m15s") == 3600 + 1800 + 15
     assert parse_duration("1d2h3m4s") == 86400 + 7200 + 180 + 4
-    assert parse_duration("0h0m") == 0.0
+    assert parse_duration("0h30m") == 1800.0  # a zero component is fine; a zero total is not
     assert parse_duration("1h 30m") == 5400  # optional whitespace between components
     assert parse_duration("3H30M") == 12600  # case-insensitive, like the single-unit form
     assert parse_duration("1.5h30m") == 5400 + 1800  # decimals, as the single-unit form allows

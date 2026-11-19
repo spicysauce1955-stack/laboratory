@@ -20,6 +20,7 @@ from lab.core import (
     check_sweep_admission,
     expand_grid,
     validate_cloud,
+    validate_durations,
 )
 from lab.models import CodeRef, JobSpec, ResourceRequest
 from lab.scheduler.bundle import create_bundle
@@ -112,6 +113,7 @@ def _check_cloud_triggers(resources: ResourceRequest, triggers: Triggers) -> Non
     """Fail-loud (FR-F3): price/offer triggers query the Vast offer feed only — gating a DO/GCP
     job on Vast prices would silently never (or always) fire."""
     validate_cloud(resources.cloud)
+    validate_durations(resources)
     cloud = resources.cloud or "vast"
     if cloud != "vast" and (triggers.max_hourly_usd is not None or triggers.offer_query):
         raise LabError(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import shlex
@@ -99,25 +100,30 @@ def parse_duration(value: str | float | None) -> float | None:
     ever sees input the old parse already rejected, and cannot change an existing answer.
     ``3h30m`` (twice in the ledger, on two jobs, as ``could not convert string to float: '3h30'``)
     is what it exists for.
+
+    The result must be a positive, finite length of time. ``float()`` happily reads ``inf``,
+    ``nan``, ``1e400`` and ``-5``: a cap that never fires, one that compares false everywhere, and
+    one that pays for a provision and kills it at once. ``0`` is refused too, because every
+    ``parse_duration(...) or default`` caller reads it as "no limit".
     """
     if value is None:
         return None
     s = str(value).strip().lower()
     if not s:
         return None
+    seconds: float | None
     try:
-        if s[-1] in _UNITS:
-            return float(s[:-1]) * _UNITS[s[-1]]
-        return float(s)
+        seconds = float(s[:-1]) * _UNITS[s[-1]] if s[-1] in _UNITS else float(s)
     except ValueError:
-        pass
-    compound = _parse_compound(s)
-    if compound is not None:
-        return compound
-    raise ValueError(
-        f"invalid duration {value!r}: expected <n>s / <n>m / <n>h / <n>d, a compound like "
-        "3h30m (largest unit first, each unit at most once), or a plain number of seconds"
-    )
+        seconds = _parse_compound(s)
+    if seconds is None:
+        raise ValueError(
+            f"invalid duration {value!r}: expected <n>s / <n>m / <n>h / <n>d, a compound like "
+            "3h30m (largest unit first, each unit at most once), or a plain number of seconds"
+        )
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"invalid duration {value!r}: must be a positive, finite length of time")
+    return seconds
 
 
 def atomic_write_text(path: Path, text: str) -> None:

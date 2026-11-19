@@ -383,6 +383,23 @@ def validate_cloud(cloud: str | None) -> str | None:
     return cloud
 
 
+def validate_durations(resources: ResourceRequest) -> None:
+    """Refuse an unparsable or non-positive ``timeout``/``provision_timeout`` when a job is asked
+    for, not when it launches. Pure.
+
+    Nothing parsed them before launch, so ``3h30`` (documented as refused) was accepted and a
+    negative timeout paid for a provision that died on arrival. Called on every create path
+    rather than as a model validator, so a legacy manifest carrying such a value still loads.
+    """
+    from lab._util import parse_duration
+
+    for field in ("timeout", "provision_timeout"):
+        try:
+            parse_duration(getattr(resources, field))
+        except ValueError as e:
+            raise LabError(f"{field}: {e}") from e
+
+
 def resolve_backend_profile(
     backend: str, resources: ResourceRequest
 ) -> tuple[str, ResourceRequest]:
@@ -399,6 +416,7 @@ def resolve_backend_profile(
     spot job's bill. Pure; no I/O.
     """
     validate_cloud(resources.cloud)
+    validate_durations(resources)
     if backend != "cpu":
         disk = default_disk_gb(resources)
         if backend == "skypilot" and disk != resources.disk_size:
@@ -530,6 +548,7 @@ class Lab:
         ``code`` overrides git introspection — used by the scheduler, which submits from an
         extracted bundle (not a git repo) with provenance captured at registration time.
         """
+        validate_durations(spec.resources)
         if preflight:
             self.preflight(spec)
         # Before a job id exists, let alone a manifest or a rental: a cap nothing on offer can
