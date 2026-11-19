@@ -179,6 +179,57 @@ def test_a_dead_dependency_cancels_even_beside_an_unreadable_one(tmp_path: Path)
     assert q.get_entry("reg-child").state is RegState.cancelled
 
 
+def test_a_tick_over_unchanged_waiting_entries_writes_nothing_but_its_heartbeat(tmp_path: Path):
+    """100 waiting entries used to cost 202 GETs + 101 PUTs *every* tick -- a fresh GET per
+    entry and a PUT of an unchanged skip reason -- ~300 sequential R2 round trips per 60s tick
+    on the always-on host. Unchanged entries need neither."""
+    from lab.scheduler.models import Triggers
+
+    sched, q, fake = r2_sched(tmp_path)
+    nb = utc_now() + timedelta(hours=10)
+    for i in range(100):
+        q.put_entry(future_reg(f"reg-{i:03d}", triggers=Triggers(not_before=nb)))
+
+    fake.ops.clear()
+    sched.tick()  # first sight: each entry's skip reason is new, so each is written once
+    assert fake.ops["put"] == 100 + 1
+
+    fake.ops.clear()
+    rep = sched.tick()  # nothing changed
+    assert fake.ops.get("put") == 1  # the heartbeat
+    assert fake.ops["get"] == 100 + 2  # the listing + heartbeat + control; no per-entry re-read
+    assert len(rep.skipped) == 100  # still reported every tick, just not rewritten
+    assert q.get_entry("reg-042").last_skip_reason == f"not_before {nb.isoformat()}"
+
+
+def test_a_changed_skip_reason_is_still_written(tmp_path: Path):
+    from lab.scheduler.models import Triggers
+
+    sched, q, fake = r2_sched(tmp_path)
+    q.put_entry(future_reg("reg-dep", state=RegState.launched, job_id="j-x"))
+    q.put_entry(future_reg("reg-child", triggers=Triggers(after=["reg-dep"])))
+    sched._sync = lambda entries, rep, markers: None  # type: ignore[method-assign]
+    sched.tick()
+    assert q.get_entry("reg-child").last_skip_reason == "waiting on dependency reg-dep (launched)"
+    q.put_entry(q.get_entry("reg-dep").model_copy(update={"state": RegState.pending}))
+    sched._launch = lambda reg, rep: None  # type: ignore[method-assign]
+    sched.tick()
+    assert q.get_entry("reg-child").last_skip_reason == "waiting on dependency reg-dep (pending)"
+
+
+def test_an_entry_expired_this_tick_is_not_launched(tmp_path: Path):
+    """Without the per-entry re-read, the in-memory copy must carry what this tick wrote."""
+    sched, q, _ = r2_sched(tmp_path)
+    reg = future_reg("reg-a")
+    q.put_entry(reg.model_copy(update={"guardrails": reg.guardrails.model_copy(
+        update={"expires_at": utc_now() - timedelta(minutes=1)})}))
+    launched: list[str] = []
+    sched._launch = lambda reg, rep: launched.append(reg.reg_id)  # type: ignore[method-assign]
+    rep = sched.tick()
+    assert launched == [] and rep.expired == ["reg-a"]
+    assert q.get_entry("reg-a").state is RegState.expired
+
+
 def test_a_readable_absent_marker_still_launches(tmp_path: Path):
     """The other half: a real 404 is "no marker", and the launch goes ahead."""
     sched, q, _ = r2_sched(tmp_path)

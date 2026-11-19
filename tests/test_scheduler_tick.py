@@ -1193,8 +1193,8 @@ def test_cancel_landing_after_the_snapshot_is_still_caught_before_submit(
     """spec §5 cancel race: the pre-submit re-check must be a FRESH read, not the snapshot.
 
     The marker is written *after* the tick took its snapshot and *after* the evaluation loop began
-    -- by the loop's own per-entry `get_entry` re-read -- so only a fresh read immediately before
-    the submit can see it. Serving that check from the snapshot would rent a machine for a
+    -- from inside the loop's own per-entry trigger evaluation -- so only a fresh read immediately
+    before the submit can see it. Serving that check from the snapshot would rent a machine for a
     registration the user had already cancelled.
     """
     sched, q = make_sched(tmp_path)
@@ -1202,16 +1202,17 @@ def test_cancel_landing_after_the_snapshot_is_still_caught_before_submit(
     real_get_entry = LocalQueueStore.get_entry
     fresh_reads: list[str] = []
     real_cancel_requested = LocalQueueStore.cancel_requested
+    real_trigger_block = Scheduler._trigger_block
 
-    def _cancel_then_read(self: LocalQueueStore, reg_id: str) -> Registration:
-        self.request_cancel(reg_id)  # lands mid-tick, after MarkerSnapshot.read()
-        return real_get_entry(self, reg_id)
+    def _cancel_then_evaluate(self: Scheduler, reg, by_id, rep):  # type: ignore[no-untyped-def]
+        self.queue.request_cancel(reg.reg_id)  # lands mid-tick, after MarkerSnapshot.read()
+        return real_trigger_block(self, reg, by_id, rep)
 
     def _counted(self: LocalQueueStore, reg_id: str) -> bool:
         fresh_reads.append(reg_id)
         return real_cancel_requested(self, reg_id)
 
-    monkeypatch.setattr(LocalQueueStore, "get_entry", _cancel_then_read)
+    monkeypatch.setattr(Scheduler, "_trigger_block", _cancel_then_evaluate)
     monkeypatch.setattr(LocalQueueStore, "cancel_requested", _counted)
 
     rep = sched.tick()
@@ -1236,12 +1237,13 @@ def test_a_hold_landing_after_the_snapshot_still_stops_the_launch(tmp_path: Path
     sched, q = make_sched(tmp_path)
     put_reg(q, tmp_path, "reg-a")
     real_get_entry = LocalQueueStore.get_entry
+    real_trigger_block = Scheduler._trigger_block
 
-    def _hold_then_read(self: LocalQueueStore, reg_id: str) -> Registration:
-        self.hold(reg_id)  # lands mid-tick, after MarkerSnapshot.read()
-        return real_get_entry(self, reg_id)
+    def _hold_then_evaluate(self: Scheduler, reg, by_id, rep):  # type: ignore[no-untyped-def]
+        self.queue.hold(reg.reg_id)  # lands mid-tick, after MarkerSnapshot.read()
+        return real_trigger_block(self, reg, by_id, rep)
 
-    monkeypatch.setattr(LocalQueueStore, "get_entry", _hold_then_read)
+    monkeypatch.setattr(Scheduler, "_trigger_block", _hold_then_evaluate)
 
     rep = sched.tick()
 

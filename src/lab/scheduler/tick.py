@@ -82,6 +82,10 @@ class Scheduler:
         self.reconcile_budget_s = (
             self.RECONCILE_BUDGET_S if reconcile_budget_s is None else reconcile_budget_s
         )
+        # Per-tick state, reset at the top of every `tick()`; initialised here too so a helper
+        # driven directly (tests, a future caller) never meets a missing attribute.
+        self._unreadable: frozenset[str] = frozenset()
+        self._written: set[str] = set()
 
     def make_lab(self, repo: Path) -> Lab:
         """Lab over the launch backend, rooted at an extracted bundle. Test seam."""
@@ -158,7 +162,8 @@ class Scheduler:
         tick_count = int((self.queue.read_heartbeat() or {}).get("tick_count", 0)) + 1
         self._price_cache: dict[tuple[str | None, str | None], float | None] = {}
         self._best_hourly_seen: dict[str, float] = {}
-        self._unreadable: frozenset[str] = frozenset()
+        self._unreadable = frozenset()
+        self._written = set()  # reg_ids this tick wrote (see `_put`)
         control: ControlConfig | None = None
         try:
             control = self.queue.read_control()
@@ -325,8 +330,17 @@ class Scheduler:
         return hourly * secs / 3600.0
 
     def _skip(self, reg: Registration, rep: TickReport, reason: str) -> None:
-        self.queue.put_entry(reg.model_copy(update={"last_skip_reason": reason}))
+        # Only a *changed* reason is worth a write. A waiting entry is skipped every tick with
+        # the same reason, and rewriting it cost one PUT per waiting entry per tick against R2
+        # (~100 sequential round trips/minute at 100 waiting entries) to record nothing new.
+        if reg.last_skip_reason != reason:
+            self._put(reg.model_copy(update={"last_skip_reason": reason}))
         rep.skipped[reg.reg_id] = reason
+
+    def _put(self, reg: Registration) -> None:
+        """Every entry write in a tick goes through here, so the tick knows what it changed."""
+        self.queue.put_entry(reg)
+        self._written.add(reg.reg_id)
 
     # ------------------------------------------------------------------ phases
     RE_MIRROR_TERMINAL_S = 900.0  # late manifest fields (teardown_status) land post-terminal
@@ -523,15 +537,17 @@ class Scheduler:
                 "last_skip_reason": "resubmitting after spot preemption",
             }
         )
-        self.queue.put_entry(updated)
+        self._put(updated)
         entries[entries.index(reg)] = updated  # rest of the tick sees the pending, counter-bumped reg
         rep.synced[reg.reg_id] = "resubmitted (preempted)"
 
     def _expire(self, entries: list[Registration], rep: TickReport) -> None:
         nowt = self.now_fn()
-        for reg in entries:
+        for i, reg in enumerate(entries):
             if reg.state is RegState.pending and nowt >= reg.guardrails.expires_at:
-                self._transition(reg, RegState.expired, reason="expired (run-by deadline passed)")
+                entries[i] = self._transition(
+                    reg, RegState.expired, reason="expired (run-by deadline passed)"
+                )
                 rep.expired.append(reg.reg_id)
 
     def _evaluate_and_launch(
@@ -557,7 +573,12 @@ class Scheduler:
                 continue
             if reg.state is not RegState.pending:
                 continue
-            reg = self.queue.get_entry(reg.reg_id)  # fresh copy (expiry may have written)
+            # Re-read only an entry this tick has itself written: entries are scheduler-owned
+            # (the laptop writes markers, never an existing entry), so the listed copy of anything
+            # untouched is already current, and a fresh GET per waiting entry per tick was ~100
+            # sequential R2 round trips a minute buying nothing.
+            if reg.reg_id in self._written:
+                reg = self.queue.get_entry(reg.reg_id)
             if reg.state is not RegState.pending:
                 continue
             if reg.reg_id in markers.cancelled:
@@ -755,5 +776,5 @@ class Scheduler:
                 **extra,
             }
         )
-        self.queue.put_entry(updated)
+        self._put(updated)
         return updated
